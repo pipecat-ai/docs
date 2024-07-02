@@ -1,0 +1,225 @@
+---
+title: "Dial-in: WebRTC (Daily)"
+description: "Call your Pipecat bot using Daily WebRTC"
+---
+
+## Things you'll need
+
+- An active [Daily](https://www.daily.co) developer key.
+- One or more Daily provisioned phone numbers (covered below).
+
+<Card
+  title="Prefer to look at code? See the example project"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat/tree/main/examples/dialin-chatbot"
+>
+  We have a complete dialin-ready project using Daily as both a transport and
+  PSTN/SIP provider in the Pipecat repo. This guide referencse the project and
+  steps through the important parts that make dial-in work.
+</Card>
+
+### Do I need to provision my phone numbers through Daily?
+
+You can use Daily solely as a transport if you prefer. This is particularly useful if you already have Twilio-provisioned numbers and workflows. In that case, you can configure Twilio to forward calls to your Pipecat agents. More details on using Twilio with Daily as a transport can be found [here](/telephony/twilio-webrtc).
+
+If you’re starting from scratch, using everything on one platform offers some convenience. By provisioning your phone numbers through Daily and using Daily as the transport layer, you won’t need to worry about initial call routing.
+
+<Note>
+  This guide assumes use of Daily for both WebRTC transport and as a phone
+  vendor.
+</Note>
+
+## Purchasing a phone number
+
+You can purchase a number via the Daily REST API
+
+<CodeGroup>
+```shell Purchase a random number
+curl --request POST \ --url
+'https://api.daily.co/v1/buy-phone-number' \ --header 'Authorization: Bearer
+[YOUR_DAILY_API_KEY]' \ --header 'Content-Type: application/json'
+```
+
+```shell Purchase specific number
+curl --request POST \
+--url 'https://api.daily.co/v1/buy-phone-number' \
+--header 'Authorization: Bearer [YOUR_DAILY_API_KEY]' \
+--header 'Content-Type: application/json' \
+--data '{
+    "number": "..."
+}'
+```
+
+```shell List numbers
+curl --request GET \
+--url 'https://api.daily.co/v1/purchased-phone-numbers' \
+--header 'Authorization: Bearer [YOUR_DAILY_API_KEY]'
+```
+
+</CodeGroup>
+
+## Configuring your bot runner
+
+You'll need a HTTP service that can receive incoming call hooks and trigger a new agent session. We discussed the concept of a [bot runner](/deployment/pattern) in the deployment section, which we'll build on here to add support for incoming phone calls.
+
+Within the `start_bot` method, we'll need to grab both `callId` and `callDomain` from the incoming web request that is trigger by Daily when someone dials our number:
+
+```python bot_daily.py
+# Get the dial-in properties from the request
+try:
+    data = await request.json()
+    callId = data.get("callId")
+    callDomain = data.get("callDomain")
+except Exception:
+    raise HTTPException(
+        status_code=500,
+        detail="Missing properties 'callId' or 'callDomain'")
+```
+
+<Note>
+  Full bot source code
+  [here](https://github.com/pipecat-ai/pipecat/blob/main/examples/dialin-chatbot/bot_daily.py)
+</Note>
+
+### Orchestrating incoming calls
+
+Daily needs a URL / webhook endpoint it can trigger when a user dials the phone number.
+
+We can configure this by assigning the number to an endpoint via their REST API.
+
+Here is an example:
+
+```shell
+curl --location 'https://api.daily.co/v1' \
+--header 'Content-Type: application/json' \
+--header 'Authorization: Bearer [DAILY API TOKEN HERE]' \
+--data '{
+    "properties": {
+        "pinless_dialin": {
+            "phone_number": "[DAILY PROVISIONED NUMBER HERE]",
+            "room_creation_api": "[BOT RUNNER URL]/start_bot"
+        }
+    }
+}'
+```
+
+If you want to test locally, you can expose your web method using a service such as [ngrok](https://ngrok.com/).
+
+```shell Example ngrok tunnel
+python bot_runner.py --host localhost --port 7860 --reload
+ngrok http localhost:7860
+
+# E.g: https://123.ngrok.app/start_bot
+```
+
+### Creating a new SIP-enabled room
+
+We'll need to configure the Daily room to be setup to receive SIP connections. `daily-helpers.py` as part of the Pipecat service, has some useful imports that make this easy. We just need to pass through new SIP parameters as part of room creation:
+
+```python bot_runner.py
+
+from pipecat.transports.services.helpers.daily_rest import DailyRoomParams, DailyRoomProperties, DailyRoomSipParams
+
+params = DailyRoomParams(
+    properties=DailyRoomProperties(
+        sip=DailyRoomSipParams(
+            display_name = "sip-dialin"
+            video = False
+            sip_mode = "dial-in"
+            num_endpoints = 1
+        )
+    )
+)
+
+# Create sip-enabled Daily room via REST
+try:
+    room: DailyRoomObject = daily_rest_helper.create_room(params=params)
+except Exception as e:
+    raise HTTPException(
+        status_code=500,
+        detail=f"Unable to provision room {e}")
+
+print (f"Daily room returned {room.url} {room.config.sip_endpoint}")
+```
+
+Incoming calls will include both `callId` and `callDomain` properties in the body of the request; we'll need to pass to the Pipecat agent.
+
+For simplicity, our agents are spawned as subprocesses of the bot runner, so we'll pass these through as command line arguments:
+
+```python bot_runner.py
+proc = subprocess.Popen(
+    [
+        f"python3 -m bot_daily -u {room.url} -t {token} -i {callId} -d {callDomain}"
+    ],
+    shell=True,
+    bufsize=1,
+    cwd=os.path.dirname(os.path.abspath(__file__))
+)
+```
+
+That's all the configuration we need in our `bot_runner.py`.
+
+## Configuring your Pipecat bot
+
+Let's take a look at `bot_daily.py` and step through the differences from other examples.
+
+First, it's setup to receive additional command line parameters which are passed through to the `DailyTransport` object:
+
+```python bot_daily.py
+# ...
+
+async def main(room_url: str, token: str, callId: str, callDomain: str):
+    async with aiohttp.ClientSession() as session:
+        diallin_settings = DailyDialinSettings(
+            call_id=callId,
+            call_domain=callDomain
+        )
+        transport = DailyTransport(
+            room_url,
+            token,
+            "Chatbot",
+            DailyParams(
+                api_url=daily_api_url,
+                api_key=daily_api_key,
+                dialin_settings=diallin_settings,
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                camera_out_enabled=False,
+                vad_enabled=True,
+                vad_analyzer=SileroVADAnalyzer(),
+                transcription_enabled=True,
+            )
+        )
+
+        # ... your bot code
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Pipecat Simple ChatBot")
+    parser.add_argument("-u", type=str, help="Room URL")
+    parser.add_argument("-t", type=str, help="Token")
+    parser.add_argument("-i", type=str, help="Call ID")
+    parser.add_argument("-d", type=str, help="Call Domain")
+    config = parser.parse_args()
+
+    asyncio.run(main(config.u, config.t, config.i, config.d))
+```
+
+Optionally, we can listen and respond to the `on_dialin_ready` event manually. This is useful if you have specific scenarios in whih you want to indicates that the SIP worker and is ready to be forwarded to the call.
+
+This would stop any hold music and connect the end-user to our Pipecat bot.
+
+```python
+@transport.event_handler("on_dialin_ready")
+async def on_dialin_ready(transport, cdata):
+    print(f"on_dialin_ready", cdata)
+
+```
+
+Since we're using Daily as a phone vendor, this method is handled internally by the Pipecat Daily service. It can, however, be useful to override this default behaviour if you want to configure your bot in a certain way as soon as the call is ready. Typically, however, initial setup is done in the `on_first_participant_joined` event after the user has joined the session.
+
+```python
+@transport.event_handler("on_first_participant_joined")
+async def on_first_participant_joined(transport, participant):
+    transport.capture_participant_transcription(participant["id"])
+    await task.queue_frames([LLMMessagesFrame(messages)])
+```
