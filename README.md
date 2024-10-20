@@ -4,7 +4,7 @@
 
 # Pipecat docs
 
-Welcome to the Pipecat documentation repository! This project contains the official [documentation(https://docs.pipecat.ai)] for the [Pipecat](https://github.com/pipecat-ai/pipecat) open-source project.
+Welcome to the Pipecat documentation repository! This project contains the official [documentation](https://docs.pipecat.ai)] for the [Pipecat](https://github.com/pipecat-ai/pipecat) open-source project.
 
 This repository is deployed on [docs.pipecat.ai](https://docs.pipecat.ai).
 
@@ -28,7 +28,7 @@ We welcome contributions of all kinds! Whether you're fixing a typo, adding a ne
 
 2. **Clone the repository**: Clone your forked repository to your local machine.
    ```bash
-   git clone https://github.com/pipecat-ai/docs
+   git clone https://github.com/your-username/docs
    ```
 3. **Create a branch**: For your contribution, create a new branch.
     ```bash
@@ -46,7 +46,7 @@ git commit -m "Description of your changes"
 ```bash
 git push origin your-branch-name
 ```
-9. *Submit a Pull Request (PR)*: Open a PR from your forked repository to the main branch of this repo. Describe the changes you've made clearly.
+9. **Submit a Pull Request (PR)**: Open a PR from your forked repository to the main branch of this repo. Describe the changes you've made clearly.
 
 Our maintainers will review your PR, and once everything is good, your contributions will be merged!
 
