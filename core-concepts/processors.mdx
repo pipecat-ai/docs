@@ -1,0 +1,217 @@
+---
+title: Frame Processors
+description: 'Understanding frame processors - the components that transform and process data in Pipecat pipelines.'
+---
+
+## What are Frame Processors?
+
+Frame processors are the workers in your Pipecat pipeline. Each processor has a specific job - like transcribing speech, generating responses, or converting text to audio. They receive frames, process them, and output new or modified frames.
+
+Think of processors like workers on an assembly line:
+
+- Each worker specializes in specific tasks
+- They take in certain types of items (frames)
+- They either process the items or pass them along
+- They can produce new items as output
+
+## Types of Processors
+
+### Synchronous Processors
+
+The synchronous processors push output frames from the same task that they receive input frames, and therefore they only push frames from one task. Once a frame is pushed downstream a synchronous frame processor will wait until the frame is pushed all the way to the last frame processor (it’s basically calling a function from a function from a function….).
+
+The image shows two synchronous frame processors:
+
+<Frame>![Synchronous frame processor](/images/sync-frame-processor.svg)</Frame>
+
+```python
+class SimpleTextProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, TextFrame):
+            # Process immediately and push result
+            processed_text = frame.text.upper()
+            await self.push_frame(TextFrame(processed_text))
+```
+
+Key characteristics:
+
+- Process frames in the receiving task
+- Wait for processing to complete
+- Maintain strict frame ordering
+- Ideal for fast, local operations
+
+Real-world example:
+
+```python
+class VolumeAdjuster(FrameProcessor):
+    def __init__(self, gain=1.0):
+        super().__init__()
+        self.gain = gain
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, AudioFrame):
+            # Immediately adjust volume and push
+            adjusted_audio = frame.audio_data * self.gain
+            await self.push_frame(AudioFrame(adjusted_audio))
+        else:
+            # Pass through other frame types
+            await self.push_frame(frame)
+```
+
+### Asynchronous Processors
+
+Asynchronous frame processors can have internal tasks to perform things asynchronously (e.g. receiving data from a websocket) but they also have a single task where they push frames from. Pushing a frame into an asynchronous frame processor usually returns fast (i.e. they are usually enqueued or sent over the network), but we don’t know when it will push output frame. The single push task is transparent to the developer so they don’t have to worry about it, all they have to do is push frames as usual.
+
+The image below shows an asynchronous frame processor. It has a Task 3 (it could have more) which might generate output frames asynchronously. Those frames are then pushed downstream from a single task, Task 2:
+
+<Frame>
+  ![Asynchronous frame processor](/images/async-frame-processor.svg)
+</Frame>
+
+```python
+class LLMProcessor(AsyncFrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, LLMMessagesFrame):
+            # Queue frame for processing
+            await self.queue_frame(frame)
+            # Processing happens asynchronously
+            # Results pushed when ready
+```
+
+Key characteristics:
+
+- Can process multiple frames concurrently
+- Don't block the pipeline
+- Maintain single push task rule
+- Ideal for network calls or heavy processing
+
+Real-world example:
+
+```python
+class TextToSpeechProcessor(AsyncFrameProcessor):
+    def __init__(self, api_client):
+        super().__init__()
+        self.api_client = api_client
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, TextFrame):
+            # Queue the text for TTS conversion
+            await self.queue_frame(frame)
+        else:
+            await self.push_frame(frame)
+
+    async def process_queued_frame(self, frame: Frame):
+        # Convert text to speech via API
+        audio_data = await self.api_client.synthesize_speech(frame.text)
+        # Push resulting audio frame
+        await self.push_frame(AudioFrame(audio_data))
+```
+
+## Frame Type Handling
+
+Processors should be explicit about what frames they handle:
+
+```python
+class TranscriptionProcessor(FrameProcessor):
+    def consumes_frames(self):
+        return ['audio/raw']
+
+    def produces_frames(self):
+        return ['text/transcription']
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if not isinstance(frame, AudioFrame):
+            await self.push_frame(frame)  # Pass through
+            return
+
+        # Process audio frame
+        text = await self.transcribe(frame.audio_data)
+        await self.push_frame(TextFrame(text))
+```
+
+This allows Pipecat to:
+
+- Validate pipeline connections
+- Optimize frame routing
+- Provide better error messages
+
+## The Single Push Task Rule
+
+To maintain frame ordering, processors should only push frames from a single task:
+
+```python
+# Good - pushing from single task
+async def process_frame(self, frame: Frame):
+    result = await self.process_async()
+    await self.push_frame(result)
+
+# Bad - pushing from multiple tasks
+async def process_frame(self, frame: Frame):
+    asyncio.create_task(self.process_and_push(frame))  # Don't do this!
+```
+
+## Resource Management
+
+Processors should clean up their resources properly:
+
+```python
+class APIProcessor(FrameProcessor):
+    async def setup(self):
+        # Initialize resources
+        self.client = await APIClient.connect()
+
+    async def cleanup(self):
+        # Clean up resources
+        await self.client.close()
+        await super().cleanup()
+```
+
+## Best Practices
+
+### Clear Frame Type Handling
+
+```python
+async def process_frame(self, frame: Frame):
+    if not isinstance(frame, TextFrame):
+        await self.push_frame(frame)  # Pass through
+        return
+    # Process text frame
+```
+
+### Error Handling
+
+```python
+async def process_frame(self, frame: Frame):
+    try:
+        result = await self.process(frame)
+        await self.push_frame(result)
+    except ProcessingError as e:
+        logger.error(f"Processing failed: {e}")
+        await self.push_frame(ErrorFrame(str(e)))
+```
+
+### State Management
+
+```python
+class StatefulProcessor(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self.state = {}
+
+    async def process_frame(self, frame: Frame):
+        # Update state based on frame
+        self.state.update(frame.metadata)
+        # Use state in processing
+        result = await self.process_with_state(frame, self.state)
+        await self.push_frame(result)
+```
+
+## Next Steps
+
+Now that you understand processors, learn how to connect them together in:
+
+- [Pipelines](/core-concepts/pipelines)
+
+Or review the foundation:
+
+- [Frames](/core-concepts/frames)
