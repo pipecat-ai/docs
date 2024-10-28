@@ -5,167 +5,227 @@ description: 'Understanding frames - the fundamental unit of data flowing throug
 
 ## What are Frames?
 
-Frames are the fundamental unit of data in Pipecat. Like packages on a conveyor belt, each frame contains a specific type of data and metadata about how it should be handled. Every piece of information - from audio samples to LLM responses - travels through your application as a frame.
+Frames are the fundamental unit of data in Pipecat. Like packages on a conveyor belt, each frame contains specific data and flows through your application's pipeline. Every piece of information - from audio samples to LLM responses - travels through your application as a frame.
 
-## Frame Types
+## Frame Categories
 
-### System Frames
+### DataFrame
 
-System frames carry control signals and can bypass normal processing rules. They're used for critical operations and system control:
-
-```python
-# Examples of system frames
-CancelFrame()              # Stop processing (e.g., Ctrl-C)
-StartInterruptionFrame()   # User started speaking
-EndInterruptionFrame()     # User stopped speaking
-```
-
-### Control Frames
-
-Control frames manage the flow of processing:
+Base class for all data-carrying frames. These frames contain the actual content flowing through your application:
 
 ```python
-# Examples of control frames
-TTSStartFrame()           # TTS service starting output
-LLMStartResponseFrame()   # LLM beginning to respond
-EndFrame()                # Pipeline ending
-```
-
-### Data Frames
-
-Data frames carry the actual content through your application:
-
-```python
-# Examples of data frames
-from pipecat.frames import (
-    AudioFrame,
-    TextFrame,
-    ImageFrame,
-    LLMMessagesFrame
-)
-
 # Audio data (e.g., from microphone)
-audio_frame = AudioFrame(audio_data, sample_rate=16000)
+class AudioRawFrame(DataFrame):
+    audio: bytes
+    sample_rate: int
+    num_channels: int
 
-# Transcribed speech
-text_frame = TextFrame("Hello, how can I help you?")
+# Text content
+class TextFrame(DataFrame):
+    text: str
 
-# Conversation context
-llm_frame = LLMMessagesFrame([
-    {"role": "user", "content": "What's the weather?"},
-    {"role": "assistant", "content": "I can help with that."}
-])
+# Images
+class ImageRawFrame(DataFrame):
+    image: bytes
+    size: Tuple[int, int]
+    format: str | None
+
+# LLM conversation context
+class LLMMessagesFrame(DataFrame):
+    messages: List[dict]
 ```
 
-### Application Frames
+### SystemFrame
 
-Custom frames for your specific application needs:
+Frames for system control that can bypass normal processing order:
 
 ```python
-class CustomStateFrame(Frame):
-    def __init__(self, state_data):
-        super().__init__()
-        self.state_data = state_data
+# Common system frames
+ErrorFrame("Network error")       # Signal error conditions
+StartInterruptionFrame()          # User started speaking
+StopInterruptionFrame()           # User stopped speaking
+UserStartedSpeakingFrame()        # Speech detection
+UserStoppedSpeakingFrame()        # Speech end detection
 ```
 
-## Frame Properties
+### ControlFrame
 
-Every frame includes essential metadata:
+Frames for pipeline flow control:
 
 ```python
-class ExampleFrame(Frame):
-    def __init__(self, data):
-        super().__init__(
-            type="example/data",        # Frame type identifier
-            timestamp=time.time(),      # When the frame was created
-            id=generate_unique_id(),    # Unique frame identifier
-            metadata={                  # Additional information
-                "source": "example",
-                "processor_chain": ["p1", "p2"]
-            }
-        )
-        self.data = data
+# Common control frames
+StartFrame()                  # Initialize pipeline
+EndFrame()                    # Normal termination
+LLMFullResponseStartFrame()   # Start of LLM response
+LLMFullResponseEndFrame()     # End of LLM response
+TTSStartedFrame()             # Start speech synthesis
+TTSStoppedFrame()             # End speech synthesis
 ```
 
-### Core Properties
+### AppFrame
 
-- **type**: Identifies the frame's content type (e.g., `image/raw`, `text/plain`)
-- **timestamp**: When the frame was created
-- **id**: Unique identifier for tracking
-- **processor_chain**: List of processors that handled the frame
-- **metadata**: Additional contextual information
+Base class for your custom application-specific frames:
+
+```python
+@dataclass
+class CustomStateFrame(AppFrame):
+    state: dict
+    timestamp: str
+```
+
+## Frame Relationships
+
+Frames work together to create complete interactions. Here's how frames flow in a typical voice interaction:
+
+```python
+# Complete voice interaction example
+UserStartedSpeakingFrame()           # User begins speaking
+InputAudioRawFrame(audio_data)       # Raw audio input
+TranscriptionFrame("Hello")          # Speech converted to text
+OpenAILLMContextFrame(messages)      # Context for LLM
+TextFrame("Hi, how can I help?")     # LLM response
+TTSAudioRawFrame(audio_response)     # Synthesized speech
+UserStoppedSpeakingFrame()           # User finished speaking
+```
+
+## Common Patterns
+
+Frames work together in common patterns to manage interactions and state changes in your application. Here are some key patterns you'll use frequently:
+
+### Turn Taking
+
+In conversational applications, frames help manage who is speaking and when. This ensures natural dialogue flow and prevents talking over each other:
+
+```python
+# Managing turns in conversation
+UserStartedSpeakingFrame()    # User's turn begins
+StartInterruptionFrame()      # Interrupt if bot is speaking
+UserStoppedSpeakingFrame()    # User's turn ends
+BotStartedSpeakingFrame()     # Bot's turn begins
+```
+
+### State Changes
+
+Your application needs to know when important states change, like when speech synthesis starts or stops, or when errors occur. Frames provide a clean way to signal these changes:
+
+```python
+TTSStartedFrame()            # Bot begins speaking
+TTSStoppedFrame()            # Bot finished speaking
+ErrorFrame("Network error")  # Something went wrong
+```
 
 ## Frame Flow
 
-Frames move through your pipeline in a specific way:
+Frames can move in two directions through your pipeline, enabling both normal processing and control signals. The direction of flow determines how frames are handled:
 
 ```python
-# Example pipeline showing frame flow
+class FrameDirection(Enum):
+    DOWNSTREAM = 1  # Normal processing flow
+    UPSTREAM = 2    # Error reporting and control signals
+```
+
+A typical pipeline shows how different frame types flow through your application:
+
+```python
 pipeline = Pipeline([
-    transport.input(),   # Creates AudioFrames
-    transcriber,         # AudioFrames -> TextFrames
-    llm_processor,       # TextFrames -> LLMResponseFrames
-    tts_service,         # LLMResponseFrames -> AudioFrames
-    transport.output()   # Handles AudioFrames
+    transport.input(),   # Creates InputAudioRawFrame
+    transcriber,         # Produces TranscriptionFrame
+    llm_processor,       # Produces TextFrame
+    tts_service,         # Produces TTSAudioRawFrame
+    transport.output()   # Handles audio output
 ])
 ```
 
-1. Each processor receives frames
-2. Processes frames it's interested in
+Each processor in the pipeline follows these rules:
+
+1. Receives frames
+2. Processes relevant frames by type
 3. Generates new frames as needed
 4. Passes through frames it doesn't handle
 
-## Frame Ordering
+## Design Principles
 
-Frames maintain their order through the pipeline (except for system frames):
+### Immutability
+
+Frames should be treated as immutable. Instead of modifying frames, create new ones:
 
 ```python
-# Example showing frame ordering
-async def process_frame(self, frame: Frame):
-    if isinstance(frame, TextFrame):
-        # Process frames in order received
-        response = await self.generate_response(frame.text)
-        # Push frames in same order
-        await self.push_frame(ResponseFrame(response))
+# Good: Create new frames for transformed data
+text_frame = TranscriptionFrame(transcribed_text)
+await self.push_frame(text_frame)
+
+# Bad: Don't modify existing frames
+frame.text = new_text  # Avoid this!
 ```
 
-## Best Practices
+### Single Responsibility
 
-### Type Checking
-
-Always check frame types before processing:
+Each frame type should have a clear purpose:
 
 ```python
-async def process_frame(self, frame: Frame):
-    if not isinstance(frame, AudioFrame):
+# Specific frame types for specific purposes
+UserStartedSpeakingFrame()  # Speech detection only
+TranscriptionFrame(text)    # Speech content only
+ErrorFrame(error)           # Error conditions only
+```
+
+### Frame Ordering
+
+Frames maintain their order through the pipeline, with two exceptions:
+
+1. System frames bypass normal ordering
+2. Upstream frames (like errors) flow backward
+
+```python
+async def process_frame(self, frame: Frame, direction: FrameDirection):
+    if isinstance(frame, SystemFrame):
+        # 1. System frames bypass normal ordering
+        await self.handle_system_frame(frame)
+    elif direction == FrameDirection.UPSTREAM:
+        # 2. Upstream frames (like errors) flow backward
+        await self.handle_upstream(frame)
+    else:
+        # Normal frames maintain order
+        await self.process_ordered_frame(frame)
+```
+
+## Using Frames Effectively
+
+Understanding how to handle frames in your processors and pipelines is key to building effective applications. Here are common patterns for working with frames:
+
+### In Processors
+
+Processors should handle different frame types appropriately, paying special attention to system events and direction:
+
+```python
+async def process_frame(self, frame: Frame, direction: FrameDirection):
+    # Handle system events immediately
+    if isinstance(frame, StartInterruptionFrame):
+        await self.stop_processing()
         return
-    # Process audio frame
+
+    # Process data frames normally
+    if isinstance(frame, AudioRawFrame):
+        text = await self.transcribe(frame.audio)
+        await self.push_frame(TranscriptionFrame(text))
+
+    # Pass through other frames
+    await self.push_frame(frame, direction)
 ```
 
-### Metadata Usage
+### In Pipelines
 
-Include relevant metadata for debugging and tracking:
-
-```python
-await self.push_frame(TextFrame(
-    text="Hello!",
-    metadata={
-        "confidence": 0.95,
-        "source": "transcription"
-    }
-))
-```
-
-### Frame Creation
-
-Create new frames instead of modifying existing ones:
+Pipelines coordinate complex operations by connecting processors that handle different frame types. Each processor focuses on its specific task while maintaining the overall flow:
 
 ```python
-# Good - create new frame
-new_frame = TextFrame(processed_text)
-
-# Bad - modify existing frame
-frame.text = processed_text
+pipeline = Pipeline([
+    audio_input,         # Produces AudioRawFrame
+    vad_processor,       # Produces speech detection frames
+    transcriber,         # Produces TranscriptionFrame
+    context_manager,     # Manages conversation context
+    llm_service,         # Generates responses
+    tts_service          # Converts to speech
+])
 ```
 
 ## Next Steps
