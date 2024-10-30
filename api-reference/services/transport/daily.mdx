@@ -1,0 +1,446 @@
+---
+title: 'Daily'
+description: 'WebRTC transport implementation using Daily for real-time audio/video communication'
+---
+
+## Overview
+
+`DailyTransport` provides real-time audio and video communication capabilities using Daily's WebRTC platform. It supports bidirectional audio/video streams, transcription, voice activity detection (VAD), and participant management.
+
+## Installation
+
+To use DailyTransport, install the required dependencies:
+
+```bash
+pip install pipecat-ai[daily]
+```
+
+You'll also need to set up your Daily API key as an environment variable:
+`DAILY_API_KEY`.
+
+<Tip>
+  You can obtain a Daily API key by signing up at
+  [Daily](https://dashboard.daily.co/u/signup?pipecat=true).
+</Tip>
+
+## Configuration
+
+### Constructor Parameters
+
+<ParamField path="room_url" type="str" required>
+  Daily room URL
+</ParamField>
+
+<ParamField path="token" type="str | None">
+  Daily room token
+</ParamField>
+
+<ParamField path="bot_name" type="str" required>
+  Name of the bot in the room
+</ParamField>
+
+<ParamField path="params" type="DailyParams" default="DailyParams()">
+  Transport configuration parameters
+</ParamField>
+
+### DailyParams Configuration
+
+```python
+class DailyParams(TransportParams):
+    api_url: str = "https://api.daily.co/v1"
+    api_key: str = ""
+
+    # Audio Output Configuration
+    audio_out_enabled: bool = False          # Enable audio output
+    audio_out_is_live: bool = False          # Live audio streaming
+    audio_out_sample_rate: int = 24000       # Sample rate in Hz
+    audio_out_channels: int = 1              # Number of audio channels
+    audio_out_bitrate: int = 96000           # Audio bitrate in bps
+
+    # Audio Input Configuration
+    audio_in_enabled: bool = False           # Enable audio input
+    audio_in_sample_rate: int = 16000        # Input sample rate in Hz
+    audio_in_channels: int = 1               # Input audio channels
+
+    # Video Output Configuration
+    camera_out_enabled: bool = False         # Enable video output
+    camera_out_is_live: bool = False         # Live video streaming
+    camera_out_width: int = 1024             # Video width in pixels
+    camera_out_height: int = 768             # Video height in pixels
+    camera_out_bitrate: int = 800000         # Video bitrate in bps
+    camera_out_framerate: int = 30           # Frames per second
+    camera_out_color_format: str = "RGB"     # Color format (RGB, BGR, etc.)
+
+    # Voice Activity Detection (VAD)
+    vad_enabled: bool = False                # Enable VAD
+    vad_audio_passthrough: bool = False      # Pass through audio during VAD
+    vad_analyzer: VADAnalyzer | None = None  # VAD analyzer implementation
+
+    # Feature Settings
+    dialin_settings: Optional[DailyDialinSettings] = None
+    transcription_enabled: bool = False
+    transcription_settings: DailyTranscriptionSettings = DailyTranscriptionSettings()
+
+```
+
+### Transcription Settings
+
+DailyTransport supports real-time transcription through Daily's API, configurable via `DailyTranscriptionSettings`:
+
+```python
+class DailyTranscriptionSettings(BaseModel):
+    language: str = "en"                  # Default language
+    model: str = "nova-2-general"         # Transcription model
+    profanity_filter: bool = True         # Filter profanity
+    redact: bool = False                  # Redact sensitive information
+    endpointing: bool = True              # Enable speech endpointing
+    punctuate: bool = True                # Add punctuation
+    includeRawResponse: bool = True       # Include raw API response
+    extra: Mapping[str, Any] = {
+        "interim_results": True           # Enable interim results
+    }
+```
+
+## Basic Usage
+
+```python
+from pipecat.transports.services.daily import DailyTransport, DailyParams
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+# Configure transport
+transport = DailyTransport(
+    room_url="https://your-domain.daily.co/room-name",
+    token="your-room-token",
+    bot_name="AI Assistant",
+    params=DailyParams(
+        audio_out_enabled=True,
+        transcription_enabled=True,
+        vad_enabled=True,
+        vad_analyzer=SileroVADAnalyzer()
+    )
+)
+
+# Use in pipeline
+pipeline = Pipeline([
+    transport.input(),    # Handle incoming audio/video
+    stt_service,          # Speech-to-text
+    llm_service,          # Language model
+    tts_service,          # Text-to-speech
+    transport.output()    # Handle outgoing audio/video
+])
+```
+
+## Event Callbacks
+
+DailyTransport provides a comprehensive callback system for handling various events. Register callbacks using the `@transport.event_handler()` decorator.
+
+### Connection Events
+
+<ResponseField name="on_joined" type="async callback">
+  Called when the bot successfully joins the room.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `data`: Dictionary containing room join information
+
+```python
+@transport.event_handler("on_joined")
+async def on_joined(transport, data: Dict[str, Any]):
+    logger.info(f"Joined room with data: {data}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_left" type="async callback">
+  Called when the bot leaves the room.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+
+```python
+@transport.event_handler("on_left")
+async def on_left(transport):
+    logger.info("Left room")
+```
+
+</ResponseField>
+
+### Participant Events
+
+<ResponseField name="on_first_participant_joined" type="async callback">
+  Called when the first participant joins the room. Useful for initializing conversations.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `participant`: Dictionary containing participant information
+
+```python
+@transport.event_handler("on_first_participant_joined")
+async def on_first_participant_joined(transport, participant: Dict[str, Any]):
+    await transport.capture_participant_transcription(participant["id"])
+    await task.queue_frames([LLMMessagesFrame(initial_messages)])
+```
+
+</ResponseField>
+
+<ResponseField name="on_participant_joined" type="async callback">
+  Called when any participant joins the room.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `participant`: Dictionary containing participant information
+
+```python
+@transport.event_handler("on_participant_joined")
+async def on_participant_joined(transport, participant: Dict[str, Any]):
+    logger.info(f"Participant joined: {participant['id']}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_participant_left" type="async callback">
+  Called when a participant leaves the room.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `participant`: Dictionary containing participant information
+- `reason`: String describing why the participant left
+
+```python
+@transport.event_handler("on_participant_left")
+async def on_participant_left(transport, participant: Dict[str, Any], reason: str):
+    logger.info(f"Participant {participant['id']} left: {reason}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_participant_updated" type="async callback">
+  Called when a participant's state changes (e.g., audio/video state).
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `participant`: Dictionary containing updated participant information
+
+```python
+@transport.event_handler("on_participant_updated")
+async def on_participant_updated(transport, participant: Dict[str, Any]):
+    logger.info(f"Participant updated: {participant}")
+```
+
+</ResponseField>
+
+### Communication Events
+
+<ResponseField name="on_app_message" type="async callback">
+  Called when receiving an application message from another participant.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `message`: The message content (any type)
+- `sender`: String identifier of the message sender
+
+```python
+@transport.event_handler("on_app_message")
+async def on_app_message(transport, message: Any, sender: str):
+    logger.info(f"Message from {sender}: {message}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_call_state_updated" type="async callback">
+  Called when the call state changes.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `state`: String representing the new call state
+
+```python
+@transport.event_handler("on_call_state_updated")
+async def on_call_state_updated(transport, state: str):
+    logger.info(f"Call state updated: {state}")
+```
+
+</ResponseField>
+
+### Dial Events
+
+<ResponseField name="on_dialin_ready" type="async callback">
+  Called when dial-in functionality is ready.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `sip_endpoint`: String containing the SIP endpoint information
+
+```python
+@transport.event_handler("on_dialin_ready")
+async def on_dialin_ready(transport, sip_endpoint: str):
+    logger.info(f"Dial-in ready at: {sip_endpoint}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_dialout_answered" type="async callback">
+  Called when a dial-out call is answered.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `data`: Dictionary containing call information
+
+```python
+@transport.event_handler("on_dialout_answered")
+async def on_dialout_answered(transport, data: Any):
+    logger.info(f"Dial-out answered: {data}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_dialout_connected" type="async callback">
+  Called when a dial-out call is successfully connected.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `data`: Dictionary containing connection information
+
+```python
+@transport.event_handler("on_dialout_connected")
+async def on_dialout_connected(transport, data: Any):
+    logger.info(f"Dial-out connected: {data}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_dialout_error" type="async callback">
+  Called when a dial-out operation encounters an error.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `data`: Dictionary containing error information
+
+```python
+@transport.event_handler("on_dialout_error")
+async def on_dialout_error(transport, data: Any):
+    logger.error(f"Dial-out error: {data}")
+```
+
+</ResponseField>
+
+<ResponseField name="on_dialout_warning" type="async callback">
+  Called when a dial-out operation generates a warning.
+
+**Parameters:**
+
+- `transport`: The DailyTransport instance
+- `data`: Dictionary containing warning information
+
+```python
+@transport.event_handler("on_dialout_warning")
+async def on_dialout_warning(transport, data: Any):
+    logger.warning(f"Dial-out warning: {data}")
+```
+
+</ResponseField>
+
+### Notes on Callbacks
+
+- All callbacks are asynchronous
+- Callbacks are executed in the order they were registered
+- Multiple handlers can be registered for the same event
+- Exceptions in callbacks are logged but don't stop the transport
+- Callbacks should be lightweight to avoid blocking the event loop
+- Heavy processing should be offloaded to separate tasks
+
+## Frame Types
+
+### Input Frames
+
+<ParamField path="InputAudioRawFrame" type="Frame">
+  Raw audio data from participants
+</ParamField>
+
+<ParamField path="UserImageRawFrame" type="Frame">
+  Video frames from participants
+</ParamField>
+
+### Output Frames
+
+<ParamField path="OutputAudioRawFrame" type="Frame">
+  Audio data to be sent
+</ParamField>
+
+<ParamField path="OutputImageRawFrame" type="Frame">
+  Video frames to be sent
+</ParamField>
+
+## Advanced Features
+
+### Voice Activity Detection
+
+```python
+# Configure with WebRTC VAD
+transport = DailyTransport(
+    params=DailyParams(
+        vad_enabled=True,
+        vad_analyzer=WebRTCVADAnalyzer()
+    )
+)
+
+# Or with Silero VAD
+transport = DailyTransport(
+    params=DailyParams(
+        vad_enabled=True,
+        vad_analyzer=SileroVADAnalyzer()
+    )
+)
+```
+
+### Video Capture
+
+```python
+# Capture participant video
+await transport.capture_participant_video(
+    participant_id="participant-id",
+    framerate=30,
+    video_source="camera",
+    color_format="RGB"
+)
+```
+
+### Recording
+
+```python
+# Start recording
+await transport.start_recording(
+    streaming_settings={
+        "layout": {"preset": "grid"},
+        "format": "mp4"
+    }
+)
+
+# Stop recording
+await transport.stop_recording()
+```
+
+## Notes
+
+- Supports real-time audio/video communication
+- Handles WebRTC connection management
+- Provides voice activity detection
+- Includes transcription capabilities
+- Manages participant interactions
+- Supports recording and streaming
+- Thread-safe processing
+- All callbacks are asynchronous
+- Multiple handlers can be registered for the same event
+- Exceptions in callbacks are logged but don't stop the transport

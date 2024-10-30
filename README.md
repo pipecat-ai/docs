@@ -1,5 +1,5 @@
 <div align="center">
- <img alt="pipecat" width="300px" height="auto" src="https://raw.githubusercontent.com/pipecat-ai/pipecat/main/pipecat.png">
+  <img alt="pipecat" width="300px" height="auto" src="https://raw.githubusercontent.com/pipecat-ai/pipecat/main/pipecat.png" />
 </div>
 
 # Pipecat docs
@@ -31,9 +31,9 @@ We welcome contributions of all kinds! Whether you're fixing a typo, adding a ne
    git clone https://github.com/your-username/docs
    ```
 3. **Create a branch**: For your contribution, create a new branch.
-    ```bash
-    git checkout -b your-branch-name
-    ```
+   ```bash
+   git checkout -b your-branch-name
+   ```
 4. **Make your changes**: Edit or add files as necessary.
 5. **Test your changes**: Ensure that your changes look correct and follow the style guide. Refer to **Development** section to test portal locally.
 6. **Commit your changes**: Once you're satisfied with your changes, commit them with a meaningful message.
@@ -41,11 +41,13 @@ We welcome contributions of all kinds! Whether you're fixing a typo, adding a ne
 ```bash
 git commit -m "Description of your changes"
 ```
+
 7. **Push your changes**: Push your branch to your forked repository.
 
 ```bash
 git push origin your-branch-name
 ```
+
 9. **Submit a Pull Request (PR)**: Open a PR from your forked repository to the main branch of this repo. Describe the changes you've made clearly.
 
 Our maintainers will review your PR, and once everything is good, your contributions will be merged!
