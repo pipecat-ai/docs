@@ -1,5 +1,5 @@
 <h1><div align="center">
-  <img alt="pipecat" width="500px" height="auto" src="https://raw.githubusercontent.com/pipecat-ai/pipecat-docs/main/pipecat-docs.png" />
+  <img alt="pipecat" width="500px" height="auto" src="https://github.com/pipecat-ai/docs/blob/main/pipecat-docs.png" />
 </div></h1>
 
 Welcome to the Pipecat documentation repository! This project contains the official [documentation](https://docs.pipecat.ai)] for the [Pipecat](https://github.com/pipecat-ai/pipecat) open-source project.
