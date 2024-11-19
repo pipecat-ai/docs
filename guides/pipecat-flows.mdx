@@ -1,0 +1,342 @@
+---
+title: 'Pipecat Flows'
+description: 'Learn how to create structured conversations using Pipecat’s flow system'
+---
+
+## Overview
+
+Pipecat Flows is a conversational flow system that allows you to create structured, multi-turn conversations by defining your flow in JSON and processing it through the `FlowManager`. The system treats conversations as a series of connected nodes, where each node represents a distinct state with specific behaviors and options.
+
+Your JSON configuration defines the flow structure, while Pipecat's `FlowManager` and `FlowState` classes handle the state transitions, function calls, and actions. This separation makes it easy to design complex conversations without worrying about the underlying mechanics.
+
+## Anatomy of a Node
+
+Each node in your flow consists of three main components:
+
+### Messages
+
+Messages set the context for the LLM at each state. You can include multiple messages with different roles:
+
+```python
+"messages": [
+    {
+        "role": "system",
+        "content": "You are handling pizza orders. Ask for size selection."
+    },
+    {
+        "role": "assistant",
+        "content": "Example of how to handle size selection"
+    }
+]
+```
+
+### Functions
+
+Functions are define the exit criteria for each node.
+
+A function is an LLM function call. In a node, you define for the LLM the possible functions to execute. The LLM will select a given function based on the context of the conversation. Selecting a function will both execute any function call actions (e.g. REST API call or data retrieval) and serve as a transition to the next node.
+
+<Note>
+  Function call names must match the name of a node in the flow configuration,
+  as the function represents both the function call for the LLM to make and the
+  next node to transition to.
+</Note>
+
+```python
+"functions": [
+    {
+        "type": "function",
+        "function": {
+            "name": "select_pizza_size",  # Terminal function
+            "description": "Select pizza size",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "size": {
+                        "type": "string",
+                        "enum": ["small", "medium", "large"]
+                    }
+                }
+            }
+        }
+    }
+]
+```
+
+### Actions
+
+Actions execute during state transitions:
+
+- Pre-actions: Run before updating LLM context
+- Post-actions: Run after updating LLM context
+
+```python
+"pre_actions": [
+    {
+        "type": "tts_say",
+        "text": "Let me help you with that..."
+    }
+]
+```
+
+## Installation
+
+### Basic Installation
+
+To use Pipecat Flows with your Pipecat project:
+
+```bash
+pip install "pipecat-ai[flows]"
+```
+
+### Requirements
+
+- Python >= 3.10
+- pipecat-ai >= 0.0.48
+
+## Building a Flow: Food Ordering Example
+
+Let's build a complete food ordering flow:
+
+<Tip>
+  See foundational example
+  [25-conversation-flow.py](https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/25-conversation-flow.py)
+  for the full flow_config
+</Tip>
+
+```python
+flow_config = {
+    "initial_node": "start",
+    "nodes": {
+        "start": {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an order-taking assistant. Ask if they want pizza or sushi."
+                }
+            ],
+            "functions": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "choose_pizza",
+                        "description": "User wants pizza",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "choose_sushi",
+                        "description": "User wants sushi",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }
+            ]
+        },
+        "choose_pizza": {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Handle pizza size selection. Confirm before proceeding."
+                }
+            ],
+            "functions": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "select_pizza_size",
+                        "description": "Select pizza size",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "size": {"type": "string", "enum": ["small", "medium", "large"]}
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "end",
+                        "description": "Complete order",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }
+            ],
+            "pre_actions": [
+                {
+                    "type": "tts_say",
+                    "text": "Ok, let's order your pizza..."
+                }
+            ]
+        }
+        # Additional nodes...
+    }
+}
+```
+
+To use this flow:
+
+```python
+# Import the Flow Manager from the installed pipecat-ai-flows package
+from pipecat_flows import FlowManager
+
+# Initialize context and tools
+initial_tools = flow_config["nodes"]["start"]["functions"]  # Available functions for starting state
+context = OpenAILLMContext(messages, initial_tools)        # Create LLM context with initial state
+context_aggregator = llm.create_context_aggregator(context)
+
+# Create your pipeline: No new processors are required
+pipeline = Pipeline(
+    [
+        transport.input(),  # Transport user input
+        stt,  # STT
+        context_aggregator.user(),  # User responses
+        llm,  # LLM
+        tts,  # TTS
+        transport.output(),  # Transport bot output
+        context_aggregator.assistant(),  # Assistant spoken responses
+    ]
+)
+
+# Create the Pipecat task
+task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True))
+
+# Initialize flow management
+flow_manager = FlowManager(flow_config, task, tts_service)  # Create flow manager
+await flow_manager.register_functions(llm_service)          # Register all possible functions
+
+# Initialize with starting messages
+@transport.event_handler("on_first_participant_joined")
+async def on_first_participant_joined(transport, participant):
+    await transport.capture_participant_transcription(participant["id"])
+    # Initialize the flow processor
+    await flow_manager.initialize(messages)
+    # Kick off the conversation using the context aggregator
+    await task.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+This example demonstrates:
+
+1. A clear starting point
+2. Transitional functions for major state changes
+3. Terminal functions for refinement (size selection)
+4. Immediate feedback through pre-actions
+5. Clear conversation paths
+
+## Best Practices
+
+1. Keep node messages focused on current state
+
+   - Each node should have clear, specific instructions for its purpose
+   - Avoid including information about other states
+
+2. Use terminal functions for refinement
+
+   - When users might need to adjust or correct their choices
+   - When multiple steps are needed within a state
+
+3. Use transitional functions for major state changes
+
+   - When moving to a completely different part of the conversation
+   - When the context needs to change significantly
+
+4. Provide immediate TTS feedback with pre-actions
+
+   - Especially useful for operations that take time
+   - Keeps the user informed about what's happening
+
+5. Use post-actions for cleanup
+
+   - Perfect for finalizing state changes
+   - Good place for logging or analytics
+
+6. Ensure function names map to node names
+   - Makes the flow structure clear and maintainable
+   - Helps prevent configuration errors
+
+## Flow Editor
+
+The Pipecat Flow Editor is a visual tool for creating and editing flow configurations. It provides a node-based interface that makes it easier to design, visualize, and modify your conversation flows.
+
+### Using the Editor
+
+#### Nodes and Connections
+
+The editor represents your flow as a series of connected nodes:
+
+- **Start Node** (Green): The entry point of your flow
+- **Flow Nodes** (Blue): Intermediate conversation states
+- **End Node** (Red): The final state of the conversation
+- **Function Nodes** (Purple or Orange): Represent transitions between states
+- **Merge Nodes** (Gray): Multiple paths can lead to the same node, allowing conversations to converge
+
+Functions can be either:
+
+- **Connecting Functions** (Purple): Link one node to another (e.g., `choose_pizza`, `process_payment`)
+- **Terminal Functions** (Orange): Handle actions within a node (e.g., `select_pizza_size`, `end`)
+
+#### Node Configuration
+
+Each node contains:
+
+- A list of messages that guide the LLM's behavior
+- Available functions for that state
+- Optional pre-actions and post-actions
+
+Click on any node to edit its properties in the side panel.
+
+### Working with Flows
+
+#### Creating a New Flow
+
+1. Start with a "Start Node"
+2. Add Flow Nodes for different conversation states
+3. Connect nodes using Function Nodes
+4. Add an End Node to complete the flow
+
+#### Importing and Exporting
+
+- **Import Flow**: Load an existing flow configuration (JSON)
+- **Export Flow**: Save your visual flow as a JSON configuration file
+
+The exported JSON can be used directly with the `FlowManager` in your Pipecat application.
+
+### Example: Food Ordering Flow
+
+Here's how the food ordering example looks in the Flow Editor:
+
+![Food Ordering Flow](images/food-ordering-flow.png)
+
+This visual representation makes it easy to:
+
+- Understand the flow structure at a glance
+- Identify conversation paths
+- Verify function connections
+- Ensure proper flow completion
+
+### Best Practices for the Editor
+
+1. **Organize Nodes Clearly**
+
+   - Arrange nodes in a logical flow
+   - Keep related nodes grouped together
+   - Use consistent spacing
+
+2. **Name Functions Meaningfully**
+
+   - Use descriptive names for functions
+   - Make the purpose of each transition clear
+   - Follow the node naming convention
+
+3. **Review Generated JSON**
+
+   - Verify the exported configuration
+   - Check for any missing connections
+   - Ensure all required properties are set
+
+4. **Test Flow Logic**
+   - Verify all paths lead to proper endpoints
+   - Check that terminal functions are properly configured
+   - Ensure actions are correctly specified
