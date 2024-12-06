@@ -57,6 +57,58 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 # Core Concepts
 
+## Designing Conversation Flows
+
+Functions in Pipecat Flows serve two key purposes: interfacing with external systems and advancing the conversation.
+
+### Function Handlers
+
+When you need to collect data, validate input, or retrieve information, add a handler to your function. These handlers are async functions that execute when the LLM calls the function, allowing you to interact with databases, APIs, or other external services:
+
+```python
+# Example function handler
+async def check_availability(args: FlowArgs) -> FlowResult:
+    """Check restaurant availability for the requested time."""
+    date = args["date"]
+    time = args["time"]
+    party_size = args["party_size"]
+
+    # Interface with reservation system
+    available = await reservation_system.check_availability(date, time, party_size)
+    return {"status": "success", "available": available}
+```
+
+### Transitioning Between Nodes
+
+To advance the conversation, Pipecat Flows offers two approaches based on your flow type:
+
+For static flows, use the `transition_to` property to specify the next node:
+
+```python
+{
+    "type": "function",
+    "function": {
+        "name": "confirm_reservation",
+        "handler": save_reservation,  # Process the reservation
+        "parameters": {...},
+        "transition_to": "send_confirmation"  # Move to confirmation node
+    }
+}
+```
+
+For dynamic flows, use a transition callback to determine the next node at runtime:
+
+```python
+async def handle_transitions(function_name: str, args: Dict, flow_manager):
+    if function_name == "check_availability":
+        if args["available"]:
+            await flow_manager.set_node("collect_details", create_details_node())
+        else:
+            await flow_manager.set_node("suggest_alternatives", create_alternatives_node())
+```
+
+You can combine both approaches: use handlers to process data and transitions to advance the conversation, creating flows that are both functional and conversational.
+
 ## Node Structure
 
 Each node in your flow represents a conversation state and consists of three main components:
@@ -82,15 +134,15 @@ Messages set the context for the LLM at each state:
 
 Functions come in two types, each serving a different purpose:
 
-#### Node Functions
+#### Node Functions with Transitions
 
-Execute operations within the current state:
+Process data and optionally transition to a new state:
 
 ```python
 from pipecat_flows import FlowArgs, FlowResult
 
 async def select_size(args: FlowArgs) -> FlowResult:
-    """Handle pizza size selection."""
+    """Handle pizza size selection and transition."""
     size = args["size"]
     return {
         "status": "success",
@@ -102,14 +154,15 @@ async def select_size(args: FlowArgs) -> FlowResult:
     "type": "function",
     "function": {
         "name": "select_size",
-        "handler": select_size,  # Handler required for node functions
+        "handler": select_size,
         "description": "Select pizza size",
         "parameters": {
             "type": "object",
             "properties": {
                 "size": {"type": "string", "enum": ["small", "medium", "large"]}
             }
-        }
+        },
+        "transition_to": "toppings"  # Optional: Specify next node
     }
 }
 ```
@@ -122,9 +175,10 @@ Create transitions between states:
 {
     "type": "function",
     "function": {
-        "name": "next_node",  # Must match a node name
+        "name": "next_step",
         "description": "Move to next state",
-        "parameters": {"type": "object", "properties": {}}
+        "parameters": {"type": "object", "properties": {}},
+        "transition_to": "target_node"  # Required: Specify target node
     }
 }
 ```
@@ -148,33 +202,7 @@ Actions execute during state transitions:
 ]
 ```
 
-## Function Types
-
-### Type Safety
-
-Pipecat Flows provides type definitions for function handlers:
-
-```python
-from pipecat_flows import FlowArgs, FlowResult
-
-async def my_handler(args: FlowArgs) -> FlowResult:
-    """Type-safe function handler."""
-    return {
-        "status": "success",
-        "data": process_args(args)
-    }
-```
-
-### Handler Implementation
-
-Function handlers should:
-
-- Be async functions
-- Accept FlowArgs (or no args)
-- Return FlowResult
-- Include status in response
-
-## Provider Support
+## LLM Provider Support
 
 Pipecat Flows automatically handles format differences between LLM providers:
 
@@ -266,15 +294,16 @@ flow_config = {
                 {
                     "type": "function",
                     "function": {
-                        "name": "choose_pizza",  # Edge function
+                        "name": "choose_pizza",
                         "description": "User wants pizza",
-                        "parameters": {"type": "object", "properties": {}}
+                        "parameters": {"type": "object", "properties": {}},
+                        "transition_to": "pizza_order"  # Specify transition
                     }
                 },
                 {
                     "type": "function",
                     "function": {
-                        "name": "select_size",  # Node function
+                        "name": "select_size",
                         "handler": select_size,
                         "description": "Select pizza size",
                         "parameters": {
@@ -282,14 +311,9 @@ flow_config = {
                             "properties": {
                                 "size": {"type": "string", "enum": ["small", "medium", "large"]}
                             }
-                        }
+                        },
+                        "transition_to": "toppings"  # Optional transition after processing
                     }
-                }
-            ],
-            "pre_actions": [
-                {
-                    "type": "tts_say",
-                    "text": "Welcome! What would you like to order?"
                 }
             ]
         }
@@ -297,13 +321,14 @@ flow_config = {
 }
 ```
 
-### Best Practices
+### Transition Best Practices
 
-- Define complete conversation paths upfront
-- Use clear, descriptive node names
-- Keep node messages focused on current state
-- Ensure edge functions match valid node names
-- Test all paths and transitions
+- Use `transition_to` to make state changes explicit
+- Combine handlers with transitions when appropriate
+- Keep transitions focused on single responsibilities
+- Use clear, descriptive names for target nodes
+- Validate all transition targets exist
+- Test both successful and failed transitions
 
 ## Dynamic Flows
 
@@ -444,25 +469,7 @@ The Pipecat Flow Editor provides a visual interface for creating and managing co
     }
     ```
 
-### Node Configuration
-
-Each node can be configured with:
-
-- Messages for LLM context
-- Available functions
-- Pre/post actions
-- State transitions
-
-## Best Practices
-
-### Organization
-
-- Arrange nodes in logical flow
-- Group related nodes together
-- Use consistent spacing
-- Make transitions clear
-
-### Naming Conventions
+## Naming Conventions
 
 - **Start Node**: Use descriptive names (e.g., "greeting", "welcome")
 - **Flow Nodes**: Name based on purpose (e.g., "collect_info", "verify_data")
@@ -476,9 +483,10 @@ Each node can be configured with:
 {
     "type": "function",
     "function": {
-        "name": "next_state",  # Matches target node name
+        "name": "next_state",
         "description": "Clear transition description",
         "parameters": {...}
+        "transition_to": "target_node_name" # Transition target
     }
 }
 
@@ -493,13 +501,6 @@ Each node can be configured with:
     }
 }
 ```
-
-### Testing Flows
-
-- Verify all paths lead to valid endpoints
-- Test node functions with sample data
-- Ensure edge functions connect properly
-- Validate configuration export
 
 ## Using the Editor
 
