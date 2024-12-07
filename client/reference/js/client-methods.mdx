@@ -1,0 +1,518 @@
+---
+title: "Client Methods"
+---
+
+The RTVI clients expose a number of [core](https://github.com/pipecat-ai/rtvi-client-web/blob/main/rtvi-client-js/src/client.ts) methods. These are documented below.
+
+<Info>
+  RTVI implementations will often publish helper libraries that extend the core
+  client with additional methods and events. For more on helpers, see
+  [here](./helpers/introduction).
+</Info>
+
+## Session connectivity
+
+### connect()
+
+`Promise<void>`
+
+Connect to a real-time session with your bot. This method sends a web request `baseUrl` + `endpoints.connect` and passes the response your transport class.
+
+A server-side connect endpoint will typically:
+
+- Authenticate / configure the connect request.
+- Initialize the bot process.
+- Return a the necessary authentication tokens and configuration to the client's transport class.
+
+```typescript
+await rtviClient.connect();
+```
+
+<Note>
+  Calling `connect()` asynchronously will resolve when the bot and client signal
+  that they are ready. See [messages and events](./messages). If you want to
+  call `connect()` without `await`, you can use the `onBotReady` callback or
+  `BotReady` event to know when you can interact with the bot.
+</Note>
+
+<Warning>
+  Attempting to call `connect()` when the transport is not in a 'connected'
+  state will throw an error. You should [disconnect](#disconnect) from a session
+  first before attempting to connect again.
+</Warning>
+
+This method can be try / catched to handle errors at startup:
+
+```typescript
+try {
+  await rtviClient.connect();
+} catch (error) {
+  console.error(error);
+}
+```
+
+### disconnect()
+
+Disconnects from the active session and reinitialzie the transport.
+
+For most bots that implement the RTVI standard the bot will exit and cleanup when the client disconnects.
+
+```typescript
+await rtviClient.disconnect();
+```
+
+## Bot configuration
+
+Methods to query and update the configuration of the bot the client is connected to.
+
+See: [configuration](./configuration).
+
+### getBotConfig()
+
+`Promise<RTVIClientConfigOption[]>`
+
+Returns a Promise that resolves with the bot's current configuration.
+
+```typescript
+config = await rtvi.getBotConfig();
+```
+
+A typical config might look like this.
+
+```json
+[
+  {
+    "service": "vad",
+    "options": [{ "name": "params", "value": { "stop_secs": 3.0 } }]
+  },
+  {
+    "service": "tts",
+    "options": [
+      { "name": "voice", "value": "79a125e8-cd45-4c13-8a67-188112f4dd22" }
+    ]
+  },
+  {
+    "service": "llm",
+    "options": [
+      {
+        "name": "model",
+        "value": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+      },
+      {
+        "name": "initial_messages",
+        "value": [
+          {
+            "role": "system",
+            "content": `You are a assistant called ExampleBot. You can ask me anything.
+              Keep responses brief and legible.
+              Your responses will converted to audio. Please do not include any special characters in your response other than '!' or '?'.
+              Start by briefly introducing yourself.`
+          }
+        ]
+      },
+      { "name": "run_on_config", "value": true }
+    ]
+  }
+]
+```
+
+The client's current config state can be accessed with `rtviClient.getConfig`. This property is hydrated with the bot's config after `connect()` is called, and after any `updateConfig` request.
+
+### updateConfig()
+
+`Promise<RTVIMessage>`
+
+Update the bot's [config](./configuration). Passing a partial config is fine. Only the individual options that are passed to the `updateConfig()` call will be updated. You can omit any services or options within a service that you don't want to change.
+
+Returns a Promise that resolves with the full updated configuration.
+
+On resolve, will trigger the `onConfigUpdate` callback and `ConfigUpdated` event.
+
+On reject, will trigger the `onMessageError` callback and `MessageError` event.
+
+<ParamField path="config" type="rtviClientConfigOption[]" required="true">
+  `rtviClientConfigOption[]` partial object with the new configuration
+</ParamField>
+
+<ParamField path="interrupt" type="boolean" default="false">
+  Should the new config be immediately applied (interrupting the bot), or wait
+  until the current pipeline turn concludes.
+</ParamField>
+
+```typescript
+try {
+  const new_config = await rtviClient.updateConfig(
+    [{ service: "vad", options: [{ stop_secs: 0.5 }] }],
+    true | false
+  );
+} catch (error) {
+  console.error("Error updating bot config", error);
+}
+```
+
+### describeConfig()
+
+`Promise<unknown>`
+
+Describe the shape of available config options for the bot the client is connected to.
+
+Returns a Promise that resolve's with the bot's configuration description.
+
+```typescript
+const configDescription = await rtviClient.describeConfig();
+console.log("Config shape", configDescription);
+
+// e.g:
+"config": [
+  {
+      "service": "llm",
+      "options": [
+        { "name": "model", "type": "string" },
+        { "name": "messages", "type": "array" },
+        ...
+      ]
+  },
+  {
+      "service": "tts",
+      "options": [
+        { "name": "voice", "type": "string" },
+        ...
+      ]
+  },
+  ...
+]
+```
+
+### getServiceOptionsFromConfig()
+
+`rtviClientConfigOption | undefined`
+
+Config helper method that returns configuration options for specified service key.
+
+If connected, this method will first call `getConfig` to get the latest config from the bot. If not connected, it will expect a `config` array to be passed.
+
+<ParamField path="serviceKey" type="string" required="true">
+  Service key / string identifier e.g. `llm`
+</ParamField>
+
+<ParamField path="config" type="RTVIClientConfigOption[]">
+  Optional `RTVIClientConfigOption[]` to query (vs. using remote config). This
+  can be useful when working with configuration arrays before connecting to a
+  bot.
+
+Returns new instance (copy) of the service options array.
+
+</ParamField>
+
+```typescript
+const llmServiceConfig: rtviClientConfigOption =
+  rtviClient.getServiceOptionsFromConfig("llm");
+// > [{ service: "llm", options: [ { name: "model", value: "GPT-4o" }, ... ] }]
+```
+
+Returns undefined when an invalid service key is provided.
+
+### getServiceOptionValueFromConfig()
+
+`unknown | undefined`
+
+Returns configuration option value (unknown) for specified service key and option name. As with `getServiceOptionsFromConfig`, this method will first call `getConfig` to get the latest config from the bot if connected, or expect a `config` array to be passed.
+
+<ParamField path="serviceKey" type="string" required="true">
+  Service key / string identifier e.g. `llm`
+</ParamField>
+
+<ParamField path="option" type="string" required="true">
+  Service option to retrieve e.g. `model`
+</ParamField>
+
+<ParamField path="config" type="RTVIClientConfigOption[]">
+  Optional `RTVIClientConfigOption[]` to query (vs. using remote config). This
+  can be useful when working with configuration arrays before connecting to a
+  bot.
+
+Returns new instance (copy) of the service options array.
+
+</ParamField>
+
+```typescript
+const llmModel = rtviClient.getServiceOptionsFromConfig("llm", "model");
+// > "GPT-4o"
+```
+
+Returns undefined when an invalid service key or unknown option value is provided.
+
+### setServiceOptionInConfig()
+
+`Promise<RTVIClientConfigOption[] | undefined>`
+
+Config helper method that sets a new value for a service option in the config. Returns new instance of config with updated option(s) for specified service key and option name.
+
+_Note: does not update current config, only returns a new object (call [updateConfig](#updateconfig) to apply changes)._
+
+<ParamField path="serviceKey" type="string" required="true">
+  Service key / string identifier e.g. `llm`
+</ParamField>
+
+<ParamField
+  path="serviceKey"
+  type="ConfigOption | ConfigOption[]"
+  required="true"
+>
+  Service option value to update, or array of service options.
+</ParamField>
+
+<ParamField path="config" type="RTVIClientConfigOption[]">
+  Config object to update, otherwise uses a clone of the current bot config by
+  called `getConfig` config.
+</ParamField>
+
+You can pass a single `ConfigOption` object...
+
+```typescript
+const newConfig = rtviClient.setServiceOptionInConfig("llm", {
+  name: "model",
+  value: "new-model",
+});
+// > [{ service: "llm", options: [ { name: "model", value: "new-model" }, ... ] }]
+
+await rtviClient.updateConfig(newConfig);
+```
+
+...or an array of `ConfigOption` objects.
+
+```typescript
+const newConfig = rtviClient.setServiceOptionInConfig("llm", [
+  { name: "model", value: "new-model" },
+  { name: "initial_messages", value: [...] },
+]);
+
+// > [{
+// >    service: "llm", options: [
+// >      { name: "model", value: "new-model" },
+// >      { name: "initial_messages", value: [ ... ] },
+// >      ...]
+// > }]
+
+await rtviClient.updateConfig(newConfig);
+```
+
+You can pass an optional config object to update, otherwise calls `getConfig` to get the latest config from the bot if in ready state. Returns new instance (copy) of the client config.
+
+```typescript
+const workInProgressConfig = [...];
+const newConfig = setServiceOptionInConfig("llm", [
+  { name: "model", value: "new-model" },
+  { name: "initial_messages", value: [...] },
+], workInProgressConfig);
+
+await rtviClient.updateConfig(newConfig);
+```
+
+### setConfigOptions()
+
+`Promise<RTVIClientConfigOption[]>`
+
+Config helper method that sets new values for multiple service options in the config.
+
+Convenience method for calling `setServiceOptionInConfig` multiple times.
+
+You can pass an optional config object to update, otherwise calls `getConfig` to get the latest config from the bot if in ready state. Returns new instance (copy) of the client config.
+
+_Note: does not update current config, only returns a new object (call [updateConfig](#updateconfig) to apply changes)._
+
+<ParamField
+  path="configOptions"
+  type="RTVIClientConfigOption[]"
+  required="true"
+>
+  Array of service options to update.
+</ParamField>
+
+<ParamField path="config" type="rtviClientConfigOption[]">
+  Config object to update (if not provided, calls `getConfig` to get the latest
+  bot configuration.)
+</ParamField>
+
+```typescript
+const newConfig = rtviClient.setConfigOptions([
+  { service: "llm", options: [
+    { name: "model", value: "new-model" },
+    { name: "initial_messages", value: [...] },
+  ] },
+  { service: "tts", options: [
+    { name: "voice", value: "new-voice" },
+  ] },
+]);
+
+await updateConfig(newConfig);
+```
+
+## Messages
+
+Dispatches a `RTVIMessage` data object to the bot.
+
+See: [messages and events](./messages).
+
+### sendMessage()
+
+<ParamField path="message" type="RTVIMessage">
+  An `RTVIMessage` object containing the type of message and data object to
+  dispatch.
+</ParamField>
+
+Messages are sychronous events that are dispatched to the bot. They do not return a Promise and cannot be awaited.
+
+See [messages](./messages) for more information.
+
+## Actions
+
+Dispatches a service-specific action to the bot.
+
+See: [actions](./actions).
+
+### describeActions()
+
+`Promise<unknown>`
+
+Describe the actions implemented by the bot that the client is connected to.
+
+Returns a Promise that resolves with the bot's actions description.
+
+```typescript
+actions_metadescription = await rtviClient.describeActions();
+console.log(actions_metadescription)
+
+// >>>
+{
+  "label": "rtvi-ai",
+  "type": "actions-available",
+  "id": "UNIQUE_ID_FROM_REQUEST",
+  "data": {
+    "actions": [
+      {
+	      "service": "tts",
+	      "action": "say",
+	      "arguments": [
+		      { "name": "text", "type": "string" },
+		      { "name": "interrupt", "type": "bool" },
+		      ...
+	      ]
+      },
+      ...
+    ]
+  }
+}
+```
+
+### action()
+
+`Promise<RTVIActionResponse>`
+
+Dispatch an action message to the bot.
+
+What actions a bot responds to depend on on how your bot has been configured. RTVI defines an actions protocol, but does not define any specific actions. [Helper libraries](./helpers/introduction) will often install convenience methods that make it less verbose (and more type-safe) to call actions.
+
+<ParamField path="action" type="RTVIActionRequestData">
+  The action to dispatch.
+  
+  Returns `Promise<RTVIActionResponse>`.
+</ParamField>
+
+```typescript
+// send a tts:say action using RTVI primitives
+
+response = await rtviClient.action({
+  service: "tts",
+  action: "say",
+  arguments: [{ name: "text", value: "Say 'Hello world!'" }],
+} as RTVIActionRequestData);
+```
+
+## Devices
+
+### initDevices()
+
+Initialize the media device selection machinery in the web browser. This method can be called before `connect()` to test and switch between camera and microphone sources.
+
+```typescript
+await rtviClient.initDevices();
+```
+
+### getAllMics()
+
+Returns a list of available microphones in the form of [`MediaDeviceInfo[]`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDeviceInfo).
+
+```typescript
+mic_device_list = rtviClient.getAllMics();
+```
+
+### getAllCams()
+
+Returns a list of available cameras in the form of [`MediaDeviceInfo[]`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDeviceInfo).
+
+```typescript
+cam = rtviClient.getAllCams();
+```
+
+### updateMic()
+
+Switches to the microphone identified by the provided `micId`, which should map a `deviceId` in the list returned from [`getAllMics()`](#getAllMics).
+
+<ParamField path="micId" type="string">
+  deviceId
+</ParamField>
+
+```typescript
+rtviClient.updateMic(deviceId);
+```
+
+### updateCam()
+
+Switches to the camera identified by the provided `camId`, which should map a `deviceId` in the list returned from [`getAllCams()`](#getAllCams).
+
+<ParamField path="camId" type="string">
+  deviceId
+</ParamField>
+
+```typescript
+rtviClient.updateMic(deviceId);
+```
+
+### enableMic(enable: boolean)
+
+Turn on or off (unmute or mute) the client mic input.
+
+```typescript
+rtviClient.enableMic(true);
+```
+
+### enableCam(enable: boolean)
+
+Turn on or off the client cam input.
+
+```typescript
+rtviClient.enableCam(true);
+```
+
+## Tracks (audio and video)
+
+### tracks()
+
+Returns available `MediaStreamTrack` objects for both the client and the bot.
+
+```typescript
+live_tracks_list = rtviClient.tracks()
+
+// return type is:
+{
+  local: {
+    audio?: MediaStreamTrack;
+    video?: MediaStreamTrack;
+  },
+  bot?: {
+    audio?: MediaStreamTrack;
+    video?: MediaStreamTrack;
+  }
+}
+```
