@@ -8,7 +8,7 @@ This repository is deployed on [docs.pipecat.ai](https://docs.pipecat.ai).
 
 ## What is Pipecat
 
-`pipecat` is a framework for building voice (and multimodal) conversational agents. Things like personal coaches, meeting assistants, [story-telling toys for kids](https://storytelling-chatbot.fly.dev/), customer support bots, [intake flows](https://www.youtube.com/watch?v=lDevgsp9vn0), and snarky social companions.
+`pipecat` is a framework for building voice (and multimodal) conversational agents. Things like personal coaches, meeting assistants, [storytelling toys for kids](https://storytelling-chatbot.fly.dev/), customer support bots, [intake flows](https://www.youtube.com/watch?v=lDevgsp9vn0), and snarky social companions.
 
 ## Documentation Structure
 
