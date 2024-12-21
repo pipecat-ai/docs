@@ -20,7 +20,7 @@ pip install pipecat-ai-flows
 # Basic installation
 pip install pipecat-ai-flows
 
-# Install Pipecat with specific LLM provider options:
+# Install Pipecat with required provider dependencies:
 pip install "pipecat-ai[daily,openai,deepgram]"     # For OpenAI
 pip install "pipecat-ai[daily,anthropic,deepgram]"  # For Anthropic
 pip install "pipecat-ai[daily,google,deepgram]"     # For Google
@@ -32,7 +32,7 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 ### FlowArgs
 
-<ParamField type="Dict[str, Any]">
+<ParamField path="FlowArgs" type="Dict[str, Any]">
   Type alias for function handler arguments.
 </ParamField>
 
@@ -72,18 +72,78 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
   Configuration for a single node in the flow.
 
   <Expandable title="Fields">
-    <ResponseField name="messages" type="List[dict]" required>
-      LLM context messages
+    <ResponseField name="role_messages" type="List[dict]">
+      Defines the role or persona of the LLM. Required for the initial node and optional for subsequent nodes.
+
+      ```python
+      # Example role messages
+      "role_messages": [
+          {
+              "role": "system",
+              "content": "You are a helpful assistant..."
+          }
+      ],
+      ```
+    </ResponseField>
+    <ResponseField name="task_messages" type="List[dict]" required>
+      Defines the task for a given node. Required for all nodes.
+
+      ```python
+      # Example task messages
+      "task_messages": [
+          {
+              "role": "system", # May be `user` depending on the LLM
+              "content": "Ask the user for their name..."
+          }
+      ],
+      ```
     </ResponseField>
     <ResponseField name="functions" type="List[dict]" required>
-      Available functions
+      LLM function / tool call, defined in the format for the specific LLM provider.
+
+      In addition to the standard fields, the function call can also contain two special fields:
+      - `handler`: a custom handler that executes when the function is called.
+      - `transition_to`: indicates the next node to transition to after the function call. Applies to static flows only.
+
+      ```python
+      # Example function call: OpenAI
+      "functions": [
+          {
+              "name": "get_current_movies",
+              "handler": get_movies, # Optional custom handler
+              "description": "Fetch movies currently playing in theaters",
+              "input_schema": {"type": "object", "properties": {}},
+              "transition_to": "explore_movie", # Optional: transition to next node
+          },
+      ],
+      ```
     </ResponseField>
     <ResponseField name="pre_actions" type="List[dict]" optional>
-      Actions before state change
+      Actions that execute before the LLM inference. For example, you can send a message to the TTS to speak a phrase (e.g. "Hold on a moment..."), which may be effective if an LLM function call takes time to execute.
+
+      ```python
+      # Example pre_actions
+      "pre_actions": [
+          {
+              "type": "tts_say",
+              "text": "Hold on a moment..."
+          }
+      ],
+      ```
     </ResponseField>
     <ResponseField name="post_actions" type="List[dict]" optional>
-      Actions after state change
+      Actions that execute after the LLM inference. For example, you can end the conversation.
+
+      ```python
+      # Example post_actions
+      "post_actions": [
+          {
+              "type": "end_conversation"
+          }
+      ]
+      ```
     </ResponseField>
+
   </Expandable>
 </ResponseField>
 
@@ -97,7 +157,7 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
       Pipeline task for frame queueing
     </ResponseField>
     <ResponseField name="llm" type="Any" required>
-      LLM service instance (OpenAI, Anthropic, or Google)
+      LLM service instance (OpenAI, Anthropic, or Google). Must be initialized with the corresponding pipecat-ai provider dependency installed.
     </ResponseField>
     <ResponseField name="tts" type="Optional[Any]">
       Optional TTS service for voice actions
@@ -116,12 +176,6 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 <ResponseField name="initialize" type="method">
   Initialize the flow with starting messages.
 
-<Expandable title="Parameters">
-  <ResponseField name="initial_messages" type="List[dict]" required>
-    Initial system messages for the LLM
-  </ResponseField>
-</Expandable>
-
   <Expandable title="Raises">
     <ResponseField name="FlowInitializationError">
       If initialization fails
@@ -131,6 +185,9 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 <ResponseField name="set_node" type="method">
   Set up a new conversation node.
+  
+  - For dynamic flows, the application must advance the conversation using `set_node` to set up the next node.
+  - For static flows, `set_node` is triggered by a function call that contains a `transition_to` field.
 
 <Expandable title="Parameters">
   <ResponseField name="node_id" type="str" required>
@@ -190,33 +247,88 @@ async def handle_transitions(
 <CodeGroup>
 
 ```python Static Flow
-# Initialize with configuration
-flow_manager = FlowManager(task=task, llm=llm, tts=tts, flow_config=flow_config)
+flow_config: FlowConfig = {
+    "initial_node": "greeting",
+    "nodes": {
+        "greeting": {
+            "role_messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant. Your responses will be converted to audio."
+                }
+            ],
+            "task_messages": [
+                {
+                    "role": "system",
+                    "content": "Start by greeting the user and asking for their name."
+                }
+            ],
+            "functions": [{
+                "type": "function",
+                "function": {
+                    "name": "collect_name",
+                    "description": "Record user's name",
+                    "parameters": {...},
+                    "handler": collect_name_handler,     # Specify handler
+                    "transition_to": "next_step"         # Specify transition
+                }
+            }]
+        }
+    }
+}
 
-# Initialize the flow
-await flow_manager.initialize(messages)
+# Create and initialize the FlowManager
+flow_manager = FlowManager(task, llm, tts, flow_config=flow_config)
+
+# Initialize the flow_manager to start the conversation
+await flow_manager.initialize()
 ```
 
 ```python Dynamic Flow
+def create_initial_node() -> NodeConfig:
+    return {
+        "role_messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant."
+            }
+        ],
+        "task_messages": [
+            {
+                "role": "system",
+                "content": "Ask the user for their age."
+            }
+        ],
+        "functions": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "collect_age",
+                    "handler": collect_age,
+                    "description": "Record user's age",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "age": {"type": "integer"}
+                        },
+                        "required": ["age"]
+                    }
+                }
+            }
+        ]
+    }
+
 # Initialize with transition callback
-async def handle_transitions(
-    function_name: str,
-    args: Dict[str, Any],
-    flow_manager: FlowManager
-) -> None:
-    if function_name == "collect_data":
-        await flow_manager.set_node("next", create_next_node())
+flow_manager = FlowManager(task, llm, tts, transition_callback=handle_transitions)
+await flow_manager.initialize()
 
-flow_manager = FlowManager(
-    task=task,
-    llm=llm,
-    tts=tts,
-    transition_callback=handle_transitions
-)
-
-# Initialize and set first node
-await flow_manager.initialize(messages)
-await flow_manager.set_node("start", create_start_node())
+# Initialize the flow_manager and set the initial node
+@transport.event_handler("on_first_participant_joined")
+async def on_first_participant_joined(transport, participant):
+    await transport.capture_participant_transcription(participant["id"])
+    await flow_manager.initialize()
+    await flow_manager.set_node("initial", create_initial_node())
+    await task.queue_frames([context_aggregator.user().get_context_frame()])
 ```
 
 </CodeGroup>
@@ -507,10 +619,10 @@ flow_manager.register_action("notify", custom_notification)
 # Use in node configuration
 
 "pre_actions": [
-{
-"type": "notify",
-"message": "Important update!"
-}
+    {
+        "type": "notify",
+        "message": "Important update!"
+    }
 ]
 ```
 
@@ -527,9 +639,9 @@ Base exception for all flow-related errors.
 from pipecat_flows import FlowError
 
 try:
-await flow_manager.set_node("invalid", config)
+    await flow_manager.set_node("invalid", config)
 except FlowError as e:
-print(f"Flow error: {e}")
+    print(f"Flow error: {e}")
 ```
 
 </CodeBlock>
@@ -545,9 +657,9 @@ Raised when flow initialization fails.
 from pipecat_flows import FlowInitializationError
 
 try:
-await flow_manager.initialize(messages)
+    await flow_manager.initialize()
 except FlowInitializationError as e:
-print(f"Initialization failed: {e}")
+    print(f"Initialization failed: {e}")
 
 ```
 
@@ -564,9 +676,9 @@ Raised when a state transition fails.
 from pipecat_flows import FlowTransitionError
 
 try:
-await flow_manager.set_node("next", node_config)
+    await flow_manager.set_node("next", node_config)
 except FlowTransitionError as e:
-print(f"Transition failed: {e}")
+    print(f"Transition failed: {e}")
 
 ```
 
@@ -593,7 +705,7 @@ await flow_manager.set_node("node", {
 })
 
 except InvalidFunctionError as e:
-  print(f"Invalid function: {e}")
+    print(f"Invalid function: {e}")
 ```
 
 </CodeBlock>

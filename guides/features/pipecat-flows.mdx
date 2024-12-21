@@ -13,9 +13,37 @@ The framework consists of:
 ## Key Concepts
 
 - **Nodes**: Represent conversation states with specific messages and available functions
+- **Messages**: Set the role and tasks for each node
 - **Functions**: Define actions and transitions (Node functions for operations, Edge functions for transitions)
 - **Actions**: Execute operations during state transitions (pre/post actions)
 - **State Management**: Handle conversation state and data persistence
+
+## Example Flows
+
+<CardGroup>
+  <Card
+    title="Movie Explorer (Static)"
+    icon="film"
+    href="https://github.com/pipecat-ai/pipecat-flows/blob/main/examples/static/movie_explorer_openai.py"
+  >
+    A static flow demonstrating movie exploration using OpenAI. Shows real API
+    integration with TMDB, structured data collection, and state management.
+  </Card>
+
+  <Card
+    title="Insurance Policy (Dynamic)"
+    icon="shield"
+    href="https://github.com/pipecat-ai/pipecat-flows/blob/main/examples/dynamic/insurance_gemini.py"
+  >
+    A dynamic flow using Google Gemini that adapts policy recommendations based
+    on user responses. Demonstrates runtime node creation and conditional paths.
+  </Card>
+</CardGroup>
+
+<Note>
+  These examples are fully functional and can be run locally. Make sure you have
+  the required dependencies installed and API keys configured.
+</Note>
 
 ## When to Use Static vs Dynamic Flows
 
@@ -59,7 +87,10 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 ## Designing Conversation Flows
 
-Functions in Pipecat Flows serve two key purposes: interfacing with external systems and advancing the conversation.
+Functions in Pipecat Flows serve two key purposes:
+
+- interfacing with external systems and APIs
+- advancing the conversation to the next node
 
 ### Function Handlers
 
@@ -115,46 +146,66 @@ Each node in your flow represents a conversation state and consists of three mai
 
 ### Messages
 
-Messages set the context for the LLM at each state:
+Nodes use two types of messages to control the conversation:
+
+1. **Role Messages**: Define the bot's personality or role (optional)
 
 ```python
-"messages": [
+"role_messages": [
     {
         "role": "system",
-        "content": "You are handling pizza orders. Ask for size selection."
-    },
-    {
-        "role": "assistant",
-        "content": "Example response pattern"
+        "content": "You are a friendly pizza ordering assistant. Keep responses casual and upbeat."
     }
 ]
 ```
 
+2. **Task Messages**: Define what the bot should do in the current node
+
+```python
+"task_messages": [
+    {
+        "role": "system",
+        "content": "Ask the customer which pizza size they'd like: small, medium, or large."
+    }
+]
+```
+
+Role messages are typically defined in your initial node and inherited by subsequent nodes, while task messages are specific to each node's purpose.
+
 ### Functions
 
-Functions come in two types, each serving a different purpose:
+Functions in Pipecat Flows can:
 
-#### Node Functions with Transitions
+1. Process data (using `handler`)
+2. Create transitions (using `transition_to`)
+3. Do both simultaneously
 
-Process data and optionally transition to a new state:
+This leads to two conceptual types of functions:
+
+#### Node Functions
+
+Functions that process data within a state. They typically:
+
+- Have a `handler` to interface with external systems or APIs
+- May optionally include `transition_to` to move to another state after processing
 
 ```python
 from pipecat_flows import FlowArgs, FlowResult
 
 async def select_size(args: FlowArgs) -> FlowResult:
-    """Handle pizza size selection and transition."""
+    """Process pizza size selection."""
     size = args["size"]
     return {
         "status": "success",
         "size": size
     }
 
-# Function configuration
+# Node function configuration
 {
     "type": "function",
     "function": {
         "name": "select_size",
-        "handler": select_size,
+        "handler": select_size,           # Required: Processes the selection
         "description": "Select pizza size",
         "parameters": {
             "type": "object",
@@ -162,45 +213,170 @@ async def select_size(args: FlowArgs) -> FlowResult:
                 "size": {"type": "string", "enum": ["small", "medium", "large"]}
             }
         },
-        "transition_to": "toppings"  # Optional: Specify next node
+        "transition_to": "toppings"       # Optional: Move to toppings selection
     }
 }
 ```
 
 #### Edge Functions
 
-Create transitions between states:
+Functions that create transitions between states. They:
+
+- Must have `transition_to` to specify the next state
+- May optionally include a `handler` to perform operations during transition
 
 ```python
+# Edge function configuration
 {
     "type": "function",
     "function": {
         "name": "next_step",
         "description": "Move to next state",
         "parameters": {"type": "object", "properties": {}},
-        "transition_to": "target_node"  # Required: Specify target node
+        "handler": select_size,        # Optional: Process data during transition
+        "transition_to": "target_node" # Required: Specify next state
     }
 }
 ```
 
+A function's behavior is determined by its properties:
+
+- `handler` only: Process data, stay in current state
+- `transition_to` only: Pure transition to next state
+- Both: Process data, then transition
+
 ### Actions
 
-Actions execute during state transitions:
+Actions are operations that execute during state transitions, with two distinct timing options:
+
+#### Pre-Actions
+
+Execute before LLM inference. Useful for:
+
+- Providing immediate feedback while waiting for LLM responses
+- Bridging gaps during longer function calls
+- Setting up state or context
 
 ```python
 "pre_actions": [
     {
         "type": "tts_say",
-        "text": "Processing your order..."
+        "text": "Hold on a moment..."  # Immediate feedback during processing
     }
 ],
+```
+
+<Tip>
+  Avoid mixing `tts_say` actions with chat completions as this may result in a
+  conversation flow that feels unnatural. `tts_say` are best used as filler
+  words when the LLM will take time to generate an completion.
+</Tip>
+
+#### Post-Actions
+
+Execute after LLM inference completes. Useful for:
+
+- Cleanup operations
+- State finalization
+- Ensuring proper sequence of operations
+
+```python
 "post_actions": [
     {
-        "type": "update_db",
-        "data": {"status": "completed"}
+        "type": "end_conversation"  # Ensures TTS completes before ending
     }
 ]
 ```
+
+#### Timing Considerations
+
+- **Pre-actions**: Execute immediately, before any LLM processing begins
+- **LLM Inference**: Processes the node's messages and functions
+- **Post-actions**: Execute only after LLM processing and TTS completion
+
+For example, when using `end_conversation` as a post-action, the sequence is:
+
+1. LLM generates response
+2. TTS speaks the response
+3. End conversation action executes
+
+This ordering ensures proper completion of all operations.
+
+## State Management
+
+The `state` variable in FlowManager is a shared dictionary that persists throughout the conversation. Think of it as a conversation memory that lets you:
+
+- Store user information
+- Track conversation progress
+- Share data between nodes
+- Inform decision-making
+
+Here's a practical example of a pizza ordering flow:
+
+```python
+# Store user choices as they're made
+async def select_size(args: FlowArgs) -> FlowResult:
+    """Handle pizza size selection."""
+    size = args["size"]
+
+    # Initialize order in state if it doesn't exist
+    if "order" not in flow_manager.state:
+        flow_manager.state["order"] = {}
+
+    # Store the selection
+    flow_manager.state["order"]["size"] = size
+
+    return {"status": "success", "size": size}
+
+async def select_toppings(args: FlowArgs) -> FlowResult:
+    """Handle topping selection."""
+    topping = args["topping"]
+
+    # Get existing order and toppings
+    order = flow_manager.state.get("order", {})
+    toppings = order.get("toppings", [])
+
+    # Add new topping
+    toppings.append(topping)
+    order["toppings"] = toppings
+    flow_manager.state["order"] = order
+
+    return {"status": "success", "toppings": toppings}
+
+async def finalize_order(args: FlowArgs) -> FlowResult:
+    """Process the complete order."""
+    order = flow_manager.state.get("order", {})
+
+    # Validate order has required information
+    if "size" not in order:
+        return {"status": "error", "error": "No size selected"}
+
+    # Calculate price based on stored selections
+    size = order["size"]
+    toppings = order.get("toppings", [])
+    price = calculate_price(size, len(toppings))
+
+    return {
+        "status": "success",
+        "summary": f"Ordered: {size} pizza with {', '.join(toppings)}",
+        "price": price
+    }
+```
+
+In this example:
+
+1. `select_size` initializes the order and stores the size
+2. `select_toppings` builds a list of toppings
+3. `finalize_order` uses the stored information to process the complete order
+
+The state variable makes it easy to:
+
+- Build up information across multiple interactions
+- Access previous choices when needed
+- Validate the complete order
+- Calculate final results
+
+This is particularly useful when information needs to be collected across multiple conversation turns or when later decisions depend on earlier choices.
 
 ## LLM Provider Support
 
@@ -261,7 +437,8 @@ flow_config = {
     "initial_node": "greeting",
     "nodes": {
         "greeting": {
-            "messages": [...],
+            "role_messages": [...],
+            "task_messages": [...],
             "functions": [...]
         }
     }
@@ -273,7 +450,7 @@ flow_manager = FlowManager(task=task, llm=llm, tts=tts, flow_config=flow_config)
 @transport.event_handler("on_first_participant_joined")
 async def on_first_participant_joined(transport, participant):
     await transport.capture_participant_transcription(participant["id"])
-    await flow_manager.initialize(messages)
+    await flow_manager.initialize()
     await task.queue_frames([context_aggregator.user().get_context_frame()])
 ```
 
@@ -284,7 +461,13 @@ flow_config = {
     "initial_node": "start",
     "nodes": {
         "start": {
-            "messages": [
+            "role_messages": [
+                {
+                    "role": "system",
+                    "content": "You are an order-taking assistant. You must ALWAYS use the available functions to progress the conversation. This is a phone conversation and your responses will be converted to audio. Keep the conversation friendly, casual, and polite. Avoid outputting special characters and emojis.",
+                }
+            ],
+            "task_messages": [
                 {
                     "role": "system",
                     "content": "You are an order-taking assistant. Ask if they want pizza or sushi."
@@ -358,7 +541,7 @@ flow_manager = FlowManager(
 @transport.event_handler("on_first_participant_joined")
 async def on_first_participant_joined(transport, participant):
     await transport.capture_participant_transcription(participant["id"])
-    await flow_manager.initialize(messages)
+    await flow_manager.initialize()
     await flow_manager.set_node("initial", create_initial_node())
     await task.queue_frames([context_aggregator.user().get_context_frame()])
 ```
@@ -380,7 +563,7 @@ async def calculate_quote(args: FlowArgs) -> FlowResult:
 def create_quote_node(customer_data: Dict[str, Any]) -> Dict[str, Any]:
     """Create a node for quote calculation."""
     return {
-        "messages": [
+        "task_messages": [
             {
                 "role": "system",
                 "content": f"Calculate quote for {customer_data['age']} year old customer"
@@ -427,7 +610,8 @@ The Pipecat Flow Editor provides a visual interface for creating and managing co
 
   ```python
   "greeting": {
-      "messages": [...],
+      "role_messages": [...],
+      "task_messages": [...],
       "functions": [...]
   }
   ```
@@ -436,7 +620,7 @@ The Pipecat Flow Editor provides a visual interface for creating and managing co
 
   ```python
   "collect_info": {
-      "messages": [...],
+      "task_messages": [...],
       "functions": [...],
       "pre_actions": [...]
   }
@@ -446,7 +630,7 @@ The Pipecat Flow Editor provides a visual interface for creating and managing co
 
   ```python
   "end": {
-      "messages": [...],
+      "task_messages": [...],
       "functions": [],
       "post_actions": [{"type": "end_conversation"}]
   }
@@ -541,16 +725,17 @@ The handler will be looked up in your main script when the flow is executed.
     "initial_node": "greeting",
     "nodes": {
         "greeting": {
-            "messages": [...],
+            "role_messages": [...],
+            "task_messages": [...],
             "functions": [...],
             "pre_actions": [...]
         },
         "process": {
-            "messages": [...],
+            "task_messages": [...],
             "functions": [...],
         },
         "end": {
-            "messages": [...],
+            "task_messages": [...],
             "functions": [],
             "post_actions": [...]
         }
