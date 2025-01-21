@@ -127,16 +127,33 @@ For static flows, use the `transition_to` property to specify the next node:
 }
 ```
 
-For dynamic flows, use a transition callback to determine the next node at runtime:
+For dynamic flows, register transition handlers for specific functions:
 
 ```python
-async def handle_transitions(function_name: str, args: Dict, flow_manager):
-    if function_name == "check_availability":
-        if args["available"]:
-            await flow_manager.set_node("collect_details", create_details_node())
-        else:
-            await flow_manager.set_node("suggest_alternatives", create_alternatives_node())
+# Define transition handlers
+async def handle_availability_check(args: Dict, flow_manager: FlowManager):
+    """Handle transition after availability check."""
+    if args["available"]:
+        await flow_manager.set_node("collect_details", create_details_node())
+    else:
+        await flow_manager.set_node("suggest_alternatives", create_alternatives_node())
+
+# Initialize with per-function transitions
+flow_manager = FlowManager(
+    task=task,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    tts=tts,
+    transition_callbacks={
+        "check_availability": handle_availability_check
+    }
+)
 ```
+
+Functions behave differently based on their type:
+
+- Node Functions execute their handler and trigger an immediate LLM completion with the result
+- Edge Functions execute their handler (if provided) and transition to a new node, with the LLM completion occurring after both the function result and new node's messages are added to context
 
 You can combine both approaches: use handlers to process data and transitions to advance the conversation, creating flows that are both functional and conversational.
 
@@ -177,7 +194,7 @@ Role messages are typically defined in your initial node and inherited by subseq
 Functions in Pipecat Flows can:
 
 1. Process data (using `handler`)
-2. Create transitions (using `transition_to` for static or `transition_callback` for dynamic flows)
+2. Create transitions (using `transition_to` for static flows or registered transition handlers for dynamic flows)
 3. Do both simultaneously
 
 This leads to two conceptual types of functions:
@@ -187,7 +204,7 @@ This leads to two conceptual types of functions:
 Functions that process data within a state. They typically:
 
 - Have a `handler` to interface with external systems or APIs
-- May optionally include `transition_to` to move to another state after processing
+- Do not have transitions registered
 - Trigger an immediate LLM completion with the result
 
 ```python
@@ -213,8 +230,7 @@ async def select_size(args: FlowArgs) -> FlowResult:
             "properties": {
                 "size": {"type": "string", "enum": ["small", "medium", "large"]}
             }
-        },
-        "transition_to": "toppings"       # Optional: Move to toppings selection
+        }
     }
 }
 ```
@@ -225,27 +241,46 @@ Functions that create transitions between nodes. When called, they:
 
 - Execute their `handler` (if one is provided)
 - Add function results to context
-- Must have `transition_to` (static flow) or `transition_callback` (dynamic flow) to specify the next state
+- Must have either transition_to (static flows) or a registered transition handler (dynamic flows)
 - Trigger LLM completion after both the function result and new node's messages are in context
 
+Static flows use `transition_to`:
+
 ```python
-# Edge function configuration
+# Static edge function
 {
     "type": "function",
     "function": {
         "name": "next_step",
         "description": "Move to next state",
         "parameters": {"type": "object", "properties": {}},
-        "handler": select_size,        # Optional: Process data during transition
-        "transition_to": "target_node" # Required: Specify next state
+        "handler": process_data,        # Optional: Process data during transition
+        "transition_to": "target_node"  # Required: Specify next state
     }
 }
 ```
 
+Dynamic flows register transition handlers:
+
+```python
+# Define edge function handler
+async def handle_age_collection(args: Dict, flow_manager: FlowManager):
+    """Handle age collection transition."""
+    flow_manager.state["age"] = args["age"]
+    await flow_manager.set_node("next", create_next_node())
+
+# Register edge functions
+flow_manager = FlowManager(
+    transition_callbacks={
+        "collect_age": handle_age_collection
+    }
+)
+```
+
 A function's behavior is determined by its properties:
 
-- `handler` only: Process data, stay in current state
-- `transition_to` (static flow) or `transition_callback` (dynamic flow) only: Pure transition to next state
+- No transitions: Node function - process data with LLM completion
+- Has transition: Edge function - process data (if handler provided) and transition to next node
 - Both: Process data, then transition
 
 ### Actions
@@ -530,21 +565,23 @@ Dynamic flows create and modify conversation paths at runtime based on data or b
 ```python
 from pipecat_flows import FlowManager
 
-# Define transition callback
-async def handle_transitions(function_name: str, args: Dict[str, Any], flow_manager):
-    if function_name == "collect_age":
-        if args["age"] < 25:
-            await flow_manager.set_node("young_adult", create_young_adult_node())
-        else:
-            await flow_manager.set_node("standard", create_standard_node())
+# Define transition handlers
+async def handle_age_collection(args: Dict[str, Any], flow_manager: FlowManager):
+    """Handle age collection transition."""
+    if args["age"] < 25:
+        await flow_manager.set_node("young_adult", create_young_adult_node())
+    else:
+        await flow_manager.set_node("standard", create_standard_node())
 
-# Initialize flow manager with transition callback
+# Initialize flow manager with transition handlers
 flow_manager = FlowManager(
     task=task,
     llm=llm,
     context_aggregator=context_aggregator,
     tts=tts,
-    transition_callback=handle_transitions
+    transition_callbacks={
+        "collect_age": handle_age_collection
+    }
 )
 
 @transport.event_handler("on_first_participant_joined")
