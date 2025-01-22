@@ -103,19 +103,39 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
       In addition to the standard fields, the function call can also contain two special fields:
       - `handler`: a custom handler that executes when the function is called.
-      - `transition_to`: indicates the next node to transition to after the function call. Applies to static flows only.
+      - `transition_to`: for static flows, specifies the next node to transition to.
+      - `transition_callback`: for dynamic flows, provides a handler to determine the next node.
+
+      Note: A function cannot have both `transition_to` and `transition_callback`.
 
       ```python
-      # Example function call: OpenAI
+      # Static flow example
       "functions": [
           {
-              "name": "get_current_movies",
-              "handler": get_movies, # Optional custom handler
-              "description": "Fetch movies currently playing in theaters",
-              "input_schema": {"type": "object", "properties": {}},
-              "transition_to": "explore_movie", # Optional: transition to next node
-          },
-      ],
+              "type": "function",
+              "function": {
+                  "name": "get_current_movies",
+                  "handler": get_movies,  # Optional custom handler
+                  "description": "Fetch movies currently playing",
+                  "parameters": {...},
+                  "transition_to": "explore_movie"  # Static transition
+              },
+          }
+      ]
+
+      # Dynamic flow example
+      "functions": [
+          {
+              "type": "function",
+              "function": {
+                  "name": "collect_age",
+                  "handler": collect_age,  # Process the data
+                  "description": "Collect user's age",
+                  "parameters": {...},
+                  "transition_callback": handle_age_transition  # Dynamic transition
+              },
+          }
+      ]
       ```
     </ResponseField>
     <ResponseField name="pre_actions" type="List[dict]" optional>
@@ -167,9 +187,6 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
     </ResponseField>
     <ResponseField name="flow_config" type="Optional[Dict[str, Any]]">
       Optional static flow configuration
-    </ResponseField>
-    <ResponseField name="transition_callback" type="Optional[Callable]">
-      Optional callback for handling transitions
     </ResponseField>
   </Expandable>
 </ResponseField>
@@ -270,9 +287,9 @@ flow_config: FlowConfig = {
                 "type": "function",
                 "function": {
                     "name": "collect_name",
+                    "handler": collect_name_handler,     # Specify handler
                     "description": "Record user's name",
                     "parameters": {...},
-                    "handler": collect_name_handler,     # Specify handler
                     "transition_to": "next_step"         # Specify transition
                 }
             }]
@@ -321,19 +338,19 @@ def create_initial_node() -> NodeConfig:
                             "age": {"type": "integer"}
                         },
                         "required": ["age"]
-                    }
+                    },
+                    "transition_callback": handle_age_transition
                 }
             }
         ]
     }
 
-# Initialize with transition callback
+# Initialize the FlowManager
 flow_manager = FlowManager(
     task=task,
     llm=llm,
     context_aggregator=context_aggregator,
     tts=tts,
-    transition_callback=handle_transitions
 )
 
 await flow_manager.initialize()
@@ -349,7 +366,7 @@ async def on_first_participant_joined(transport, participant):
 </CodeGroup>
 
 <ResponseField name="Node Functions" type="concept">
-  Functions that execute operations within a state and optionally transition to a new state.
+  Functions that execute operations within a state.
 
 <CodeBlock>
 
@@ -378,7 +395,6 @@ async def process_data(args: FlowArgs) -> FlowResult:
                 "data": {"type": "string"}
             }
         },
-        "transition_to": "next_node"  # Optional: Specify next node
     }
 }
 ```
@@ -388,7 +404,7 @@ async def process_data(args: FlowArgs) -> FlowResult:
 </ResponseField>
 
 <ResponseField name="Edge Functions" type="concept">
-  Functions that create transitions between nodes. Use transition_to to specify the target node.
+  Functions that create transitions between nodes. Use `transition_to` (static flow) or `transition_callback` (dynamic flow) to specify the target node.
 
 <CodeBlock>
 
@@ -400,7 +416,7 @@ async def process_data(args: FlowArgs) -> FlowResult:
         "name": "next_step",
         "description": "Transition to next node",
         "parameters": {"type": "object", "properties": {}},
-        "transition_to": "target_node"  # Required: Specify target node
+        "transition_to": "target_node"  # Required: Specify target node (or use transition_callback for dynamic flows)
     }
 }
 ```
@@ -416,8 +432,7 @@ async def process_data(args: FlowArgs) -> FlowResult:
 Async function that processes data within a node. Can be specified as:
 
 - Direct function reference
-- String with `__function__:` prefix (e.g.,
-  `"__function__:process_data"`) to reference a function in the main script
+- Either a Callable function or a string with `__function__:` prefix (e.g., `"__function__:process_data"`) to reference a function in the main script
 
 <CodeGroup>
 ```python Direct Reference
@@ -425,7 +440,7 @@ Async function that processes data within a node. Can be specified as:
     "type": "function",
     "function": {
         "name": "process_data",
-        "handler": process_data,  # Direct function reference
+        "handler": process_data,  # Callable function
         "parameters": {...}
     }
 }
@@ -447,54 +462,55 @@ Async function that processes data within a node. Can be specified as:
 </ResponseField>
 
 <ResponseField name="transition_to" type="Optional[str]">
-Name of the node to transition to after function execution. The presence of this property determines the function's behavior:
+Name of the node to transition to after function execution. Used in static flows.
+
+The presence of this property determines the function's behavior:
 
 - Without `transition_to`: Node function that triggers immediate LLM completion upon result
 - With `transition_to`: Edge function that triggers LLM completion after both function result and new node context are added
 
 </ResponseField>
 
-### Transition Types
+<ResponseField name="transition_callback" type="Optional[Callable]">
+  Handler for dynamic flow transitions. Must be an async function with the signature:
 
-<CodeGroup>
-    ```python Handler with Transition
-    # Process data and transition
-    {
-        "type": "function",
-        "function": {
-            "name": "save_order",
-            "handler": save_order_handler,
-            "parameters": {...},
-            "transition_to": "confirmation"
-        }
+```python
+async def handle_transition(args: Dict[str, Any], flow_manager: FlowManager) -> None:
+    """Handle transition to next node."""
+    # Process args and determine next node
+    await flow_manager.set_node("next", create_next_node())
+```
+
+The callback receives:
+
+- `args`: Arguments from the function call
+- `flow_manager`: Reference to the FlowManager instance
+
+Example usage:
+
+```python
+async def handle_age_transition(args: Dict, flow_manager: FlowManager):
+    age = args["age"]
+    if age < 25:
+        await flow_manager.set_node("young_adult", create_young_adult_node())
+    else:
+        await flow_manager.set_node("standard", create_standard_node())
+
+# Use in function configuration
+{
+    "type": "function",
+    "function": {
+        "name": "collect_age",
+        "handler": collect_age,
+        "parameters": {...},
+        "transition_callback": handle_age_transition
     }
-    ```
+}
+```
 
-    ```python Pure Transition
-    # Transition only
-    {
-        "type": "function",
-        "function": {
-            "name": "go_to_checkout",
-            "parameters": {},
-            "transition_to": "checkout"
-        }
-    }
-    ```
+Note: A function cannot have both `transition_to` and `transition_callback`.
 
-    ```python Handler Only
-    # Process without transition
-    {
-        "type": "function",
-        "function": {
-            "name": "validate_input",
-            "handler": validate_handler,
-            "parameters": {...}
-        }
-    }
-    ```
-
-</CodeGroup>
+</ResponseField>
 
 ### Handler Signatures
 
@@ -584,7 +600,9 @@ Name of the node to transition to after function execution. The presence of this
 
 </CodeGroup>
 
-## Built-in Actions
+## Actions
+
+### Built-in Actions
 
 <ResponseField name="tts_say" type="action">
   Speaks text immediately using the TTS service.
@@ -631,19 +649,20 @@ async def custom_notification(action: dict):
     message = action.get("message", "")
     await notify_user(message)
 
-# Register the action
-
-flow_manager.register_action("notify", custom_notification)
-
 # Use in node configuration
 
 "pre_actions": [
     {
         "type": "notify",
-        "message": "Important update!"
+        "handler": send_notification
     }
 ]
 ```
+
+<Note>
+  Actions declared in the NodeConfig are automatically registered. You can
+  optionally register using `register_action`.
+</Note>
 
 </CodeBlock>
 
@@ -730,32 +749,3 @@ except InvalidFunctionError as e:
 </CodeBlock>
 
 </ResponseField>
-
-### Error Handling Best Practices
-
-<CodeGroup>
-    ```python Catch Specific Exceptions
-    try:
-        await flow_manager.set_node("next", config)
-    except FlowTransitionError as e:
-        # Handle transition specific error
-        logger.error(f"Transition failed: {e}")
-    except FlowError as e:
-        # Handle general flow errors
-        logger.error(f"Flow error: {e}")
-    ```
-
-    ```python Graceful Degradation
-    try:
-        await flow_manager.set_node("next", config)
-    except FlowError:
-        # Fallback to safe state
-        await flow_manager.set_node("error", create_error_node())
-    ```
-
-    ```python State Validation
-    if "required_data" not in flow_manager.state:
-        raise FlowError("Missing required state data")
-    ```
-
-</CodeGroup>
