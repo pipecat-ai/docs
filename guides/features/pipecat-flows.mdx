@@ -89,7 +89,7 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 Functions in Pipecat Flows serve two key purposes:
 
-- interfacing with external systems and APIs
+- interfacing with external systems and APIs through LLM function calls
 - advancing the conversation to the next node
 
 ### Function Handlers
@@ -130,12 +130,15 @@ For static flows, use the `transition_to` property to specify the next node:
 For dynamic flows, use a transition callback to determine the next node at runtime:
 
 ```python
-async def handle_transitions(function_name: str, args: Dict, flow_manager):
-    if function_name == "check_availability":
-        if args["available"]:
-            await flow_manager.set_node("collect_details", create_details_node())
-        else:
-            await flow_manager.set_node("suggest_alternatives", create_alternatives_node())
+{
+    "type": "function",
+    "function": {
+        "name": "confirm_reservation",
+        "handler": save_reservation,  # Process the reservation
+        "parameters": {...},
+        "transition_callback": send_confirmation  # Call the corresponding handler to set_node()
+    }
+}
 ```
 
 You can combine both approaches: use handlers to process data and transitions to advance the conversation, creating flows that are both functional and conversational.
@@ -182,12 +185,19 @@ Functions in Pipecat Flows can:
 
 This leads to two conceptual types of functions:
 
+- Node functions, which execute a handler within a state
+- Edge function, which create transitions between nodes and optionally executes a handler
+
+<Note>
+  Function type is defined implicitly based on the existence (or absence) of the
+  transition properties
+</Note>
+
 #### Node Functions
 
 Functions that process data within a state. They typically:
 
 - Have a `handler` to interface with external systems or APIs
-- May optionally include `transition_to` to move to another state after processing
 - Trigger an immediate LLM completion with the result
 
 ```python
@@ -214,7 +224,6 @@ async def select_size(args: FlowArgs) -> FlowResult:
                 "size": {"type": "string", "enum": ["small", "medium", "large"]}
             }
         },
-        "transition_to": "toppings"       # Optional: Move to toppings selection
     }
 }
 ```
@@ -251,6 +260,9 @@ A function's behavior is determined by its properties:
 ### Actions
 
 Actions are operations that execute during state transitions, with two distinct timing options:
+
+- Pre-actions: execute before the LLM completion
+- Post-actions: execute after the LLM completion
 
 #### Pre-Actions
 
@@ -392,8 +404,10 @@ Pipecat Flows automatically handles format differences between LLM providers:
     "type": "function",
     "function": {
         "name": "function_name",
+        "handler": select_size, # Optional handler
         "description": "description",
-        "parameters": {...}
+        "parameters": {...},
+        "transition_to": "target_node" # Optional transition (or transition_callback for dynamic flows)
     }
 }]
 ```
@@ -403,8 +417,10 @@ Pipecat Flows automatically handles format differences between LLM providers:
 ```python
 "functions": [{
     "name": "function_name",
+    "handler": select_size, # Optional handler
     "description": "description",
-    "input_schema": {...}
+    "input_schema": {...},
+    "transition_to": "target_node" # Optional transition (or transition_callback for dynamic flows)
 }]
 ```
 
@@ -414,8 +430,10 @@ Pipecat Flows automatically handles format differences between LLM providers:
 "functions": [{
     "function_declarations": [{
         "name": "function_name",
+        "handler": select_size, # Optional handler
         "description": "description",
-        "parameters": {...}
+        "parameters": {...},
+        "transition_to": "target_node" # Optional transition (or transition_callback for dynamic flows)
     }]
 }]
 ```
@@ -462,7 +480,7 @@ async def on_first_participant_joined(transport, participant):
     await flow_manager.initialize()
 ```
 
-### Example Configuration
+### Example FlowConfig
 
 ```python
 flow_config = {
@@ -517,34 +535,99 @@ flow_config = {
 - Use `transition_to` to make state changes explicit
 - Combine handlers with transitions when appropriate
 - Keep transitions focused on single responsibilities
-- Use clear, descriptive names for target nodes
-- Validate all transition targets exist
-- Test both successful and failed transitions
 
 ## Dynamic Flows
 
 Dynamic flows create and modify conversation paths at runtime based on data or business logic.
 
-### Basic Setup
+### Example Implementation
+
+Here's a complete example of a dynamic insurance quote flow:
 
 ```python
-from pipecat_flows import FlowManager
+from pipecat_flows import FlowManager, FlowArgs, FlowResult
 
-# Define transition callback
-async def handle_transitions(function_name: str, args: Dict[str, Any], flow_manager):
-    if function_name == "collect_age":
-        if args["age"] < 25:
-            await flow_manager.set_node("young_adult", create_young_adult_node())
-        else:
-            await flow_manager.set_node("standard", create_standard_node())
+# Define handlers and transitions
+async def collect_age(args: FlowArgs) -> FlowResult:
+    """Process age collection."""
+    age = args["age"]
+    return {"status": "success", "age": age}
 
-# Initialize flow manager with transition callback
+async def handle_age_transition(args: Dict, flow_manager: FlowManager):
+    """Transition handler that determines next node based on age."""
+    age = args["age"]
+    flow_manager.state["age"] = age  # Store for later use
+
+    if age < 25:
+        await flow_manager.set_node("young_adult", create_young_adult_node())
+    else:
+        await flow_manager.set_node("standard", create_standard_node())
+
+# Node creation functions
+def create_initial_node() -> Dict[str, Any]:
+    """Create initial age collection node."""
+    return {
+        "role_messages": [
+            {
+                "role": "system",
+                "content": "You are an insurance quote assistant."
+            }
+        ],
+        "task_messages": [
+            {
+                "role": "system",
+                "content": "Ask for the customer's age."
+            }
+        ],
+        "functions": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "collect_age",
+                    "handler": collect_age,  # Process the age
+                    "description": "Collect customer age",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "age": {"type": "integer"}
+                        }
+                    },
+                    "transition_callback": handle_age_transition  # Handle transition
+                }
+            }
+        ]
+    }
+
+def create_young_adult_node() -> Dict[str, Any]:
+    """Create node for young adult quotes."""
+    return {
+        "task_messages": [
+            {
+                "role": "system",
+                "content": "Explain our special young adult coverage options."
+            }
+        ],
+        "functions": [...]  # Additional quote-specific functions
+    }
+
+def create_standard_node() -> Dict[str, Any]:
+    """Create node for standard quotes."""
+    return {
+        "task_messages": [
+            {
+                "role": "system",
+                "content": "Present our standard coverage options."
+            }
+        ],
+        "functions": [...]  # Additional quote-specific functions
+    }
+
+# Initialize flow manager
 flow_manager = FlowManager(
     task=task,
     llm=llm,
     context_aggregator=context_aggregator,
     tts=tts,
-    transition_callback=handle_transitions
 )
 
 @transport.event_handler("on_first_participant_joined")
@@ -554,55 +637,11 @@ async def on_first_participant_joined(transport, participant):
     await flow_manager.set_node("initial", create_initial_node())
 ```
 
-### Node Creation
-
-```python
-from pipecat_flows import FlowArgs, FlowResult
-
-async def calculate_quote(args: FlowArgs) -> FlowResult:
-    """Calculate insurance quote."""
-    coverage = args["coverage_amount"]
-    monthly_premium = calculate_premium(coverage)
-    return {
-        "status": "success",
-        "premium": monthly_premium
-    }
-
-def create_quote_node(customer_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a node for quote calculation."""
-    return {
-        "task_messages": [
-            {
-                "role": "system",
-                "content": f"Calculate quote for {customer_data['age']} year old customer"
-            }
-        ],
-        "functions": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "calculate_quote",
-                    "handler": calculate_quote,
-                    "description": "Calculate insurance quote",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "coverage_amount": {"type": "integer"}
-                        }
-                    }
-                }
-            }
-        ]
-    }
-```
-
 ### Best Practices
 
-- Keep state in flow_manager.state
+- Keep data processing in handlers and flow logic in transition callbacks
+- Store shared data in flow_manager.state
 - Create separate functions for node creation
-- Handle errors gracefully in transitions
-- Document state dependencies
-- Test node creation and transitions thoroughly
 
 # Flow Editor
 
