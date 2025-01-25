@@ -3,13 +3,19 @@ title: "UserIdleProcessor"
 description: "A processor that monitors user inactivity and triggers callbacks after specified timeout periods"
 ---
 
-The `UserIdleProcessor` is a specialized frame processor that monitors user activity in a conversation and executes callbacks when the user becomes idle. It's particularly useful for maintaining engagement by detecting periods of user inactivity.
+The `UserIdleProcessor` is a specialized frame processor that monitors user activity in a conversation and executes callbacks when the user becomes idle. It's particularly useful for maintaining engagement by detecting periods of user inactivity and providing escalating responses to inactivity.
 
 ## Constructor Parameters
 
-<ParamField path="callback" type="Callable" required>
-  An async function that will be called when user inactivity is detected. The
-  function should accept the processor instance as its argument.
+<ParamField path="callback" type="Union[BasicCallback, RetryCallback]" required>
+An async function that will be called when user inactivity is detected. Can be
+either:
+
+- Basic callback: `async def(processor: UserIdleProcessor) -> None`
+
+- Retry callback: `async def(processor: UserIdleProcessor, retry_count: int) ->
+bool` where returning `False` stops idle monitoring
+
 </ParamField>
 
 <ParamField path="timeout" type="float" required>
@@ -24,39 +30,95 @@ The processor starts monitoring for inactivity only after the first conversation
 - Pauses idle monitoring while user is speaking
 - Resets idle timer when bot is speaking
 - Stops monitoring on conversation end or cancellation
+- Manages a retry count for the retry callback
+- Stops monitoring when retry callback returns `False`
 
-## Example Implementation
+## Properties
 
-Here's a complete example showing how to use the UserIdleProcessor in a pipeline:
+<ParamField path="retry_count" type="int">
+  The current number of retry attempts made to engage the user.
+</ParamField>
 
-```python
-async def user_idle_callback(user_idle: UserIdleProcessor):
-    messages.append({
-        "role": "system",
-        "content": "Ask the user if they are still there and try to prompt for some input."
-    })
-    await user_idle.push_frame(LLMMessagesFrame(messages))
+## Example Implementations
 
-# Create the processor
-user_idle = UserIdleProcessor(
-    callback=user_idle_callback,
-    timeout=5.0
-)
+Here are two example showing how to use the `UserIdleProcessor`: one with the basic callback and one with the retry callback:
 
-# Add to pipeline
-pipeline = Pipeline([
-    transport.input(),
-    user_idle,  # Add the processor to monitor user activity
-    context_aggregator.user(),
-    # ... rest of pipeline
-])
-```
+<Tabs>
+  <Tab title="Basic Callback">
+    ```python
+    async def handle_idle(user_idle: UserIdleProcessor) -> None:
+        messages.append({
+            "role": "system",
+            "content": "Ask the user if they are still there and try to prompt for some input."
+        })
+        await user_idle.push_frame(LLMMessagesFrame(messages))
+
+    # Create the processor
+    user_idle = UserIdleProcessor(
+        callback=handle_idle,
+        timeout=5.0
+    )
+
+    # Add to pipeline
+    pipeline = Pipeline([
+        transport.input(),
+        user_idle,  # Add the processor to monitor user activity
+        context_aggregator.user(),
+        # ... rest of pipeline
+    ])
+    ```
+
+  </Tab>
+  <Tab title="Retry Callback">
+    ```python
+    async def handle_user_idle(user_idle: UserIdleProcessor, retry_count: int) -> bool:
+        if retry_count == 1:
+            # First attempt: Gentle reminder
+            messages.append({
+                "role": "system",
+                "content": "The user has been quiet. Politely and briefly ask if they're still there."
+            })
+            await user_idle.push_frame(LLMMessagesFrame(messages))
+            return True
+        elif retry_count == 2:
+            # Second attempt: Direct prompt
+            messages.append({
+                "role": "system",
+                "content": "The user is still inactive. Ask if they'd like to continue our conversation."
+            })
+            await user_idle.push_frame(LLMMessagesFrame(messages))
+            return True
+        else:
+            # Third attempt: End conversation
+            await user_idle.push_frame(
+                TTSSpeakFrame("It seems like you're busy right now. Have a nice day!")
+            )
+            await task.queue_frame(EndFrame())
+            return False  # Stop monitoring
+
+    # Create the processor
+    user_idle = UserIdleProcessor(
+        callback=handle_user_idle,
+        timeout=5.0
+    )
+
+    # Add to pipeline
+    pipeline = Pipeline([
+        transport.input(),
+        user_idle,  # Add the processor to monitor user activity
+        context_aggregator.user(),
+        # ... rest of pipeline
+    ])
+    ```
+
+  </Tab>
+</Tabs>
 
 ## Frame Handling
 
 The processor handles the following frame types:
 
-- `UserStartedSpeakingFrame`: Marks user as active and resets idle timer
+- `UserStartedSpeakingFrame`: Marks user as active, resets idle timer and retry count
 - `UserStoppedSpeakingFrame`: Starts idle monitoring
 - `BotSpeakingFrame`: Resets idle timer
 - `EndFrame` / `CancelFrame`: Stops idle monitoring
@@ -65,3 +127,4 @@ The processor handles the following frame types:
 
 - The idle callback won't be triggered while the user or bot is actively speaking
 - The processor automatically cleans up its resources when the pipeline ends
+- Basic callbacks are supported for backward compatibility
