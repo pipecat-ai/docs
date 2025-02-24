@@ -25,8 +25,30 @@ You'll also need to set up your Google API key as an environment variable: `GOOG
   Google API key
 </ParamField>
 
-<ParamField path="model" type="str" default="gemini-1.5-flash-latest">
+<ParamField path="model" type="str" default="gemini-2.0-flash-001">
   Model identifier
+</ParamField>
+
+<ParamField path="system_instruction" type="Optional[str]" default="None">
+System instructions for the model.
+
+<Note>
+Unlike OpenAI, Google Gemini handles system messages differently. System messages are:
+
+- Set during client initialization as `system_instruction`
+- Can be updated during a conversation, which will recreate the client
+- Not directly included in the message context like in OpenAI
+
+</Note>
+
+</ParamField>
+
+<ParamField path="tools" type="Optional[List[Dict[str, Any]]]" default="None">
+  List of function definitions for the model to use
+</ParamField>
+
+<ParamField path="tool_config" type="Optional[Dict[str, Any]]" default="None">
+  Configuration for tool usage
 </ParamField>
 
 <ParamField path="params" type="InputParams" optional>
@@ -87,6 +109,10 @@ You'll also need to set up your Google API key as an environment variable: `GOOG
   Signals end of response
 </ParamField>
 
+<ParamField path="LLMSearchResponseFrame" type="Frame">
+  Contains search results and origins when grounding is used
+</ParamField>
+
 ## Context Management
 
 The Google service uses specialized context management to handle conversations and message formatting. This includes managing the conversation history, system prompts, function calls, and converting between OpenAI and Google message formats.
@@ -97,9 +123,9 @@ The base context manager for Google conversations:
 
 ```python
 context = GoogleLLMContext(
-    messages=[],  # Conversation history
-    tools=[],     # Available function calling tools
-    system="You are a helpful assistant"  # System prompt
+    messages=[],    # Conversation history
+    tools=[],       # Available function calling tools
+    tool_choice={}  # How the model should use the provided tools
 )
 ```
 
@@ -179,6 +205,95 @@ See the [Function Calling guide](/guides/features/function-calling) for:
 - Control over function call behavior
 - Complete usage examples
 
+## Search Grounding
+
+`GoogleLLMService` supports Google's Search Grounding feature, which enables the model to retrieve and reference information from the web when generating responses. This feature enhances the model's ability to provide up-to-date information and cite sources.
+
+### Enabling Search Grounding
+
+To enable Search Grounding, configure the `tools` parameter with a Google search retrieval configuration:
+
+```python
+# Configure search grounding
+search_tool = {
+    "google_search_retrieval": {
+        "dynamic_retrieval_config": {
+            "mode": "MODE_DYNAMIC",
+            "dynamic_threshold": 0,  # 0 = always ground with search
+        }
+    }
+}
+
+# Initialize LLM with search tool
+llm = GoogleLLMService(
+    api_key=os.getenv("GOOGLE_API_KEY"),
+    model="gemini-1.5-flash-002",  # Use a model that supports grounding
+    system_instruction="Your system instruction here",
+    tools=[search_tool],
+)
+```
+
+### Dynamic Retrieval Configuration
+
+The `dynamic_retrieval_config` controls when Search Grounding is applied:
+
+<ParamField path="mode" type="string" default="MODE_UNSPECIFIED">
+  Retrieval mode: "MODE_UNSPECIFIED" (always on), "MODE_DYNAMIC" (model decides)
+</ParamField>
+
+<ParamField path="dynamic_threshold" type="float" default="0.3">
+  Controls frequency of search retrieval when using MODE_DYNAMIC. Range: 0.0
+  (always retrieve) to 1.0 (never retrieve)
+</ParamField>
+
+### Receiving Search Results
+
+When Search Grounding is used, the service generates a `LLMSearchResponseFrame` containing the search results and source information:
+
+<ParamField path="search_result" type="str">
+  The full text response generated with search grounding
+</ParamField>
+
+<ParamField path="origins" type="List[Dict]">
+
+Information about source websites and referenced content:
+
+- `site_uri`: Source URL
+- `site_title`: Source title
+- `results`: Text segments from the source with confidence scores
+
+</ParamField>
+
+<ParamField path="rendered_content" type="Optional[str]">
+  Additional content rendered by the grounding system
+</ParamField>
+
+### Pipeline Example
+
+Here's how to integrate Search Grounding in a pipeline:
+
+```python
+# Configure the service
+llm = GoogleLLMService(
+    api_key=os.getenv("GOOGLE_API_KEY"),
+    model="gemini-1.5-flash-002",
+    system_instruction=system_instruction,
+    tools=[search_tool],
+)
+
+
+# Create pipeline
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
 ## Usage Examples
 
 ### Basic Usage
@@ -193,6 +308,10 @@ llm = GoogleLLMService(
         max_tokens=1000
     )
 )
+
+# Create context and aggregators
+context = GoogleLLMContext()
+context_aggregator = llm.create_context_aggregator(context)
 
 # Create pipeline
 pipeline = Pipeline([
