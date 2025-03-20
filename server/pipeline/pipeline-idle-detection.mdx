@@ -1,0 +1,111 @@
+---
+title: "Pipeline Idle Detection"
+description: "Automatically detect and handle idle pipelines with no bot activity"
+---
+
+## Overview
+
+Pipeline idle detection is a feature that monitors activity in your pipeline and can automatically cancel tasks when no meaningful bot interactions are occurring. This helps prevent pipelines from running indefinitely when a conversation has naturally ended but wasn't properly terminated.
+
+## How It Works
+
+The system monitors specific "activity frames" that indicate the bot is actively engaged in the conversation. By default, these are:
+
+- `BotSpeakingFrame` - When the bot is speaking
+- `LLMFullResponseEndFrame` - When the LLM has completed a response
+
+If no activity frames are detected within the configured timeout period (5 minutes by default), the system considers the pipeline idle and can automatically terminate it.
+
+<Note>
+  Idle detection only starts after the pipeline has begun processing frames. The
+  idle timer resets whenever an activity frame (as specified in
+  `idle_timeout_frames`) is received.
+</Note>
+
+## Configuration
+
+You can configure idle detection behavior when creating a `PipelineTask`:
+
+```python
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+
+# Default configuration - cancel after 5 minutes of inactivity
+task = PipelineTask(pipeline)
+
+# Custom configuration
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(allow_interruptions=True),
+    idle_timeout_secs=600,  # 10 minute timeout
+    idle_timeout_frames=(BotSpeakingFrame,),  # Only monitor bot speaking
+    cancel_on_idle_timeout=False,  # Don't auto-cancel, just notify
+)
+```
+
+## Configuration Parameters
+
+<ParamField path="idle_timeout_secs" type="Optional[float]" default="300">
+  Timeout in seconds before considering the pipeline idle. Set to `None` to
+  disable idle detection.
+</ParamField>
+
+<ParamField
+  path="idle_timeout_frames"
+  type="Tuple[Type[Frame], ...]"
+  default="(BotSpeakingFrame, LLMFullResponseEndFrame)"
+>
+  Frame types that should prevent the pipeline from being considered idle.
+</ParamField>
+
+<ParamField path="cancel_on_idle_timeout" type="bool" default="True">
+  Whether to automatically cancel the pipeline task when idle timeout is
+  reached.
+</ParamField>
+
+## Handling Idle Timeouts
+
+You can respond to idle timeout events by adding an event handler:
+
+```python
+@task.event_handler("on_idle_timeout")
+async def on_idle_timeout(task):
+    logger.info("Pipeline has been idle for too long")
+    # Perform any custom cleanup or logging
+    # Note: If cancel_on_idle_timeout=True, the pipeline will be cancelled after this handler runs
+```
+
+## Example Implementation
+
+Here's a complete example showing how to configure idle detection with custom handling:
+
+```python
+from pipecat.frames.frames import BotSpeakingFrame, LLMFullResponseEndFrame, TTSSpeakFrame
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+
+# Create pipeline
+pipeline = Pipeline([...])
+
+# Configure task with custom idle settings
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(allow_interruptions=True),
+    idle_timeout_secs=180,  # 3 minutes
+    cancel_on_idle_timeout=False  # Don't auto-cancel
+)
+
+# Add event handler for idle timeout
+@task.event_handler("on_idle_timeout")
+async def on_idle_timeout(task):
+    logger.info("Conversation has been idle for 3 minutes")
+
+    # Add a farewell message
+    await task.queue_frame(TTSSpeakFrame("I haven't heard from you in a while. Goodbye!"))
+
+    # Then end the conversation gracefully
+    await task.stop_when_done()
+
+runner = PipelineRunner()
+
+await runner.run(task)
+```
