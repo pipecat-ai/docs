@@ -27,11 +27,54 @@ Here's how it works:
 
 ### 1. Define Functions
 
-Functions are defined differently depending on your LLM provider. Here are examples of a weather function for supported providers:
+Pipecat provides a standardized `FunctionSchema` that works across all supported LLM providers. This makes it easy to define functions once and use them with any provider.
+
+#### Using the Standard Schema (Recommended)
+
+```python
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+# Define a function using the standard schema
+weather_function = FunctionSchema(
+    name="get_current_weather",
+    description="Get the current weather in a location",
+    properties={
+        "location": {
+            "type": "string",
+            "description": "The city and state, e.g. San Francisco, CA",
+        },
+        "format": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"],
+            "description": "The temperature unit to use.",
+        },
+    },
+    required=["location", "format"]
+)
+
+# Create a tools schema with your functions
+tools = ToolsSchema(standard_tools=[weather_function])
+
+# Pass this to your LLM context
+context = OpenAILLMContext(
+    messages=[{"role": "system", "content": "You are a helpful assistant."}],
+    tools=tools
+)
+```
+
+The `ToolsSchema` will be automatically converted to the correct format for your LLM provider through adapters.
+
+#### Using Provider-Specific Formats (Alternative)
+
+You can also define functions in the provider-specific format if needed:
 
 <CodeGroup>
 
 ```python OpenAI
+from openai.types.chat import ChatCompletionToolParam
+
+# OpenAI native format
 tools = [
     ChatCompletionToolParam(
         type="function",
@@ -59,6 +102,7 @@ tools = [
 ```
 
 ```python Anthropic
+# Anthropic native format
 tools = [
     {
         "name": "get_weather",
@@ -83,6 +127,7 @@ tools = [
 ```
 
 ```python Gemini
+# Gemini native format
 tools = [
     {
         "function_declarations": [
@@ -112,16 +157,48 @@ tools = [
 
 </CodeGroup>
 
+#### Provider-Specific Custom Tools
+
+Some providers support unique tools that don't fit the standard function schema. For these cases, you can add custom tools:
+
+```python
+from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+
+# Standard functions
+weather_function = FunctionSchema(
+    name="get_current_weather",
+    description="Get the current weather",
+    properties={"location": {"type": "string"}},
+    required=["location"]
+)
+
+# Custom Gemini search tool
+gemini_search_tool = {
+    "web_search": {
+        "description": "Search the web for information"
+    }
+}
+
+# Create a tools schema with both standard and custom tools
+tools = ToolsSchema(
+    standard_tools=[weather_function],
+    custom_tools={
+        AdapterType.GEMINI: [gemini_search_tool]
+    }
+)
+```
+
+<Tip>
+  See the provider-specific documentation for details on custom tools and their
+  formats.
+</Tip>
+
 ### 2. Register Function Handlers
 
-Register handlers for your functions using the LLM service's [`register_function` method](/api-reference/services/base-service-classes#methods-2):
+Register handlers for your functions using the LLM service's [`register_function` method](/server/base-classes/llm#methods):
 
 ```python
 llm = OpenAILLMService(api_key="your-api-key", model="gpt-4")
-
-# Optional start callback - called when function execution begins
-async def start_fetch_weather(function_name, llm, context):
-    logger.debug(f"Starting weather fetch: {function_name}")
 
 # Main function handler - called to execute the function
 async def fetch_weather_from_api(function_name, tool_call_id, args, llm, context, result_callback):
@@ -133,7 +210,6 @@ async def fetch_weather_from_api(function_name, tool_call_id, args, llm, context
 llm.register_function(
     "get_current_weather",
     fetch_weather_from_api,
-    start_callback=start_fetch_weather
 )
 ```
 
@@ -142,26 +218,24 @@ llm.register_function(
 Include your LLM service in your pipeline with the registered functions:
 
 ```python
-# Initiliaze the LLM context, including messges and tool calls
-context = OpenAILLMContext(messages, tools)
+# Initialize the LLM context with your function schemas
+context = OpenAILLMContext(
+    messages=[{"role": "system", "content": "You are a helpful assistant."}],
+    tools=tools
+)
 
-# Create the context aggregator, to collec the user and assistnat context
+# Create the context aggregator to collect the user and assistant context
 context_aggregator = llm.create_context_aggregator(context)
 
 # Create the pipeline
-# 1. Input from the transport
-# 2. User context aggregation
-# 3. LLM processing
-# 4. TTS processing
-# 5. Output to the transport
-# 6. Assistant context aggregation
 pipeline = Pipeline([
-    transport.input(),
-    context_aggregator.user(),
-    llm,
-    tts,
-    transport.output(),
-    context_aggregator.assistant(),
+    transport.input(),               # Input from the transport
+    stt,                             # STT processing
+    context_aggregator.user(),       # User context aggregation
+    llm,                             # LLM processing
+    tts,                             # TTS processing
+    transport.output(),              # Output to the transport
+    context_aggregator.assistant(),  # Assistant context aggregation
 ])
 ```
 
@@ -182,9 +256,15 @@ pipeline = Pipeline([
 - Return `None` to ignore the function call
 - Errors should be handled within your function
 
-## Controlling Function Call Behavior
+## Controlling Function Call Behavior (Advanced)
 
 When returning results from a function handler, you can control how the LLM processes those results using a `FunctionCallResultProperties` frame.
+
+<Tip>
+  It can be handy to skip a completion when you have back-to-back function
+  calls. Note, if you skip a completion, then you must manually trigger one from
+  the context.
+</Tip>
 
 ### Properties
 
@@ -192,7 +272,8 @@ When returning results from a function handler, you can control how the LLM proc
 Controls whether the LLM should generate a response after the function call:
 
 - `True`: Run LLM after function call (default if no other function calls in progress)
-- `False`: Don't run LLM after function call - `None`: Use default behavior
+- `False`: Don't run LLM after function call
+- `None`: Use default behavior
 
 </ParamField>
 
