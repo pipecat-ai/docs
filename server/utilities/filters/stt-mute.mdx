@@ -63,7 +63,10 @@ The processor is configured using `STTMuteConfig`, which determines when and how
 </ParamField>
 
 <ParamField path="CUSTOM" type="STTMuteStrategy">
-  Use custom logic provided via callback to determine when to mute
+  Use custom logic provided via callback to determine when to mute. The callback
+  is invoked when the bot is speaking and can use application state to decide
+  whether to mute. When the bot stops speaking, unmuting occurs automatically if
+  no other strategy requires muting.
 </ParamField>
 
 <Note>
@@ -151,19 +154,61 @@ stt_mute_filter = STTMuteFilter(
 )
 ```
 
-### Custom Muting Logic with Function Calls
+### Custom Muting Logic
+
+The `CUSTOM` strategy allows you to control muting based on application state when the bot is speaking. The callback will be invoked whenever the bot is speaking, and your logic decides whether to mute:
+
+```python
+# Create a state manager
+class SessionState:
+    def __init__(self):
+        self.session_ending = False
+
+session_state = SessionState()
+
+# Callback function that determines whether to mute
+async def session_state_mute_logic(stt_filter: STTMuteFilter) -> bool:
+    # Return True to mute, False otherwise
+    # This is called when the bot is speaking
+    return session_state.session_ending
+
+# Configure filter with CUSTOM strategy
+stt_mute_filter = STTMuteFilter(
+    config=STTMuteConfig(
+        strategies={STTMuteStrategy.CUSTOM},
+        should_mute_callback=session_state_mute_logic
+    )
+)
+
+# Later, when you want to trigger muting (e.g., during session timeout):
+async def handle_session_timeout():
+    # Update state that will be checked by the callback
+    session_state.session_ending = True
+
+    # Send goodbye message
+    goodbye_message = "Thank you for using our service. This session is now ending."
+    await pipeline.push_frame(TTSSpeakFrame(text=goodbye_message))
+
+    # The system will automatically mute during this message because:
+    # 1. Bot starts speaking, triggering the callback
+    # 2. Callback returns True (session_ending is True)
+    # 3. When bot stops speaking, unmuting happens automatically
+```
+
+### Combining Multiple Strategies
 
 ```python
 async def custom_mute_logic(processor: STTMuteFilter) -> bool:
     # Example: Mute during business hours only
     current_hour = datetime.now().hour
-    return processor._bot_is_speaking and (9 <= current_hour < 17)
+    return 9 <= current_hour < 17
 
 stt_mute_filter = STTMuteFilter(
     config=STTMuteConfig(
         strategies={
-            STTMuteStrategy.CUSTOM,
-            STTMuteStrategy.FUNCTION_CALL
+            STTMuteStrategy.FUNCTION_CALL,       # Mute during function calls
+            STTMuteStrategy.CUSTOM,              # And during business hours
+            STTMuteStrategy.MUTE_UNTIL_FIRST_BOT_COMPLETE  # And until first bot speech completes
         },
         should_mute_callback=custom_mute_logic
     )
@@ -185,7 +230,8 @@ graph TD
 - Combines STT muting and interruption control into a single concept
 - Muting prevents both transcription and interruptions
 - Multiple strategies can be active simultaneously
-- Custom strategy allows for complex muting logic
+- CUSTOM strategy callback is only invoked when the bot is speaking
+- Unmuting happens automatically when bot speech ends (if no other strategy requires muting)
 - Placed before STT service in pipeline
 - Maintains conversation flow during bot speech and function calls
 - Efficient state tracking for minimal overhead
