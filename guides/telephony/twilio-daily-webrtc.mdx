@@ -1,196 +1,265 @@
 ---
 title: "Dial-in: WebRTC (Twilio + Daily)"
-description: "Call your Pipecat bot using Daily WebRTC and a Twilio phone number"
+description: "Connect phone calls to your Pipecat bot using Twilio and Daily's SIP integration"
 ---
 
 ## Things you'll need
 
-- An active [Twilio](https://www.twilio.com) developer key.
-- One or more Twilio provisioned phone numbers (covered below).
-- The Twilio Python client library (`pip install twilio`).
+- An active [Twilio](https://www.twilio.com) developer key
+- One or more Twilio provisioned phone numbers (covered below)
+- The Twilio Python client library (`pip install twilio`)
 
 <Card
   title="Prefer to look at code? See the example project!"
   icon="code"
-  href="https://github.com/pipecat-ai/pipecat/tree/main/examples/phone-chatbot"
+  href="https://github.com/pipecat-ai/pipecat/tree/main/examples/phone-chatbot-daily-twilio-sip"
 >
-  We have a complete dialin-ready project using Daily as both a transport and
-  Twilio as a phone provider in the Pipecat repo. This guide references the
-  project and steps through the important parts that make dial-in work.
+  We have a complete example project using Daily as a transport with Twilio as a
+  phone provider. This guide walks through the important components and best
+  practices when integrating voice calls.
 </Card>
+
+## How It Works
+
+Here's the sequence of events when someone calls your Twilio number:
+
+1. Twilio receives an incoming call to your phone number
+2. Twilio calls your webhook server (`/call` endpoint)
+3. Your server creates a Daily room with SIP capabilities
+4. Your server starts the bot process with the room details
+5. Your server responds to Twilio with TwiML that puts the caller on hold with music
+6. The bot joins the Daily room and signals readiness via the `on_dialin_ready` event
+7. The bot forwards the call to Daily's SIP endpoint
+8. The caller and bot are connected, and the bot handles the conversation
 
 ## Getting a phone number
 
-- Visit [console.twilio.com](https://console.twilio.com) and purchase a new phone number (or via the API.)
-- Ensure your purchased number supports Voice capabilities.
-- Ensure your purchased number appears in your 'active numbers' list.
+- Visit [console.twilio.com](https://console.twilio.com) and purchase a new phone number (or via the API)
+- Ensure your purchased number supports Voice capabilities
+- Ensure your purchased number appears in your 'active numbers' list
 
 ## Project setup
 
-You'll need to set two environment variables for your project: `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`, value for which you can obtain via the Twilio console.
+You'll need to set two environment variables for your project: `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`, which you can obtain from the Twilio console.
 
 ```shell .env
 DAILY_API_KEY=...
+DAILY_API_URL=https://api.daily.co/v1
 TWILIO_ACCOUNT_SID=...
 TWILIO_AUTH_TOKEN=...
-
-# ... service API keys etc
+OPENAI_API_KEY=...
+CARTESIA_API_KEY=...
 ```
 
 ## Configuring your bot runner
 
-You'll need a HTTP service that can receive incoming call hooks and trigger a new agent session. We discussed the concept of a [bot runner](/deployment/pattern) in the deployment section, which we'll build on here to add support for incoming phone calls.
+You'll need a HTTP service that can receive incoming call hooks and trigger a new agent session. We discussed the concept of a [bot runner](/guides/deployment/pattern) in the deployment section, which we'll build on here to add support for incoming phone calls.
 
-Within the `start_bot` method, we'll setup the Twilio client like so:
+Here's how to implement this with FastAPI:
 
-```python bot_runner.py
-@app.post("/start_bot", response_class=PlainTextResponse)
-async def start_bot (request: Request):
-    # Note: unlike Daily, Twilio uses FormData and PlainText responses
-    data = None
+```python server.py
+@app.post("/call", response_class=PlainTextResponse)
+async def handle_call(request: Request):
+    """Handle incoming Twilio call webhook."""
+    print("Received call webhook from Twilio")
+
     try:
+        # Get form data from Twilio webhook
         form_data = await request.form()
         data = dict(form_data)
-    except Exception:
-        pass
 
-    # We'll need to pass through the caller ID to our Pipecat bot
-    callId = data.get('CallSid')
+        # Extract call ID (required to forward the call later)
+        call_sid = data.get("CallSid")
+        if not call_sid:
+            raise HTTPException(status_code=400, detail="Missing CallSid in request")
 
-    # Create a room and spawn bot
-    # ... see below for creating a room
-    proc = subprocess.Popen(
-        [
-            f"python3 -m bot_twilio -u {room.url} -t {token} -i {callId} -s {room.config.sip_endpoint}"
-        ],
-        shell=True,
-        bufsize=1,
-        cwd=os.path.dirname(os.path.abspath(__file__))
-    )
+        print(f"Processing call with ID: {call_sid}")
 
-    # We have the room and the SIP URI,
-    # but we do not know if the Daily SIP Worker and the Bot have joined the call
-    # put the call on hold until the 'on_dialin_ready' fires.
-    # The bot will call forward_twilio_call when it ready.
-    resp = VoiceResponse()
-    resp.play(url="http://com.twilio.sounds.music.s3.amazonaws.com/MARKOVICHAMP-Borghestral.mp3", loop=10)
-    return str(resp)
-```
+        # 1. Create a Daily room with SIP capabilities
+        # More on this in the next section
+        room_details = await create_sip_room(request.app.session)
+        room_url = room_details["room_url"]
+        token = room_details["token"]
+        sip_endpoint = room_details["sip_endpoint"]
 
-### Creating a new SIP-enabled room
+        # 2. Start the bot process with the necessary parameters
+        bot_cmd = f"python bot.py -u {room_url} -t {token} -i {call_sid} -s {sip_endpoint}"
+        subprocess.Popen(shlex.split(bot_cmd))
+        print(f"Started bot process with command: {bot_cmd}")
 
-We'll need to configure the Daily room to be setup to receive SIP connections. `daily-helpers.py` as part of the Pipecat service, has some useful imports that make this easy. We just need to pass through new SIP parameters as part of room creation:
-
-```python bot_runner.py
-
-from pipecat.transports.services.helpers.daily_rest import DailyRoomParams, DailyRoomProperties, DailyRoomSipParams
-
-params = DailyRoomParams(
-    properties=DailyRoomProperties(
-        sip=DailyRoomSipParams(
-            display_name = "sip-dialin"
-            video = False
-            sip_mode = "dial-in"
-            num_endpoints = 1
+        # 3. IMPORTANT: Put the caller on hold with music while the bot initializes
+        # This is critical to avoid timing issues with Daily SIP initialization
+        resp = VoiceResponse()
+        resp.play(
+            url="https://your-hold-music.mp3",  # Your custom hold music URL
+            loop=10,  # Loop the music until the bot is ready
         )
+
+        return str(resp)
+
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+```
+
+### Creating a SIP-enabled room
+
+We'll need to configure the Daily room to be setup to receive SIP connections. In our example project, `utils/daily-helpers.py` demonstrates how to set up the Daily room using the [Daily REST helpers](/server/utilities/daily/rest-helpers) available in Pipecat. We just need to pass through new SIP parameters as part of room creation:
+
+```python utils/daily_helpers.py
+async def create_sip_room(session: Optional[aiohttp.ClientSession] = None) -> Dict[str, str]:
+    """Create a Daily room with SIP capabilities for phone calls."""
+    daily_helper = await get_daily_helper(session)
+
+    # Configure SIP parameters
+    sip_params = DailyRoomSipParams(
+        display_name="phone-user",  # This can be customized with caller info
+        video=False,                # Audio-only call
+        sip_mode="dial-in",         # For receiving calls
+        num_endpoints=1,            # Number of SIP endpoints needed
     )
-)
 
-# Create sip-enabled Daily room via REST
-try:
-    room: DailyRoomObject = daily_rest_helper.create_room(params=params)
-except Exception as e:
-    raise HTTPException(
-        status_code=500,
-        detail=f"Unable to provision room {e}")
+    # Create room properties with SIP enabled
+    properties = DailyRoomProperties(
+        sip=sip_params,
+        enable_dialout=True,  # For future expansion if needed
+        enable_chat=False,    # No need for chat in a voice bot
+        start_video_off=True, # Voice only
+    )
 
-print (f"Daily room returned {room.url} {room.config.sip_endpoint}")
+    # Create and return the room
+    room = await daily_helper.create_room(DailyRoomParams(properties=properties))
+    token = await daily_helper.get_token(room.url, 24 * 60 * 60)  # 24 hours validity
+
+    return {
+        "room_url": room.url,
+        "token": token,
+        "sip_endpoint": room.config.sip_endpoint
+    }
 ```
 
-## Setup the Twilio webhook on your phone number
+## Configuring your bot
 
-Twilio needs to know where our `start_bot` URL is located as a webhook which it can trigger when a user dials a phone number. You can do this via the Twilio console or via the Twilio API:
+Your bot needs to handle the `on_dialin_ready` event to forward the call at the right time:
 
-<Frame>
-  ![Twilio webhook setup](/telephony/images/twilio-webhook-setup.png)
-</Frame>
+```python bot.py
+async def run_bot(room_url: str, token: str, call_id: str, sip_uri: str) -> None:
+    """Run the voice bot with the given parameters."""
+    logger.info(f"Starting bot with room: {room_url}")
+    logger.info(f"SIP endpoint: {sip_uri}")
 
-If you want to test locally, you can expose your web method using a service such as [ngrok](https://ngrok.com/).
+    # IMPORTANT: Track if call has been forwarded to avoid multiple forwards
+    call_already_forwarded = False
 
-```shell Example ngrok tunnel
-python bot_runner.py --host localhost --port 7860 --reload
-ngrok http localhost:7860
+    # Setup the Daily transport
+    transport = DailyTransport(
+        room_url,
+        token,
+        "Phone Bot",
+        DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            transcription_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
 
-# E.g: https://123.ngrok.app/start_bot
+    # ... rest of your bot setup code ...
+
+    # Handle call ready to forward
+    @transport.event_handler("on_dialin_ready")
+    async def on_dialin_ready(transport, cdata):
+        nonlocal call_already_forwarded
+
+        # We only want to forward the call once
+        # The on_dialin_ready event will be triggered for each SIP endpoint
+        if call_already_forwarded:
+            logger.warning("Call already forwarded, ignoring this event.")
+            return
+
+        logger.info(f"Forwarding call {call_id} to {sip_uri}")
+
+        try:
+            # Update the Twilio call with TwiML to forward to the Daily SIP endpoint
+            twilio_client.calls(call_id).update(
+                twiml=f"<Response><Dial timeout=\"30\"><Sip>{sip_uri}</Sip></Dial></Response>"
+            )
+            logger.info("Call forwarded successfully")
+            call_already_forwarded = True
+        except Exception as e:
+            logger.error(f"Failed to forward call: {str(e)}")
+            raise
 ```
 
-### A quick test
+## Setting up the Twilio webhook
 
-With the webhook configured, you should now be able to dial your Twilio number and trigger the `start_bot` URL on your bot runner.
+Configure your Twilio phone number to use your server's webhook URL:
 
-Assuming your webhook is configured correctly, we now need to configure our bot to signal to Twilio when it is ready for the call to be forwarded.
+1. Go to the [Twilio Console](https://console.twilio.com)
+2. Navigate to Phone Numbers → Manage → Active Numbers
+3. Click on your phone number
+4. Under "Configure", set "A Call Comes In" to:
+   - Webhook: `https://your-server.com/call` (your server's URL)
+   - HTTP Method: POST
 
-## Configuring your Pipecat bot
+## Testing locally
 
-Let's take a look at `bot_twilio.py` and step through the configuration.
+For local development, you can use [ngrok](https://ngrok.com/) to expose your local server:
 
-First, it's setup to receive additional command line parameters which are passed through to the `DailyTransport` object:
+```shell
+# Start your server
+python server.py
+
+# In another terminal, start ngrok
+ngrok http 8000
+
+# Use the ngrok URL (e.g., https://a1b2c3.ngrok.io/call) as your webhook
+```
+
+## Best Practices and Common Pitfalls
+
+### ✅ Best Practice: Put the call on hold
+
+Always respond to Twilio's initial webhook with hold music. This gives your bot time to initialize and the Daily SIP endpoint to become ready.
 
 ```python
-from pipecat.transports.services.daily import DailyParams, DailyTransport, DailyDialinSettings
-
-from twilio.twiml.voice_response import Dial, VoiceResponse, Sip
-from twilio.rest import Client
-
-twilio_account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-twilio = Client(twilio_account_sid, twilio_auth_token)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pipecat Daily Example")
-    parser.add_argument("-u", type=str, help="Room URL")
-    parser.add_argument("-t", type=str, help="Token")
-    parser.add_argument("-i", type=str, help="Call ID")
-    parser.add_argument("-s", type=str, help="SIP URI")
-    config = parser.parse_args()
-
-    asyncio.run(main(config.u, config.t, config.i, config.d, config.s))
-
-async def main(room_url: str, token: str, callId: str, sipUri: str):
-    async with aiohttp.ClientSession() as session:
-        # diallin_settings are only needed if Daily's SIP URI is used
-        # If you are handling this via Twilio, Telnyx, set this to None
-        # and handle call-forwarding when on_dialin_ready fires.
-        diallin_settings = None
-
-        transport = DailyTransport(
-            room_url,
-            token,
-            "Chatbot",
-            DailyParams(
-                api_url=daily_api_path,
-                api_key=daily_api_key,
-                dialin_settings=diallin_settings,
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                video_out_enabled=False,
-                vad_analyzer=SileroVADAnalyzer(),
-                transcription_enabled=True,
-            )
-        )
-
-        # ... your bot code here
-
-        @transport.event_handler("on_dialin_ready")
-        async def on_dialin_ready(transport, cdata):
-            # For Twilio, Telnyx, etc. You need to update the state of the call
-            # and forward it to the sip_uri..
-            try:
-                # The TwiML is updated using Twilio's client library
-                call = twilioclient.calls(callId).update(
-                    twiml=f'<Response><Dial><Sip>{sipUri}</Sip></Dial></Response>'
-                )
-            except Exception as e:
-                raise Exception(detail=f"Failed to forward call: {str(e)}")
+resp = VoiceResponse()
+resp.play(url="https://your-hold-music.mp3", loop=10)
+return str(resp)
 ```
+
+### ❌ Pitfall: Using `<Pause>` instead of hold music
+
+Don't use the TwiML `<Pause>` element to wait for the bot to initialize:
+
+```python
+# DON'T DO THIS
+resp = VoiceResponse()
+resp.pause(length=10)  # This can cause connection issues
+```
+
+Twilio can only pause a call for a short duration (~5 seconds), which may not be enough time for the Daily SIP setup to complete.
+
+### ✅ Best Practice: Handle multiple `on_dialin_ready` events
+
+If your Daily room has multiple SIP endpoints, use a flag to ensure you only forward the call once:
+
+```python
+call_already_forwarded = False
+
+@transport.event_handler("on_dialin_ready")
+async def on_dialin_ready(transport, cdata):
+    nonlocal call_already_forwarded
+
+    if call_already_forwarded:
+        logger.info("Call already forwarded, ignoring this event.")
+        return
+
+    # Forward the call...
+    call_already_forwarded = True
+```
+
+<Note>
+  A single SIP endpoint is sufficient for the initial connection. A second SIP
+  endpoint is needed only if you plan to forward the call.
+</Note>
