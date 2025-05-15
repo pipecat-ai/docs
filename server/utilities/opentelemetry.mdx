@@ -1,0 +1,340 @@
+---
+title: "OpenTelemetry Tracing"
+sidebarTitle: "OpenTelemetry"
+description: "Monitor and analyze your Pipecat conversational pipelines using OpenTelemetry"
+---
+
+## Overview
+
+Pipecat includes built-in support for OpenTelemetry tracing, allowing you to gain deep visibility into your voice applications. Tracing helps you:
+
+- Track latency and performance across your conversation pipeline
+- Monitor service health and identify bottlenecks
+- Visualize conversation turns and service dependencies
+- Collect usage metrics and operational analytics
+
+## Installation
+
+To use OpenTelemetry tracing with Pipecat, install the tracing dependencies:
+
+```bash
+pip install "pipecat-ai[tracing]"
+```
+
+<Tip>
+For local development and testing, we recommend using Jaeger as a trace collector.
+You can run it with Docker:
+
+```bash
+docker run -d --name jaeger \\
+  -p 16686:16686 \\
+  -p 4317:4317 \\
+  -p 4318:4318 \\
+  jaegertracing/all-in-one:latest
+```
+
+Then access the UI at [http://localhost:16686](http://localhost:16686)
+
+</Tip>
+
+## Basic Setup
+
+Enabling tracing in your Pipecat application requires two steps:
+
+1. **Initialize the OpenTelemetry SDK** with your preferred exporter
+2. **Enable tracing in your PipelineTask**
+
+```python
+import os
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from pipecat.utils.tracing.setup import setup_tracing
+from pipecat.pipeline.task import PipelineTask, PipelineParams
+
+# Step 1: Initialize OpenTelemetry with your chosen exporter
+exporter = OTLPSpanExporter(
+    endpoint="http://localhost:4317",  # Jaeger or other collector endpoint
+    insecure=True,
+)
+
+setup_tracing(
+    service_name="my-voice-app",
+    exporter=exporter,
+    console_export=False,  # Set to True for debug output
+)
+
+# Step 2: Enable tracing in your PipelineTask
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        enable_metrics=True,         # Required for some service metrics
+    ),
+    enable_tracing=True,             # Enable tracing for this task
+    conversation_id="customer-123",  # Optional - will auto-generate if not provided
+)
+```
+
+## Trace Structure
+
+Pipecat organizes traces hierarchically, following the natural structure of conversations:
+
+```
+Conversation (conversation-uuid)
+├── turn-1
+│   ├── stt_deepgramsttservice
+│   ├── llm_openaillmservice
+│   └── tts_cartesiattsservice
+└── turn-2
+    ├── stt_deepgramsttservice
+    ├── llm_openaillmservice
+    └── tts_cartesiattsservice
+```
+
+This hierarchical structure makes it easy to:
+
+- Track the full lifecycle of a conversation
+- Measure latency for individual turns
+- Identify which services are contributing to delays
+- Compare performance across different conversations
+
+## Exporter Options
+
+Pipecat supports any OpenTelemetry-compatible exporter. Here are some common options:
+
+### OTLP Exporter (for Jaeger, Grafana, etc.)
+
+```python
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+exporter = OTLPSpanExporter(
+    endpoint="http://localhost:4317",  # Your collector endpoint
+    insecure=True,  # Use False for TLS connections
+)
+```
+
+### Zipkin Exporter
+
+```python
+from opentelemetry.exporter.zipkin.json import ZipkinExporter
+
+exporter = ZipkinExporter(
+    endpoint="http://localhost:9411/api/v2/spans",
+)
+```
+
+### Console Exporter (for debugging)
+
+The console exporter can be enabled alongside any other exporter by setting `console_export=True`:
+
+```python
+setup_tracing(
+    service_name="my-voice-app",
+    exporter=otlp_exporter,
+    console_export=True,  # Prints traces to stdout
+)
+```
+
+### Cloud Provider Exporters
+
+Many cloud providers offer OpenTelemetry-compatible observability services:
+
+- **AWS X-Ray**
+- **Google Cloud Trace**
+- **Azure Monitor**
+- **Datadog APM**
+
+Check the OpenTelemetry documentation for specific exporter configurations: [OpenTelemetry Vendors](https://opentelemetry.io/ecosystem/vendors/)
+
+## Span Attributes
+
+Pipecat enriches spans with detailed attributes about service operations:
+
+### TTS Service Spans
+
+- `service.name`: Name of the TTS service (e.g., "cartesia")
+- `model`: Model ID/name
+- `voice_id`: Voice identifier
+- `text`: The text being synthesized
+- `metrics.tts.character_count`: Number of characters in the text
+- `metrics.ttfb_ms`: Time to first byte in milliseconds
+- `settings.*`: Service-specific configuration parameters
+
+### STT Service Spans
+
+- `service.name`: Name of the STT service (e.g., "deepgram")
+- `model`: Model ID/name
+- `transcript`: The transcribed text
+- `is_final`: Whether the transcription is final
+- `language`: Detected or configured language
+- `vad_enabled`: Whether voice activity detection is enabled
+- `metrics.ttfb_ms`: Time to first byte in milliseconds
+- `settings.*`: Service-specific configuration parameters
+
+### LLM Service Spans
+
+- `service.name`: Name of the LLM service (e.g., "openai")
+- `model`: Model ID/name
+- `stream`: Whether streaming is enabled
+- `messages`: JSON-serialized messages
+- `tools`: JSON-serialized tools configuration
+- `tool_count`: Number of tools available
+- `system`: System message content
+- `llm.prompt_tokens`: Number of prompt tokens (when available)
+- `llm.completion_tokens`: Number of completion tokens (when available)
+- `metrics.ttfb_ms`: Time to first byte in milliseconds
+- `param.*`: Service-specific parameters
+- `extra.*`: Additional configuration parameters
+
+### Turn Spans
+
+- `turn.number`: Sequential turn number
+- `turn.type`: Type of turn (e.g., "conversation")
+- `turn.duration_seconds`: Duration of the turn
+- `turn.was_interrupted`: Whether the turn was interrupted
+- `conversation.id`: ID of the parent conversation
+
+### Conversation Spans
+
+- `conversation.id`: Unique identifier for the conversation
+- `conversation.type`: Type of conversation (e.g., "voice")
+
+## Usage Metrics
+
+Pipecat's tracing implementation automatically captures usage metrics for LLM and TTS services:
+
+### LLM Token Usage
+
+Token usage is captured in LLM spans as:
+
+- `llm.prompt_tokens`
+- `llm.completion_tokens`
+
+### TTS Character Count
+
+Character count is captured in TTS spans as:
+
+- `metrics.tts.character_count`
+
+## Performance Metrics
+
+Pipecat traces capture key performance metrics for each service:
+
+### Time To First Byte (TTFB)
+
+The time it takes for a service to produce its first response:
+
+- `metrics.ttfb_ms` (in milliseconds)
+
+### Processing Duration
+
+The total time spent processing in each service is captured in the span duration.
+
+## Configuration Options
+
+### PipelineTask Parameters
+
+<ParamField path="enable_tracing" type="bool" default="True">
+  Enable or disable tracing for the pipeline
+</ParamField>
+
+<ParamField path="conversation_id" type="Optional[str]" default="None">
+  Custom ID for the conversation. If not provided, a UUID will be generated
+</ParamField>
+
+### setup_tracing() Parameters
+
+<ParamField path="service_name" type="str" default="pipecat">
+  Name of the service for traces
+</ParamField>
+
+<ParamField path="exporter" type="Optional[SpanExporter]" default="None">
+  A pre-configured OpenTelemetry span exporter instance
+</ParamField>
+
+<ParamField path="console_export" type="bool" default="False">
+  Whether to also export traces to console (useful for debugging)
+</ParamField>
+
+## Example
+
+Here's a complete example showing OpenTelemetry tracing setup with Jaeger:
+
+```python
+import os
+from dotenv import load_dotenv
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.utils.tracing.setup import setup_tracing
+
+load_dotenv()
+
+# Initialize tracing if enabled
+if os.getenv("ENABLE_TRACING"):
+    # Create the exporter
+    otlp_exporter = OTLPSpanExporter(
+        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"),
+        insecure=True,
+    )
+
+    # Set up tracing with the exporter
+    setup_tracing(
+        service_name="pipecat-demo",
+        exporter=otlp_exporter,
+        console_export=bool(os.getenv("OTEL_CONSOLE_EXPORT")),
+    )
+
+# Create your services
+stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    voice_id="your-voice-id"
+)
+
+# Build pipeline
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+
+# Create pipeline task with tracing enabled
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        allow_interruptions=True,
+        enable_metrics=True,
+        enable_usage_metrics=True,
+    ),
+    enable_tracing=True,
+    conversation_id="customer-123",  # Optional; will auto-generate if not provided
+)
+
+# Run the pipeline
+runner = PipelineRunner()
+await runner.run(task)
+```
+
+## Troubleshooting
+
+If you're having issues with tracing:
+
+- **No Traces Visible**: Ensure the OpenTelemetry packages are installed and that your collector endpoint is correct
+- **Missing Service Data**: Verify that `enable_metrics=True` is set in PipelineParams
+- **Debugging Tracing**: Enable console export with `console_export=True` to view traces in your logs
+- **Connection Errors**: Check network connectivity to your trace collector
+- **Collector Configuration**: Verify your collector is properly set up to receive traces
+
+## References
+
+- [OpenTelemetry Python Documentation](https://opentelemetry-python.readthedocs.io/)
+- [OpenTelemetry Tracing Specification](https://opentelemetry.io/docs/reference/specification/trace/api/)
+- [Jaeger Documentation](https://www.jaegertracing.io/docs/latest/)
