@@ -89,30 +89,41 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 Functions in Pipecat Flows serve two key purposes:
 
-- interfacing with external systems and APIs through LLM function calls
-- advancing the conversation to the next node
+- Processing data (likely by interfacing with external systems and APIs)
+- Advancing the conversation to the next node
 
-### Function Handlers
+Each function can do one or both.
 
-When you need to collect data, validate input, or retrieve information, add a handler to your function. These handlers are async functions that execute when the LLM calls the function, allowing you to interact with databases, APIs, or other external services:
+LLMs decide when to run each function, via their function calling (or tool calling) mechanism.
 
-Function handlers can use one of two signature patterns:
+### Defining a Function
 
-<CodeGroup>
+A function is expected to return a `(result, next_node)` tuple. More precisely, it’s expected to return:
 
-```python Modern (with FlowManager)
-async def check_availability(args: FlowArgs, flow_manager: FlowManager) -> FlowResult:
-    """Check restaurant availability, with access to flow manager.
+```python
+# (result, next_node)
+Tuple[Optional[FlowResult], Optional[Union[NodeConfig, str]]]
+```
 
-    This signature gives you access to conversation state, transport methods,
-    and other flow resources.
-    """
-    # Get requested date from args
+If the function processes data, it should return a non-`None` value for the first element of the tuple. This value should be a `FlowResult` or subclass.
+
+If the function advances the conversation to the next node, it should return a non-`None` value for the second element of the tuple. This value can be either:
+
+- A `NodeConfig` defining the next node (for dynamic flows)
+- A string identifying the next node (for static flows)
+
+### Example Function
+
+```python
+from pipecat_flows import FlowArgs, FlowManager, FlowResult, NodeConfig
+
+async def check_availability(args: FlowArgs, flow_manager: FlowManager) -> tuple[FlowResult, NodeConfig]:
+    # Read arguments
     date = args["date"]
     time = args["time"]
 
-    # Get party size from either args or state
-    party_size = args.get("party_size", flow_manager.state.get("party_size"))
+    # Read previously-stored data
+    party_size = flow_manager.state.get("party_size")
 
     # Use flow_manager for immediate user feedback
     await flow_manager.task.queue_frame(TTSSpeakFrame("Checking our reservation system..."))
@@ -121,87 +132,20 @@ async def check_availability(args: FlowArgs, flow_manager: FlowManager) -> FlowR
     flow_manager.state["requested_date"] = date
 
     # Interface with reservation system
-    available = await reservation_system.check_availability(date, time, party_size)
+    is_available = await reservation_system.check_availability(date, time, party_size)
 
-    return {"status": "success", "available": available}
-```
+    # Assemble result
+    result = { "status": "success", "available": available }
 
-```python Legacy (args only)
-async def check_availability(args: FlowArgs) -> FlowResult:
-    """Check restaurant availability using only the function arguments."""
-    date = args["date"]
-    time = args["time"]
-    party_size = args["party_size"]
-    # Interface with reservation system
-    available = await reservation_system.check_availability(date, time, party_size)
-    return {"status": "success", "available": available}
-```
-
-</CodeGroup>
-
-The framework automatically detects which signature you're using and calls your handler appropriately.
-
-### Transitioning Between Nodes
-
-To advance the conversation, Pipecat Flows offers two approaches based on your flow type:
-
-For static flows, use the `transition_to` property to specify the next node:
-
-```python
-{
-    "type": "function",
-    "function": {
-        "name": "confirm_reservation",
-        "handler": save_reservation,  # Process the reservation
-        "parameters": {...},
-        "transition_to": "send_confirmation"  # Move to confirmation node
-    }
-}
-```
-
-For dynamic flows, use a transition callback to determine the next node at runtime:
-
-```python
-{
-    "type": "function",
-    "function": {
-        "name": "confirm_reservation",
-        "handler": save_reservation,  # Process the reservation
-        "parameters": {...},
-        "transition_callback": send_confirmation  # Call the corresponding handler to set_node()
-    }
-}
-```
-
-### Transition Callbacks (Dynamic Flows)
-
-Transition callbacks receive both the original function arguments and the typed result:
-
-```python
-async def handle_confirmation(
-    args: Dict,           # Original function arguments
-    result: FlowResult,   # Typed result from handler
-    flow_manager: FlowManager
-):
-    """Handle transition based on function result."""
-    if result["success"]:
-        await flow_manager.set_node("send_confirmation", create_confirmation_node())
+    # Decide which node to go to next
+    if is_available:
+        next_node = create_confirmation_node()
     else:
-        await flow_manager.set_node(
-            "retry_reservation",
-            create_retry_node(result.error_message)
-        )
+        next_node = create_no_availability_node()
+
+    # Return both result and next node
+    return result, next_node
 ```
-
-For backwards compatibility, callbacks can also use the two-argument signature:
-
-```python
-async def handle_confirmation(args: Dict, flow_manager: FlowManager):
-    """Legacy transition handler."""
-    await flow_manager.set_node("next", create_next_node())
-```
-
-You can combine both approaches: use handlers to process data and transitions to advance the conversation, creating flows that are both functional and conversational.
 
 ## Node Structure
 
@@ -239,19 +183,16 @@ Role messages are typically defined in your initial node and inherited by subseq
 
 Functions in Pipecat Flows can:
 
-1. Process data (using `handler`)
-2. Create transitions (using `transition_to` for static or `transition_callback` for dynamic flows)
-3. Do both simultaneously
+1. Process data
+2. Specify node transitions
+3. Do both
 
 This leads to two conceptual types of functions:
 
-- Node functions, which execute a handler within a state
-- Edge function, which create transitions between nodes and optionally executes a handler
+- **Node functions**, which only process data.
+- **Edge functions**, which also (or only) transition to the next node.
 
-<Note>
-  Function type is defined implicitly based on the existence (or absence) of the
-  transition properties
-</Note>
+The function itself ([which you can read more about here](#defining-a-function)) is passed into the `handler` field of its **function schema**.
 
 #### Function Schemas
 
@@ -273,7 +214,6 @@ Pipecat Flows supports two ways to define functions:
                 "size": {"type": "string", "enum": ["small", "medium", "large"]}
             }
         },
-        "transition_to": "toppings"
     }
 }
 ```
@@ -291,8 +231,7 @@ size_function = FlowsFunctionSchema(
         "size": {"type": "string", "enum": ["small", "medium", "large"]}
     },
     required=["size"],
-    handler=select_size,
-    transition_to="toppings"
+    handler=select_size
 )
 
 # Use in node configuration
@@ -316,28 +255,29 @@ The `FlowsFunctionSchema` approach provides:
 
 #### Node Functions
 
-Functions that process data within a state. They typically:
+Functions that process data within a single conversational state, without switching nodes. When called, they:
 
-- Have a `handler` to interface with external systems or APIs
+- Execute their `handler` to do the data processing (typically by interfacing with an external system or API)
 - Trigger an immediate LLM completion with the result
 
 ```python
-from pipecat_flows import FlowArgs, FlowResult
+from pipecat_flows import FlowArgs, FlowManager, FlowResult
 
-async def select_size(args: FlowArgs) -> FlowResult:
+async def select_size(args: FlowArgs, flow_manager: FlowManager) -> tuple[FlowResult, None]:
     """Process pizza size selection."""
     size = args["size"]
+    await ordering_system.record_size_selection(size)
     return {
         "status": "success",
         "size": size
-    }
+    }, None
 
-# Node function configuration
+# Function schema
 {
     "type": "function",
     "function": {
         "name": "select_size",
-        "handler": select_size,           # Required: Processes the selection
+        "handler": select_size,
         "description": "Select pizza size",
         "parameters": {
             "type": "object",
@@ -351,32 +291,42 @@ async def select_size(args: FlowArgs) -> FlowResult:
 
 #### Edge Functions
 
-Functions that create transitions between nodes. When called, they:
+Functions that specify a transition between nodes (optionally processing data first). When called, they:
 
-- Execute their `handler` (if one is provided)
-- Add function results to context
-- Must have `transition_to` (static flow) or `transition_callback` (dynamic flow) to specify the next state
-- Trigger LLM completion after both the function result and new node's messages are in context
+- Execute their `handler` to do any data processing (optional) and determine the next node
+- Add the function result to the LLM context
+- Trigger LLM completion after both the function result and the next node's messages are in the context
 
 ```python
-# Edge function configuration
+from pipecat_flows import FlowArgs, FlowManager, FlowResult
+
+async def select_size(args: FlowArgs, flow_manager: FlowManager) -> tuple[FlowResult, NodeConfig]:
+    """Process pizza size selection."""
+    size = args["size"]
+    await ordering_system.record_size_selection(size)
+    result = {
+        "status": "success",
+        "size": size
+    }
+    next_node = create_confirmation_node()
+    return result, next_node
+
+# Function schema
 {
     "type": "function",
     "function": {
-        "name": "next_step",
-        "description": "Move to next state",
-        "parameters": {"type": "object", "properties": {}},
-        "handler": select_size,        # Optional: Process data during transition
-        "transition_to": "target_node" # Required: Specify next state
+        "name": "select_size",
+        "handler": select_size,
+        "description": "Select pizza size",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "size": {"type": "string", "enum": ["small", "medium", "large"]}
+            }
+        },
     }
 }
 ```
-
-A function's behavior is determined by its properties:
-
-- `handler` only: Process data, stay in current state
-- `transition_to` (static flow) or `transition_callback` (dynamic flow) only: Pure transition to next state
-- Both: Process data, then transition
 
 ### Actions
 
@@ -616,10 +566,9 @@ Pipecat Flows automatically handles format differences between LLM providers:
     "type": "function",
     "function": {
         "name": "function_name",
-        "handler": select_size, # Optional handler
+        "handler": select_size,
         "description": "description",
-        "parameters": {...},
-        "transition_to": "target_node" # Optional transition (or transition_callback for dynamic flows)
+        "parameters": {...}
     }
 }]
 ```
@@ -629,10 +578,9 @@ Pipecat Flows automatically handles format differences between LLM providers:
 ```python
 "functions": [{
     "name": "function_name",
-    "handler": select_size, # Optional handler
+    "handler": select_size,
     "description": "description",
-    "input_schema": {...},
-    "transition_to": "target_node" # Optional transition (or transition_callback for dynamic flows)
+    "input_schema": {...}
 }]
 ```
 
@@ -642,10 +590,9 @@ Pipecat Flows automatically handles format differences between LLM providers:
 "functions": [{
     "function_declarations": [{
         "name": "function_name",
-        "handler": select_size, # Optional handler
+        "handler": select_size,
         "description": "description",
-        "parameters": {...},
-        "transition_to": "target_node" # Optional transition (or transition_callback for dynamic flows)
+        "parameters": {...}
     }]
 }]
 ```
@@ -715,24 +662,28 @@ flow_config = {
                     "type": "function",
                     "function": {
                         "name": "choose_pizza",
+                        "handler": choose_pizza, # Returns [None, "pizza_order"]
                         "description": "User wants pizza",
-                        "parameters": {"type": "object", "properties": {}},
-                        "transition_to": "pizza_order"  # Specify transition
+                        "parameters": {"type": "object", "properties": {}}
                     }
-                },
+                }
+            ]
+        },
+        "pizza_order": {
+            "task_messages": [...],
+            "functions": [
                 {
                     "type": "function",
                     "function": {
                         "name": "select_size",
-                        "handler": select_size,
+                        "handler": select_size, # Returns [FlowResult, "toppings"]
                         "description": "Select pizza size",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "size": {"type": "string", "enum": ["small", "medium", "large"]}
                             }
-                        },
-                        "transition_to": "toppings"  # Optional transition after processing
+                        }
                     }
                 }
             ]
@@ -740,12 +691,6 @@ flow_config = {
     }
 }
 ```
-
-### Transition Best Practices
-
-- Use `transition_to` to make state changes explicit
-- Combine handlers with transitions when appropriate
-- Keep transitions focused on single responsibilities
 
 ## Dynamic Flows
 
@@ -759,22 +704,20 @@ Here's a complete example of a dynamic insurance quote flow:
 from pipecat_flows import FlowManager, FlowArgs, FlowResult
 
 # Define handlers and transitions
-async def collect_age(args: FlowArgs) -> AgeResult:
+async def collect_age(args: FlowArgs, flow_manager: FlowManager) -> tuple[AgeResult, NodeConfig]:
     """Process age collection."""
     age = args["age"]
-    return AgeResult(status="success", age=age)
 
-async def handle_age_transition(
-    args: Dict,
-    result: AgeResult,  # Typed result from handler
-    flow_manager: FlowManager
-):
-    """Transition handler that determines next node based on age."""
-    # Use typed result directly
-    if result.age < 25:
-        await flow_manager.set_node("young_adult", create_young_adult_node())
+    # Assemble result
+    result = AgeResult(status="success", age=age)
+
+    # Decide which node to go to next
+    if age < 25:
+        await flow_manager.set_node_from_config(create_young_adult_node())
     else:
-        await flow_manager.set_node("standard", create_standard_node())
+        await flow_manager.set_node_from_config(create_standard_node())
+
+    return result, age
 
 # Node creation functions
 def create_initial_node() -> NodeConfig:
@@ -805,8 +748,7 @@ def create_initial_node() -> NodeConfig:
                         "properties": {
                             "age": {"type": "integer"}
                         }
-                    },
-                    "transition_callback": handle_age_transition
+                    }
                 }
             }
         ]
@@ -853,7 +795,6 @@ async def on_first_participant_joined(transport, participant):
 
 ### Best Practices
 
-- Keep data processing in handlers and flow logic in transition callbacks
 - Store shared data in flow_manager.state
 - Create separate functions for node creation
 
@@ -924,24 +865,12 @@ The Pipecat Flow Editor provides a visual interface for creating and managing co
 ### Function Configuration
 
 ```python
-# Edge Function (Transition)
-{
-    "type": "function",
-    "function": {
-        "name": "next_state",
-        "description": "Clear transition description",
-        "parameters": {...}
-        "transition_to": "target_node_name" # Transition target
-    }
-}
-
-# Node Function (Operation)
 {
     "type": "function",
     "function": {
         "name": "process_data",
-        "handler": process_handler,  # Include handler
-        "description": "Clear operation description",
+        "handler": process_handler,
+        "description": "Process user data",
         "parameters": {...}
     }
 }

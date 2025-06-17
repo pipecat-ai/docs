@@ -126,10 +126,14 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
       In addition to the standard fields, the function call can also contain:
 
       - `handler`: a custom handler that executes when the function is called.
-      - `transition_to`: for static flows, specifies the next node to transition to.
-      - `transition_callback`: for dynamic flows, provides a handler to determine the next node.
+      - `transition_to`: for static flows, specifies the next node to transition to. (⚠️ deprecated)
+      - `transition_callback`: for dynamic flows, provides a handler to determine the next node. (⚠️ deprecated)
 
       Note: A function cannot have both `transition_to` and `transition_callback`.
+
+      <Warning>
+      Deprecated: instead of `transition_to`/`transition_callback`, use a "consolidated" `handler` that returns a tuple (result, next node).
+      </Warning>
 
       ```python
       # Using native format
@@ -138,10 +142,9 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
               "type": "function",
               "function": {
                   "name": "get_current_movies",
-                  "handler": get_movies,  # Optional custom handler
+                  "handler": get_movies,
                   "description": "Fetch movies currently playing",
-                  "parameters": {...},
-                  "transition_to": "explore_movie"  # Static transition
+                  "parameters": {...}
               },
           }
       ]
@@ -153,8 +156,7 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
               description="Fetch movies currently playing",
               properties={...},
               required=[...],
-              handler=get_movies,
-              transition_to="explore_movie"
+              handler=get_movies
           )
       ]
       ```
@@ -204,16 +206,32 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 <ParamField
   path="LegacyFunctionHandler"
-  type="Callable[[FlowArgs], Awaitable[FlowResult]]"
+  type="Callable[[FlowArgs], Awaitable[FlowResult | ConsolidatedFunctionResult]]"
 >
   Legacy function handler that only receives arguments.
+
+Returns either:
+
+- A `FlowResult` (⚠️ deprecated)
+- A "consolidated" result tuple (result, next node), where:
+  - result is an optional `FlowResult`
+  - next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
+
 </ParamField>
 
 <ParamField
   path="FlowFunctionHandler"
-  type="Callable[[FlowArgs, FlowManager], Awaitable[FlowResult]]"
+  type="Callable[[FlowArgs, FlowManager], Awaitable[FlowResult | ConsolidatedFunctionResult]]"
 >
-  Modern function handler that receives both arguments and FlowManager.
+  Modern function handler that receives both arguments and `FlowManager`.
+
+Returns either:
+
+- A `FlowResult` (⚠️ deprecated)
+- A "consolidated" result tuple (result, next node), where:
+  - result is an optional `FlowResult`
+  - next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
+
 </ParamField>
 
 ### ContextStrategy
@@ -282,12 +300,21 @@ config = ContextStrategyConfig(
     <ResponseField name="handler" type="Optional[FunctionHandler]">
       Function handler to process the function call
     </ResponseField>
-    <ResponseField name="transition_to" type="Optional[str]">
+    <ResponseField name="transition_to" type="Optional[str]" deprecated>
       Target node to transition to after function execution
+
+      <Warning>
+      Deprecated: instead of `transition_to`, use a "consolidated" `handler` that returns a tuple (result, next node).
+      </Warning>
     </ResponseField>
-    <ResponseField name="transition_callback" type="Optional[Callable]">
+    <ResponseField name="transition_callback" type="Optional[Callable]" deprecated>
       Callback function for dynamic transitions
+
+      <Warning>
+      Deprecated: instead of `transition_callback`, use a "consolidated" `handler` that returns a tuple (result, next node).
+      </Warning>
     </ResponseField>
+
   </Expandable>
 
 <Note>
@@ -311,8 +338,7 @@ collect_name_schema = FlowsFunctionSchema(
         }
     },
     required=["name"],
-    handler=collect_name_handler,
-    transition_to="next_node"
+    handler=collect_name_handler
 )
 
 # Use in node configuration
@@ -523,10 +549,9 @@ flow_config: FlowConfig = {
                 "type": "function",
                 "function": {
                     "name": "collect_name",
-                    "handler": collect_name_handler,     # Specify handler
+                    "handler": collect_name_handler,
                     "description": "Record user's name",
-                    "parameters": {...},
-                    "transition_to": "next_step"         # Specify transition
+                    "parameters": {...}
                 }
             }]
         }
@@ -574,8 +599,7 @@ def create_initial_node() -> NodeConfig:
                             "age": {"type": "integer"}
                         },
                         "required": ["age"]
-                    },
-                    "transition_callback": handle_age_transition
+                    }
                 }
             }
         ]
@@ -598,23 +622,23 @@ async def on_first_participant_joined(transport, participant):
 </CodeGroup>
 
 <ResponseField name="Node Functions" type="concept">
-  Functions that execute operations within a state.
+  Functions that execute operations within a single conversational state, without switching nodes.
 
 <CodeBlock>
 
 ```python
 from pipecat_flows import FlowArgs, FlowResult
 
-async def process_data(args: FlowArgs) -> FlowResult:
+async def process_data(args: FlowArgs) -> tuple[FlowResult, None]:
     """Handle data processing within a node."""
     data = args["data"]
     result = await process(data)
     return {
         "status": "success",
         "processed_data": result
-    }
+    }, None
 
-# Node configuration with transition
+# Function schema
 {
     "type": "function",
     "function": {
@@ -626,7 +650,7 @@ async def process_data(args: FlowArgs) -> FlowResult:
             "properties": {
                 "data": {"type": "string"}
             }
-        },
+        }
     }
 }
 ```
@@ -636,19 +660,25 @@ async def process_data(args: FlowArgs) -> FlowResult:
 </ResponseField>
 
 <ResponseField name="Edge Functions" type="concept">
-  Functions that create transitions between nodes. Use `transition_to` (static flow) or `transition_callback` (dynamic flow) to specify the target node.
+  Functions that specify a transition between nodes (optionally processing data first).
 
 <CodeBlock>
 
 ```python
-# Edge function configuration
+from pipecat_flows import FlowArgs, FlowResult
+
+async def next_step(args: FlowArgs) -> tuple[None, str]:
+    """Specify the next node to transition to."""
+    return None, "target_node" # Return NodeConfig instead of str for dynamic flows
+
+# Function schema
 {
     "type": "function",
     "function": {
         "name": "next_step",
+        "handler": next_step,
         "description": "Transition to next node",
-        "parameters": {"type": "object", "properties": {}},
-        "transition_to": "target_node"  # Required: Specify target node (or use transition_callback for dynamic flows)
+        "parameters": {"type": "object", "properties": {}}
     }
 }
 ```
@@ -661,7 +691,7 @@ async def process_data(args: FlowArgs) -> FlowResult:
 
 <ResponseField name="handler" type="Optional[Callable]">
   
-Async function that processes data within a node. Can be specified as:
+Async function that processes data within a node and/or specifies the next node ([more details here](/guides/features/pipecat-flows#defining-a-function)). Can be specified as:
 
 - Direct function reference
 - Either a Callable function or a string with `__function__:` prefix (e.g., `"__function__:process_data"`) to reference a function in the main script
@@ -693,8 +723,15 @@ Async function that processes data within a node. Can be specified as:
 
 </ResponseField>
 
-<ResponseField name="transition_callback" type="Optional[Callable]">
-  Handler for dynamic flow transitions. Must be an async function with one of these signatures:
+<ResponseField name="transition_callback" type="Optional[Callable]" deprecated>
+  Handler for dynamic flow transitions. 
+  
+  <Warning>
+    Deprecated: instead of `transition_callback`, use a "consolidated" `handler`
+    that returns a tuple (result, next node).
+  </Warning>
+  
+  Must be an async function with one of these signatures:
 
 ```python
 # New style (recommended)
@@ -705,10 +742,9 @@ async def handle_transition(
 ) -> None:
     """Handle transition to next node."""
     if result.available:  # Type-safe access to result
-        await flow_manager.set_node("confirm", create_confirmation_node())
+        await flow_manager.set_node_from_config(create_confirmation_node())
     else:
-        await flow_manager.set_node(
-            "no_availability",
+        await flow_manager.set_node_from_config(
             create_no_availability_node(result.alternative_times)
         )
 
@@ -718,7 +754,7 @@ async def handle_transition(
     flow_manager: FlowManager
 ) -> None:
     """Handle transition to next node."""
-    await flow_manager.set_node("next", create_next_node())
+    await flow_manager.set_node_from_config(create_next_node())
 ```
 
 The callback receives:
@@ -737,10 +773,9 @@ async def handle_availability_check(
 ):
     """Handle availability check and transition based on result."""
     if result.available:
-        await flow_manager.set_node("confirm", create_confirmation_node())
+        await flow_manager.set_node_from_config(create_confirmation_node())
     else:
-        await flow_manager.set_node(
-            "no_availability",
+        await flow_manager.set_node_from_config(
             create_no_availability_node(result.alternative_times)
         )
 
