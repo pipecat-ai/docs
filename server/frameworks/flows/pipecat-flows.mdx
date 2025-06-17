@@ -72,6 +72,15 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
   Configuration for a single node in the flow.
 
   <Expandable title="Fields">
+    <ResponseField name="name" type="str">
+      The name of the node, used in debug logging in dynamic flows. If no name is specified, an 
+      automatically-generated UUID is used.
+
+      ```python
+      # Example name
+      "name": "greeting"
+      ```
+    </ResponseField>
     <ResponseField name="role_messages" type="List[dict]">
       Defines the role or persona of the LLM. Required for the initial node and optional for subsequent nodes.
 
@@ -308,6 +317,7 @@ collect_name_schema = FlowsFunctionSchema(
 
 # Use in node configuration
 node_config = {
+    "name": "greeting",
     "task_messages": [
         {"role": "system", "content": "Ask the user for their name."}
     ],
@@ -315,7 +325,7 @@ node_config = {
 }
 
 # Pass to flow manager
-await flow_manager.set_node("greeting", node_config)
+await flow_manager.set_node_from_config(node_config)
 ```
 
 </ResponseField>
@@ -335,8 +345,11 @@ await flow_manager.set_node("greeting", node_config)
     <ResponseField name="context_aggregator" type="Any" required>
       Context aggregator used for pushing messages to the LLM service
     </ResponseField>
-    <ResponseField name="tts" type="Optional[Any]">
-      **Deprecated**: Optional TTS service for voice actions
+    <ResponseField name="tts" type="Optional[Any]" deprecated>
+      Optional TTS service for voice actions.
+      <Warning>
+        Deprecated: No need to explicitly pass `tts` to `FlowManager` in order to use `tts_say` actions.
+      </Warning>
     </ResponseField>
     <ResponseField name="flow_config" type="Optional[FlowConfig]">
       Optional static flow configuration
@@ -345,6 +358,7 @@ await flow_manager.set_node("greeting", node_config)
       Optional configuration for how context should be managed during transitions.
       Defaults to APPEND strategy if not specified.
     </ResponseField>
+
   </Expandable>
 </ResponseField>
 
@@ -353,6 +367,14 @@ await flow_manager.set_node("greeting", node_config)
 <ResponseField name="initialize" type="method">
   Initialize the flow with starting messages.
 
+<Expandable title="Parameters">
+  <ResponseField name="initial_node" type="NodeConfig">
+    The initial conversation node (needed for dynamic flows only). If not
+    specified, you'll need to call `set_node_from_config()` to kick off the
+    conversation.
+  </ResponseField>
+</Expandable>
+
   <Expandable title="Raises">
     <ResponseField name="FlowInitializationError">
       If initialization fails
@@ -360,25 +382,49 @@ await flow_manager.set_node("greeting", node_config)
   </Expandable>
 </ResponseField>
 
-<ResponseField name="set_node" type="method">
-  Set up a new conversation node.
+<ResponseField name="set_node" type="method" deprecated>
+  Set up a new conversation node programmatically (dynamic flows only).
   
-  - For dynamic flows, the application must advance the conversation using `set_node` to set up the next node.
-  - For static flows, `set_node` is triggered by a function call that contains a `transition_to` field.
+  - In dynamic flows, the application advances the conversation using `set_node` to set up each next node.
+  - In static flows, `set_node` is triggered under the hood when a node contains a `transition_to` field.
+  <Warning>
+    Deprecated: use the following patterns instead of `set_node`:
+    - Prefer "consolidated" function handlers that return a tuple (result, next node), which implicitly sets up the next node
+    - Prefer passing your initial node to `FlowManager.initialize()`
+    - If you really need to set a node explicitly, use `set_node_from_config()` (note: its name will be read from its `NodeConfig`)
+  </Warning>
+  <Expandable title="Parameters">
+    <ResponseField name="node_id" type="str" required>
+      Identifier for the new node
+    </ResponseField>
+    <ResponseField name="node_config" type="NodeConfig" required>
+      Node configuration including messages, functions, and actions
+    </ResponseField>
+  </Expandable>
+
+  <Expandable title="Raises">
+    <ResponseField name="FlowError">
+      If node setup fails
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="set_node_from_config" type="method">
+  Set up a new conversation node programmatically (dynamic flows only).
+
+Note that this method should only be used in rare circumstances. Most often, you should:
+
+- Prefer "consolidated" function handlers that return a tuple (result, next node), which implicitly sets up the next node
+- Prefer passing your initial node to `FlowManager.initialize()`
 
 <Expandable title="Parameters">
-  <ResponseField name="node_id" type="str" required>
-    Identifier for the new node
-  </ResponseField>
   <ResponseField name="node_config" type="NodeConfig" required>
     Node configuration including messages, functions, and actions
   </ResponseField>
 </Expandable>
 
   <Expandable title="Raises">
-    <ResponseField name="FlowError">
-      If node setup fails
-    </ResponseField>
+    <ResponseField name="FlowError">If node setup fails</ResponseField>
   </Expandable>
 </ResponseField>
 
@@ -502,6 +548,7 @@ await flow_manager.initialize()
 ```python Dynamic Flow
 def create_initial_node() -> NodeConfig:
     return {
+        "name": "initial",
         "role_messages": [
             {
                 "role": "system",
@@ -534,21 +581,18 @@ def create_initial_node() -> NodeConfig:
         ]
     }
 
-# Initialize the FlowManager
+# Create the FlowManager
 flow_manager = FlowManager(
     task=task,
     llm=llm,
     context_aggregator=context_aggregator,
 )
 
-await flow_manager.initialize()
-
-# Initialize the flow_manager and set the initial node
+# Initialize the flow_manager with the initial node
 @transport.event_handler("on_first_participant_joined")
 async def on_first_participant_joined(transport, participant):
     await transport.capture_participant_transcription(participant["id"])
-    await flow_manager.initialize()
-    await flow_manager.set_node("initial", create_initial_node())
+    await flow_manager.initialize(create_initial_node())
 ```
 
 </CodeGroup>
@@ -951,7 +995,7 @@ Base exception for all flow-related errors.
 from pipecat_flows import FlowError
 
 try:
-    await flow_manager.set_node("invalid", config)
+    await flow_manager.set_node_from_config(config)
 except FlowError as e:
     print(f"Flow error: {e}")
 ```
@@ -988,7 +1032,7 @@ Raised when a state transition fails.
 from pipecat_flows import FlowTransitionError
 
 try:
-    await flow_manager.set_node("next", node_config)
+    await flow_manager.set_node_from_config(node_config)
 except FlowTransitionError as e:
     print(f"Transition failed: {e}")
 
@@ -999,7 +1043,7 @@ except FlowTransitionError as e:
 </ResponseField>
 
 <ResponseField name="InvalidFunctionError" type="exception">
-Raised when an invalid or unavailable function is called.
+Raised when an invalid or unavailable function is specified.
 
 <CodeBlock>
 
@@ -1007,7 +1051,7 @@ Raised when an invalid or unavailable function is called.
 from pipecat_flows import InvalidFunctionError
 
 try:
-await flow_manager.set_node("node", {
+await flow_manager.set_node_from_config({
   "functions": [{
     "type": "function",
     "function": {
