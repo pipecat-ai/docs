@@ -120,23 +120,10 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
     </ResponseField>
     <ResponseField name="functions" type="List[Union[dict, FlowsFunctionSchema]]" required>
 
-      LLM function / tool calls, defined either as dictionaries in the format for the specific LLM provider,
-      or as FlowsFunctionSchema objects.
-
-      In addition to the standard fields, the function call can also contain:
-
-      - `handler`: a custom handler that executes when the function is called.
-      - `transition_to`: for static flows, specifies the next node to transition to. (⚠️ deprecated)
-      - `transition_callback`: for dynamic flows, provides a handler to determine the next node. (⚠️ deprecated)
-
-      Note: A function cannot have both `transition_to` and `transition_callback`.
-
-      <Warning>
-      Deprecated: instead of `transition_to`/`transition_callback`, use a "consolidated" `handler` that returns a tuple (result, next node).
-      </Warning>
+      LLM function / tool call configurations, defined in one of the [supported formats](/guides/features/pipecat-flows#function-configuration).
 
       ```python
-      # Using native format
+      # Using provider-specific dictionary format
       "functions": [
           {
               "type": "function",
@@ -159,6 +146,9 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
               handler=get_movies
           )
       ]
+
+      # Using direct functions (auto-configuration)
+      "functions": [get_movies]
       ```
 
     </ResponseField>
@@ -213,7 +203,7 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 Returns either:
 
 - A `FlowResult` (⚠️ deprecated)
-- A "consolidated" result tuple (result, next node), where:
+- A "consolidated" result tuple (result, next node) where:
   - result is an optional `FlowResult`
   - next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
 
@@ -228,9 +218,24 @@ Returns either:
 Returns either:
 
 - A `FlowResult` (⚠️ deprecated)
-- A "consolidated" result tuple (result, next node), where:
+- A "consolidated" result tuple (result, next node) where:
   - result is an optional `FlowResult`
   - next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
+
+</ParamField>
+
+<ParamField
+  path="DirectFunction"
+  type="DirectFunction"
+>
+  Function that is meant to be [passed directly](/guides/features/pipecat-flows#function-configuration) into a `NodeConfig` rather than into the `handler` field of a function configuration.
+
+It must be an `async` function with `flow_manager: FlowManager` as its first parameter.
+
+It must return a `ConsolidatedFunctionResult`, which is a tuple (result, next node) where:
+
+- result is an optional `FlowResult`
+- next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
 
 </ParamField>
 
@@ -492,10 +497,10 @@ Example usage:
 context = flow_manager.get_current_context()
 
 # Use in handlers
-async def process_response(args: FlowArgs) -> FlowResult:
+async def process_response(args: FlowArgs) -> tuple[FlowResult, str]:
     context = flow_manager.get_current_context()
     # Process conversation history
-    return {"status": "success"}
+    return {"status": "success"}, "next"
 ```
 
 </ResponseField>
@@ -638,7 +643,7 @@ async def process_data(args: FlowArgs) -> tuple[FlowResult, None]:
         "processed_data": result
     }, None
 
-# Function schema
+# Function configuration
 {
     "type": "function",
     "function": {
@@ -671,7 +676,7 @@ async def next_step(args: FlowArgs) -> tuple[None, str]:
     """Specify the next node to transition to."""
     return None, "target_node" # Return NodeConfig instead of str for dynamic flows
 
-# Function schema
+# Function configuration
 {
     "type": "function",
     "function": {
@@ -797,11 +802,11 @@ Note: A function cannot have both `transition_to` and `transition_callback`.
 
 ### Handler Signatures
 
-Function handlers can be defined with three different signatures:
+Function handlers passed as a `handler` in a function configuration can be defined with three different signatures:
 
 <CodeGroup>
     ```python Modern (Args + FlowManager)
-    async def handler_with_flow_manager(args: FlowArgs, flow_manager: FlowManager) -> FlowResult:
+    async def handler_with_flow_manager(args: FlowArgs, flow_manager: FlowManager) -> tuple[FlowResult, NodeConfig]:
         """Modern handler that receives both arguments and FlowManager access."""
         # Access state
         previous_data = flow_manager.state.get("stored_data")
@@ -815,32 +820,48 @@ Function handlers can be defined with three different signatures:
         return {
             "status": "success",
             "result": "Processed with flow access"
-        }
+        }, create_next_node()
     ```
 
     ```python Legacy (Args Only)
-    async def handler_with_args(args: FlowArgs) -> FlowResult:
+    async def handler_with_args(args: FlowArgs) -> tuple[FlowResult, NodeConfig]:
         """Legacy handler that only receives arguments."""
         value = args["some_value"]
         return {
             "status": "success",
             "result": value
-        }
+        }, create_next_node()
     ```
 
     ```python No Arguments
-    async def handler_no_args() -> FlowResult:
+    async def handler_no_args() -> tuple[FlowResult, NodeConfig]:
         """Handler that doesn't need arguments."""
         result = await fetch_data()
         return {
             "status": "success",
             "data": result
-        }
+        }, create_next_node()
     ```
 
 </CodeGroup>
 
 The framework automatically detects which signature your handler is using and calls it appropriately.
+
+If you're [passing your function directly](/guides/features/pipecat-flows#function-configuration) into your `NodeConfig` rather than as a `handler` in a function configuration, you'd use a somewhat different signature:
+
+```python Direct
+async def do_something(flow_manager: FlowManager, foo: int, bar: str = "") -> tuple[FlowResult, NodeConfig]:
+    """
+    Do something interesting.
+
+    Args:
+      foo (int): The foo to do something interesting with.
+      bar (string): The bar to do something interesting with. Defaults to empty string.
+    """
+    result = await fetch_data(foo, bar)
+    next_node = create_end_node()
+    return result, next_node
+```
 
 ### Return Types
 
