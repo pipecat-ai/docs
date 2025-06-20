@@ -5,7 +5,7 @@ description: "Record and buffer audio from conversations"
 
 ## Overview
 
-The `AudioBufferProcessor` captures and buffers audio from both input (user) and output (bot) sources during conversations. It synchronizes these audio streams, supports both mono and stereo recording with configurable sample rates, and provides flexible event handlers for various audio processing needs. The processor can operate in continuous or speech-only recording modes and produce either combined or separate audio tracks.
+The `AudioBufferProcessor` captures and buffers audio from both input (user) and output (bot) sources during conversations. It synchronizes these audio streams, supports both mono and stereo recording with configurable sample rates, and provides flexible event handlers for various audio processing needs. The processor can produce either combined or separate audio tracks and supports both continuous buffering and chunked processing for long-form recordings.
 
 ## Usage
 
@@ -18,7 +18,7 @@ from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 audiobuffer = AudioBufferProcessor(
     sample_rate=44100,  # Optional: desired output sample rate
     num_channels=2,     # 1 for mono, 2 for stereo
-    buffer_size=0       # Size in bytes to trigger buffer callbacks
+    buffer_size=24000 * 2 * 30  # 30 seconds of audio (sample_rate * 2 bytes * seconds)
 )
 
 # Add to pipeline
@@ -83,15 +83,7 @@ Number of audio channels:
   
   Size in bytes that triggers the `on_audio_data` event:
   - `0`: Only triggers when recording stops
-  - `>0`: Triggers whenever buffer reaches this size
-
-</ParamField>
-
-<ParamField path="user_continuous_stream" type="bool" default="True">
-  
-  Whether user audio is continuous or speech-only:
-  - `True`: Expects continuous audio stream
-  - `False`: Expects only speech segments with silence between them
+  - `>0`: Triggers whenever buffer reaches this size (recommended for longer recordings)
 
 </ParamField>
 
@@ -148,13 +140,15 @@ Triggered alongside on_audio_data, providing separate user and bot audio tracks:
 async def on_track_audio_data(buffer, user_audio: bytes, bot_audio: bytes,
                              sample_rate: int, num_channels: int):
     # Handle separate audio tracks
-    # user_audio: Raw user audio bytes
-    # bot_audio: Raw bot audio bytes
+    # user_audio: Raw user audio bytes (always mono)
+    # bot_audio: Raw bot audio bytes (always mono)
+    # sample_rate: Sample rate in Hz
+    # num_channels: Always 1 for individual tracks
 ```
 
 ### on_user_turn_audio_data
 
-Triggered when a user speaking turn ends, providing that turn's audio:
+Triggered when a user speaking turn ends (requires `enable_turn_audio=True`):
 
 ```python
 @audiobuffer.event_handler("on_user_turn_audio_data")
@@ -164,7 +158,7 @@ async def on_user_turn_audio_data(buffer, audio: bytes, sample_rate: int, num_ch
 
 ### on_bot_turn_audio_data
 
-Triggered when a bot speaking turn ends, providing that turn's audio:
+Triggered when a bot speaking turn ends (requires `enable_turn_audio=True`):
 
 ```python
 @audiobuffer.event_handler("on_bot_turn_audio_data")
@@ -172,11 +166,84 @@ async def on_bot_turn_audio_data(buffer, audio: bytes, sample_rate: int, num_cha
     # Handle audio from a single bot turn
 ```
 
+## Long-Form Recording Strategies
+
+For longer conversations (>5-10 minutes), we recommend using a chunked approach to avoid memory issues and enable real-time processing:
+
+### Chunked Recording
+
+Set a reasonable `buffer_size` to trigger periodic uploads:
+
+```python
+# 30-second chunks (recommended for most use cases)
+SAMPLE_RATE = 24000
+CHUNK_DURATION = 30  # seconds
+audiobuffer = AudioBufferProcessor(
+    sample_rate=SAMPLE_RATE,
+    buffer_size=SAMPLE_RATE * 2 * CHUNK_DURATION  # 2 bytes per sample (16-bit)
+)
+
+chunk_counter = 0
+
+@audiobuffer.event_handler("on_track_audio_data")
+async def on_chunk_ready(buffer, user_audio, bot_audio, sample_rate, num_channels):
+    global chunk_counter
+
+    # Upload or save individual chunks
+    await upload_audio_chunk(f"user_chunk_{chunk_counter:03d}.wav", user_audio, sample_rate, 1)
+    await upload_audio_chunk(f"bot_chunk_{chunk_counter:03d}.wav", bot_audio, sample_rate, 1)
+
+    chunk_counter += 1
+```
+
+### Multipart Upload Strategy
+
+For cloud storage, consider using multipart uploads to stream audio chunks:
+
+**Conceptual Approach:**
+
+1. **Initialize multipart upload** when recording starts
+2. **Upload chunks as parts** when buffers fill (every 30 seconds)
+3. **Complete multipart upload** when recording ends
+4. **Post-process** to create final WAV file(s)
+
+**Benefits:**
+
+- Memory efficient for long sessions
+- Fault tolerant (no data loss if connection drops)
+- Enables real-time processing and analysis
+- Parallel upload of multiple tracks
+
+### Post-Processing Pipeline
+
+After uploading chunks, create final audio files using tools like FFmpeg:
+
+**Concatenating Audio Files:**
+
+```bash
+# Method 1: Simple concatenation (same format)
+ffmpeg -i "concat:chunk_001.wav|chunk_002.wav|chunk_003.wav" -acodec copy final.wav
+
+# Method 2: Using file list (recommended for many chunks)
+# Create filelist.txt with format:
+# file 'chunk_001.wav'
+# file 'chunk_002.wav'
+# ...
+ffmpeg -f concat -safe 0 -i filelist.txt -c copy final_recording.wav
+```
+
+**Automation Considerations:**
+
+- Use sequence numbers in chunk filenames for proper ordering
+- Include metadata (sample rate, channels, duration) with each chunk
+- Implement retry logic for failed uploads
+- Consider using cloud functions/lambdas for automatic post-processing
+
 ## Audio Processing Features
 
-- Automatic resampling of audio to specified sample rate
-- Buffer synchronization between user and bot audio streams
-- Silence insertion for non-continuous audio streams
-- Support for both continuous and speech-only recording modes
-- Separate tracking of user and bot speaking turns
-- Stereo channel separation for user and bot audio
+- **Automatic resampling** of audio to specified sample rate
+- **Buffer synchronization** between user and bot audio streams
+- **Silence insertion** for non-continuous audio streams to maintain timing
+- **Separate tracking** of user and bot speaking turns
+- **Stereo channel separation** for user and bot audio (when `num_channels=2`)
+- **Memory-efficient chunking** for long-form recordings
