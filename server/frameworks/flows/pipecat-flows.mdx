@@ -72,6 +72,15 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
   Configuration for a single node in the flow.
 
   <Expandable title="Fields">
+    <ResponseField name="name" type="str">
+      The name of the node, used in debug logging in dynamic flows. If no name is specified, an 
+      automatically-generated UUID is used.
+
+      ```python
+      # Example name
+      "name": "greeting"
+      ```
+    </ResponseField>
     <ResponseField name="role_messages" type="List[dict]">
       Defines the role or persona of the LLM. Required for the initial node and optional for subsequent nodes.
 
@@ -111,28 +120,18 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
     </ResponseField>
     <ResponseField name="functions" type="List[Union[dict, FlowsFunctionSchema]]" required>
 
-      LLM function / tool calls, defined either as dictionaries in the format for the specific LLM provider,
-      or as FlowsFunctionSchema objects.
-
-      In addition to the standard fields, the function call can also contain:
-
-      - `handler`: a custom handler that executes when the function is called.
-      - `transition_to`: for static flows, specifies the next node to transition to.
-      - `transition_callback`: for dynamic flows, provides a handler to determine the next node.
-
-      Note: A function cannot have both `transition_to` and `transition_callback`.
+      LLM function / tool call configurations, defined in one of the [supported formats](/guides/features/pipecat-flows#function-configuration).
 
       ```python
-      # Using native format
+      # Using provider-specific dictionary format
       "functions": [
           {
               "type": "function",
               "function": {
                   "name": "get_current_movies",
-                  "handler": get_movies,  # Optional custom handler
+                  "handler": get_movies,
                   "description": "Fetch movies currently playing",
-                  "parameters": {...},
-                  "transition_to": "explore_movie"  # Static transition
+                  "parameters": {...}
               },
           }
       ]
@@ -144,10 +143,12 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
               description="Fetch movies currently playing",
               properties={...},
               required=[...],
-              handler=get_movies,
-              transition_to="explore_movie"
+              handler=get_movies
           )
       ]
+
+      # Using direct functions (auto-configuration)
+      "functions": [get_movies]
       ```
 
     </ResponseField>
@@ -195,16 +196,47 @@ pip install "pipecat-ai[daily,google,deepgram]"     # For Google
 
 <ParamField
   path="LegacyFunctionHandler"
-  type="Callable[[FlowArgs], Awaitable[FlowResult]]"
+  type="Callable[[FlowArgs], Awaitable[FlowResult | ConsolidatedFunctionResult]]"
 >
   Legacy function handler that only receives arguments.
+
+Returns either:
+
+- A `FlowResult` (⚠️ deprecated)
+- A "consolidated" result tuple (result, next node) where:
+  - result is an optional `FlowResult`
+  - next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
+
 </ParamField>
 
 <ParamField
   path="FlowFunctionHandler"
-  type="Callable[[FlowArgs, FlowManager], Awaitable[FlowResult]]"
+  type="Callable[[FlowArgs, FlowManager], Awaitable[FlowResult | ConsolidatedFunctionResult]]"
 >
-  Modern function handler that receives both arguments and FlowManager.
+  Modern function handler that receives both arguments and `FlowManager`.
+
+Returns either:
+
+- A `FlowResult` (⚠️ deprecated)
+- A "consolidated" result tuple (result, next node) where:
+  - result is an optional `FlowResult`
+  - next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
+
+</ParamField>
+
+<ParamField
+  path="DirectFunction"
+  type="DirectFunction"
+>
+  Function that is meant to be [passed directly](/guides/features/pipecat-flows#function-configuration) into a `NodeConfig` rather than into the `handler` field of a function configuration.
+
+It must be an `async` function with `flow_manager: FlowManager` as its first parameter.
+
+It must return a `ConsolidatedFunctionResult`, which is a tuple (result, next node) where:
+
+- result is an optional `FlowResult`
+- next node is an optional `NodeConfig` (for dynamic flows) or string (for static flows)
+
 </ParamField>
 
 ### ContextStrategy
@@ -273,12 +305,21 @@ config = ContextStrategyConfig(
     <ResponseField name="handler" type="Optional[FunctionHandler]">
       Function handler to process the function call
     </ResponseField>
-    <ResponseField name="transition_to" type="Optional[str]">
+    <ResponseField name="transition_to" type="Optional[str]" deprecated>
       Target node to transition to after function execution
+
+      <Warning>
+      Deprecated: instead of `transition_to`, use a "consolidated" `handler` that returns a tuple (result, next node).
+      </Warning>
     </ResponseField>
-    <ResponseField name="transition_callback" type="Optional[Callable]">
+    <ResponseField name="transition_callback" type="Optional[Callable]" deprecated>
       Callback function for dynamic transitions
+
+      <Warning>
+      Deprecated: instead of `transition_callback`, use a "consolidated" `handler` that returns a tuple (result, next node).
+      </Warning>
     </ResponseField>
+
   </Expandable>
 
 <Note>
@@ -302,12 +343,12 @@ collect_name_schema = FlowsFunctionSchema(
         }
     },
     required=["name"],
-    handler=collect_name_handler,
-    transition_to="next_node"
+    handler=collect_name_handler
 )
 
 # Use in node configuration
 node_config = {
+    "name": "greeting",
     "task_messages": [
         {"role": "system", "content": "Ask the user for their name."}
     ],
@@ -315,7 +356,7 @@ node_config = {
 }
 
 # Pass to flow manager
-await flow_manager.set_node("greeting", node_config)
+await flow_manager.set_node_from_config(node_config)
 ```
 
 </ResponseField>
@@ -335,8 +376,11 @@ await flow_manager.set_node("greeting", node_config)
     <ResponseField name="context_aggregator" type="Any" required>
       Context aggregator used for pushing messages to the LLM service
     </ResponseField>
-    <ResponseField name="tts" type="Optional[Any]">
-      **Deprecated**: Optional TTS service for voice actions
+    <ResponseField name="tts" type="Optional[Any]" deprecated>
+      Optional TTS service for voice actions.
+      <Warning>
+        Deprecated: No need to explicitly pass `tts` to `FlowManager` in order to use `tts_say` actions.
+      </Warning>
     </ResponseField>
     <ResponseField name="flow_config" type="Optional[FlowConfig]">
       Optional static flow configuration
@@ -345,6 +389,7 @@ await flow_manager.set_node("greeting", node_config)
       Optional configuration for how context should be managed during transitions.
       Defaults to APPEND strategy if not specified.
     </ResponseField>
+
   </Expandable>
 </ResponseField>
 
@@ -353,6 +398,14 @@ await flow_manager.set_node("greeting", node_config)
 <ResponseField name="initialize" type="method">
   Initialize the flow with starting messages.
 
+<Expandable title="Parameters">
+  <ResponseField name="initial_node" type="NodeConfig">
+    The initial conversation node (needed for dynamic flows only). If not
+    specified, you'll need to call `set_node_from_config()` to kick off the
+    conversation.
+  </ResponseField>
+</Expandable>
+
   <Expandable title="Raises">
     <ResponseField name="FlowInitializationError">
       If initialization fails
@@ -360,25 +413,49 @@ await flow_manager.set_node("greeting", node_config)
   </Expandable>
 </ResponseField>
 
-<ResponseField name="set_node" type="method">
-  Set up a new conversation node.
+<ResponseField name="set_node" type="method" deprecated>
+  Set up a new conversation node programmatically (dynamic flows only).
   
-  - For dynamic flows, the application must advance the conversation using `set_node` to set up the next node.
-  - For static flows, `set_node` is triggered by a function call that contains a `transition_to` field.
+  - In dynamic flows, the application advances the conversation using `set_node` to set up each next node.
+  - In static flows, `set_node` is triggered under the hood when a node contains a `transition_to` field.
+  <Warning>
+    Deprecated: use the following patterns instead of `set_node`:
+    - Prefer "consolidated" function handlers that return a tuple (result, next node), which implicitly sets up the next node
+    - Prefer passing your initial node to `FlowManager.initialize()`
+    - If you really need to set a node explicitly, use `set_node_from_config()` (note: its name will be read from its `NodeConfig`)
+  </Warning>
+  <Expandable title="Parameters">
+    <ResponseField name="node_id" type="str" required>
+      Identifier for the new node
+    </ResponseField>
+    <ResponseField name="node_config" type="NodeConfig" required>
+      Node configuration including messages, functions, and actions
+    </ResponseField>
+  </Expandable>
+
+  <Expandable title="Raises">
+    <ResponseField name="FlowError">
+      If node setup fails
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="set_node_from_config" type="method">
+  Set up a new conversation node programmatically (dynamic flows only).
+
+Note that this method should only be used in rare circumstances. Most often, you should:
+
+- Prefer "consolidated" function handlers that return a tuple (result, next node), which implicitly sets up the next node
+- Prefer passing your initial node to `FlowManager.initialize()`
 
 <Expandable title="Parameters">
-  <ResponseField name="node_id" type="str" required>
-    Identifier for the new node
-  </ResponseField>
   <ResponseField name="node_config" type="NodeConfig" required>
     Node configuration including messages, functions, and actions
   </ResponseField>
 </Expandable>
 
   <Expandable title="Raises">
-    <ResponseField name="FlowError">
-      If node setup fails
-    </ResponseField>
+    <ResponseField name="FlowError">If node setup fails</ResponseField>
   </Expandable>
 </ResponseField>
 
@@ -420,10 +497,10 @@ Example usage:
 context = flow_manager.get_current_context()
 
 # Use in handlers
-async def process_response(args: FlowArgs) -> FlowResult:
+async def process_response(args: FlowArgs) -> tuple[FlowResult, str]:
     context = flow_manager.get_current_context()
     # Process conversation history
-    return {"status": "success"}
+    return {"status": "success"}, "next"
 ```
 
 </ResponseField>
@@ -477,10 +554,9 @@ flow_config: FlowConfig = {
                 "type": "function",
                 "function": {
                     "name": "collect_name",
-                    "handler": collect_name_handler,     # Specify handler
+                    "handler": collect_name_handler,
                     "description": "Record user's name",
-                    "parameters": {...},
-                    "transition_to": "next_step"         # Specify transition
+                    "parameters": {...}
                 }
             }]
         }
@@ -502,6 +578,7 @@ await flow_manager.initialize()
 ```python Dynamic Flow
 def create_initial_node() -> NodeConfig:
     return {
+        "name": "initial",
         "role_messages": [
             {
                 "role": "system",
@@ -527,50 +604,46 @@ def create_initial_node() -> NodeConfig:
                             "age": {"type": "integer"}
                         },
                         "required": ["age"]
-                    },
-                    "transition_callback": handle_age_transition
+                    }
                 }
             }
         ]
     }
 
-# Initialize the FlowManager
+# Create the FlowManager
 flow_manager = FlowManager(
     task=task,
     llm=llm,
     context_aggregator=context_aggregator,
 )
 
-await flow_manager.initialize()
-
-# Initialize the flow_manager and set the initial node
+# Initialize the flow_manager with the initial node
 @transport.event_handler("on_first_participant_joined")
 async def on_first_participant_joined(transport, participant):
     await transport.capture_participant_transcription(participant["id"])
-    await flow_manager.initialize()
-    await flow_manager.set_node("initial", create_initial_node())
+    await flow_manager.initialize(create_initial_node())
 ```
 
 </CodeGroup>
 
 <ResponseField name="Node Functions" type="concept">
-  Functions that execute operations within a state.
+  Functions that execute operations within a single conversational state, without switching nodes.
 
 <CodeBlock>
 
 ```python
 from pipecat_flows import FlowArgs, FlowResult
 
-async def process_data(args: FlowArgs) -> FlowResult:
+async def process_data(args: FlowArgs) -> tuple[FlowResult, None]:
     """Handle data processing within a node."""
     data = args["data"]
     result = await process(data)
     return {
         "status": "success",
         "processed_data": result
-    }
+    }, None
 
-# Node configuration with transition
+# Function configuration
 {
     "type": "function",
     "function": {
@@ -582,7 +655,7 @@ async def process_data(args: FlowArgs) -> FlowResult:
             "properties": {
                 "data": {"type": "string"}
             }
-        },
+        }
     }
 }
 ```
@@ -592,19 +665,25 @@ async def process_data(args: FlowArgs) -> FlowResult:
 </ResponseField>
 
 <ResponseField name="Edge Functions" type="concept">
-  Functions that create transitions between nodes. Use `transition_to` (static flow) or `transition_callback` (dynamic flow) to specify the target node.
+  Functions that specify a transition between nodes (optionally processing data first).
 
 <CodeBlock>
 
 ```python
-# Edge function configuration
+from pipecat_flows import FlowArgs, FlowResult
+
+async def next_step(args: FlowArgs) -> tuple[None, str]:
+    """Specify the next node to transition to."""
+    return None, "target_node" # Return NodeConfig instead of str for dynamic flows
+
+# Function configuration
 {
     "type": "function",
     "function": {
         "name": "next_step",
+        "handler": next_step,
         "description": "Transition to next node",
-        "parameters": {"type": "object", "properties": {}},
-        "transition_to": "target_node"  # Required: Specify target node (or use transition_callback for dynamic flows)
+        "parameters": {"type": "object", "properties": {}}
     }
 }
 ```
@@ -617,7 +696,7 @@ async def process_data(args: FlowArgs) -> FlowResult:
 
 <ResponseField name="handler" type="Optional[Callable]">
   
-Async function that processes data within a node. Can be specified as:
+Async function that processes data within a node and/or specifies the next node ([more details here](/guides/features/pipecat-flows#defining-a-function)). Can be specified as:
 
 - Direct function reference
 - Either a Callable function or a string with `__function__:` prefix (e.g., `"__function__:process_data"`) to reference a function in the main script
@@ -649,8 +728,15 @@ Async function that processes data within a node. Can be specified as:
 
 </ResponseField>
 
-<ResponseField name="transition_callback" type="Optional[Callable]">
-  Handler for dynamic flow transitions. Must be an async function with one of these signatures:
+<ResponseField name="transition_callback" type="Optional[Callable]" deprecated>
+  Handler for dynamic flow transitions. 
+  
+  <Warning>
+    Deprecated: instead of `transition_callback`, use a "consolidated" `handler`
+    that returns a tuple (result, next node).
+  </Warning>
+  
+  Must be an async function with one of these signatures:
 
 ```python
 # New style (recommended)
@@ -661,10 +747,9 @@ async def handle_transition(
 ) -> None:
     """Handle transition to next node."""
     if result.available:  # Type-safe access to result
-        await flow_manager.set_node("confirm", create_confirmation_node())
+        await flow_manager.set_node_from_config(create_confirmation_node())
     else:
-        await flow_manager.set_node(
-            "no_availability",
+        await flow_manager.set_node_from_config(
             create_no_availability_node(result.alternative_times)
         )
 
@@ -674,7 +759,7 @@ async def handle_transition(
     flow_manager: FlowManager
 ) -> None:
     """Handle transition to next node."""
-    await flow_manager.set_node("next", create_next_node())
+    await flow_manager.set_node_from_config(create_next_node())
 ```
 
 The callback receives:
@@ -693,10 +778,9 @@ async def handle_availability_check(
 ):
     """Handle availability check and transition based on result."""
     if result.available:
-        await flow_manager.set_node("confirm", create_confirmation_node())
+        await flow_manager.set_node_from_config(create_confirmation_node())
     else:
-        await flow_manager.set_node(
-            "no_availability",
+        await flow_manager.set_node_from_config(
             create_no_availability_node(result.alternative_times)
         )
 
@@ -718,11 +802,11 @@ Note: A function cannot have both `transition_to` and `transition_callback`.
 
 ### Handler Signatures
 
-Function handlers can be defined with three different signatures:
+Function handlers passed as a `handler` in a function configuration can be defined with three different signatures:
 
 <CodeGroup>
     ```python Modern (Args + FlowManager)
-    async def handler_with_flow_manager(args: FlowArgs, flow_manager: FlowManager) -> FlowResult:
+    async def handler_with_flow_manager(args: FlowArgs, flow_manager: FlowManager) -> tuple[FlowResult, NodeConfig]:
         """Modern handler that receives both arguments and FlowManager access."""
         # Access state
         previous_data = flow_manager.state.get("stored_data")
@@ -736,32 +820,48 @@ Function handlers can be defined with three different signatures:
         return {
             "status": "success",
             "result": "Processed with flow access"
-        }
+        }, create_next_node()
     ```
 
     ```python Legacy (Args Only)
-    async def handler_with_args(args: FlowArgs) -> FlowResult:
+    async def handler_with_args(args: FlowArgs) -> tuple[FlowResult, NodeConfig]:
         """Legacy handler that only receives arguments."""
         value = args["some_value"]
         return {
             "status": "success",
             "result": value
-        }
+        }, create_next_node()
     ```
 
     ```python No Arguments
-    async def handler_no_args() -> FlowResult:
+    async def handler_no_args() -> tuple[FlowResult, NodeConfig]:
         """Handler that doesn't need arguments."""
         result = await fetch_data()
         return {
             "status": "success",
             "data": result
-        }
+        }, create_next_node()
     ```
 
 </CodeGroup>
 
 The framework automatically detects which signature your handler is using and calls it appropriately.
+
+If you're [passing your function directly](/guides/features/pipecat-flows#function-configuration) into your `NodeConfig` rather than as a `handler` in a function configuration, you'd use a somewhat different signature:
+
+```python Direct
+async def do_something(flow_manager: FlowManager, foo: int, bar: str = "") -> tuple[FlowResult, NodeConfig]:
+    """
+    Do something interesting.
+
+    Args:
+      foo (int): The foo to do something interesting with.
+      bar (string): The bar to do something interesting with. Defaults to empty string.
+    """
+    result = await fetch_data(foo, bar)
+    next_node = create_end_node()
+    return result, next_node
+```
 
 ### Return Types
 
@@ -951,7 +1051,7 @@ Base exception for all flow-related errors.
 from pipecat_flows import FlowError
 
 try:
-    await flow_manager.set_node("invalid", config)
+    await flow_manager.set_node_from_config(config)
 except FlowError as e:
     print(f"Flow error: {e}")
 ```
@@ -988,7 +1088,7 @@ Raised when a state transition fails.
 from pipecat_flows import FlowTransitionError
 
 try:
-    await flow_manager.set_node("next", node_config)
+    await flow_manager.set_node_from_config(node_config)
 except FlowTransitionError as e:
     print(f"Transition failed: {e}")
 
@@ -999,7 +1099,7 @@ except FlowTransitionError as e:
 </ResponseField>
 
 <ResponseField name="InvalidFunctionError" type="exception">
-Raised when an invalid or unavailable function is called.
+Raised when an invalid or unavailable function is specified.
 
 <CodeBlock>
 
@@ -1007,7 +1107,7 @@ Raised when an invalid or unavailable function is called.
 from pipecat_flows import InvalidFunctionError
 
 try:
-await flow_manager.set_node("node", {
+await flow_manager.set_node_from_config({
   "functions": [{
     "type": "function",
     "function": {
