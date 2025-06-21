@@ -1,45 +1,279 @@
 ---
-title: "Messages"
+title: "Custom Messaging"
 ---
 
-The Pipecat JavaScript client can send and receive arbitrary data messages to a bot using the RTVI standard for message handling.
+The Pipecat JavaScript client can send and receive arbitrary messages to/from the server running the bot. This page outlines and demonstrates both client and server code for passing and responding to custom messages as well as providing arbitrary data at connection time.
 
-Messages differ from [actions](./actions) in that they are not associated with a specific service and do not return a Promise.
+## Connection-Time Configuration
 
-Messages are used by a client for passing an instruction to a bot that typically results in a [callback or event](./callbacks).
+Oftentimes clients need to provide configuration data to the server when connecting. This can include things like preferred language, user preferences, initial messages, or any other data that the server needs to know about the client. This must occur before the bot is started and therefore not part of the RTVI standard, but rather a custom implementation. That said, the PipecatClient makes it easy to send this data as part of the `connect()` method, by passing an object with the `requestData` property. Your server endpoint can then handle this data as needed. In the example below, we demonstrate sending an initial prompt and preferred language to the server when connecting.
 
-Examples of messages include:
-
-- `updateConfig`
-- `describeConfig`
-- `describeActions`
-- `disconnectBot`
-
-Developers can build their own messages and create handlers to respond to messages received from a bot either by extending `RTVIClient` with their own class or by building a [helper](./helpers/introduction).
-
-### sendMessage(message: RTVIMessage)
-
-This is a "fire and forget" function to send an arbitrary message to a bot. It does not wait for a response, so nothing is returned.
-
-Most clients will not use this function directly. They will use [actions](./actions) and [helper methods](./helpers), instead.
-
-It is up to the transport layer to pack and unpack messages, send messages over the wire, and deliver messages to the SDK so that events can be emitted.
-
-### Anatomy of a message
-
-```typescript
-{
-  label: "rtvi-ai",
-  type: "EVENT_TYPE",
-  data: { EVENT_TYPE_DATA }
+<CodeGroup>
+```javascript client
+try {
+	pcClient.connect({
+		endpoint: 'https://your-server/connect',
+		requestData: {
+			initial_prompt: "You are a pirate captain",
+			preferred_language: 'en-US'
+		}
+	});
+} catch (error) {
+	console.error("Error connecting to server:", error);
 }
+```
 
-// example message dispatch
-rtviClient.sendMessage({
-	label: "rtvi-ai",
-	type: "myMessage",
-	data: {
-		"hello": "world"
-  	}
+```python FastAPI endpoint
+
+def validate_request_data(body: Dict[str, Any]) -> Tuple[str, str]:
+	"""Validate and extract prompt and language from request data."""
+	if not isinstance(body, dict):
+		raise ValueError("Request body must be a dictionary")
+	
+	prompt = body.get("initial_prompt", "You are a pirate captain")
+	lang = body.get("preferred_language", "en-US")
+	
+	if not isinstance(prompt, str) or not isinstance(lang, str):
+		raise ValueError("Both initial_prompt and preferred_language must be strings")
+	
+	return prompt, lang
+
+@app.post("/connect")
+async def rtvi_connect(request: Request) -> Dict[Any, Any]:
+    """RTVI connect endpoint that creates a room and returns connection credentials.
+
+    This endpoint is called by RTVI clients to establish a connection.
+
+    Returns:
+        Dict[Any, Any]: Authentication bundle containing room_url and token
+
+    Raises:
+        HTTPException: If room creation, token generation, or bot startup fails
+    """
+    body = await request.json()
+	try:
+		prompt, lang = validate_request_data(body)
+	except ValueError as e:
+		raise HTTPException(status_code=400, info=f"Invalid request data: {e}")
+
+    print("Creating room for RTVI connection", body)
+    room_url, token = await create_room_and_token()
+    print(f"Room URL: {room_url}")
+
+    # Start the bot process
+    try:
+        proc = subprocess.Popen(
+            [f"python3 -m bot -u {room_url} -t {token} -p {prompt} -l {lang}"],
+            shell=True,
+            bufsize=1,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        bot_procs[proc.pid] = (proc, room_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
+
+    # Return the authentication bundle in format expected by DailyTransport
+    return {"url": room_url, "token": token}
+```
+
+```python bot
+import argparse
+import asyncio
+
+def extract_arguments():
+    parser = argparse.ArgumentParser(description="Example")
+    parser.add_argument(
+        "-u", "--room-url", type=str, default=os.getenv("DAILY_SAMPLE_ROOM_URL", "")
+    )
+    parser.add_argument(
+        "-t", "--token", type=str, default=os.getenv("DAILY_SAMPLE_ROOM_TOKEN", None)
+    )
+    parser.add_argument(
+        "-p", "--prompt", type=str, default="You are a pirate captain"
+	)
+	parser.add_argument("-l", "--language", type=str, default="en-US")
+    return parser.parse_args()
+
+async def main():
+    args = extract_arguments()
+    print(f"room_url: {args.room_url}")
+
+    daily_transport = DailyTransport(
+        args.room_url,
+        args.token,
+        "Chatbot",
+        DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
+    llm = GeminiMultimodalLiveLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        voice_id="Puck",
+        transcribe_user_audio=True,
+        system_instruction=SYSTEM_INSTRUCTION,
+		params=InputParams(
+			language=args.language,  # Pass preferred language to LLM
+		),
+    )
+
+	messages = [ { role: "system", content: args.prompt } ]
+    context = OpenAILLMContext(messages)
+    context_aggregator = llm.create_context_aggregator(context)
+
+    # RTVI events for Pipecat client UI
+    rtvi = RTVIProcessor(config=RTVIConfig(config=[]), transport=daily_transport)
+
+    pipeline = Pipeline(
+        [
+            daily_transport.input(),
+            context_aggregator.user(),
+            rtvi,
+            llm,
+            daily_transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(allow_interruptions=True),
+        observers=[RTVIObserver(rtvi)],
+    )
+
+    @rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        await rtvi.set_bot_ready()
+        # Kick off the conversation
+        await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+    @daily_transport.event_handler("on_participant_left")
+    async def on_participant_left(transport, participant, reason):
+        logger.debug(f"Participant left: {participant}")
+        await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=False)
+
+    await runner.run(task)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+</CodeGroup>
+
+## Sending Custom Messages to the Server
+
+Once connected, you can send custom messages to the server using the `sendClientMessage` method. This is useful for triggering specific actions or sending data that the server needs to process.
+
+<CodeGroup>
+```javascript client
+try {
+	pcClient.sendClientMessage('set-language', { language: 'en-US' });
+} catch (error) {
+	console.error("Error sending message to server:", error);
+}
+```
+
+```python bot
+# Listen for a RTVIClientMessageFrame and push a STTUpdateSettingsFrame
+class CustomFrameProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+		if isinstance(frame, RTVIClientMessageFrame):
+            print("RTVI client message:", frame.msg_id, frame.type, frame.data)
+            if frame.type == "set-language":
+				language = frame.data.get("language", "en-US")
+				await self.push_frame(STTUpdateSettingsFrame(language=language))
+                return
+        await self.push_frame(frame, direction)
+```
+</CodeGroup>
+
+## Requesting Information from the Server
+
+You can also request information from the server using the `sendClientRequest` method. This is useful for querying the server for specific data or triggering and action and getting a success/failure response.
+
+<CodeGroup>
+```javascript client
+try {
+	const response = await pcClient.sendClientRequest('get-language');
+	console.log("Current language:", response.language);
+} catch (error) {
+	console.error("Error requesting data from server:", error);
+}
+```
+
+```python bot
+@rtvi.event_handler("on_client_message")
+async def on_client_message(rtvi, msg):
+	print("RTVI client message:", msg.type, msg.data)
+	if msg.type == "get-language":
+		await rtvi.send_server_response(msg, {"language": get_current_language()})
+
+### Alternatively, from inside a FrameProcessor, listen for a RTVIClientMessageFrame
+### and push a RTVIServerResponseFrame
+class CustomFrameProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+		if isinstance(frame, RTVIClientMessageFrame):
+            print("RTVI client message:", frame.msg_id, frame.type, frame.data)
+            if frame.type == "get-language":
+                data = {"language": get_current_language()}
+                await self.push_frame(
+                    RTVIServerResponseFrame(
+                        client_msg=frame,
+                        data=data,
+                    ),
+                )
+                return
+        await self.push_frame(frame, direction)
+```
+</CodeGroup>
+
+## Handling Custom Messages from the Server
+
+You can handle custom messages sent from the server using the `onServerMessage` callback. This allows you to process messages that the server sends back to the client, such as notifications or updates.
+
+<CodeGroup>
+```javascript client
+pcClient.onServerMessage((message) => {
+	console.log("Received message from server:", message);
+	if (message.data.msg === 'language-updated') {
+		console.log("Language updated to:", message.data.language);
+	}
 });
 ```
+
+```python bot
+## From inside an Observer, call `send_server_message` directly on your rtvi instance
+class CustomObserver(BaseObserver):
+	async def on_push_frame(self, data: FramePushed):
+        if isinstance(frame, STTUpdateSettingsFrame):
+			for key, value in settings.items():
+				if key == "language":
+					await rtvi.send_server_message({
+						"msg": "language-updated",
+						"language": value
+					})
+
+### Alternatively, from inside a FrameProcessor, push a RTVIServerMessageFrame
+class CustomFrameProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+		if isinstance(frame, STTUpdateSettingsFrame):
+			for key, value in settings.items():
+				if key == "language":
+					await self.push_frame(
+						RTVIServerMessageFrame(
+							data={
+								"msg": "language-updated",
+								"language": value
+							}
+						)
+					)
+        await self.push_frame(frame, direction)
+```
+</CodeGroup>
