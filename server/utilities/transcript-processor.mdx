@@ -1,134 +1,154 @@
 ---
 title: "TranscriptProcessor"
-description: "Factory for creating and managing user and assistant transcript processors with shared event handling"
+description: "Factory for creating and managing conversation transcript processors with shared event handling"
 ---
 
 ## Overview
 
-`TranscriptProcessor` is a factory that creates and manages processors for handling conversation transcripts from both users and assistants. It provides unified access to transcript processors with shared event handling, making it easy to track and respond to conversation updates in real-time.
+The `TranscriptProcessor` is a factory class that creates and manages processors for handling conversation transcripts from both users and assistants. It provides unified access to transcript processors with shared event handling, making it easy to track and respond to conversation updates in real-time.
 
-The processor normalizes messages from various LLM services (OpenAI, Anthropic, Google) into a consistent format and emits events when new messages are added to the conversation.
+The processor normalizes messages from various sources into a consistent `TranscriptionMessage` format and emits events when new messages are added to the conversation.
 
-<Tip>
-  Check out the [transcript processor
-  example](https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/28-transcription-processor.py),
-  to see it in action.
-</Tip>
+## Constructor
 
-## Factory Methods
+```python
+TranscriptProcessor()
+```
 
-<ParamField path="user" type="method">
-  Creates/returns a UserTranscriptProcessor instance that handles user messages
-</ParamField>
+Creates a new transcript processor factory with no parameters.
 
-<ParamField path="assistant" type="method">
-  Creates/returns an AssistantTranscriptProcessor instance that handles
-  assistant messages
-</ParamField>
+## Methods
 
-<ParamField path="event_handler" type="decorator">
-  Registers event handlers that will be applied to both processors
-</ParamField>
+### user()
 
-## Events
+```python
+def user(**kwargs) -> UserTranscriptProcessor
+```
 
-<ParamField path="on_transcript_update" type="event">
-  
-Emitted when new messages are added to the conversation transcript.
+Get or create the user transcript processor instance. This processor handles `TranscriptionFrame`s from STT services.
 
-Handler receives:
+**Parameters:**
 
-- `processor`: The `TranscriptProcessor` instance
-- `frame`: `TranscriptionUpdateFrame` containing new messages
+- `**kwargs`: Arguments passed to the `UserTranscriptProcessor` constructor
 
-</ParamField>
+**Returns:** `UserTranscriptProcessor` instance for processing user messages.
 
-## Transcription Messages
+### assistant()
 
-Transcription messages are normalized to this format:
+```python
+def assistant(**kwargs) -> AssistantTranscriptProcessor
+```
+
+Get or create the assistant transcript processor instance. This processor handles `TTSTextFrame`s from TTS services and aggregates them into complete utterances.
+
+**Parameters:**
+
+- `**kwargs`: Arguments passed to the `AssistantTranscriptProcessor` constructor
+
+**Returns:** `AssistantTranscriptProcessor` instance for processing assistant messages.
+
+### event_handler()
+
+```python
+def event_handler(event_name: str)
+```
+
+Decorator that registers event handlers for both user and assistant processors.
+
+**Parameters:**
+
+- `event_name`: Name of the event to handle
+
+**Returns:** Decorator function that registers the handler with both processors.
+
+## Event Handlers
+
+### on_transcript_update
+
+Triggered when new messages are added to the conversation transcript.
+
+```python
+@transcript.event_handler("on_transcript_update")
+async def handle_transcript_update(processor, frame):
+    # Handle transcript updates
+    pass
+```
+
+**Parameters:**
+
+- `processor`: The specific processor instance that emitted the event (UserTranscriptProcessor or AssistantTranscriptProcessor)
+- `frame`: `TranscriptionUpdateFrame` containing the new messages
+
+## Data Structures
+
+### TranscriptionMessage
 
 ```python
 @dataclass
 class TranscriptionMessage:
-    role: Literal["user", "assistant"]  # Type of message sender
-    content: str                        # Transcription message
-    timestamp: str | None = None        # Message timestamp
+    role: Literal["user", "assistant"]
+    content: str
+    timestamp: str | None = None
+    user_id: str | None = None
 ```
 
-## Pipeline Integration
+**Fields:**
 
-The TranscriptProcessor is designed to be used in a pipeline to process conversation transcripts in real-time. In the pipeline:
+- `role`: The message sender type ("user" or "assistant")
+- `content`: The transcribed text content
+- `timestamp`: ISO 8601 timestamp when the message was created
+- `user_id`: Optional user identifier (for user messages only)
 
-- The UserTranscriptProcessor (`transcript.user()`) handles `TranscriptionFrame`s from the STT service
-- The AssistantTranscriptProcessor (`transcript.assistant()`) handles `TTSTextFrame`s from the TTS service.
+### TranscriptionUpdateFrame
 
-<Tip>
-Pipeline placement:
+Frame containing new transcript messages, emitted by the `on_transcript_update` event.
 
-- `transcript.user()`: Place after the STT Service
-- `transcript.assistant()`: Place after the transport.output() so that spoken words are transcribed
+**Properties:**
 
-</Tip>
+- `messages`: List of `TranscriptionMessage` objects containing the new transcript content
 
-See the Basic Usage example below for more details.
+## Frames
 
-## Usage Examples
+### UserTranscriptProcessor
 
-### Basic Usage
+- **Input:** `TranscriptionFrame` from STT services
+- **Output:** `TranscriptionMessage` with role "user"
 
-This example shows the basic usage for the TranscriptProcessor factory.
+### AssistantTranscriptProcessor
+
+- **Input:** `TTSTextFrame` from TTS services
+- **Output:** `TranscriptionMessage` with role "assistant"
+
+## Integration Notes
+
+### Pipeline Placement
+
+Place the processors at specific positions in your pipeline for accurate transcript collection:
 
 ```python
-transcript = TranscriptProcessor()
-
 pipeline = Pipeline([
     transport.input(),
-    stt,
-    transcript.user(),              # Process user messages
+    stt,                        # Speech-to-text service
+    transcript.user(),          # Place after STT
     context_aggregator.user(),
     llm,
-    tts,
+    tts,                        # Text-to-speech service
     transport.output(),
-    transcript.assistant(),         # Process assistant messages
+    transcript.assistant(),     # Place after transport.output()
     context_aggregator.assistant(),
 ])
-
-# Register event handler for transcript updates
-@transcript.event_handler("on_transcript_update")
-async def handle_update(processor, frame):
-    for msg in frame.messages:
-        print(f"{msg.role}: {msg.content}")
 ```
 
-### Maintaining Conversation History
+### Event Handler Registration
 
-This example extends the basic usage example by showing how to create a custom handler to maintain conversation history and log new messages with timestamps.
+Event handlers are automatically applied to both user and assistant processors:
 
 ```python
-class TranscriptHandler:
-    def __init__(self):
-        self.messages = []
-
-    async def on_transcript_update(self, processor, frame):
-        self.messages.extend(frame.messages)
-
-        # Log new messages with timestamps
-        for msg in frame.messages:
-            timestamp = f"[{msg.timestamp}] " if msg.timestamp else ""
-            print(f"{timestamp}{msg.role}: {msg.content}")
-
 transcript = TranscriptProcessor()
-handler = TranscriptHandler()
 
+# This handler will receive events from both processors
 @transcript.event_handler("on_transcript_update")
-async def on_update(processor, frame):
-    await handler.on_transcript_update(processor, frame)
+async def handle_update(processor, frame):
+    for message in frame.messages:
+        print(f"{message.role}: {message.content}")
 ```
-
-## Notes
-
-- Supports multiple LLM services (OpenAI, Anthropic, Google)
-- Normalizes message formats from different services
-- Maintains conversation history with timestamps
-- Emits events for real-time transcript updates
-- Thread-safe for concurrent processing
