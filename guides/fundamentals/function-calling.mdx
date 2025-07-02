@@ -29,6 +29,8 @@ Here's how it works:
 
 Pipecat provides a standardized `FunctionSchema` that works across all supported LLM providers. This makes it easy to define functions once and use them with any provider.
 
+As a shorthand, you could also bypass specifying a function configuration at all and instead use "direct" functions. Under the hood, these are converted to `FunctionSchema`s.
+
 #### Using the Standard Schema (Recommended)
 
 ```python
@@ -64,6 +66,42 @@ context = OpenAILLMContext(
 ```
 
 The `ToolsSchema` will be automatically converted to the correct format for your LLM provider through adapters.
+
+#### Using Direct Functions (Shorthand)
+
+You can bypass specifying a function configuration (as a `FunctionSchema` or in a provider-specific format) and instead pass the function directly to your `ToolsSchema`. Pipecat will auto-configure the function, gathering relevant metadata from its signature and docstring. Metadata includes:
+
+- name
+- description
+- properties (including individual property descriptions)
+- list of required properties
+
+Note that the function signature is a bit different when using direct functions. The first parameter is `FunctionCallParams`, followed by any others necessary for the function.
+
+```python
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.llm_service import FunctionCallParams
+
+# Define a direct function
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
+    """
+    weather_data = {"conditions": "sunny", "temperature": "75"}
+    await params.result_callback(weather_data)
+
+# Create a tools schema, passing your function directly to it
+tools = ToolsSchema(standard_tools=[get_current_weather])
+
+# Pass this to your LLM context
+context = OpenAILLMContext(
+    messages=[{"role": "system", "content": "You are a helpful assistant."}],
+    tools=tools
+)
+```
 
 #### Using Provider-Specific Formats (Alternative)
 
@@ -195,9 +233,16 @@ tools = ToolsSchema(
 
 ### 2. Register Function Handlers
 
-Register handlers for your functions using the LLM service's [`register_function` method](/server/base-classes/llm#methods):
+Register handlers for your functions using one of these [LLM service methods](/server/base-classes/llm#methods):
 
-```python
+- `register_function`
+- `register_direct_function`
+
+Which one you use depends on whether your function is a ["direct" function](#using-direct-functions-shorthand).
+
+<CodeGroup>
+
+```python Non-Direct Function
 from pipecat.services.llm_service import FunctionCallParams
 
 llm = OpenAILLMService(api_key="your-api-key", model="gpt-4")
@@ -214,6 +259,28 @@ llm.register_function(
     fetch_weather_from_api,
 )
 ```
+
+```python Direct Function
+from pipecat.services.llm_service import FunctionCallParams
+
+llm = OpenAILLMService(api_key="your-api-key", model="gpt-4")
+
+# Direct function
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
+    """
+    weather_data = {"conditions": "sunny", "temperature": "75"}
+    await params.result_callback(weather_data)
+
+# Register the function
+llm.register_direct_function(get_current_weather)
+```
+
+</CodeGroup>
 
 ### 3. Create the Pipeline
 
@@ -283,12 +350,15 @@ The `FunctionCallParams` object contains all the information needed for handling
 
 Your function handler should:
 
-1. Receive a `FunctionCallParams` object
-2. Extract needed arguments from `params.arguments`
-3. Process data or call external services
-4. Return results via `params.result_callback(result)`
+1. Receive necessary arguments, either:
+   - From `params.arguments`
+   - Directly From function arguments, if using [direct functions](#using-direct-functions-shorthand)
+2. Process data or call external services
+3. Return results via `params.result_callback(result)`
 
-```python
+<CodeGroup>
+
+```python Non-Direct Function
 async def fetch_weather_from_api(params: FunctionCallParams):
     try:
         # Extract arguments
@@ -311,6 +381,34 @@ async def fetch_weather_from_api(params: FunctionCallParams):
             "error": f"Failed to get weather: {str(e)}"
         })
 ```
+
+```python Direct Function
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
+    """
+    try:
+        # Call external API
+        api_result = await weather_api.get_weather(location, format)
+
+        # Return formatted result
+        await params.result_callback({
+            "location": location,
+            "temperature": api_result["temp"],
+            "conditions": api_result["conditions"],
+            "unit": format_type
+        })
+    except Exception as e:
+        # Handle errors
+        await params.result_callback({
+            "error": f"Failed to get weather: {str(e)}"
+        })
+```
+
+</CodeGroup>
 
 ## Controlling Function Call Behavior (Advanced)
 
