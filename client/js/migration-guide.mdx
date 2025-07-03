@@ -1,0 +1,224 @@
+---
+title: "RTVIClient Migration Guide for JavaScript"
+description: "A Guide to migrating from a JavaScript RTVIClient to PipecatClient"
+---
+
+This guide covers migrating from RTVIClient to the new `PipecatClient` in a JavaScript application. The new client introduces simplified configuration and improved client-server messaging. For an overview of the changes, see the top-level [RTVIClient Migration Guide](https://docs.pipecat.ai/client/migration-guide).
+
+## Key Changes
+
+### 1. Package and Class Names
+
+**Old**
+```javascript
+import { RTVIClient } from '@pipecat-ai/client-js';
+```
+**New**
+```javascript
+// New
+import { PipecatClient } from '@pipecat-ai/client-js';
+```
+
+### 2. Client and Transport Configuration
+
+The core difference here is that the client no longer accepts a `params` field. The configuration that used to be provided here is no longer supported and endpoint information is now provided directly in the `connect()` method.
+
+**Old**
+```javascript
+const transport = new DailyTransport();
+const client = new RTVIClient({
+  transport,
+  params: {
+    baseUrl: 'http://localhost:7860',
+    endpoints: {
+      connect: '/connect'
+    }
+  }
+});
+```
+**New**
+```javascript
+const client = new PipecatClient({
+  transport: new DailyTransport(),
+  // Connection params moved to connect() call
+});
+```
+
+### 3. Connection Method
+
+Previously, `connect()` was called on the client instance without parameters. Now, you provide connection parameters directly in the `connect()` method. This allows for more flexibility and customization of the connection process. For ease of use, you can either provide an object that contains the connection parameters your `Transport` requires or a REST endpoint that returns the connection parameters.
+
+**Old**
+
+```javascript
+await client.connect();
+```
+
+**New**
+
+```javascript
+await client.connect({
+  endpoint: 'http://localhost:7860/connect',
+  requestData: {
+    // Any custom data your /connect endpoint requires
+    llm_provider: 'openai',
+    initial_prompt: "You are a pirate captain",
+    // Any additional data
+  }
+});
+```
+
+### 4. Function Call Handling
+
+Previously, you would use a helper class to handle function calls and provide a single callback to handle any/all function calls. Now, you can register a callback for each function call by name directly on the `PipecatClient` instance.
+
+**Old**
+```javascript
+let llmHelper = new LLMHelper({});
+llmHelper.handleFunctionCall(async (data) => {
+  return await this.handleFunctionCall(data.functionName, data.arguments);
+});
+client.registerHelper('openai', llmHelper);
+```
+**New**
+```javascript
+client.registerFunctionCallHandler('functionName', async (data) => {
+  // Handle function call
+  return result;
+});
+```
+
+### 5. Pipeline Configuration Initialization
+
+Previously, you could provide a pipeline configuration as part of the `RTVIClient` constructor and it was expected to be in a specific format. Now, if you would like to pass any initial pipeline configurations, you do so as `requestData` added to the endpoint you provide to `connect()`. In both cases, you would need server-side code to parse and apply these settings, but now you can define the structure and what pieces of configuration you want to send.
+
+**Old**
+```javascript
+const pipelineConfig = [{
+  "service": "llm",
+  "options": [
+    {
+      "name": "initial_messages",
+      "value": [
+        {
+          "role": "system",
+          "content": `You are a pirate captain.`
+        }
+      ]
+    },
+  ],
+},
+{
+  "service": "tts",
+  "options": [
+    {
+      "name": "language",
+      "value": "en-US"
+    }
+  ]
+}];
+
+const rtviClient = new RTVIClient({
+  ...
+  params: {
+    ...
+    config: pipelineConfig
+  },
+});
+rtviClient.connect();
+```
+**New**
+
+Check out [this section of docs](./api-reference/messages#connection-time-configuration) for an example, complete with server-side code showing how to initialize the pipeline configuration at connection time.
+
+```javascript
+try {
+  pcClient.connect({
+    endpoint: 'https://your-server/connect',
+    requestData: {
+      initial_prompt: "You are a pirate captain",
+      preferred_language: 'en-US'
+    }
+  });
+} catch (error) {
+  console.error("Error connecting to server:", error);
+}
+```
+
+### 6. Pipeline Configuration Updates
+
+Previously, the client supported updating the pipeline configuration using a specific method that took a configuration object in a generic format. Dynamic and predifined configuration updates, however, are a security concern, allowing clients to override settings and potentially abuse API keys. For this reason, it has been removed and most configuration updates need to be handled custom by your application. To do so, you should take advantage of the client-server messaging system, which allows you to send messages to the server and handle responses. This way, you can implement your own logic for updating configurations securely.
+
+**Old**
+```javascript
+const updatedConfig = [{
+  "service": "tts",
+  "options": [
+    {
+      "name": "voice",
+      "value": "Janice"
+    }
+  ]
+}];
+try {
+  await rtviClient.updateConfig(
+    updatedConfig as RTVIClientConfigOption[],
+    true
+  );
+} catch (e) {
+  console.error("Failed to update config", e);
+}
+```
+**New**
+
+Check out [this section of docs](./api-reference/messages#sending-custom-messages-to-the-server) for a more complete example, along with an example on making a request (`sendClientRequest()`) to wait for a response.
+
+```javascript
+try {
+  pcClient.sendClientMessage('set-voice', { voice: 'Janice' });
+} catch (error) {
+  console.error("Error sending message to server:", error);
+}
+```
+
+### 7. LLM Context Updates
+
+Previously, you would use a helper class to update the context. This could be a security concern for the same reasons as mentioned above and should now be done using the [client-server messaging system](./api-reference/messages). However, in the case where you simply wish to add to the user's or assistant's context, you can use the [`appendToContext()`](./api-reference/client-methods#appendtocontext) method on the `PipecatClient` instance. This allows for easy, built-in support for text-based context updates without needing to implement custom messaging.
+
+**Old**
+```javascript
+let llmHelper = new LLMHelper({});
+client.registerHelper('llm', llmHelper);
+await llmHelper.setContext(
+  {
+    messages: [
+      {
+        role: "user",
+        content: "Tell me a joke.",
+      },
+    ],
+  },
+  true
+);
+```
+**New**
+```javascript
+client.appendToContext({
+  role: "user",\
+  content: "Tell me a joke.",
+  run_immediately: true
+});
+```
+
+
+## Breaking Changes
+
+1. **Configuration Structure**: Connection parameters are now passed to connect() instead of constructor
+2. **Helper System**: Removed in favor of direct `PipecatClient` member functions or client-server messaging.
+
+## Migration Steps
+
+1. Update package imports to use new names
+2. Move connection configuration from constructor to connect() method
+3. Replace any helper classes with corresponding `PipecatClient` methods or custom messaging
+4. Update any TypeScript types referencing old names
