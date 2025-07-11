@@ -1,0 +1,96 @@
+---
+title: "Context Management"
+description: "A guide to working with Pipecat's Context and Context Aggregators"
+---
+
+## What is Context in Pipecat?
+
+In Pipecat, **context** refers to the text that the LLM uses to perform an inference. Commonly, this is the text inputted to the LLM and outputted from the LLM. The context consists of a list of alternating user/assistant messages that represents the information you want an LLM to respond to. Since Pipecat is a real-time voice (and multimodal) AI framework, the context serves as the collective history of the entire conversation.
+
+## How Context Updates During Conversations
+
+After every user and bot turn in the conversation, processors in the pipeline push frames to update the context:
+
+- **STT Service**: Pushes `TranscriptionFrame` objects that represent what the user says.
+- **LLM and TTS Services**: Work together to represent what the bot says. The LLM streams tokens (as `LLMTextFrame`s) to the TTS service, which outputs `TTSTextFrame`s representing the bot's spoken words.
+
+## Setting Up Context Management
+
+Pipecat includes a context aggregator class that creates and manages context for both user and assistant messages. Here's how to set it up:
+
+### 1. Create the Context and Context Aggregator
+
+```python
+# Create LLM service
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Create context
+context = OpenAILLMContext(messages, tools)
+
+# Create context aggregator instance
+context_aggregator = llm.create_context_aggregator(context)
+```
+
+The context (which represents the conversation) is passed to the context aggregator. This ensures that both user and assistant instances of the context aggregators have access to the shared conversation context.
+
+### 2. Add Context Aggregators to Your Pipeline
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),      # User context aggregator
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(), # Assistant context aggregator
+])
+```
+
+## Context Aggregator Placement
+
+The placement of context aggregator instances in your pipeline is **crucial** for proper operation:
+
+### User Context Aggregator
+
+Place the user context aggregator **downstream from the STT service**. Since the user's speech results in `TranscriptionFrame` objects pushed by the STT service, the user aggregator needs to be positioned to collect these frames.
+
+### Assistant Context Aggregator
+
+Place the assistant context aggregator **after `transport.output()`**. This positioning is important because:
+
+- The TTS service outputs spoken words in addition to audio
+- The assistant aggregator must be downstream to collect those frames
+- It ensures context updates happen word-by-word for specific services (e.g. Cartesia, ElevenLabs, and Rime)
+- Your context stays updated at the word level in case an interruption occurs
+
+<Tip>
+  Always place the assistant context aggregator **after** `transport.output()`
+  to ensure proper word-level context updates during interruptions.
+</Tip>
+
+## Manually Managing Context
+
+You can programmatically add new messages to the context by pushing or queueing specific frames:
+
+### Adding Messages
+
+- **`LLMMessagesAppendFrame`**: Appends a new message to the existing context
+- **`LLMMessagesUpdateFrame`**: Completely replaces the existing context with new context provided in the frame
+
+### Retrieving Current Context
+
+The context aggregator provides a `get_context_frame()` method to obtain the latest context:
+
+```python
+await task.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+## Triggering Bot Responses
+
+You'll commonly use this manual mechanism—obtaining the current context and pushing/queueing it—to trigger the bot to speak in two scenarios:
+
+1. **Starting a pipeline** where the bot should speak first
+2. **After pushing new context frames** using `LLMMessagesAppendFrame` or `LLMMessagesUpdateFrame`
+
+This gives you fine-grained control over when and how the bot responds during the conversation flow.

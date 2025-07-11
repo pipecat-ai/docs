@@ -3,6 +3,14 @@ title: "Daily REST Helper"
 description: "Classes and methods for interacting with the Daily API to manage rooms and tokens"
 ---
 
+<Card
+  title="Daily REST API Documentation"
+  icon="link"
+  href="https://docs.daily.co/reference/rest-api"
+>
+  For complete Daily REST API reference and additional details
+</Card>
+
 ## Classes
 
 ### DailyRoomSipParams
@@ -32,12 +40,40 @@ sip_params = DailyRoomSipParams(
 )
 ```
 
+### RecordingsBucketConfig
+
+Configuration for storing Daily recordings in a custom S3 bucket.
+
+<ResponseField name="bucket_name" type="string" required>
+  Name of the S3 bucket for storing recordings
+</ResponseField>
+<ResponseField name="bucket_region" type="string" required>
+  AWS region where the S3 bucket is located
+</ResponseField>
+<ResponseField name="assume_role_arn" type="string" required>
+  ARN of the IAM role to assume for S3 access
+</ResponseField>
+<ResponseField name="allow_api_access" type="boolean" default={false}>
+  Whether to allow API access to the recordings
+</ResponseField>
+
+```python
+from pipecat.transports.services.helpers.daily_rest import RecordingsBucketConfig
+
+bucket_config = RecordingsBucketConfig(
+    bucket_name="my-recordings-bucket",
+    bucket_region="us-west-2",
+    assume_role_arn="arn:aws:iam::123456789012:role/DailyRecordingsRole",
+    allow_api_access=True
+)
+```
+
 ### DailyRoomProperties
 
 Properties that configure a Daily room's behavior and features.
 
-<ResponseField name="exp" type="float" default="current_time + 5 minutes">
-  Room expiration time as Unix timestamp
+<ResponseField name="exp" type="float" optional>
+  Room expiration time as Unix timestamp (e.g., time.time() + 300 for 5 minutes)
 </ResponseField>
 <ResponseField name="enable_chat" type="boolean" default={false}>
   Whether chat is enabled in the room
@@ -48,38 +84,62 @@ Properties that configure a Daily room's behavior and features.
 <ResponseField name="enable_emoji_reactions" type="boolean" default={false}>
   Whether emoji reactions are enabled
 </ResponseField>
-<ResponseField name="eject_at_room_exp" type="boolean" default={true}>
+<ResponseField name="eject_at_room_exp" type="boolean" default={false}>
   Whether to eject participants when room expires
 </ResponseField>
 <ResponseField name="enable_dialout" type="boolean" optional>
   Whether dial-out is enabled
 </ResponseField>
+<ResponseField name="enable_recording" type="string" optional>
+  Recording settings ("cloud", "local", or "raw-tracks")
+</ResponseField>
+<ResponseField name="geo" type="string" optional>
+  Geographic region for room
+</ResponseField>
 <ResponseField name="max_participants" type="number" optional>
   Maximum number of participants allowed in the room
+</ResponseField>
+<ResponseField name="recordings_bucket" type="RecordingsBucketConfig" optional>
+  Configuration for custom S3 bucket recordings
 </ResponseField>
 <ResponseField name="sip" type="DailyRoomSipParams" optional>
   SIP configuration parameters
 </ResponseField>
 <ResponseField name="sip_uri" type="dict" optional>
-  SIP URI configuration
+  SIP URI configuration (returned by Daily)
 </ResponseField>
-<ResponseField name="start_video_off" type="boolean">
+<ResponseField name="start_video_off" type="boolean" default={false}>
   Whether the camera video is turned off by default
 </ResponseField>
+
+The class also includes a `sip_endpoint` property that returns the SIP endpoint URI if available.
 
 ```python
 import time
 from pipecat.transports.services.helpers.daily_rest import (
     DailyRoomProperties,
     DailyRoomSipParams,
+    RecordingsBucketConfig,
 )
 
 properties = DailyRoomProperties(
     exp=time.time() + 3600,  # 1 hour from now
     enable_chat=True,
     enable_emoji_reactions=True,
-    sip=DailyRoomSipParams(display_name="conference")
+    enable_recording="cloud",
+    geo="us-west",
+    max_participants=50,
+    sip=DailyRoomSipParams(display_name="conference"),
+    recordings_bucket=RecordingsBucketConfig(
+        bucket_name="my-bucket",
+        bucket_region="us-west-2",
+        assume_role_arn="arn:aws:iam::123456789012:role/DailyRole"
+    )
 )
+
+# Access SIP endpoint if available
+if properties.sip_endpoint:
+    print(f"SIP endpoint: {properties.sip_endpoint}")
 ```
 
 ### DailyRoomParams
@@ -133,7 +193,7 @@ Response object representing a Daily room.
   Complete room URL
 </ResponseField>
 <ResponseField name="created_at" type="string">
-  Room creation timestamp
+  Room creation timestamp in ISO 8601 format
 </ResponseField>
 <ResponseField name="config" type="DailyRoomProperties">
   Room configuration
@@ -206,6 +266,9 @@ Properties for configuring a Daily meeting token.
 <ResponseField name="start_cloud_recording" type="boolean" optional>
   Whether to start cloud recording when user joins
 </ResponseField>
+<ResponseField name="permissions" type="dict" optional>
+  Initial default permissions for a non-meeting-owner participant
+</ResponseField>
 
 ### DailyMeetingTokenParams
 
@@ -225,7 +288,8 @@ token_params = DailyMeetingTokenParams(
     properties=DailyMeetingTokenProperties(
         user_name="John Doe",
         enable_screenshare=True,
-        start_video_off=True
+        start_video_off=True,
+        permissions={"canSend": ["video", "audio"]}
     )
 )
 ```
@@ -304,14 +368,19 @@ Generates a meeting token for a specific room.
   Token expiration time in seconds
 </ParamField>
 
+<ParamField path="eject_at_token_exp" type="bool" default="False">
+  Whether to eject user when token expires
+</ParamField>
+
 <ParamField path="owner" type="bool" default="True">
   Whether the token should have owner privileges (overrides any setting in
   params)
 </ParamField>
 
 <ParamField path="params" type="DailyMeetingTokenParams" optional>
-  Additional token configuration. Note that `room_name`, `exp`, and `is_owner`
-  will be set based on the other function parameters.
+  Additional token configuration. Note that `room_name`, `exp`,
+  `eject_at_token_exp`, and `is_owner` will be set based on the other function
+  parameters.
 </ParamField>
 
 ```python
@@ -319,7 +388,8 @@ Generates a meeting token for a specific room.
 token = await helper.get_token(
     room_url="https://your-domain.daily.co/my-room",
     expiry_time=1800,  # 30 minutes
-    owner=False
+    owner=True,
+    eject_at_token_exp=True
 )
 
 # Advanced token generation with additional properties
@@ -333,6 +403,7 @@ token = await helper.get_token(
     room_url="https://your-domain.daily.co/my-room",
     expiry_time=1800,
     owner=False,
+    eject_at_token_exp=True,
     params=token_params
 )
 ```

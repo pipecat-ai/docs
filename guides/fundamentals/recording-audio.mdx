@@ -6,9 +6,21 @@ description: "Learn how to record and save audio from conversations between user
 
 ## Overview
 
-Recording audio from conversations provides valuable data for analysis, debugging, and quality control. Pipecat's `AudioBufferProcessor` makes it easy to capture high-quality audio recordings of both the user and bot during interactions.
+Recording audio from conversations provides valuable data for analysis, debugging, and quality control. You have two options for how to record with Pipecat:
 
-## How It Works
+### Option 1: Record using your transport service provider
+
+Record without writing custom code by using your [transport](/server/services/supported-services#transports) provider's recording capabilities. In addition to saving you development time, some providers offer unique recording capabilities.
+
+<Info>Refer to your service provider's documentation to learn more.</Info>
+
+### Option 2: Create your own recording pipeline
+
+Pipecat's `AudioBufferProcessor` makes it easy to capture high-quality audio recordings of both the user and bot during interactions. Opt for this approach if you want more control over your recording.
+
+This guide focuses on how to recording using the `AudioBufferProcessor`, including high-level guidance for how to set up post-processing jobs for longer recordings.
+
+## How the AudioBufferProcessor Works
 
 The `AudioBufferProcessor` captures audio by:
 
@@ -110,6 +122,84 @@ async def on_audio_data(buffer, audio, sample_rate, num_channels):
   handler to save user and bot audio separately.
 </Tip>
 
+## Recording Longer Conversations
+
+For conversations that last a few minutes, it may be sufficient to just buffer the audio in memory. However, for longer sessions, storing audio in memory poses two challenges:
+
+1. **Memory Usage**: Long recordings can consume significant memory, leading to potential crashes or performance issues.
+2. **Conversation Loss**: If the application crashes or the connection drops, you may lose all recorded audio.
+
+Instead, consider using a chunked approach to record audio in manageable segments. This allows you to periodically save audio data to disk or upload it to cloud storage, reducing memory usage and ensuring data persistence.
+
+### Chunked Recording
+
+Set a reasonable `buffer_size` to trigger periodic uploads:
+
+```python
+# 30-second chunks (recommended for most use cases)
+SAMPLE_RATE = 24000
+CHUNK_DURATION = 30  # seconds
+audiobuffer = AudioBufferProcessor(
+    sample_rate=SAMPLE_RATE,
+    buffer_size=SAMPLE_RATE * 2 * CHUNK_DURATION  # 2 bytes per sample (16-bit)
+)
+
+chunk_counter = 0
+
+@audiobuffer.event_handler("on_track_audio_data")
+async def on_chunk_ready(buffer, user_audio, bot_audio, sample_rate, num_channels):
+    global chunk_counter
+
+    # Upload or save individual chunks
+    await upload_audio_chunk(f"user_chunk_{chunk_counter:03d}.wav", user_audio, sample_rate, 1)
+    await upload_audio_chunk(f"bot_chunk_{chunk_counter:03d}.wav", bot_audio, sample_rate, 1)
+
+    chunk_counter += 1
+```
+
+### Multipart Upload Strategy
+
+For cloud storage, consider using multipart uploads to stream audio chunks:
+
+**Conceptual Approach:**
+
+1. **Initialize multipart upload** when recording starts
+2. **Upload chunks as parts** when buffers fill (every ~30 seconds)
+3. **Complete multipart upload** when recording ends
+4. **Post-process** to create final WAV file(s)
+
+**Benefits:**
+
+- Memory efficient for long sessions
+- Fault tolerant (no data loss if connection drops)
+- Enables real-time processing and analysis
+- Parallel upload of multiple tracks
+
+### Post-Processing Pipeline
+
+After uploading chunks, create final audio files using tools like FFmpeg:
+
+**Concatenating Audio Files:**
+
+```bash
+# Method 1: Simple concatenation (same format)
+ffmpeg -i "concat:chunk_001.wav|chunk_002.wav|chunk_003.wav" -acodec copy final.wav
+
+# Method 2: Using file list (recommended for many chunks)
+# Create filelist.txt with format:
+# file 'chunk_001.wav'
+# file 'chunk_002.wav'
+# ...
+ffmpeg -f concat -safe 0 -i filelist.txt -c copy final_recording.wav
+```
+
+**Automation Considerations:**
+
+- Use sequence numbers in chunk filenames for proper ordering
+- Include metadata (sample rate, channels, duration) with each chunk
+- Implement retry logic for failed uploads
+- Consider using cloud functions/lambdas for automatic post-processing
+
 ## Next Steps
 
 <CardGroup cols={2}>
@@ -127,7 +217,7 @@ async def on_audio_data(buffer, audio, sample_rate, num_channels):
     title="AudioBufferProcessor Reference"
     icon="book"
     iconType="duotone"
-    href="/server/utilities/audio/audio-recording"
+    href="/server/utilities/audio/audio-buffer-processor"
   >
     Read the complete API reference documentation for advanced configuration
     options and event handlers.

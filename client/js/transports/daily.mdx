@@ -2,37 +2,35 @@
 title: "Daily WebRTC Transport"
 ---
 
-The DailyTransport class provides a WebRTC transport layer using [Daily.co's](https://daily.co) infrastructure. It handles audio/video device management, WebRTC connections, and real-time communication between clients and bots.
+The DailyTransport class provides a WebRTC transport layer using [Daily.co's](https://daily.co) infrastructure. It wraps a Daily-JS call client to handle audio/video device management, WebRTC connections, and real-time communication between clients and bots. For complete documentation on Daily's API, see the [Daily API Reference](https://docs.daily.co/reference/daily-js).
+
+This transport is designed for production use cases, leveraging Daily's global infrastructure for low-latency, high-quality audio and video streaming. It expects your Pipecat server to include the corresponding [`DailyTransport` server-side](/server/services/transport/daily) implementation.
 
 ## Usage
 
 ### Basic Setup
 
 ```javascript
-import { RTVIClient } from "@pipecat-ai/client-js";
+import { PipecatClient } from "@pipecat-ai/client-js";
 import { DailyTransport } from "@pipecat-ai/daily-transport";
 
-const transport = new DailyTransport({
-  dailyFactoryOptions: {
-    // Daily.co specific configuration
-  }
-});
-
-const rtviClient = new RTVIClient({
-    transport,
+const pcClient = new PipecatClient({
+    transport: new DailyTransport ({
+      // DailyTransport constructor options
+      bufferLocalAudioUntilBotReady: true, // Optional, defaults to false
+      inputSettings: { video: { processor: {type: 'background-blur'}  } },
+    }),
     enableCam: false,  // Default camera off
     enableMic: true,   // Default microphone on
     callbacks: {
       // Event handlers
     },
-    params: {
-      baseUrl,
-      endpoints
-    }
     // ...
 });
 
-await rtviClient.connect();
+await pcClient.connect({
+    endpoint: 'https://your-server/connect',
+});
 ```
 
 ## API Reference
@@ -40,53 +38,86 @@ await rtviClient.connect();
 ### Constructor Options
 
 ```typescript
-interface DailyTransportConstructorOptions {
-  dailyFactoryOptions?: DailyFactoryOptions;
+interface DailyTransportConstructorOptions extends DailyFactoryOptions {
+  bufferLocalAudioUntilBotReady?: boolean;
 }
 ```
 
-- `dailyFactoryOptions`
+<ParamField path="bufferLocalAudioUntilBotReady" type="boolean" default="false" required="false">
 
-  These options are passed directly through to the Daily constructor. See the [Daily API Reference](https://docs.daily.co/reference/daily-js/daily-call-client/properties) for a complete list of options.
+  If set to `true`, the transport will buffer local audio until the bot is ready. This is useful for ensuring that bot gets any audio from the user that started before the bot is ready to process it.
+</ParamField>
+
+<ParamField path="DailyFactoryOptions">
+
+  The `DailyTransportConstructorOptions` extends the `DailyFactoryOptions` type that is accepted by the underlying Daily instance. These options are passed directly through to the Daily constructor. See the [Daily API Reference](https://docs.daily.co/reference/daily-js/daily-call-client/properties) for a complete list of options.
 
 <Note>
-The room url and optional token required for a Daily call should be provided by your connection endpoint in the form of `room_url` and `token` respectively. The RTVI client will pass the response from your connection endpoint as-is to the DailyTransport as part of its `connect()` process. See the [baseUrl](https://docs.pipecat.ai/client/js/api-reference/client-constructor#param-base-url) and [connect endpoint](https://docs.pipecat.ai/client/js/api-reference/client-constructor#param-endpoints) documentation for more information.
+While you can provide the room url and optional token as part of your constructor options, the typical pattern is to provide them via a connection endpoint or directly as part of `connect()`. See below.
 </Note>
 
-### States
+</ParamField>
 
-The transport can be in one of these states:
+### TransportConnectionParams
 
+On `connect()`, the `DailyTransport` optionally takes a set of [`DailyCallOptions`](https://docs.daily.co/reference/daily-js/daily-call-client/methods#dailycalloptions) to connect to a Daily room. This can be provided directly or via a connection endpoint passed to the `PipecatClient`'s connect method. If using an endpoint, your endpoint should return a JSON object matching the `DailyCallOptions` type. See the [client connect()](https://docs.pipecat.ai/client/js/api-reference/client-methods#connect) documentation for more information.
+
+<CodeGroup>
+```typescript client
+pcClient.connect({
+  url: 'https://your.daily.co/room'
+});
+// OR...
+pcClient.connect({
+  endpoint: 'https://your-server/connect',
+});
 ```
-| 'initializing'
-| 'initialized'
-| 'connecting'
-| 'connected'
-| 'ready'
-| 'disconnecting'
-| 'disconnected'
-| 'error'
+
+```python server
+@app.post("/connect")
+async def rtvi_connect(request: Request) -> Dict[Any, Any]:
+    print("Creating room and token for RTVI connection")
+    room_url, token = await create_room_and_token()
+
+    # Start the bot process
+    try:
+        subprocess.Popen(
+            [f"python3 -m bot.py -u {room_url} -t {token}"],
+            shell=True,
+            bufsize=1,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
+
+    # Return the Daily call options in format expected by DailyTransport/Daily Call Object
+    return {"url": room_url, "token": token}
 ```
+</CodeGroup>
 
 ### Methods
 
-Most methods have an equivalent in the RTVI client. The transport is designed to be used with the RTVI client, so in most cases you should use the RTVI client methods to interact with the transport, rather than calling these methods directly. This is especially true for `initialize()`, `connect()`, and `disconnect()`.
+For most operations, you will not interact with the transport directly. Most methods have an equivalent in the `PipecatClient` and should be called from the `PipecatClient`. However, there are a few transport-specific methods that you may need to call directly. When doing so, be sure to access your transport via the `transport` property of the `PipecatClient` instance.
 
 - `preAuth()`
 
-  This is the one method meant to be called directly, which is used to allow you to gather information about the Daily room prior to connecting. As a Daily-specific action, it is not exposed through the RTVI client. This method must be called prior to `connect()` and use the same room_url and token (optional) as what will be returned by your connection endpoint.
+  This is the one method meant to be called directly, which is used to allow you to gather information about the Daily room prior to connecting. As a Daily-specific action, it is not exposed through the `PipecatClient`. This method must be called prior to `connect()` and use the same `room_url` and `token` (optional) as what will be returned by your connection endpoint/eventually used on `connect()`.
 
   ```typescript
-  transport.preAuth({
+  pcClient.transport.preAuth({
     url: 'https://your.daily.co/room',
     token: 'your_token'
   });
-  const roomInfo = transport.dailyCallClient.room();
+  const roomInfo = pcClient.transport.dailyCallClient.room();
   ```
 
 ## Events
 
-The transport implements the various [RTVI event handlers](https://docs.pipecat.ai/client/js/api-reference/callbacks). These events will not fire until the transport has been attached to an RTVIClient.
+The transport implements the various [`PipecatClient` event handlers](https://docs.pipecat.ai/client/js/api-reference/callbacks). For Daily-specific events, you can attach listeners to the underlying Daily call client. For a list of available events, see the [Daily API Reference](https://docs.daily.co/reference/daily-js/events).
+
+```typescript
+pcClient.transport.dailyCallClient.on('recording-started', (ev) => {...});
+```
 
 ## Advanced
 
@@ -95,11 +126,11 @@ The transport implements the various [RTVI event handlers](https://docs.pipecat.
 For advanced use cases, where you may need to work with the Daily call client directly, you can access it via the `dailyCallClient` property.
 
 ```javascript
-const dailyCall = transport.dailyCallClient;
+const dailyCall = pcClient.transport.dailyCallClient;
 ```
 
 <Note>
-The Daily call client returned is safe-guarded to not allow you to call functions which affect the call's lifecycle and will redirect you to use either a Transport method or the RTVI client to perform the equivalent action.
+The Daily call client returned is safe-guarded to not allow you to call functions which affect the call's lifecycle and will redirect you to use either a Transport method or the `PipecatClient` to perform the equivalent action.
 </Note>
 
 ## More Information
