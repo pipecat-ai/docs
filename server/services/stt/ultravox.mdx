@@ -5,173 +5,108 @@ description: "Speech-to-text service implementation using a locally-loaded Ultra
 
 ## Overview
 
-`UltravoxSTTService` provides real-time speech-to-text capabilities using the Ultravox multimodal model running locally. Ultravox directly encodes audio into the LLM's embedding space, eliminating the need for a separate ASR component and providing faster, more efficient transcription.
+`UltravoxSTTService` provides real-time speech-to-text using the Ultravox multimodal model running locally. Ultravox directly encodes audio into the LLM's embedding space, eliminating traditional ASR components and providing faster, more efficient transcription with built-in conversational understanding.
+
+<CardGroup cols={3}>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.ultravox.stt.html"
+  >
+    Complete API documentation and method details
+  </Card>
+  <Card title="Ultravox Docs" icon="book" href="https://docs.ultravox.ai/">
+    Official Ultravox documentation and features
+  </Card>
+  <Card
+    title="Example Code"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/07u-interruptible-ultravox.py"
+  >
+    Working example with GPU optimization
+  </Card>
+</CardGroup>
 
 ## Installation
 
-To use `UltravoxSTTService`, install the required dependencies:
+To use Ultravox services, install the required dependency:
 
 ```bash
 pip install "pipecat-ai[ultravox]"
 ```
 
-## Configuration
+You'll also need a Hugging Face token to access the models: `HF_TOKEN`.
 
-### Constructor Parameters
+<Tip>
+  Get your Hugging Face token from [Hugging Face
+  Settings](https://huggingface.co/settings/tokens).
+</Tip>
 
-<ParamField
-  path="model_size"
-  type="str"
-  default="fixie-ai/ultravox-v0_4_1-llama-3_1-8b"
->
-  The Ultravox model to use. Defaults to the 8B parameter model based on Llama
-  3.1.
-</ParamField>
+## Frames
 
-<ParamField path="hf_token" type="str" optional>
-  Your Hugging Face token for accessing the model. Will use the HF_TOKEN
-  environment variable if not provided.
-</ParamField>
+### Input
 
-<ParamField path="temperature" type="float" default="0.7">
-  Temperature for text generation, controlling creativity vs. determinism.
-</ParamField>
+- `InputAudioRawFrame` - Raw PCM audio data (16-bit, 16kHz, mono)
+- `UserStartedSpeakingFrame` - Triggers audio buffering
+- `UserStoppedSpeakingFrame` - Processes collected audio
+- `STTUpdateSettingsFrame` - Runtime transcription configuration updates
+- `STTMuteFrame` - Mute audio input for transcription
 
-<ParamField path="max_tokens" type="int" default="100">
-  Maximum number of tokens to generate for each transcription.
-</ParamField>
+### Output
 
-## Input
+- `LLMFullResponseStartFrame` - Indicates transcription generation start
+- `LLMTextFrame` - Streaming text tokens as they're generated
+- `LLMFullResponseEndFrame` - Indicates transcription completion
+- `ErrorFrame` - Processing errors or resource issues
 
-The service processes `AudioRawFrame` instances containing:
+## Models
 
-- Raw PCM audio data
-- 16-bit depth (int16)
-- 16kHz sample rate (recommended)
-- Single channel (mono)
+Ultravox offers several models with different resource requirements:
 
-The service intelligently buffers audio between `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame` events.
+- `fixie-ai/ultravox-v0_6-llama-3_3-70b` - Latest model with improved accuracy and efficiency
+- `fixie-ai/ultravox-v0_5-llama-3_3-70b` - Recommended for new deployments
+- `fixie-ai/ultravox-v0_5-llama-3_1-8b` - Smaller model for resource-constrained environments
+- `fixie-ai/ultravox-v0_4_1-llama-3_1-8b` - Previous version for compatibility
+- `fixie-ai/ultravox-v0_4_1-llama-3_1-70b` - Larger model for high accuracy
 
-## Output Frames
-
-The service produces the following frame during transcription:
-
-### TranscriptionFrame
-
-Generated when speech processing is complete, containing:
-
-<ParamField path="text" type="string">
-  Transcribed text
-</ParamField>
-
-<ParamField path="user_id" type="string">
-  User identifier
-</ParamField>
-
-<ParamField path="timestamp" type="string">
-  ISO 8601 formatted timestamp
-</ParamField>
+See the [Ultravox models](https://huggingface.co/fixie-ai/collections) on Hugging Face for more details.
 
 ## Usage Example
 
+### Basic Configuration
+
 ```python
 from pipecat.services.ultravox.stt import UltravoxSTTService
-import os
 
-# Configure service
-stt = UltravoxSTTService(
-    model_size="fixie-ai/ultravox-v0_4_1-llama-3_1-8b",
-    hf_token=os.environ.get("HF_TOKEN"),
-    temperature=0.5,
-    max_tokens=150,
+# Simple setup with default model
+ultravox_processor = UltravoxSTTService(
+    hf_token=os.getenv("HF_TOKEN"),
+    temperature=0.7,
+    max_tokens=100
 )
 
-# Use in pipeline
+# Use in pipeline (requires VAD for speech detection)
 pipeline = Pipeline([
     transport.input(),
-    stt,
-    llm,
-    ...
+    ultravox_processor,  # Note: Ultravox outputs LLM frames, not transcription frames
+    tts,
+    transport.output()
 ])
 ```
 
-## Internal Architecture
+## Metrics
 
-`UltravoxSTTService` uses the following internal components:
+The service provides comprehensive metrics:
 
-### AudioBuffer
+- **Time to First Byte (TTFB)** - Latency from speech end to first token
+- **Processing Duration** - Total time for audio processing and generation
 
-Collects audio frames during speech events for batch processing:
+## Additional Notes
 
-- Manages frames between `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame`
-- Tracks speech start timestamp
-- Prevents concurrent processing with status flag
-
-### UltravoxModel
-
-Handles loading and running the Ultravox model:
-
-- Initializes vLLM engine for optimal GPU inference
-- Manages model tokenization and prompt formatting
-- Provides streaming text generation from audio input
-
-## Frame Flow
-
-```mermaid
-graph TD
-    A[UserStartedSpeakingFrame] --> B[AudioBuffer]
-    C[AudioRawFrame] --> B
-    D[UserStoppedSpeakingFrame] --> E[Process Audio Buffer]
-    E --> F[UltravoxModel]
-    F --> G[TranscriptionFrame]
-    F --> H[ErrorFrame]
-```
-
-## Metrics Support
-
-The service supports metrics collection:
-
-- Time to First Byte (TTFB)
-- Total processing duration
-- Buffer collection time
-
-## Error Handling
-
-The service produces ErrorFrames in the following scenarios:
-
-- Empty audio buffer
-- Invalid audio data
-- Model inference errors
-- Timeout during processing
-
-## Available Models
-
-| Model ID                               | Parameters | Base LLM  | Min VRAM | Languages                     |
-| -------------------------------------- | ---------- | --------- | -------- | ----------------------------- |
-| fixie-ai/ultravox-v0_4_1-llama-3_1-8b  | 8B         | Llama 3.1 | 16GB     | English, limited multilingual |
-| fixie-ai/ultravox-v0_4_1-llama-3_1-70b | 70B        | Llama 3.1 | 80GB+    | English, broader multilingual |
-| fixie-ai/ultravox-v0_4-mistral-7b      | 7B         | Mistral   | 14GB     | English                       |
-
-See the [Fixie.ai Hugging Face page](https://huggingface.co/fixie-ai) for the latest model availability.
-
-<Note>
-  Ensure your environment has sufficient GPU resources for the selected model.
-</Note>
-
-## Memory Considerations
-
-The Ultravox model requires GPU resources:
-
-- For the 8B parameter model (`fixie-ai/ultravox-v0_4_1-llama-3_1-8b`):
-  - Benchmarked on A100-40GB GPUs
-  - Can run on consumer GPUs with appropriate memory (at least 8GB VRAM, but performance may vary)
-- For larger variants like the 70B parameter model:
-  - Requires significantly more memory (40GB+ VRAM recommended)
-- Audio buffer size grows with speech duration
-- Processing occurs in batches, not streaming
-
-<Note>
-  According to the Hugging Face card, the 8B model achieves a
-  time-to-first-token of approximately 150ms and generates 50-100 tokens per
-  second on an A100-40GB GPU.
-</Note>
+- **VAD Dependency**: Requires Voice Activity Detection (VAD) to trigger audio processing
+- **GPU Acceleration**: Designed for GPU deployment; consider using Cerebrium, Modal, or other GPU-optimized environments
+- **Model Loading**: First model load can take several minutes; consider pre-initialization
+- **Memory Usage**: Audio buffer grows with speech duration; automatically cleared after processing
+- **Output Format**: Generates `LLMTextFrame` objects, not traditional `TranscriptionFrame`
+- **Local Processing**: All processing happens locally; no external API calls after model download
+- **Hugging Face Authentication**: Required for downloading models from Hugging Face Hub
