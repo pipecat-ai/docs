@@ -5,137 +5,197 @@ description: "Text-to-speech service implementation using Deepgram’s Aura API"
 
 ## Overview
 
-`DeepgramTTSService` converts text to speech using Deepgram's Aura API. It supports various voices and audio configurations.
+Deepgram's Aura API provides high-quality text-to-speech synthesis with streaming capabilities and ultra-low latency. The service offers various voice models optimized for conversational AI applications with efficient audio streaming.
+
+<CardGroup cols={3}>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.deepgram.tts.html"
+  >
+    Complete API documentation and method details
+  </Card>
+  <Card
+    title="Deepgram TTS Docs"
+    icon="book"
+    href="https://developers.deepgram.com/reference/text-to-speech-api/speak"
+  >
+    Official Deepgram text-to-speech API documentation
+  </Card>
+  <Card
+    title="Example Code"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/07c-interruptible-deepgram.py"
+  >
+    Working example with Silero VAD
+  </Card>
+</CardGroup>
 
 ## Installation
 
-To use `DeepgramTTSService`, install the required dependencies:
+To use Deepgram services, install the required dependencies:
 
 ```bash
 pip install "pipecat-ai[deepgram]"
 ```
 
-You'll also need to set up your Deepgram API key as an environment variable: `DEEPGRAM_API_KEY`
+You'll also need to set up your Deepgram API key as an environment variable: `DEEPGRAM_API_KEY`.
 
-## Configuration
+<Tip>
+  Get your API key from the [Deepgram Console](https://console.deepgram.com/).
+</Tip>
 
-### Constructor Parameters
+## Frames
 
-<ParamField path="api_key" type="str" required>
-  Your Deepgram API key
-</ParamField>
+### Input
 
-<ParamField path="voice" type="str" default="aura-helios-en">
-  Voice identifier to use for synthesis
-</ParamField>
+- `TextFrame` - Text content to synthesize into speech
+- `TTSSpeakFrame` - Text that should be spoken immediately
+- `TTSUpdateSettingsFrame` - Runtime configuration updates
+- `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame` - LLM response boundaries
 
-<ParamField path="sample_rate" type="int" default="None">
-  Output audio sample rate in Hz
-</ParamField>
+### Output
 
-<ParamField path="encoding" type="str" default="linear16">
-  Audio encoding format
-</ParamField>
+- `TTSStartedFrame` - Signals start of synthesis
+- `TTSAudioRawFrame` - Generated audio data chunks (streaming)
+- `TTSStoppedFrame` - Signals completion of synthesis
+- `ErrorFrame` - API or processing errors
 
-<ParamField path="text_filter" type="BaseTextFilter" default="None">
-  Modifies text provided to the TTS. [Learn
-  more](/server/base-classes/text#text-filters) about the available filters.
-</ParamField>
+## Voice Models
 
-## Input
+Deepgram offers various Aura voice models optimized for different use cases. Here are some highlights:
 
-The service accepts text input through its TTS pipeline.
+| Voice Model           | Description                 | Language |
+| --------------------- | --------------------------- | -------- |
+| `aura-2-helena-en`    | Natural female voice        | English  |
+| `aura-2-andromeda-en` | Expressive female voice     | English  |
+| `aura-helios-en`      | Warm male voice             | English  |
+| `aura-luna-en`        | Conversational female voice | English  |
+| `aura-stella-en`      | Professional female voice   | English  |
+| `aura-zeus-en`        | Authoritative male voice    | English  |
 
-## Output Frames
+<Note>
+  Deepgram regularly adds new voice models. Check the [official
+  documentation](https://developers.deepgram.com/reference/text-to-speech-api/speak)
+  for the latest available voices.
+</Note>
 
-### TTSStartedFrame
+## Supported Sample Rates
 
-Signals the start of audio generation.
+- **8000 Hz** - Phone quality
+- **16000 Hz** - Standard quality
+- **24000 Hz** - High quality (default)
+- **44100 Hz** - CD quality
+- **48000 Hz** - Professional quality
 
-### TTSAudioRawFrame
+## Integration with VAD
 
-Contains generated audio data:
+Deepgram TTS works seamlessly with Voice Activity Detection:
 
-<ParamField path="audio" type="bytes">
-  Raw audio data chunk
-</ParamField>
+### Using Silero VAD (Recommended)
 
-<ParamField path="sample_rate" type="int">
-  Audio sample rate (24kHz default)
-</ParamField>
+```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 
-<ParamField path="num_channels" type="int">
-  Number of audio channels (1 for mono)
-</ParamField>
+transport_params = DailyParams(
+    audio_in_enabled=True,
+    audio_out_enabled=True,
+    vad_analyzer=SileroVADAnalyzer()
+)
+```
 
-### TTSStoppedFrame
+### Using Deepgram's Built-in VAD Events
 
-Signals the completion of audio generation.
+```python
+from deepgram import LiveOptions
 
-## Methods
+stt = DeepgramSTTService(
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    live_options=LiveOptions(
+        vad_events=True,
+        utterance_end_ms="1000"
+    )
+)
 
-See the [TTS base class methods](/server/base-classes/speech#ttsservice) for additional functionality.
+@stt.event_handler("on_speech_started")
+async def on_speech_started(stt, *args, **kwargs):
+    await task.queue_frames([BotInterruptionFrame()])
 
-## Language Support
-
-Deepgram TTS supports the following languages and regional variants:
-
-| Language Code | Description | Service Codes |
-| ------------- | ----------- | ------------- |
-| `Language.EN` | English     | `en`          |
+@stt.event_handler("on_utterance_end")
+async def on_utterance_end(stt, *args, **kwargs):
+    await task.queue_frames([StopInterruptionFrame()])
+```
 
 ## Usage Example
 
+### Basic Configuration
+
+Initialize the `DeepgramTTSService` with your API key and use it in your pipeline:
+
 ```python
 from pipecat.services.deepgram.tts import DeepgramTTSService
+import os
 
 # Configure service
 tts = DeepgramTTSService(
-    api_key="your-api-key",
-    voice="aura-helios-en",
-    sample_rate=24000
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    voice="aura-2-andromeda-en",
+    sample_rate=24000,
+    encoding="linear16"
 )
 
 # Use in pipeline
 pipeline = Pipeline([
-    ...,
+    transport.input(),
+    stt,
+    context_aggregator.user(),
     llm,
     tts,
     transport.output(),
+    context_aggregator.assistant()
 ])
 ```
 
-## Frame Flow
+### Custom Configuration
 
-```mermaid
-graph TD
-    A[TextFrame] --> B[DeepgramTTSService]
-    B --> C[TTSStartedFrame]
-    B --> D[TTSAudioRawFrame]
-    B --> E[TTSStoppedFrame]
-    B --> F[ErrorFrame]
+```python
+# Advanced configuration with custom settings
+tts = DeepgramTTSService(
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    voice="aura-helios-en",        # Male voice
+    base_url="https://api.deepgram.com",  # Custom endpoint
+    sample_rate=48000,             # High-quality audio
+    encoding="linear16"
+)
 ```
 
-## Metrics Support
+### Dynamic Configuration
 
-The service supports metrics collection:
+Make settings updates by pushing a `TTSUpdateSettingsFrame` for the `DeepgramTTSService`:
 
-- Time to First Byte (TTFB)
-- TTS usage metrics
-- Processing duration
+```python
+from pipecat.frames.frames import TTSUpdateSettingsFrame
 
-## Audio Processing
+await task.queue_frame(TTSUpdateSettingsFrame(
+    voice="aura-luna-en",  # Change to a different voice
+  )
+)
+```
 
-- Streams audio in 8KB chunks
-- Supports 16-bit PCM format
-- Generates mono audio output
-- Handles memory buffering
+## Metrics
 
-## Notes
+The service provides comprehensive metrics:
 
-- Requires valid Deepgram API key
-- Streams audio in chunks
-- Supports various voices
-- Provides metrics collection
-- Handles memory efficiently
-- Thread-safe processing
+- **Time to First Byte (TTFB)** - Latency from text input to first audio
+- **Processing Duration** - Total synthesis time
+- **Character Usage** - Text processed for billing
+
+<Info>
+  [Learn how to enable Metrics](/guides/features/metrics) in your Pipeline.
+</Info>
+
+## Additional Notes
+
+- **Streaming Audio**: Service streams audio in chunks for low-latency playback
+- **Voice Selection**: Choose voices based on your application's tone and audience
+- **Sample Rate Matching**: Ensure sample rate matches your pipeline's audio output sample rate
