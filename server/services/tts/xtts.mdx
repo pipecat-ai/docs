@@ -10,79 +10,65 @@ description: "Text-to-speech service implementation using Coqui’s XTTS streami
 
 ## Overview
 
-`XTTSService` provides text-to-speech capabilities using [Coqui's XTTS](https://huggingface.co/coqui/XTTS-v2) (Cross-lingual Text-to-Speech) model through a streaming server. It supports multiple languages and custom voice cloning.
+XTTS (Cross-lingual Text-to-Speech) provides multilingual voice synthesis with voice cloning capabilities through a locally hosted streaming server. The service supports real-time streaming and custom voice training using Coqui's XTTS-v2 model.
+
+<CardGroup cols={3}>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.xtts.tts.html"
+  >
+    Complete API documentation and method details
+  </Card>
+  <Card
+    title="XTTS Repository"
+    icon="book"
+    href="https://github.com/coqui-ai/xtts-streaming-server"
+  >
+    Official XTTS streaming server repository
+  </Card>
+  <Card
+    title="Example Code"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/07i-interruptible-xtts.py"
+  >
+    Working example with voice cloning
+  </Card>
+</CardGroup>
 
 ## Installation
 
-The service requires a running XTTS streaming server. You can start one using Docker:
+XTTS requires a running streaming server. Start the server using Docker:
 
 ```bash
-docker run --gpus=all -e COQUI_TOS_AGREED=1 --rm -p 8000:80 ghcr.io/coqui-ai/xtts-streaming-server:latest-cuda121
+docker run --gpus=all -e COQUI_TOS_AGREED=1 --rm -p 8000:80 \
+  ghcr.io/coqui-ai/xtts-streaming-server:latest-cuda121
 ```
 
-For more information, visit the [official repository](https://github.com/coqui-ai/xtts-streaming-server).
+<Note>
+  GPU acceleration is recommended for optimal performance. The server requires
+  CUDA support.
+</Note>
 
-## Configuration
+## Frames
 
-### Constructor Parameters
+### Input
 
-<ParamField path="voice_id" type="str" required>
-  Voice identifier from studio speakers
-</ParamField>
+- `TextFrame` - Text content to synthesize into speech
+- `TTSSpeakFrame` - Text that should be spoken immediately
+- `TTSUpdateSettingsFrame` - Runtime configuration updates
+- `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame` - LLM response boundaries
 
-<ParamField path="language" type="Language" required>
-  Language for speech synthesis
-</ParamField>
+### Output
 
-<ParamField path="base_url" type="str" required>
-  XTTS streaming server URL
-</ParamField>
-
-<ParamField path="aiohttp_session" type="aiohttp.ClientSession" required>
-  HTTP client session for API requests
-</ParamField>
-
-<ParamField path="sample_rate" type="int" default="None">
-  Output audio sample rate in Hz
-</ParamField>
-
-<ParamField path="text_filter" type="BaseTextFilter" default="None">
-  Modifies text provided to the TTS. [Learn
-  more](/server/base-classes/text#text-filters) about the available filters.
-</ParamField>
-
-## Output Frames
-
-### Control Frames
-
-<ParamField path="TTSStartedFrame" type="Frame">
-  Signals start of speech synthesis
-</ParamField>
-
-<ParamField path="TTSStoppedFrame" type="Frame">
-  Signals completion of speech synthesis
-</ParamField>
-
-### Audio Frames
-
-<ParamField path="TTSAudioRawFrame" type="Frame">
-  Contains generated audio data with: - PCM audio format - Specified sample rate
-  (resampled from 24kHz) - Single channel (mono)
-</ParamField>
-
-### Error Frames
-
-<ParamField path="ErrorFrame" type="Frame">
-  Contains XTTS server error information
-</ParamField>
-
-## Methods
-
-See the [TTS base class methods](/server/base-classes/speech#ttsservice) for additional functionality.
+- `TTSStartedFrame` - Signals start of synthesis
+- `TTSAudioRawFrame` - Generated audio data (streaming, resampled from 24kHz)
+- `TTSStoppedFrame` - Signals completion of synthesis
+- `ErrorFrame` - Server connection or processing errors
 
 ## Language Support
 
-Supports multiple languages:
+XTTS supports multiple languages with cross-lingual capabilities:
 
 | Language Code | Description          | Service Code |
 | ------------- | -------------------- | ------------ |
@@ -105,77 +91,67 @@ Supports multiple languages:
 
 ## Usage Example
 
+### Basic Configuration
+
+Initialize the `XTTSService` and use it in a pipeline:
+
 ```python
 from pipecat.services.xtts.tts import XTTSService
 from pipecat.transcriptions.language import Language
 import aiohttp
 
-# Configure service
-async with aiohttp.ClientSession() as session:
+async def setup_tts():
+    # Create HTTP session for server communication
+    session = aiohttp.ClientSession()
+
     tts = XTTSService(
-        voice_id="speaker_1",
-        language=Language.EN,
+        aiohttp_session=session,
+        voice_id="Claribel Dervla",
         base_url="http://localhost:8000",
-        aiohttp_session=session
+        language=Language.EN
     )
 
     # Use in pipeline
     pipeline = Pipeline([
-        ...,
+        transport.input(),
+        stt,
+        context_aggregator.user(),
         llm,
         tts,
         transport.output(),
+        context_aggregator.assistant()
     ])
+
+    return pipeline, session
 ```
 
-## Streaming Process
+### Dynamic Configuration
 
-The service handles audio streaming in chunks:
-
-1. Receives audio chunks from XTTS server
-2. Buffers chunks for processing
-3. Resamples audio to desired sample rate
-4. Delivers audio frames in real-time
+Make settings updates by pushing an `TTSUpdateSettingsFrame` for the `XTTSService`:
 
 ```python
-# Streaming configuration
-payload = {
-    "text": text,
-    "language": language_code,
-    "speaker_embedding": embeddings,
-    "gpt_cond_latent": latent_data,
-    "add_wav_header": False,
-    "stream_chunk_size": 20
-}
+from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+await task.queue_frame(TTSUpdateSettingsFrame(
+    voice_id="your-voice-id",
+  )
+)
 ```
 
-## Frame Flow
+## Metrics
 
-```mermaid
-graph TD
-    A[TextFrame] --> B[XTTSService]
-    B --> C[TTSStartedFrame]
-    B --> D[TTSAudioRawFrame]
-    B --> E[TTSStoppedFrame]
-    B --> F[ErrorFrame]
-```
+The service provides comprehensive metrics:
 
-## Metrics Support
+- **Time to First Byte (TTFB)** - Latency from text input to first audio
+- **Processing Duration** - Total synthesis time
+- **Streaming Performance** - Buffer utilization and chunk processing
 
-The service collects processing metrics:
+<Info>
+  [Learn how to enable Metrics](/guides/features/metrics) in your Pipeline.
+</Info>
 
-- Time to First Byte (TTFB)
-- Processing duration
-- Character usage
-- Streaming performance
+## Additional Notes
 
-## Notes
-
-- Requires GPU for optimal performance
-- Supports real-time streaming
-- Automatic audio resampling
-- Buffer management for smooth playback
-- Thread-safe processing
-- Automatic error handling
-- Manages server connection lifecycle
-- Text preprocessing (removes periods and asterisks)
+- **Local Deployment**: Runs entirely on local infrastructure for privacy
+- **Voice Cloning**: Supports custom voice training with audio samples
+- **Cross-lingual**: Can synthesize multiple languages with same voice
