@@ -15,421 +15,163 @@ SmallWebRTCTransport is the default transport for the Pipecat examples and start
   post](https://www.daily.co/blog/you-dont-need-a-webrtc-server-for-your-voice-agents/).
 </Tip>
 
+<CardGroup cols={2}>
+  <Card
+    title="SmallWebRTCTransport API"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.transports.network.small_webrtc.html"
+  >
+    Transport methods and configuration options
+  </Card>
+  <Card
+    title="SmallWebRTCConnection API"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.transports.network.webrtc_connection.html"
+  >
+    Connection management and signaling methods
+  </Card>
+  <Card
+    title="Example Code"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/p2p-webrtc/voice-agent"
+  >
+    Working example with voice agent implementation
+  </Card>
+  <Card
+    title="Official WebRTC Docs"
+    icon="book"
+    href="https://webrtc.org/getting-started/overview"
+  >
+    Learn more about WebRTC!
+  </Card>
+</CardGroup>
+
 ## Installation
 
 To use `SmallWebRTCTransport`, install the required dependencies:
 
 ```bash
-pip install pipecat-ai[webrtc]
+pip install "pipecat-ai[webrtc]"
 ```
 
-## Class Reference
+No API keys are required since this is a peer-to-peer transport implementation.
 
-### SmallWebRTCConnection
+<Tip>
+  For production deployments across different networks, you may need to
+  configure STUN/TURN servers for NAT traversal.
+</Tip>
 
-`SmallWebRTCConnection` manages the WebRTC connection details, peer connection state, and ICE candidates. It handles the signaling process and media tracks.
+## Frames
+
+### Input
+
+- `InputAudioRawFrame` - Audio data from WebRTC peer
+- `UserImageRawFrame` - Video frames from peer's camera
+- `TransportMessageUrgentFrame` - Application messages from peer
+
+### Output
+
+- `OutputAudioRawFrame` - Audio data to WebRTC peer
+- `OutputImageRawFrame` - Video frames to peer
+- `TransportMessageFrame` - Application messages to peer
+- `TransportMessageUrgentFrame` - Urgent messages to peer
+
+## Key Features
+
+- **Serverless Architecture**: Direct peer-to-peer connections with no intermediate servers
+- **Bidirectional Media**: Full-duplex audio and video streaming
+- **Data Channels**: Application messaging and signaling support
+- **Production Ready**: Heavily tested and used in Pipecat examples
+- **ICE Support**: Configurable STUN/TURN servers for NAT traversal
+
+## Usage Example
+
+SmallWebRTCTransport requires two components working together: a **signaling server** to handle the WebRTC handshake, and your **Pipecat bot** that processes the media streams. Unlike other transports, you cannot use SmallWebRTCTransport without implementing both parts.
+
+### 1. Signaling Server (Required)
+
+First, create a web server to handle WebRTC connection establishment. This server receives offers from clients and creates the WebRTC connections that your bot will use:
 
 ```python
-SmallWebRTCConnection(ice_servers=None)
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Dict
+
+from fastapi import BackgroundTasks, FastAPI
+from fastapi.responses import FileResponse
+from pipecat.transports.network.webrtc_connection import IceServer, SmallWebRTCConnection
+
+app = FastAPI()
+
+# Store active WebRTC connections by their unique ID
+connections: Dict[str, SmallWebRTCConnection] = {}
+
+# Configure ICE servers for NAT traversal
+ice_servers = [
+    IceServer(urls="stun:stun.l.google.com:19302"),
+]
+
+@app.post("/api/offer")
+async def handle_offer(request: dict, background_tasks: BackgroundTasks):
+    """Handle WebRTC offer from client and return SDP answer."""
+    pc_id = request.get("pc_id")
+
+    if pc_id and pc_id in connections:
+        # Handle reconnections
+        webrtc_connection = connections[pc_id]
+        await webrtc_connection.renegotiate(
+            sdp=request["sdp"],
+            type=request["type"]
+        )
+    else:
+        # Create new WebRTC connection
+        webrtc_connection = SmallWebRTCConnection(ice_servers=ice_servers)
+        await webrtc_connection.initialize(
+            sdp=request["sdp"],
+            type=request["type"]
+        )
+
+        # Clean up when client disconnects
+        @webrtc_connection.event_handler("closed")
+        async def on_closed(connection):
+            connections.pop(connection.pc_id, None)
+
+        # Start bot for this connection (defined below)
+        background_tasks.add_task(run_bot, webrtc_connection)
+
+    answer = webrtc_connection.get_answer()
+    connections[answer["pc_id"]] = webrtc_connection
+    return answer
+
+# Run with: uvicorn server:app --host 0.0.0.0 --port 7860
 ```
 
-<ParamField
-  path="ice_servers"
-  type="Union[List[str], List[IceServer]]"
-  optional
->
-  List of STUN/TURN server URLs for ICE connection establishment. Can be
-  provided as strings or as IceServer objects.
-</ParamField>
+### 2. Pipecat Bot Implementation
 
-#### Methods
-
-<ResponseField name="initialize" type="async method">
-  Initialize the connection with a client's SDP offer.
-
-**Parameters:**
-
-- `sdp`: String containing the Session Description Protocol data from client's offer
-- `type`: String representing the SDP message type (typically "offer")
-
-```python
-await webrtc_connection.initialize(sdp=client_sdp, type="offer")
-```
-
-</ResponseField>
-
-<ResponseField name="connect" type="async method">
-  Establish the WebRTC peer connection after initialization.
-
-```python
-await webrtc_connection.connect()
-```
-
-</ResponseField>
-
-<ResponseField name="close" type="async method">
-  Close the WebRTC peer connection.
-
-```python
-await webrtc_connection.close()
-```
-
-</ResponseField>
-
-<ResponseField name="disconnect" type="async method">
-  Disconnect the WebRTC peer connection and send a peer left message to the client.
-
-```python
-await webrtc_connection.disconnect()
-```
-
-</ResponseField>
-
-<ResponseField name="renegotiate" type="async method">
-  Handle connection renegotiation requests.
-
-**Parameters:**
-
-- `sdp`: String containing the Session Description Protocol data for renegotiation
-- `type`: String representing the SDP message type
-- `restart_pc`: Boolean indicating whether to completely restart the peer connection (default: False)
-
-```python
-await webrtc_connection.renegotiate(sdp=new_sdp, type="offer", restart_pc=False)
-```
-
-</ResponseField>
-
-<ResponseField name="get_answer" type="method">
-  Retrieve the SDP answer to send back to the client.
-  
-  Returns a dictionary with `sdp`, `type`, and `pc_id` fields.
-
-```python
-answer = webrtc_connection.get_answer()
-# Returns: {"sdp": "...", "type": "answer", "pc_id": "..."}
-```
-
-</ResponseField>
-
-<ResponseField name="send_app_message" type="method">
-  Send an application message to the client.
-
-**Parameters:**
-
-- `message`: The message to send (will be JSON serialized)
-
-```python
-webrtc_connection.send_app_message({"action": "greeting", "text": "Hello!"})
-```
-
-</ResponseField>
-
-<ResponseField name="is_connected" type="method">
-  Check if the connection is active.
-
-```python
-if webrtc_connection.is_connected():
-    print("Connection is active")
-```
-
-</ResponseField>
-
-<ResponseField name="audio_input_track" type="method">
-  Get the audio input track from the client.
-
-```python
-audio_track = webrtc_connection.audio_input_track()
-```
-
-</ResponseField>
-
-<ResponseField name="video_input_track" type="method">
-  Get the video input track from the client.
-
-```python
-video_track = webrtc_connection.video_input_track()
-```
-
-</ResponseField>
-
-<ResponseField name="replace_audio_track" type="method">
-  Replace the current audio track with a new one.
-
-**Parameters:**
-
-- `track`: The new audio track to use
-
-```python
-webrtc_connection.replace_audio_track(new_audio_track)
-```
-
-</ResponseField>
-
-<ResponseField name="replace_video_track" type="method">
-  Replace the current video track with a new one.
-
-**Parameters:**
-
-- `track`: The new video track to use
-
-```python
-webrtc_connection.replace_video_track(new_video_track)
-```
-
-</ResponseField>
-
-<ResponseField name="ask_to_renegotiate" type="method">
-  Request the client to initiate connection renegotiation.
-
-```python
-webrtc_connection.ask_to_renegotiate()
-```
-
-</ResponseField>
-
-<ResponseField name="event_handler" type="decorator">
-  Register an event handler for connection events.
-
-**Events:**
-
-- `"app-message"`: Called when a message is received from the client
-- `"track-started"`: Called when a new track is started
-- `"track-ended"`: Called when a track ends
-- `"connecting"`: Called when connection is being established
-- `"connected"`: Called when connection is established
-- `"disconnected"`: Called when connection is lost
-- `"closed"`: Called when connection is closed
-- `"failed"`: Called when connection fails
-- `"new"`: Called when a new connection is created
-
-```python
-@webrtc_connection.event_handler("connected")
-async def on_connected(connection):
-    print(f"WebRTC connection established")
-```
-
-</ResponseField>
-
-### SmallWebRTCTransport
-
-`SmallWebRTCTransport` is the main transport class that manages both input and output transports for WebRTC communication.
-
-```python
-SmallWebRTCTransport(
-    webrtc_connection: SmallWebRTCConnection,
-    params: TransportParams,
-    input_name: Optional[str] = None,
-    output_name: Optional[str] = None
-)
-```
-
-<ParamField path="webrtc_connection" type="SmallWebRTCConnection" required>
-  An instance of `SmallWebRTCConnection` that manages the WebRTC connection
-</ParamField>
-
-<ParamField path="params" type="TransportParams" required>
-  Configuration parameters for the transport
-  <Expandable title="TransportParams properties">
-    <ParamField path="audio_in_enabled" type="bool" default={false}>
-      Enable audio input from the WebRTC client
-    </ParamField>
-
-    <ParamField path="audio_in_passthrough" type="bool" default="False">
-      When enabled, incoming audio frames are pushed downstream
-    </ParamField>
-
-    <ParamField path="audio_out_enabled" type="bool" default={false}>
-      Enable audio output to the WebRTC client
-    </ParamField>
-
-    <ParamField path="audio_in_sample_rate" type="int" optional>
-      Sample rate for incoming audio (Hz)
-    </ParamField>
-
-    <ParamField path="audio_out_sample_rate" type="int" optional>
-      Sample rate for outgoing audio (Hz)
-    </ParamField>
-
-    <ParamField path="audio_in_channels" type="int" default={1}>
-      Number of audio input channels (1 for mono, 2 for stereo)
-    </ParamField>
-
-    <ParamField path="audio_out_channels" type="int" default={1}>
-      Number of audio output channels (1 for mono, 2 for stereo)
-    </ParamField>
-
-    <ParamField path="video_in_enabled" type="bool" default={false}>
-      Enable video input from the WebRTC client
-    </ParamField>
-
-    <ParamField path="video_out_enabled" type="bool" default={false}>
-      Enable video output to the WebRTC client
-    </ParamField>
-
-    <ParamField path="video_out_width" type="int" default={640}>
-      Width of outgoing video
-    </ParamField>
-
-    <ParamField path="video_out_height" type="int" default={480}>
-      Height of outgoing video
-    </ParamField>
-
-    <ParamField path="video_out_framerate" type="int" default={30}>
-      Framerate of outgoing video
-    </ParamField>
-
-    <ParamField path="vad_analyzer" type="VADAnalyzer" optional>
-      Custom VAD analyzer implementation
-    </ParamField>
-
-  </Expandable>
-</ParamField>
-
-<ParamField path="input_name" type="str" optional>
-  Optional name for the input transport
-</ParamField>
-
-<ParamField path="output_name" type="str" optional>
-  Optional name for the output transport
-</ParamField>
-
-#### Methods
-
-<ResponseField name="input" type="method">
-  Returns the input transport instance.
-
-```python
-input_transport = webrtc_transport.input()
-```
-
-</ResponseField>
-
-<ResponseField name="output" type="method">
-  Returns the output transport instance.
-
-```python
-output_transport = webrtc_transport.output()
-```
-
-</ResponseField>
-
-<ResponseField name="send_image" type="async method">
-  Send an image frame to the client.
-
-**Parameters:**
-
-- `frame`: The image frame to send (OutputImageRawFrame or SpriteFrame)
-
-```python
-await webrtc_transport.send_image(image_frame)
-```
-
-</ResponseField>
-
-<ResponseField name="send_audio" type="async method">
-  Send an audio frame to the client.
-
-**Parameters:**
-
-- `frame`: The audio frame to send (OutputAudioRawFrame)
-
-```python
-await webrtc_transport.send_audio(audio_frame)
-```
-
-</ResponseField>
-
-#### Event Handlers
-
-<ResponseField name="on_app_message" type="async callback">
-  Called when receiving application messages from the client.
-
-**Parameters:**
-
-- `message`: The received message
-
-```python
-@webrtc_transport.event_handler("on_app_message")
-async def on_app_message(message):
-    print(f"Received message: {message}")
-```
-
-</ResponseField>
-
-<ResponseField name="on_client_connected" type="async callback">
-  Called when a client successfully connects.
-
-**Parameters:**
-
-- `transport`: The SmallWebRTCTransport instance
-- `webrtc_connection`: The connection that was established
-
-```python
-@webrtc_transport.event_handler("on_client_connected")
-async def on_client_connected(transport, webrtc_connection):
-    print(f"Client connected")
-```
-
-</ResponseField>
-
-<ResponseField name="on_client_disconnected" type="async callback">
-  Called when a client disconnects.
-
-**Parameters:**
-
-- `transport`: The SmallWebRTCTransport instance
-- `webrtc_connection`: The connection that was disconnected
-
-```python
-@webrtc_transport.event_handler("on_client_disconnected")
-async def on_client_disconnected(transport, webrtc_connection):
-    print(f"Client disconnected")
-```
-
-</ResponseField>
-
-<ResponseField name="on_client_closed" type="async callback">
-  Called when a client connection is closed.
-
-**Parameters:**
-
-- `transport`: The SmallWebRTCTransport instance
-- `webrtc_connection`: The connection that was closed
-
-```python
-@webrtc_transport.event_handler("on_client_closed")
-async def on_client_closed(transport, webrtc_connection):
-    print(f"Client connection closed")
-```
-
-</ResponseField>
-
-## Basic Usage
-
-This basic usage example shows the transport specific parts of a bot.py file required to configure your bot:
+Next, implement your bot function that receives the WebRTC connection from the server and creates the transport:
 
 ```python
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
 
 async def run_bot(webrtc_connection):
-    # Create the WebRTC transport with the provided connection
+    """Run the Pipecat bot for a specific WebRTC connection."""
+    # Create transport using the connection from the server
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
-            audio_in_enabled=True,   # Accept audio from the client
-            audio_out_enabled=True,  # Send audio to the client
+            audio_in_enabled=True,   # Accept audio from client
+            audio_out_enabled=True,  # Send audio to client
             vad_analyzer=SileroVADAnalyzer(),
         ),
     )
 
-    # Set up your services and context
+    # Your services (STT, LLM, TTS, etc.)
+    # ...
 
-    # Create the pipeline
+    # Create pipeline
     pipeline = Pipeline([
         transport.input(),              # Receive audio from client
         stt,                            # Convert speech to text
@@ -440,29 +182,38 @@ async def run_bot(webrtc_connection):
         context_aggregator.assistant(), # Add assistant responses to context
     ])
 
-    # Register event handlers
+    # Handle connection events
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info("Client connected")
-        # Start the conversation when client connects
+        # Start conversation when client connects
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info("Client disconnected")
-
-    @transport.event_handler("on_client_closed")
-    async def on_client_closed(transport, client):
-        logger.info("Client closed")
         await task.cancel()
+
+    # Run the pipeline
+    # ...
 ```
 
-## How to connect with `SmallWebRTCTransport`
+### How It Works Together
 
-For a client/server connection, you have two options for how to connect the client to the server:
+1. **Client connects** to your server at `/api/offer` with WebRTC offer
+2. **Server creates** `SmallWebRTCConnection` and initializes it with the offer
+3. **Server starts** `run_bot()` in background with the connection
+4. **Bot creates** `SmallWebRTCTransport` using the connection
+5. **Media flows** directly between client and bot via WebRTC peer connection
 
-1. Use a Pipecat client SDK with the `SmallWebRTCTransport`. See the [Client SDK docs](/client/js/transports/small-webrtc) to get started.
-2. Using the WebRTC API directly. This is only recommended for advanced use cases where the Pipecat client SDKs don't have an available transport.
+This architecture gives you the benefits of peer-to-peer WebRTC (low latency, no media servers) while maintaining a simple server for connection management.
+
+## How to connect with SmallWebRTCTransport
+
+For client connections, you have two options:
+
+1. **Pipecat Client SDK** (Recommended): Use the [JavaScript SDK](/client/js/transports/small-webrtc) for easy integration
+2. **Custom WebRTC Client**: Implement WebRTC signaling manually for advanced use cases
+
+The server setup is shown in the [Usage Example](#usage-example) above.
 
 ## Examples
 
