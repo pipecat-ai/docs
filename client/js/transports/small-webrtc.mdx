@@ -7,54 +7,48 @@ description: "A lightweight WebRTC transport for peer-to-peer connections with P
 
 This transport is intended for lightweight implementations, particularly for local development and testing. It expects your Pipecat server to include the corresponding [`SmallWebRTCTransport` server-side](/server/services/transport/small-webrtc) implementation.
 
-<Warning>
-  `SmallWebRTCTransport` is best used for testing and development. For
-  production deployments with scale, consider using the
-  [DailyTransport](/client/js/transports/daily), as it has global,
-  low-latency infrastructure.
-</Warning>
-
 ## Usage
 
 ### Basic Setup
 
 ```javascript
-import { RTVIClient } from "@pipecat-ai/client-js";
+import { PipecatClient } from "@pipecat-ai/client-js";
 import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 
-const transport = new SmallWebRTCTransport();
-
-const rtviClient = new RTVIClient({
-  transport,
+const pcClient = new PipecatClient({
+  transport: new SmallWebRTCTransport({
+    // Optional configuration for the transport
+    iceServers: ["stun:stun.l.google.com:19302"],
+  }),
   enableCam: false, // Default camera off
   enableMic: true, // Default microphone on
   callbacks: {
     // Event handlers
   },
-  params: {
-    baseUrl: "http://localhost:7860",
-    endpoints: {
-      connect: "/api/offer",
-    },
-  },
 });
 
-await rtviClient.connect();
+await pcClient.connect({
+  endpoint: "https://your-server/connect",
+});
 ```
 
 ## API Reference
 
-### Constructor
+### Constructor Options
 
 ```typescript
-new SmallWebRTCTransport();
+interface SmallWebRTCTransportConstructorOptions {
+  iceServers?: RTCIceServer[];
+  waitForICEGathering?: boolean;
+  connectionUrl?: string;
+  audioCodec?: string;
+  videoCodec?: string;
+}
 ```
 
-The constructor does not take any parameters.
+#### Properties
 
-### Properties
-
-<ResponseField name="iceServers" type="string[]">
+<ParamField name="iceServers" type="string[]">
   Array of STUN/TURN server URLs for ICE connection establishment. Default is `["stun:stun.l.google.com:19302"]`.
 
 ```javascript
@@ -65,11 +59,77 @@ transport.iceServers = [
 ];
 ```
 
-</ResponseField>
+</ParamField>
+
+<ParamField name="waitForICEGathering" type="boolean" default="false">
+  If `true`, the transport will wait for ICE gathering to complete before being
+  considered `'connected'`.
+</ParamField>
+
+<ParamField name="connectionUrl" type="string">
+  URL of the WebRTC signaling server's offer endpoint. This endpoint may also be
+  provided as part of the `connect()` either directly or as the response from a
+  server-side endpoint you control. It should return an `answer` from your
+  corresponding Pipecat server's `SmallWebRTCConnection`.
+</ParamField>
+
+<ParamField name="audioCodec" type="string">
+  Preferred audio codec to use. If not specified, your browser default will be
+  used.
+</ParamField>
+
+<ParamField name="videoCodec" type="string">
+  Preferred video codec to use. If not specified, your browser default will be
+  used.
+</ParamField>
+
+### TransportConnectionParams
+
+```typescript
+export type SmallWebRTCTransportConnectionOptions = {
+  connectionUrl?: string;
+};
+```
+
+On `connect()`, the `SmallWebRTCTransport` optionally takes a set of connection parameters. This can be provided directly or via a connection endpoint passed to the `PipecatClient`'s connect method. If using an endpoint, your endpoint should return a JSON object matching the `SmallWebRTCTransportConnectionOptions` type, which currently expects a single `connectionUrl` property.
+
+<CodeGroup>
+```typescript client
+pcClient.connect({
+  connectionUrl: 'https://your-pipecat-webrtc-server'
+});
+// OR...
+pcClient.connect({
+  endpoint: 'https://your-server/api/offer',
+});
+```
+
+```python server
+# See
+# https://github.com/pipecat-ai/pipecat-examples/blob/main/p2p-webrtc/video-transform/server/server.py
+# for a complete example of how to implement the server-side endpoint.
+@app.post("/api/offer")
+async def offer(request: dict, background_tasks: BackgroundTasks):
+    pipecat_connection = SmallWebRTCConnection(ice_servers)
+    await pipecat_connection.initialize(sdp=request["sdp"], type=request["type"])
+
+    @pipecat_connection.event_handler("closed")
+    async def handle_disconnected(webrtc_connection: SmallWebRTCConnection):
+        logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
+        pcs_map.pop(webrtc_connection.pc_id, None)
+
+    background_tasks.add_task(run_bot, pipecat_connection)
+
+    answer = pipecat_connection.get_answer()
+
+    return answer
+```
+
+</CodeGroup>
 
 ### Methods
 
-Most methods have an equivalent in the RTVI client. The transport is designed to be used with the RTVI client, so in most cases you should use the RTVI client methods to interact with the transport, rather than calling these methods directly. This is especially true for `initialize()`, `connect()`, and `disconnect()`.
+For most operations, you will not interact with the transport directly. Most methods have an equivalent in the `PipecatClient` and should be called from the `PipecatClient`. However, there are a few transport-specific methods that you may need to call directly. When doing so, be sure to access your transport via the `transport` property of the `PipecatClient` instance.
 
 <ResponseField name="setAudioCodec" type="method">
   Sets the preferred audio codec.
@@ -89,48 +149,9 @@ transport.setVideoCodec("VP8");
 
 </ResponseField>
 
-### States
-
-The transport can be in one of these states:
-
-```typescript
-type TransportState =
-  | "initializing"
-  | "initialized"
-  | "connecting"
-  | "connected"
-  | "ready"
-  | "disconnecting"
-  | "disconnected"
-  | "error";
-```
-
 ## Events
 
-The transport implements the various [RTVI event handlers](https://docs.pipecat.ai/client/js/api-reference/callbacks). These events will fire when used with an RTVIClient.
-
-Key callback events:
-
-<ResponseField name="onConnected" type="callback">
-  Called when connection to the server-side transport is established and it is ready to communicate across the data channel and stream media.
-</ResponseField>
-
-<ResponseField name="onBotReady" type="callback">
-  The bot has been instantiated, its pipeline is configured, and it is receiving
-  user media and interactions.
-</ResponseField>
-
-<ResponseField name="onDisconnected" type="callback">
-  Called when connection to the server is lost.
-</ResponseField>
-
-<ResponseField name="onTransportStateChanged" type="callback">
-  Called when the transport state changes.
-</ResponseField>
-
-<ResponseField name="onTrackStarted" type="callback">
-  Called when a new track is received from the server.
-</ResponseField>
+The transport implements the various [`PipecatClient` event handlers](https://docs.pipecat.ai/client/js/api-reference/callbacks).
 
 ## Connection Process
 
@@ -156,7 +177,7 @@ The transport includes automatic reconnection logic:
     horizontal
     title="Video Transform Demo"
     icon="video"
-    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/p2p-webrtc/video-transform"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/p2p-webrtc/video-transform"
   >
     Real-time video transformation example
   </Card>

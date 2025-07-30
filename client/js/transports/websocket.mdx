@@ -1,0 +1,229 @@
+---
+title: "WebSocketTransport"
+description: "A lightweight transport for WebSocket based connections with Pipecat"
+---
+
+`WebSocketTransport` enables a purely WebSocket based connection between clients and your Pipecat application. It implements bidirectional audio and video streaming using a WebSocket for real-time communication.
+
+This transport is intended for lightweight implementations, particularly for local development and testing. It expects your Pipecat server to include the corresponding [`WebSocketTransport` server-side](/server/services/transport/websocket-server) implementation.
+
+<Warning>
+The `WebSocketTransport` is best suited for server-server applications and prototyping client/server apps.
+
+For client/server production applications, we strongly recommend using a WebRTC-based transport for robust network and media handling. For more on WebRTC vs. Websocket communication, check out [this article](https://voiceaiandvoiceagents.com/#websockets-webrtc).
+
+</Warning>
+
+## Usage
+
+### Basic Setup
+
+```javascript
+import { PipecatClient } from "@pipecat-ai/client-js";
+import {
+  WebSocketTransport,
+  ProtobufFrameSerializer,
+} from "@pipecat-ai/websocket-transport";
+
+const pcClient = new PipecatClient({
+  transport: new WebSocketTransport({
+    serializer: new ProtobufFrameSerializer(),
+    recorderSampleRate: 8000,
+    playerSampleRate: 8000,
+  }),
+  enableCam: false, // Default camera off
+  enableMic: true, // Default microphone on
+  callbacks: {
+    // Event handlers
+  },
+});
+
+await pcClient.connect({
+  endpoint: "https://your-server/connect",
+});
+```
+
+## API Reference
+
+### Constructor Options
+
+```typescript
+type WebSocketTransportOptions = {
+  ws_url?: string;
+  serializer?: WebSocketSerializer;
+  recorderSampleRate?: number;
+  playerSampleRate?: number;
+};
+```
+
+#### Properties
+
+<ParamField name="ws_url" type="string">
+  URL of the WebSocket server. This is the endpoint your client will connect to
+  for WebSocket communication.
+</ParamField>
+
+<ParamField
+  name="serializer"
+  type="WebSocketSerializer"
+  default="ProtobufFrameSerializer"
+>
+  The serializer to use for encoding/decoding messages sent over the WebSocket
+  connection. The websocket-transport package provides two serializer options: -
+  `ProtobufFrameSerializer`: Uses Protocol Buffers for serialization. -
+  `TwilioSerializer`: Uses Twilio's serialization format. The main purpose of
+  the TwilioSerializer is to allow testing the bots built to work with Twilio
+  without having to make phone calls.
+</ParamField>
+
+<ParamField name="recorderSampleRate" type="number">
+  Sample rate for which to encode the audio input. Default is `16000`.
+</ParamField>
+
+<ParamField name="playerSampleRate" type="number">
+  Sample rate for which to decode the incoming audio for output. Default is
+  `24000`.
+</ParamField>
+
+### TransportConnectionParams
+
+The `WebSocketTransport` takes the same options as the constructor; `WebSocketTransportOptions`. Anything provided here will override the defaults set in the constructor. The `ws_url` is required to establish a connection.
+
+<CodeGroup>
+```typescript client
+pcClient.connect({
+  ws_url: 'http://localhost:7860/ws'
+});
+// OR...
+pcClient.connect({
+  endpoint: 'https://your-server/connect', // returns { ws_url }
+});
+```
+
+```python server
+# See
+# https://github.com/pipecat-ai/pipecat-examples/blob/main/websocket/server/server.py
+# for a complete example of how to implement the server-side endpoint.
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print("WebSocket connection accepted")
+    try:
+        await run_bot(websocket)
+    except Exception as e:
+        print(f"Exception in run_bot: {e}")
+
+
+@app.post("/connect")
+async def bot_connect(request: Request) -> Dict[Any, Any]:
+    ws_url = "ws://localhost:7860/ws"
+    return {"ws_url": ws_url}
+```
+
+```python bot
+# See
+# https://github.com/pipecat-ai/pipecat-examples/blob/main/websocket/server/bot_websocket_server.py
+# for a complete example of a bot script using the WebSocketTransport.
+from pipecat.serializers.protobuf import ProtobufFrameSerializer
+from pipecat.transports.network.websocket_server import (
+    WebsocketServerParams,
+    WebsocketServerTransport,
+)
+
+async def run_bot(websocket_client):
+    ws_transport = FastAPIWebsocketTransport(
+        websocket=websocket_client,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            vad_analyzer=SileroVADAnalyzer(),
+            serializer=ProtobufFrameSerializer(),
+        ),
+    )
+
+    llm = ... # Initialize your LLM here, e.g., OpenAI, HuggingFace, etc.
+    context_aggregator = llm.create_context_aggregator(context)
+
+    # RTVI events for Pipecat client UI
+    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
+    pipeline = Pipeline(
+        [
+            ws_transport.input(),
+            context_aggregator.user(),
+            rtvi,
+            llm,  # LLM
+            ws_transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params,
+        observers=[RTVIObserver(rtvi)],
+    )
+    ...
+```
+
+</CodeGroup>
+
+### Methods
+
+For most operations, you will not interact with the transport directly. Most methods have an equivalent in the `PipecatClient` and should be called from the `PipecatClient`. However, there is one transport-specific methods that you may need to call directly. When doing so, be sure to access your transport via the `transport` property of the `PipecatClient` instance.
+
+<ResponseField name="handleUserAudioStream" type="method">
+  If implementing your own serializer, you will need to pass the user audio
+  stream to the transport via this method, which takes an `ArrayBuffer` of audio
+  data.
+
+```javascript
+transport.handleUserAudioStream(chunk.data);
+```
+
+</ResponseField>
+## Events
+
+The transport implements the various [`PipecatClient` event handlers](https://docs.pipecat.ai/client/js/api-reference/callbacks).
+
+## Reconnection Handling
+
+The WebSocketTransport does provide reconnection handling. If the WebSocket connection is lost, it will attempt to reconnect twice. If all reconnection attempts fail, the transport will gracefully disconnect.
+
+## More Information
+
+<CardGroup cols={2}>
+  <Card
+    horizontal
+    title="WebSocket Demo"
+    icon="video"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/websocket"
+  >
+    Basic Agent example using a WebSocket transport
+  </Card>
+  <Card
+    horizontal
+    title="Twilio Demo"
+    icon="video"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot"
+  >
+    Example using a WebSocket transport to simulate a Twilio connection to a bot
+  </Card>
+  <Card
+    horizontal
+    title="Source"
+    icon="github"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/transports/websocket-transport"
+  >
+    `WebSocketTransport`
+  </Card>
+  <Card
+    horizontal
+    title="Package"
+    icon="browser"
+    href="https://www.npmjs.com/package/@pipecat-ai/websocket-transport"
+  >
+    `@pipecat-ai/websocket-transport`
+  </Card>
+</CardGroup>
