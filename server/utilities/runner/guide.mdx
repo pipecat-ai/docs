@@ -1,0 +1,367 @@
+---
+title: "Development Runner"
+description: "Unified runner for building voice AI bots with Daily, WebRTC, and telephony transports"
+---
+
+## Overview
+
+The Pipecat development runner provides a unified way to run voice AI bots across multiple transport types. It handles infrastructure setup - creating Daily rooms, managing WebRTC connections, and routing telephony calls.
+
+## Installation
+
+```bash
+pip install pipecat-ai[runner]
+```
+
+## What is a Runner?
+
+A runner in Pipecat refers to a "bot runner", an HTTP service that provides a gateway for spawning bots on-demand. It's the component that enables your bot to run by providing it with server infrastructure and connection details like rooms and tokens.
+
+A bot runner typically creates transport sessions (like Daily WebRTC rooms), generates authentication tokens for both bots and users, spawns new bot processes when users request sessions, and manages bot lifecycle and cleanup. Think of it as the bridge between incoming user connections and your bot logic.
+
+## How the Development Runner Works
+
+The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. When you start the runner, it creates the necessary web endpoints and infrastructure for your chosen transport type.
+
+- **WebRTC connections**: It serves a built-in web interface where users can connect directly as well as an endpoint to create new WebRTC sessions
+- **Daily integration**: It provides endpoints that create new rooms and tokens and redirect users to join them
+- **Telephony providers**: For Twilio, it sets up webhook endpoints that handle incoming calls and establish WebSocket connections for audio streaming
+
+The runner automatically detects which transport type you're using and configures the appropriate infrastructure. It then discovers your bot function and spawns new instances whenever users connect. This means you can focus on writing your bot logic while the runner handles all the server infrastructure, connection management, and transport-specific details.
+
+Your bot code receives runner arguments that contain everything it needs, including Daily room URLs and tokens, WebRTC connections, or WebSocket streams for telephony. The runner abstracts away the complexity of managing these different connection types, providing a unified interface for building bots that work across multiple platforms.
+
+## Pipecat Cloud Ready
+
+The bot runner is designed to be cloud-ready, meaning that you can run the same bot code locally and deployed to Pipecat Cloud without any modifications. It automatically handles the differences in transport setup, providing you with the flexibility to test locally using a free transport, like SmallWebRTCTransport, but run in production using Daily or telephony transports.
+
+## Building with the Runner
+
+Now let's build a practical example to see how this works. The key insight is that your bot code is structured into two parts: the core bot logic that works with any transport, and the entry point that creates the appropriate transport based on the runner arguments.
+
+Here's the basic structure:
+
+```python
+# Your imports
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.runner.types import RunnerArguments
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
+
+async def run_bot(transport: BaseTransport):
+    """Your core bot logic here:
+    - Define services (STT, TTS, LLM)
+    - Initialize messages and context
+    - Create the pipeline
+    - Add event handlers
+    - Run the pipeline
+    """
+
+    # Your bot logic goes here
+    # Define STT, LLM, TTS...
+    # ...
+    # Run your pipeline
+    await runner.run(task)
+
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point compatible for local dev and Pipecat Cloud."""
+    transport = SmallWebRTCTransport(
+        params=TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+        webrtc_connection=runner_args.webrtc_connection,
+    )
+
+    await run_bot(transport)
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+    main()
+```
+
+The `run_bot()` function contains your actual bot logic and is transport-agnostic. The `bot()` function is the entry point that the runner calls - it creates the appropriate transport and passes it to your bot logic. This separation allows the same bot code to work across different transports.
+
+When you run this with `python bot.py`, the development runner starts a web server and opens a browser interface at `http://localhost:7860/client`. Each time someone connects, the runner calls your `bot()` function with WebRTC runner arguments.
+
+## Supporting Multiple Transports
+
+To make your bot work across different platforms, you can detect the transport type from the runner arguments and create the appropriate transport. Here's how to support both Daily and WebRTC:
+
+```python
+from pipecat.runner.types import DailyRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
+
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point compatible with Pipecat Cloud."""
+
+    transport = None
+
+    if isinstance(runner_args, DailyRunnerArguments):
+        from pipecat.transports.services.daily import DailyParams, DailyTransport
+
+        transport = DailyTransport(
+            runner_args.room_url,
+            runner_args.token,
+            "Pipecat Bot",
+            params=DailyParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                vad_analyzer=SileroVADAnalyzer(),
+            ),
+        )
+
+    elif isinstance(runner_args, SmallWebRTCRunnerArguments):
+        from pipecat.transports.base_transport import TransportParams
+        from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
+
+        transport = SmallWebRTCTransport(
+            params=TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                vad_analyzer=SileroVADAnalyzer(),
+            ),
+            webrtc_connection=runner_args.webrtc_connection,
+        )
+
+    else:
+        logger.error(f"Unsupported runner arguments type: {type(runner_args)}")
+        return
+
+    if transport is None:
+        logger.error("Failed to create transport")
+        return
+
+    await run_bot(transport)
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+    main()
+```
+
+Now you can run your bot with different transports:
+
+```bash
+python bot.py -t webrtc  # Uses SmallWebRTCRunnerArguments
+python bot.py -t daily   # Uses DailyRunnerArguments
+```
+
+### Understanding Runner Arguments
+
+Runner arguments are how the runner communicates transport-specific information to your bot. The runner determines which transport to use based on the command-line arguments, then creates the appropriate runner arguments:
+
+- **`DailyRunnerArguments`**: Contains `room_url` and `token` for joining Daily rooms
+- **`SmallWebRTCRunnerArguments`**: Contains `webrtc_connection` for local WebRTC sessions
+- **`WebSocketRunnerArguments`**: Contains `websocket` for telephony connections
+
+The runner handles all the complex setup - creating Daily rooms, generating tokens, establishing WebSocket connections - and provides your bot with everything it needs through these runner arguments.
+
+Notice how we use lazy imports (`from pipecat.transports.services.daily import ...`) inside the conditional blocks. This ensures that transport-specific dependencies are only required when that transport is actually used, making your bot more portable.
+
+<Info>
+  `RunnerArguments` is the base class for all runner arguments. It provides a
+  common interface for the runner to pass transport-specific information to your
+  bot.
+</Info>
+
+## Environment Detection
+
+When building bots that work both locally and in production, you often need to detect the execution environment to enable different features. The development runner sets the `ENV` environment variable to help with this:
+
+```python
+import os
+
+async def bot(runner_args: RunnerArguments):
+    # Check if running in local development environment
+    is_local = os.environ.get("ENV") == "local"
+
+    # Enable production features only when deployed
+    if not is_local:
+        from pipecat.audio.filters.krisp_filter import KrispFilter
+        krisp_filter = KrispFilter()
+    else:
+        krisp_filter = None
+
+    transport = DailyTransport(
+        runner_args.room_url,
+        runner_args.token,
+        "Pipecat Bot",
+        params=DailyParams(
+            audio_in_filter=krisp_filter,  # Krisp filter only in production
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+```
+
+### Environment Values
+
+The development runner automatically sets environment variables based on how your bot is running:
+
+- **Local development**: `ENV=local` (set by the development runner)
+- **Production/Cloud deployment**: `ENV` is not set or has a different value
+
+This allows you to easily customize behavior between development and production environments:
+
+## All Supported Transports
+
+The development runner supports five transport types, each designed for different use cases:
+
+### WebRTC (`-t webrtc`)
+
+Local WebRTC connections with a built-in browser interface. Perfect for development and testing.
+
+```bash
+python bot.py -t webrtc
+# Opens http://localhost:7860/client
+
+# ESP32 compatibility mode
+python bot.py -t webrtc --esp32 --host 192.168.1.100
+```
+
+**Runner Arguments**: `SmallWebRTCRunnerArguments`
+
+- `webrtc_connection`: Pre-configured WebRTC peer connection
+
+### Daily (`-t daily`)
+
+Integration with Daily for production video conferencing with rooms and participant management.
+
+```bash
+python bot.py -t daily
+# Opens http://localhost:7860 with room creation interface
+
+# Direct connection for testing (bypasses web server)
+python bot.py -d
+```
+
+**Runner Arguments**: `DailyRunnerArguments`
+
+- `room_url`: Daily room URL to join
+- `token`: Authentication token for the room
+- `body`: Additional request data
+
+### Telephony (`-t twilio|telnyx|plivo`)
+
+Phone call integration through telephony providers. Requires a public webhook endpoint.
+
+```bash
+python bot.py -t twilio -x yourproxy.ngrok.io
+python bot.py -t telnyx -x yourproxy.ngrok.io
+python bot.py -t plivo -x yourproxy.ngrok.io
+```
+
+**Runner Arguments**: `WebSocketRunnerArguments`
+
+- `websocket`: WebSocket connection for audio streaming
+
+The runner automatically detects the telephony provider (Twilio, Telnyx, or Plivo) from the WebSocket messages and configures the appropriate serializers and audio settings.
+
+## Command Line Options
+
+The development runner accepts several command-line arguments to customize its behavior:
+
+```bash
+python bot.py [OPTIONS]
+
+Options:
+  --host TEXT          Server host address (default: localhost)
+  --port INTEGER       Server port (default: 7860)
+  -t, --transport      Transport type: daily, webrtc, twilio, telnyx, plivo (default: webrtc)
+  -x, --proxy TEXT     Public proxy hostname for telephony webhooks (required for telephony)
+  --esp32              Enable SDP munging for ESP32 WebRTC compatibility
+  -d, --direct         Connect directly to Daily room for testing (automatically sets transport to daily)
+  -v, --verbose        Increase logging verbosity
+```
+
+### Key Arguments
+
+**`--transport` / `-t`**: Determines which transport infrastructure to set up
+
+- `webrtc`: Local WebRTC with browser interface
+- `daily`: Daily.co integration with room management
+- `twilio`, `telnyx`, `plivo`: Telephony provider integration
+
+**`--proxy` / `-x`**: Required for telephony transports. This should be a publicly accessible hostname (like `yourbot.ngrok.io`) that can receive webhooks from telephony providers.
+
+**`--direct` / `-d`**: Special mode for Daily that bypasses the web server and connects your bot directly to a Daily room. Useful for quick testing but not recommended for production use.
+
+**`--esp32`**: Enables SDP (Session Description Protocol) modifications needed for ESP32 WebRTC compatibility. Must be used with a specific IP address via `--host`.
+
+### Environment Variables
+
+Different transports require different environment variables:
+
+**Daily**:
+
+- `DAILY_API_KEY`: Daily API key for creating rooms and tokens
+- `DAILY_SAMPLE_ROOM_URL` (optional): Existing room URL to use
+
+**Telephony**:
+
+- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`: Twilio credentials
+- `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`: Plivo credentials
+- `TELNYX_API_KEY`: Telnyx API key
+
+The runner automatically uses these environment variables when creating transport sessions and authentication tokens.
+
+## Simplifying with the Transport Utility
+
+While the manual approach gives you full control, the `create_transport` utility provides a much cleaner way to handle multiple transports. Instead of writing conditional logic for each transport type, you define transport configurations upfront and let the utility handle the selection:
+
+```python
+from pipecat.runner.utils import create_transport
+
+# Define transport configurations using factory functions
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+        # add_wav_header and serializer handled automatically
+    ),
+}
+
+async def bot(runner_args):
+    """Simplified bot entry point using the transport utility."""
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport)
+```
+
+Now your bot supports three transport types with just two lines of code in the `bot()` function.
+
+## Quick Reference
+
+| Transport    | Command                                             | Access                       |
+| ------------ | --------------------------------------------------- | ---------------------------- |
+| WebRTC       | `python bot.py`                                     | http://localhost:7860/client |
+| Daily        | `python bot.py -t daily`                            | http://localhost:7860        |
+| Daily Direct | `python bot.py -d`                                  | Direct connection            |
+| Twilio       | `python bot.py -t twilio -x proxy.ngrok.io`         | Phone calls                  |
+| Telnyx       | `python bot.py -t telnyx -x proxy.ngrok.io`         | Phone calls                  |
+| Plivo        | `python bot.py -t plivo -x proxy.ngrok.io`          | Phone calls                  |
+| ESP32 WebRTC | `python bot.py -t webrtc --esp32 --host <ESP32_IP>` | ESP32 WebRTC connection      |
+
+## Examples
+
+For practical examples of using the development runner with different transports, check out the following:
+
+<Card
+  title="Runner Examples"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/runner-examples"
+>
+  Explore the examples for different ways to use the development runner with
+  various transports.
+</Card>
