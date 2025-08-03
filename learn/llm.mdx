@@ -1,0 +1,206 @@
+---
+title: "LLM Inference"
+description: "Learn how to configure language models to generate intelligent responses in your voice AI pipeline"
+---
+
+**LLM services** are responsible for chat completions and tool calling based on the provided context (conversation history). The LLM responds by streaming tokens via `LLMTextFrame`s, which are used by subsequent processors to create audio output for the bot.
+
+## Pipeline Placement
+
+The LLM instance should be placed after the user context aggregator and before any downstream services that depend on the LLM's output stream:
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,                           # Creates TranscriptionFrames
+    context_aggregator.user(),     # Processes user context → creates OpenAILLMContextFrame
+    llm,                           # Processes context → streams LLMTextFrames
+    tts,                           # Processes LLMTextFrames → creates TTSAudioRawFrames
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+**Frame flow:**
+
+- **Input**: Receives `OpenAILLMContextFrame` containing conversation history
+- **Processing**:
+  - Analyzes context and generates streaming response
+  - Handles function calls if tools are available
+  - Tracks token usage for metrics
+- **Output**:
+  - Denotes the start of the streaming response by pushing an `LLMFullResponseStartFrame`
+  - Streams `LLMTextFrame`s containing response tokens to downstream processors (enables real-time TTS processing)
+  - Ends with an `LLMFullResponseEndFrame` to mark the completion of the response
+- **Function calls:**
+  - `FunctionCallsStartedFrame`: Indicates function execution beginning
+  - `FunctionCallInProgressFrame`: Indicates a function is currently executing
+  - `FunctionCallResultFrame`: Contains results from executed functions
+
+## Supported LLM Services
+
+Pipecat supports a wide range of LLM providers to fit different needs, performance requirements, and budgets:
+
+### Text-Based LLMs
+
+Most LLM services are built on the OpenAI chat completion specification for compatibility:
+
+<CardGroup cols={2}>
+  <Card title="OpenAI" icon="openai">
+    GPT models with the original chat completion API
+  </Card>
+  <Card title="Anthropic" icon="anthropic">
+    Claude models with advanced reasoning capabilities
+  </Card>
+  <Card title="Google Gemini" icon="google">
+    Multimodal capabilities with competitive performance
+  </Card>
+  <Card title="AWS Bedrock" icon="aws">
+    Enterprise-grade hosting for various foundation models
+  </Card>
+</CardGroup>
+
+**Compatible APIs**: Any OpenAI-spec compatible service can be used via the `base_url` parameter.
+
+### Speech-to-Speech Models
+
+For lower latency, some providers offer direct speech-to-speech models:
+
+- **OpenAI Realtime**: Direct speech input/output with GPT models
+- **Gemini Live**: Real-time speech conversations with Gemini
+- **AWS Nova Sonic**: Speech-optimized models on Bedrock
+
+For a complete list of supported LLM services, see the Supported Services page:
+
+<Card
+  title="Supported LLM Services"
+  icon="list"
+  href="/server/services/supported-services#large-language-models"
+>
+  View the complete list of supported language model providers
+</Card>
+
+## LLM Service Architecture
+
+### BaseOpenAILLMService
+
+Many LLM services use the OpenAI chat completion specification. Pipecat provides a `BaseOpenAILLMService` that most providers extend, enabling easy switching between compatible services:
+
+```python
+from pipecat.services.openai.llm import OpenAILLMService
+
+# Native OpenAI
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+
+# OpenAI-compatible service via base_url
+llm = OpenAILLMService(
+    api_key=os.getenv("OTHER_API_KEY"),
+    base_url="https://api.other-provider.com/v1"  # Custom endpoint
+)
+```
+
+This architecture allows you to quickly plug in different LLM services without changing your pipeline code.
+
+## LLM Configuration
+
+### Service-Specific Configuration
+
+Each LLM service has its own configuration options. For example, configuring OpenAI with various parameters:
+
+```python
+from pipecat.services.openai.base_llm import BaseOpenAILLMService
+from pipecat.services.openai.llm import OpenAILLMService
+
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    model="gpt-4",
+    params=BaseOpenAILLMService.InputParams(
+        temperature=0.7,            # Response creativity (0.0-2.0)
+        max_completion_tokens=150,  # Maximum response length
+        frequency_penalty=0.5,      # Reduce repetition (0.0-2.0)
+        presence_penalty=0.5,       # Encourage topic diversity (0.0-2.0)
+    ),
+)
+```
+
+For detailed configuration options specific to each provider:
+
+<Card
+  title="Individual LLM Services"
+  icon="settings"
+  href="/server/services/supported-services#large-language-models"
+>
+  Explore configuration options for each supported LLM provider
+</Card>
+
+### Base Class Configuration
+
+All LLM services inherit from the `LLMService` base class with shared configuration options:
+
+```python
+llm = YourLLMService(
+    # Service-specific options...
+    run_in_parallel=True,  # Whether function calls run in parallel (default: True)
+)
+```
+
+**Key options:**
+
+- **`run_in_parallel`**: Controls whether function calls execute simultaneously or sequentially
+  - `True` (default): Faster execution when multiple functions are called
+  - `False`: Sequential execution for dependent function calls
+
+## Event Handlers
+
+LLM services provide event handlers for monitoring completion lifecycle:
+
+```python
+@llm.event_handler("on_completion_timeout")
+async def on_completion_timeout(service):
+    logger.warning("LLM completion timed out")
+    # Handle timeout (retry, fallback, etc.)
+
+@llm.event_handler("on_function_calls_started")
+async def on_function_calls_started(service, function_calls):
+    logger.info(f"Starting {len(function_calls)} function calls")
+    # Optionally notify user that bot is "thinking"
+    await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
+```
+
+**Available events:**
+
+- **`on_completion_timeout`**: Triggered when LLM requests timeout
+- **`on_function_calls_started`**: Triggered when function calls are initiated
+
+These handlers enable you to provide user feedback and implement error recovery strategies.
+
+## Function Calling
+
+LLMs can call external functions to access real-time data and perform actions beyond their training data. This enables capabilities like checking weather, querying databases, or controlling external APIs.
+
+Function calls and their results are automatically stored in the conversation context by the context aggregator.
+
+<Card title="Function Calling" icon="code" href="/learn/function-calling">
+  Learn how to enable LLMs to interact with external services and APIs
+</Card>
+
+## Key Takeaways
+
+- **Pipeline placement matters** - LLM goes after user context, before TTS
+- **Token streaming enables real-time responses** - no waiting for complete generation
+- **OpenAI compatibility** enables easy provider switching
+- **Function calling extends capabilities** beyond training data
+- **Configuration affects behavior** - tune temperature, penalties, and limits
+- **Services are modular** - swap providers without changing pipeline code
+
+## What's Next
+
+Now that you understand LLM configuration, let's explore how function calling enables your bot to interact with external services and real-time data.
+
+<Card
+  title="Function Calling"
+  icon="arrow-right"
+  href="/learn/function-calling"
+>
+  Learn how to enable LLMs to interact with external services and APIs
+</Card>
