@@ -1,0 +1,240 @@
+---
+title: "Session Initialization"
+description: "Learn how to set up connections between users and your Pipecat voice AI bot"
+---
+
+Before your voice AI bot can start processing audio and generating responses, you need to establish a connection between the user and your bot. This process is called **session initialization** - it's how users and bots find each other and establish a communication channel for real-time audio exchange.
+
+## Understanding the Architecture
+
+Session initialization involves multiple components working together:
+
+- **Runner**: A FastAPI server that handles incoming connection requests and manages session setup
+- **Pipecat Bot**: Your voice AI application running as a separate server-side service
+- **Client Application**: The user-facing app (web browser, mobile app, etc.)
+
+The runner acts as the coordinator, setting up the necessary resources and starting bot instances, while the Pipecat bot handles the actual voice AI processing.
+
+## Development Runner
+
+For most development and many production use cases, Pipecat provides a **development runner** that handles all the session initialization complexity for you. Instead of building FastAPI servers and managing WebRTC connections yourself, you focus on your bot logic while the runner handles the infrastructure.
+
+### Using the Development Runner
+
+Your bot needs a single entry point function that the runner will call:
+
+```python
+from pipecat.runner.types import RunnerArguments
+
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point called by the development runner."""
+
+    # Create your transport based on the runner arguments
+    transport = SmallWebRTCTransport(
+        params=TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+        webrtc_connection=runner_args.webrtc_connection,
+    )
+
+    # Run your bot logic
+    await run_bot(transport)
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+    main()
+```
+
+Then start your bot with different connection types:
+
+```bash
+# P2P WebRTC (opens browser interface)
+python bot.py -t webrtc
+
+# Daily room-based WebRTC
+python bot.py -t daily
+
+# Telephony (requires ngrok or similar)
+python bot.py -t twilio -x your_domain.ngrok.io
+```
+
+where `-t` specifies the transport type (e.g., `webrtc`, `daily`, `twilio`) and `-x` is the optional proxy domain for telephony.
+
+The development runner automatically:
+
+- Creates the FastAPI server
+- Sets up the appropriate endpoints
+- Handles connection management
+- Starts your bot instances
+- Provides a web interface (for WebRTC)
+
+<Tip>
+  Learn more about building with the development runner in the [runner
+  guide](/server/utilities/runner/guide).
+</Tip>
+
+## Connection Types Under the Hood
+
+While the development runner handles the complexity, understanding the three connection patterns helps you choose the right approach and debug issues:
+
+### 1. P2P WebRTC Connections
+
+**What happens:**
+
+1. Runner serves a web interface at `http://localhost:7860/client`
+2. When you open the page and connect, browser creates a WebRTC offer
+3. Runner receives the offer, establishes connection, starts your bot
+4. Browser and bot communicate directly via WebRTC
+
+**When to use:** Direct client connections, embedded applications, local development
+
+### 2. Room-Based WebRTC (Daily)
+
+**What happens:**
+
+<Steps>
+  <Step title="Room Request">
+    User visits the client application and clicks to start a session
+  </Step>
+  <Step title="Room Creation">
+    Runner calls Daily's API to create a room and tokens using
+    `pipecat.runner.daily.configure()`
+  </Step>
+  <Step title="Parallel Join">
+    Both user's browser and your bot join the same Daily room
+  </Step>
+  <Step title="Media Handshake">
+    Once media streams are established, browser sends `client_ready` message
+  </Step>
+  <Step title="Bot Activation">
+    Your bot receives the event and starts the conversation
+  </Step>
+</Steps>
+
+**When to use:** Video calls, group sessions, production deployments
+
+<Note>
+  Room-based WebRTC can also be used for SIP or PSTN connections, which require
+  different connection patterns. Refer to the [telephony
+  guide](/guides/telephony/overview) for details.
+</Note>
+
+### 3. WebSocket Connections (Telephony)
+
+**What happens:**
+
+1. Telephony provider (Twilio, etc.) receives a phone call
+2. Provider connects to your runner's webhook endpoint
+3. Runner accepts WebSocket connection and parses telephony-specific messages
+4. Your bot starts immediately with the parsed connection data
+
+**When to use:** Phone bots, telephony integrations
+
+## Starting Conversations
+
+How and when your bot begins talking depends on the connection type:
+
+### Immediate Start (P2P WebRTC, WebSocket)
+
+These connections are ready immediately, so you can start talking right after connection:
+
+```python
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    logger.info("Client connected - starting conversation")
+    messages.append({
+        "role": "system",
+        "content": "Say hello and introduce yourself."
+    })
+    await task.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+### Handshake Required (Client/Server Room-based WebRTC)
+
+For client/server applications using room-based WebRTC, a handshake ensures both sides are ready and the client won't miss the opening message:
+
+```python
+@rtvi.event_handler("on_client_ready")
+async def on_client_ready(rtvi):
+    await rtvi.set_bot_ready()  # Confirm readiness to client
+    # Start the conversation
+    await task.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+<Important>
+  For client/server room-based connections, waiting for `on_client_ready` is
+  crucial - starting too early can cause the client to miss part of the initial
+  message.
+</Important>
+
+## Process Isolation
+
+Each session runs its own dedicated bot instance for:
+
+- **Resource Management**: Dedicated CPU and memory per session
+- **Error Isolation**: One session crash doesn't affect others
+- **Clean Cleanup**: Resources automatically freed when sessions end
+
+The development runner handles this process management automatically.
+
+## Custom Runners: When You Need More Control
+
+The development runner works for most cases, but sometimes you need custom behavior - specific authentication, custom endpoints, or integration with existing systems. For these cases, you can create your own FastAPI runner.
+
+The development runner source code ([available on GitHub](https://github.com/pipecat-ai/pipecat/blob/main/src/pipecat/runner/run.py)) provides excellent examples for:
+
+**Daily Integration Example:**
+
+```python
+from pipecat.runner.daily import configure
+
+@app.post("/start")
+async def start_bot(background_tasks: BackgroundTasks):
+    async with aiohttp.ClientSession() as session:
+        room_url, token = await configure(session)
+
+        # Start bot instance
+        background_tasks.add_task(run_bot, room_url, token)
+
+        return {"room_url": room_url, "token": token}
+```
+
+**WebSocket Telephony Example:**
+
+```python
+from pipecat.runner.utils import parse_telephony_websocket
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    # Parse provider-specific messages
+    transport_type, call_data = await parse_telephony_websocket(websocket)
+
+    # Start bot with parsed data
+    await run_telephony_bot(websocket, transport_type, call_data)
+```
+
+<Tip>
+  Refer to the development runner source code to understand these patterns
+  before building custom runners. It handles many edge cases and provides
+  battle-tested implementations.
+</Tip>
+
+## Key Takeaways
+
+- **Start with the development runner** for fastest development and learning
+- **Understand connection types** to choose the right approach for your use case
+- **Handle startup timing correctly** - immediate start vs. handshake patterns matter
+- **Plan for process isolation** - one bot instance per session is the recommended pattern
+- **Reference the source code** when building custom runners for production
+
+## What's Next
+
+Now that you understand session initialization, let's explore the different transport options and how to configure them for your specific needs.
+
+<Card title="Pipeline" icon="arrow-right" href="/learn/pipeline">
+  Learn about the Pipecat Pipeline and how it can be configured.
+</Card>
