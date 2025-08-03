@@ -1,0 +1,264 @@
+---
+title: "Speech to Text"
+description: "Learn how to configure speech recognition to convert user audio into text in your Pipecat pipeline"
+---
+
+**Speech to Text (STT)** services are responsible for converting user audio into text transcriptions. They receive audio input from users and provide real-time transcriptions that your bot can process and respond to.
+
+## Pipeline Placement
+
+STT processors must be positioned correctly in your pipeline to receive and process audio frames:
+
+```python
+pipeline = Pipeline([
+    transport.input(),             # Creates InputAudioRawFrames
+    stt,                           # Processes audio → creates TranscriptionFrames
+    context_aggregator.user(),     # Uses transcriptions for context
+    llm,
+    tts,
+    transport.output(),
+])
+```
+
+**Placement requirements:**
+
+- **After `transport.input()`**: STT needs `InputAudioRawFrame`s from the transport
+- **Before context processing**: Transcriptions must be available for context aggregation
+- **Before LLM processing**: Text must be ready for language model input
+
+## STT Service Types
+
+Pipecat provides two types of STT services based on how they process audio:
+
+### 1. STTService (Streaming)
+
+**How it works:**
+
+- Establishes a WebSocket connection to the STT provider
+- Continuously streams audio for real-time transcription
+- Lower latency due to persistent connection
+
+### 2. SegmentedSTTService (HTTP-based)
+
+**How it works:**
+
+- Uses local VAD (Voice Activity Detection) to chunk speech
+- Sends audio segments to STT service as wav files
+- Higher latency due to segmentation and HTTP POST requests
+
+<Note>
+  STT services are modular and can be swapped out with no additional overhead.
+  You can easily switch between streaming and segmented services based on your
+  needs.
+</Note>
+
+## Supported STT Services
+
+Pipecat supports a wide range of STT providers to fit different needs and budgets:
+
+<Card
+  title="Supported STT Services"
+  icon="list"
+  href="/server/services/supported-services#speech-to-text"
+>
+  View the complete list of supported speech-to-text providers
+</Card>
+
+Popular options include:
+
+<CardGroup cols={3}>
+  <Card title="Deepgram" icon="microphone" href="/server/services/stt/deepgram">
+    Fast, accurate streaming STT with excellent real-time performance
+  </Card>
+  <Card
+    title="Speechmatics"
+    icon="waveform"
+    href="/server/services/stt/speechmatics"
+  >
+    Advanced speech recognition with strong accent and dialect handling
+  </Card>
+  <Card title="AssemblyAI" icon="brain" href="/server/services/stt/assemblyai">
+    AI-powered transcription with speaker diarization and sentiment analysis
+  </Card>
+  <Card title="Gladia" icon="sparkles" href="/server/services/stt/gladia">
+    High-performance STT with multilingual support and custom models
+  </Card>
+  <Card title="Azure Speech" icon="microsoft" href="/server/services/stt/azure">
+    Microsoft's enterprise-grade STT service with extensive language support
+  </Card>
+  <Card
+    title="Google Speech-to-Text"
+    icon="google"
+    href="/server/services/stt/google"
+  >
+    Reliable transcription with strong language model integration
+  </Card>
+</CardGroup>
+
+## STT Configuration
+
+### Service-Specific Configuration
+
+Each STT service has its own customization options. Refer to specific service documentation for details:
+
+<Card
+  title="Individual STT Services"
+  icon="screwdriver-wrench"
+  href="/server/services/supported-services#speech-to-text"
+>
+  Explore configuration options for each supported STT provider
+</Card>
+
+For example, let's look at configuring the **DeepgramSTTService** using the `LiveOptions` class:
+
+```python
+from deepgram import LiveOptions
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.transcriptions.language import Language
+
+# Configure using LiveOptions for full control
+live_options = LiveOptions(
+    model="nova-2",
+    language=Language.EN_US,
+    interim_results=True,        # Enable interim transcripts
+    smart_format=True,           # Enable punctuation and formatting
+    punctuate=True,              # Add punctuation
+    profanity_filter=True,       # Filter profanity
+    vad_events=False,            # Use pipeline VAD instead
+)
+
+stt = DeepgramSTTService(
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    live_options=live_options,
+)
+```
+
+### STTService Base Class Configuration
+
+All STT services inherit from the STTService base class. The base class has base configuration options which are set with smart defaults:
+
+```python
+stt = YourSTTService(
+    # Service-specific options...
+    audio_passthrough=True,      # Pass audio frames downstream (recommended)
+    sample_rate=16000,           # Audio sample rate (better set in PipelineParams)
+)
+```
+
+**Key options:**
+
+- **`audio_passthrough=True`**: Allows audio frames to continue downstream to other processors (like audio recording)
+- **`sample_rate`**: Audio sampling rate - best practice is to **set the `audio_in_sample_rate` in `PipelineParams` for consistency**
+
+<Warning>
+  Setting `audio_passthrough=False` will stop audio frames from being passed
+  downstream, which may break audio recording or other audio-dependent
+  processors.
+</Warning>
+
+### Pipeline-Level Audio Configuration
+
+Instead of setting sample rates on individual services, configure them pipeline-wide:
+
+```python
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        audio_in_sample_rate=16000,   # All input processors use this rate
+        audio_out_sample_rate=24000,  # All output processors use this rate
+    ),
+)
+```
+
+This ensures all audio processors use consistent sample rates without manual configuration.
+
+<Tip>
+  Always set audio sample rates in `PipelineParams` to avoid mismatches between
+  different audio processors. This simplifies configuration and ensures
+  consistent audio quality across your pipeline.
+</Tip>
+
+## Best Practices
+
+### Enable Interim Results
+
+When available, enable interim transcripts for better user experience:
+
+```python
+stt = DeepgramSTTService(
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    live_options=LiveOptions(
+      interim_results=True,
+    )
+)
+```
+
+**Benefits:**
+
+- Notifies context aggregation that more text is coming
+- Prevents premature LLM completions
+- Enables interruption detection
+- Improves conversation flow
+
+### Enable Punctuation and Formatting
+
+Use smart formatting when available:
+
+```python
+stt = DeepgramSTTService(
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    live_options=LiveOptions(
+        smart_format=True,     # Adds punctuation and capitalization
+        profanity_filter=True, # Optional content filtering
+    )
+)
+```
+
+**Benefits:**
+
+- Professional-looking transcripts
+- Better LLM comprehension
+- Eliminates post-processing needs
+- Improved context understanding
+
+### Use Local VAD
+
+While many STT services provide Voice Activity Detection, use Pipecat's local Silero VAD for better performance:
+
+```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+# Configure in transport params
+transport = YourTransport(
+    params=TransportParams(
+        vad_analyzer=SileroVADAnalyzer(),  # 150-200ms faster than remote VAD
+    ),
+)
+```
+
+**Advantages:**
+
+- **150-200ms faster** speech detection (no network round trip)
+- More responsive conversation flow
+- Better interruption handling
+- Reduced latency overall
+
+## Key Takeaways
+
+- **Pipeline placement matters** - STT must come after transport input, before context processing
+- **Service types differ** - streaming services have lower latency than segmented
+- **Services are modular** - easily swap providers without code changes
+- **Best practices improve performance** - use interim results, formatting, and local VAD
+- **Configuration affects quality** - proper setup significantly impacts transcription accuracy
+
+## What's Next
+
+Now that you understand speech recognition, let's explore how to manage conversation context and memory in your voice AI bot.
+
+<Card
+  title="Context Management"
+  icon="arrow-right"
+  href="/learn/context-management"
+>
+  Learn how to handle conversation history and context in your pipeline
+</Card>
