@@ -1,0 +1,206 @@
+---
+title: "Context Management"
+description: "A guide to working with Pipecat's Context and Context Aggregators"
+---
+
+## What is Context in Pipecat?
+
+In Pipecat, **context** refers to the conversation history that the LLM uses to generate responses. The context consists of a list of alternating user/assistant messages that represents the collective history of the entire conversation.
+
+```python
+# Example context structure
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"},
+    {"role": "assistant", "content": "Hi there! How can I help you?"},
+    # Context aggregators automatically add new messages here
+]
+```
+
+Since Pipecat is a real-time voice AI framework, context management happens automatically as the conversation flows, but you can also control it manually when needed.
+
+## How Context Updates During Conversations
+
+Context updates happen automatically as frames flow through your pipeline:
+
+**User Messages:**
+
+1. User speaks → `InputAudioRawFrame` → STT Service → `TranscriptionFrame`
+2. `context_aggregator.user()` receives `TranscriptionFrame` and adds user message to context
+
+**Assistant Messages:**
+
+1. LLM generates response → `LLMTextFrame` → TTS Service → `TTSTextFrame`
+2. `context_aggregator.assistant()` receives `TTSTextFrame` and adds assistant message to context
+
+**Frame types that update context:**
+
+- **`TranscriptionFrame`**: Contains user speech converted to text by STT service
+- **`LLMTextFrame`**: Contains LLM-generated responses
+- **`TTSTextFrame`**: Contains bot responses converted to text by TTS service (represents what was actually spoken)
+
+<Note>
+  The TTS service processes `LLMTextFrame`s but outputs `TTSTextFrame`s, which
+  represent the actual spoken text returned by the TTS provider. This ensures
+  context matches what users actually hear.
+</Note>
+
+## Setting Up Context Management
+
+Pipecat includes a context aggregator that creates and manages context for both user and assistant messages:
+
+### 1. Create the Context and Context Aggregator
+
+```python
+# Create LLM service
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Create context with initial messages
+messages = [
+    {"role": "system", "content": "You are a helpful voice assistant."}
+]
+
+# Create context (messages only)
+context = OpenAILLMContext(messages)
+
+# Create context aggregator instance
+context_aggregator = llm.create_context_aggregator(context)
+```
+
+### 2. Context with Function Calling
+
+Context can also include tools (function definitions) that the LLM can call during conversations:
+
+```python
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+# Define available functions
+weather_function = FunctionSchema(
+    name="get_current_weather",
+    description="Get the current weather",
+    properties={
+        "location": {
+            "type": "string",
+            "description": "The city and state, e.g. San Francisco, CA",
+        },
+        "format": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"],
+            "description": "The temperature unit to use.",
+        },
+    },
+    required=["location", "format"],
+)
+
+# Create tools schema
+tools = ToolsSchema(standard_tools=[weather_function])
+
+# Create context with both messages and tools
+context = OpenAILLMContext(messages, tools)
+context_aggregator = llm.create_context_aggregator(context)
+```
+
+Function call results are also automatically stored in the context, maintaining a complete conversation history including tool interactions.
+
+<Note>
+  We'll cover function calling in detail in an upcoming section. The context
+  aggregator handles function call storage automatically.
+</Note>
+
+### 3. Add Context Aggregators to Your Pipeline
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),      # User context aggregator
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(), # Assistant context aggregator
+])
+```
+
+## Context Aggregator Placement
+
+The placement of context aggregator instances in your pipeline is **crucial** for proper operation:
+
+### User Context Aggregator
+
+Place the user context aggregator **downstream from the STT service**. Since the user's speech results in `TranscriptionFrame` objects pushed by the STT service, the user aggregator needs to be positioned to collect these frames.
+
+### Assistant Context Aggregator
+
+Place the assistant context aggregator **after `transport.output()`**. This positioning is important because:
+
+- The TTS service outputs `TTSTextFrame`s in addition to audio
+- The assistant aggregator must be downstream to collect those frames
+- It ensures context updates happen word-by-word for specific services (e.g. Cartesia, ElevenLabs, and Rime)
+- Your context stays updated at the word level in case an interruption occurs
+
+<Tip>
+  Always place the assistant context aggregator **after** `transport.output()`
+  to ensure proper word-level context updates during interruptions.
+</Tip>
+
+## Manual Context Control
+
+You can programmatically add new messages to the context by pushing or queueing specific frames:
+
+### Adding Messages
+
+- **`LLMMessagesAppendFrame`**: Appends a new message to the existing context
+- **`LLMMessagesUpdateFrame`**: Completely replaces the existing context with new messages
+
+```python
+# Add a new system message to context
+new_message = {"role": "system", "content": "You are now in expert mode."}
+await task.queue_frames([
+    LLMMessagesAppendFrame([new_message]),
+    context_aggregator.user().get_context_frame()  # Trigger bot response
+])
+```
+
+### Retrieving Current Context
+
+The context aggregator provides a `get_context_frame()` method to obtain the latest context:
+
+```python
+await task.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+## Triggering Bot Responses
+
+You'll commonly use this manual mechanism—obtaining the current context and pushing/queueing it—to trigger the bot to speak in two scenarios:
+
+1. **Starting a pipeline** where the bot should speak first
+2. **After pushing new context frames** using `LLMMessagesAppendFrame` or `LLMMessagesUpdateFrame`
+
+```python
+# Example: Bot speaks first when pipeline starts
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    # Add greeting instruction and trigger response
+    messages.append({"role": "system", "content": "Greet the user warmly."})
+    await task.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+This gives you fine-grained control over when and how the bot responds during the conversation flow.
+
+## Key Takeaways
+
+- **Context is conversation history** - automatically maintained as users and bots exchange messages
+- **Frame types matter** - `TranscriptionFrame` for users, `TTSTextFrame` for assistants
+- **Placement matters** - user aggregator after STT, assistant aggregator after transport output
+- **Tools are included** - function definitions and results are stored in context
+- **Manual control available** - use frames to append messages or trigger responses when needed
+- **Word-level precision** - proper placement ensures context accuracy during interruptions
+
+## What's Next
+
+Now that you understand context management, let's explore how to configure the LLM services that process this context to generate intelligent responses.
+
+<Card title="LLM Inference" icon="arrow-right" href="/learn/llm">
+  Learn how to configure language models in your voice AI pipeline
+</Card>

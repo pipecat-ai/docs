@@ -1,11 +1,39 @@
 ---
 title: "Function Calling"
-description: "Enable LLMs to interact with external services and APIs"
+description: "Enable LLMs to interact with external services and APIs in your voice AI pipeline"
 ---
+
+**Function calling** (also known as tool calling) allows LLMs to request information from external services and APIs during conversations. This extends your voice AI bot's capabilities beyond its training data to access real-time information and perform actions.
+
+## Pipeline Integration
+
+Function calling works seamlessly within your existing pipeline structure. The LLM service handles function calls automatically when they're needed:
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),     # Collects user transcriptions
+    llm,                          # Processes context, calls functions when needed
+    tts,
+    transport.output(),
+    context_aggregator.assistant(), # Collects function results and responses
+])
+```
+
+**Function call flow:**
+
+1. User asks a question requiring external data
+2. LLM recognizes the need and calls appropriate function
+3. Your function handler executes and returns results
+4. LLM incorporates results into its response
+5. Response flows to TTS and user as normal
+
+**Context integration:** Function calls and their results are automatically stored in conversation context by the context aggregators, maintaining complete conversation history.
 
 ## Understanding Function Calling
 
-Function calling (also known as tool calling) allows LLMs to request information from external services and APIs. This enables your bot to access real-time data and perform actions that aren't part of its training data.
+Function calling allows your bot to access real-time data and perform actions that aren't part of its training data.
 
 For example, you could give your bot the ability to:
 
@@ -257,6 +285,7 @@ async def fetch_weather_from_api(params: FunctionCallParams):
 llm.register_function(
     "get_current_weather",
     fetch_weather_from_api,
+    cancel_on_interruption=True,  # Cancel if user interrupts (default: True)
 )
 ```
 
@@ -276,11 +305,21 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
     weather_data = {"conditions": "sunny", "temperature": "75"}
     await params.result_callback(weather_data)
 
-# Register the function
-llm.register_direct_function(get_current_weather)
+# Register direct function
+llm.register_direct_function(
+    get_current_weather,
+    cancel_on_interruption=False,  # Don't cancel on interruption
+)
 ```
 
 </CodeGroup>
+
+**Key registration options:**
+
+- **`cancel_on_interruption=True`** (default): Function call is cancelled if user interrupts
+- **`cancel_on_interruption=False`**: Function call continues even if user interrupts
+
+Use `cancel_on_interruption=False` for critical operations that should complete even if the user starts speaking. Function calls are async, so you can continue the conversation while the function executes. Once the result returns, the LLM will automatically incorporate it into the conversation context. LLMs vary in terms of how well they incorporate changes to _previous_ messages, so you may need to experiment with your LLM provider to see how it handles this.
 
 ### 3. Create the Pipeline
 
@@ -312,39 +351,41 @@ pipeline = Pipeline([
 
 ### FunctionCallParams
 
-The `FunctionCallParams` object contains all the information needed for handling function calls:
+Every function handler receives a `FunctionCallParams` object containing all the information needed for execution:
 
-- `params`: FunctionCallParams
-  - `function_name`: Name of the called function
-  - `arguments`: Arguments passed by the LLM
-  - `tool_call_id`: Unique identifier for the function call
-  - `llm`: Reference to the LLM service
-  - `context`: Current conversation context
-  - `result_callback`: Async function to return results
+```python
+@dataclass
+class FunctionCallParams:
+    function_name: str                          # Name of the called function
+    tool_call_id: str                           # Unique identifier for this call
+    arguments: Mapping[str, Any]                # Arguments from the LLM
+    llm: LLMService                             # Reference to the LLM service
+    context: OpenAILLMContext                   # Current conversation context
+    result_callback: FunctionCallResultCallback # Return results here
+```
 
-<ParamField path="function_name" type="str">
-  Name of the function being called
-</ParamField>
+**Using the parameters:**
 
-<ParamField path="tool_call_id" type="str">
-  Unique identifier for the function call
-</ParamField>
+```python
+async def example_function_handler(params: FunctionCallParams):
+    # Access function details
+    print(f"Called function: {params.function_name}")
+    print(f"Call ID: {params.tool_call_id}")
 
-<ParamField path="arguments" type="Mapping[str, Any]">
-  Arguments passed by the LLM to the function
-</ParamField>
+    # Extract arguments
+    location = params.arguments.get("location")
 
-<ParamField path="llm" type="LLMService">
-  Reference to the LLM service that initiated the call
-</ParamField>
+    # Access LLM context for conversation history
+    messages = params.context.get_messages()
 
-<ParamField path="context" type="OpenAILLMContext">
-  Current conversation context
-</ParamField>
+    # Use LLM service for additional operations
+    await params.llm.say("Looking up weather data...")
 
-<ParamField path="result_callback" type="FunctionCallResultCallback">
-  Async callback function to return results
-</ParamField>
+    # Return results
+    await params.result_callback({"temperature": "75°F"})
+```
+
+See the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#pipecat.services.llm_service.FunctionCallParams) for complete details.
 
 ### Handler Structure
 
@@ -352,7 +393,7 @@ Your function handler should:
 
 1. Receive necessary arguments, either:
    - From `params.arguments`
-   - Directly From function arguments, if using [direct functions](#using-direct-functions-shorthand)
+   - Directly from function arguments, if using [direct functions](#using-direct-functions-shorthand)
 2. Process data or call external services
 3. Return results via `params.result_callback(result)`
 
@@ -399,7 +440,7 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
             "location": location,
             "temperature": api_result["temp"],
             "conditions": api_result["conditions"],
-            "unit": format_type
+            "unit": format
         })
     except Exception as e:
         # Handle errors
@@ -414,29 +455,30 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
 
 When returning results from a function handler, you can control how the LLM processes those results using a `FunctionCallResultProperties` object passed to the result callback.
 
-<Tip>
-  It can be handy to skip a completion when you have back-to-back function
-  calls. Note, if you skip a completion, you must manually trigger one from the
-  context.
-</Tip>
-
 ### Properties
 
-<ParamField path="run_llm" type="Optional[bool]">
-Controls whether the LLM should generate a response after the function call:
+`FunctionCallResultProperties` provides fine-grained control over LLM execution:
 
-- `True`: Run LLM after function call (default if no other function calls in progress)
-- `False`: Don't run LLM after function call
-- `None`: Use default behavior
+```python
+@dataclass
+class FunctionCallResultProperties:
+    run_llm: Optional[bool] = None                 # Whether to run LLM after this result
+    on_context_updated: Optional[Callable] = None  # Callback when context is updated
+```
 
-</ParamField>
+**Property options:**
 
-<ParamField
-  path="on_context_updated"
-  type="Optional[Callable[[], Awaitable[None]]]"
->
-  Optional callback that runs after the function result is added to the context
-</ParamField>
+- **`run_llm=True`**: Run LLM after function call (default behavior)
+- **`run_llm=False`**: Don't run LLM after function call (useful for chained calls)
+- **`on_context_updated`**: Async callback executed after the function result is added to context
+
+<Tip>
+  Skip LLM execution (`run_llm=False`) when you have back-to-back function
+  calls. If you skip a completion, you must manually trigger one from the
+  context aggregator.
+</Tip>
+
+See the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.frames.frames.html#pipecat.frames.frames.FunctionCallResultProperties) for complete details.
 
 ### Example Usage
 
@@ -469,7 +511,18 @@ async def query_database(params: FunctionCallParams):
     await params.result_callback(results, properties=properties)
 ```
 
-## Next steps
+## Key Takeaways
 
-- Check out the [function calling examples](https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/14-function-calling.py) to see a complete example for specific LLM providers.
-- Refer to your LLM provider's documentation to learn more about their function calling capabilities.
+- **Function calling extends LLM capabilities** beyond training data to real-time information
+- **Context integration is automatic** - function calls and results are stored in conversation history
+- **Multiple definition approaches** - use standard schema for portability, direct functions for simplicity
+- **Pipeline integration is seamless** - functions work within your existing voice AI architecture
+- **Advanced control available** - fine-tune LLM execution and monitor function call lifecycle
+
+## What's Next
+
+Now that you understand function calling, let's explore how to configure text-to-speech services to convert your LLM's responses (including function call results) into natural-sounding speech.
+
+<Card title="Text to Speech" icon="arrow-right" href="/learn/text-to-speech">
+  Learn how to configure speech synthesis in your voice AI pipeline
+</Card>
