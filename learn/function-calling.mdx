@@ -285,6 +285,7 @@ async def fetch_weather_from_api(params: FunctionCallParams):
 llm.register_function(
     "get_current_weather",
     fetch_weather_from_api,
+    cancel_on_interruption=True,  # Cancel if user interrupts (default: True)
 )
 ```
 
@@ -304,11 +305,21 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
     weather_data = {"conditions": "sunny", "temperature": "75"}
     await params.result_callback(weather_data)
 
-# Register the function
-llm.register_direct_function(get_current_weather)
+# Register direct function
+llm.register_direct_function(
+    get_current_weather,
+    cancel_on_interruption=False,  # Don't cancel on interruption
+)
 ```
 
 </CodeGroup>
+
+**Key registration options:**
+
+- **`cancel_on_interruption=True`** (default): Function call is cancelled if user interrupts
+- **`cancel_on_interruption=False`**: Function call continues even if user interrupts
+
+Use `cancel_on_interruption=False` for critical operations that should complete even if the user starts speaking. Function calls are async, so you can continue the conversation while the function executes. Once the result returns, the LLM will automatically incorporate it into the conversation context. LLMs vary in terms of how well they incorporate changes to _previous_ messages, so you may need to experiment with your LLM provider to see how it handles this.
 
 ### 3. Create the Pipeline
 
@@ -340,7 +351,41 @@ pipeline = Pipeline([
 
 ### FunctionCallParams
 
-The `FunctionCallParams` object contains all the information needed for handling function calls. See the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#pipecat.services.llm_service.FunctionCallParams) for complete details.
+Every function handler receives a `FunctionCallParams` object containing all the information needed for execution:
+
+```python
+@dataclass
+class FunctionCallParams:
+    function_name: str                          # Name of the called function
+    tool_call_id: str                           # Unique identifier for this call
+    arguments: Mapping[str, Any]                # Arguments from the LLM
+    llm: LLMService                             # Reference to the LLM service
+    context: OpenAILLMContext                   # Current conversation context
+    result_callback: FunctionCallResultCallback # Return results here
+```
+
+**Using the parameters:**
+
+```python
+async def example_function_handler(params: FunctionCallParams):
+    # Access function details
+    print(f"Called function: {params.function_name}")
+    print(f"Call ID: {params.tool_call_id}")
+
+    # Extract arguments
+    location = params.arguments.get("location")
+
+    # Access LLM context for conversation history
+    messages = params.context.get_messages()
+
+    # Use LLM service for additional operations
+    await params.llm.say("Looking up weather data...")
+
+    # Return results
+    await params.result_callback({"temperature": "75°F"})
+```
+
+See the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#pipecat.services.llm_service.FunctionCallParams) for complete details.
 
 ### Handler Structure
 
@@ -410,15 +455,30 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
 
 When returning results from a function handler, you can control how the LLM processes those results using a `FunctionCallResultProperties` object passed to the result callback.
 
-<Tip>
-  It can be handy to skip a completion when you have back-to-back function
-  calls. Note, if you skip a completion, you must manually trigger one from the
-  context.
-</Tip>
-
 ### Properties
 
-For complete details on `FunctionCallResultProperties`, see the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.frames.frames.html#pipecat.frames.frames.FunctionCallResultProperties).
+`FunctionCallResultProperties` provides fine-grained control over LLM execution:
+
+```python
+@dataclass
+class FunctionCallResultProperties:
+    run_llm: Optional[bool] = None                 # Whether to run LLM after this result
+    on_context_updated: Optional[Callable] = None  # Callback when context is updated
+```
+
+**Property options:**
+
+- **`run_llm=True`**: Run LLM after function call (default behavior)
+- **`run_llm=False`**: Don't run LLM after function call (useful for chained calls)
+- **`on_context_updated`**: Async callback executed after the function result is added to context
+
+<Tip>
+  Skip LLM execution (`run_llm=False`) when you have back-to-back function
+  calls. If you skip a completion, you must manually trigger one from the
+  context aggregator.
+</Tip>
+
+See the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.frames.frames.html#pipecat.frames.frames.FunctionCallResultProperties) for complete details.
 
 ### Example Usage
 
