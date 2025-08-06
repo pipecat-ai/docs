@@ -150,9 +150,14 @@ python bot.py -t daily   # Uses DailyRunnerArguments
 
 Runner arguments are how the runner communicates transport-specific information to your bot. The runner determines which transport to use based on the command-line arguments, then creates the appropriate runner arguments:
 
-- **`DailyRunnerArguments`**: Contains `room_url` and `token` for joining Daily rooms
+- **`DailyRunnerArguments`**: Contains `room_url`, `token` (Optional), `body` (Optional) for joining Daily rooms
 - **`SmallWebRTCRunnerArguments`**: Contains `webrtc_connection` for local WebRTC sessions
 - **`WebSocketRunnerArguments`**: Contains `websocket` for telephony connections
+
+All runner arguments also include:
+
+- **`handle_sigint`**: Whether the bot should handle SIGINT (Ctrl+C) signals (managed automatically)
+- **`handle_sigterm`**: Whether the bot should handle SIGTERM signals (managed automatically)
 
 The runner handles all the complex setup - creating Daily rooms, generating tokens, establishing WebSocket connections - and provides your bot with everything it needs through these runner arguments.
 
@@ -226,11 +231,12 @@ python bot.py -t webrtc --esp32 --host 192.168.1.100
 
 ### Daily (`-t daily`)
 
-Integration with Daily for production video conferencing with rooms and participant management.
+Integration with Daily for production video conferencing with rooms, participant management, and Pipecat client compatibility.
 
 ```bash
 python bot.py -t daily
 # Opens http://localhost:7860 with room creation interface
+# Also provides POST /start endpoint for Pipecat clients
 
 # Direct connection for testing (bypasses web server)
 python bot.py -d
@@ -240,23 +246,39 @@ python bot.py -d
 
 - `room_url`: Daily room URL to join
 - `token`: Authentication token for the room
-- `body`: Additional request data
+- `body`: Request data from /start endpoint (dict)
+
+**Available Endpoints**:
+
+- `GET /`: Web interface for creating rooms
+- `POST /start`: RTVI-compatible endpoint for programmatic access
 
 ### Telephony (`-t twilio|telnyx|plivo`)
 
-Phone call integration through telephony providers. Requires a public webhook endpoint.
+Phone call integration through telephony providers. Requires a public webhook endpoint and provider credentials.
 
 ```bash
+# Set up environment variables first
+export TWILIO_ACCOUNT_SID=your_account_sid
+export TWILIO_AUTH_TOKEN=your_auth_token
+
+# Then run with public proxy
 python bot.py -t twilio -x yourproxy.ngrok.io
-python bot.py -t telnyx -x yourproxy.ngrok.io
-python bot.py -t plivo -x yourproxy.ngrok.io
 ```
+
+**Environment Variables**:
+
+- Twilio: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`
+- Telnyx: `TELNYX_API_KEY`
+- Plivo: `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`
+
+Environment variables are optional, but when provided will attempt to hang up the call when the session ends.
 
 **Runner Arguments**: `WebSocketRunnerArguments`
 
 - `websocket`: WebSocket connection for audio streaming
 
-The runner automatically detects the telephony provider (Twilio, Telnyx, or Plivo) from the WebSocket messages and configures the appropriate serializers and audio settings.
+The runner automatically detects the telephony provider from incoming WebSocket messages and configures the appropriate serializers and audio settings. Your bot receives a pre-configured FastAPI WebSocket connection ready for telephony audio streaming.
 
 ## Command Line Options
 
@@ -296,7 +318,7 @@ Different transports require different environment variables:
 **Daily**:
 
 - `DAILY_API_KEY`: Daily API key for creating rooms and tokens
-- `DAILY_SAMPLE_ROOM_URL` (optional): Existing room URL to use
+- `DAILY_SAMPLE_ROOM_URL` (Optional): Existing room URL to use
 
 **Telephony**:
 
@@ -339,19 +361,114 @@ async def bot(runner_args):
     await run_bot(transport)
 ```
 
-Now your bot supports three transport types with just two lines of code in the `bot()` function.
+The utility automatically:
+
+- Detects the telephony provider from WebSocket messages
+- Configures the appropriate serializer (Twilio, Telnyx, or Plivo)
+- Sets up authentication using environment variables
+- Handles WebRTC and Daily transport creation
+
+Now your bot supports all five transport types with just two lines of code in the bot() function.
+
+## RTVI Integration
+
+The development runner provides RTVI (Real-Time Voice Interface) compatible endpoints for the Pipecat client SDKs. This allows you to use the Pipecat client libraries locally during development as well as when deployed to Pipecat Cloud.
+
+### The `/start` Endpoint
+
+For Daily transports, the runner automatically creates a `/start` POST endpoint that:
+
+1. **Creates Daily rooms and tokens** using your `DAILY_API_KEY`
+2. **Spawns bot instances** with request `body` data
+3. **Returns connection details** in RTVI-compatible format
+
+```bash
+# Start the Daily runner
+python bot.py -t daily
+
+# The /start endpoint is now available at:
+# POST http://localhost:7860/start
+```
+
+**Request Format:**
+
+```json
+{
+  "createDailyRoom": true,
+  "dailyRoomProperties": {
+    "start_video_off": true,
+    "start_audio_off": false
+  },
+  "body": {
+    "custom_data": "your_value",
+    "user_id": "user123"
+  }
+}
+```
+
+<Note>`dailyRoomProperties` are not yet handled by the runner.</Note>
+
+**Response Format:**
+
+```json
+{
+  "dailyRoom": "https://domain.daily.co/room-name",
+  "dailyToken": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+}
+```
+
+### Accessing Request Data in Your Bot
+
+The `body` field from the `/start` request is passed to your bot through `DailyRunnerArguments.body`:
+
+```python
+async def bot(runner_args: DailyRunnerArguments):
+    # Access custom data from the /start request
+    custom_data = runner_args.body.get("custom_data")
+    user_id = runner_args.body.get("user_id")
+
+    print(f"Bot started for user: {user_id}")
+    print(f"Custom data: {custom_data}")
+
+    # Your bot logic here
+    transport = DailyTransport(runner_args.room_url, runner_args.token, "Bot")
+    await run_bot(transport)
+```
+
+### RTVI Client Example
+
+You can use RTVI client libraries to connect to your local development runner:
+
+```javascript
+import { PipecatClient } from "@pipecat-ai/client-js";
+import { DailyTransport } from "@pipecat-ai/daily-transport";
+
+const client = new PipecatClient({
+  transport: new DailyTransport(),
+  enableMic: true,
+  enableCam: false,
+});
+
+// Start a session with custom data
+await client.connect({ endpoint: "http://localhost:7860/start" });
+```
+
+<Info>
+  The `/start` endpoint is only available for Daily transports (`-t daily`).
+  WebRTC and telephony transports use different connection methods.
+</Info>
 
 ## Quick Reference
 
-| Transport    | Command                                             | Access                       |
-| ------------ | --------------------------------------------------- | ---------------------------- |
-| WebRTC       | `python bot.py`                                     | http://localhost:7860/client |
-| Daily        | `python bot.py -t daily`                            | http://localhost:7860        |
-| Daily Direct | `python bot.py -d`                                  | Direct connection            |
-| Twilio       | `python bot.py -t twilio -x proxy.ngrok.io`         | Phone calls                  |
-| Telnyx       | `python bot.py -t telnyx -x proxy.ngrok.io`         | Phone calls                  |
-| Plivo        | `python bot.py -t plivo -x proxy.ngrok.io`          | Phone calls                  |
-| ESP32 WebRTC | `python bot.py -t webrtc --esp32 --host <ESP32_IP>` | ESP32 WebRTC connection      |
+| Transport    | Command                                             | Access                       | Environment Variables                               |
+| ------------ | --------------------------------------------------- | ---------------------------- | --------------------------------------------------- |
+| WebRTC       | `python bot.py`                                     | http://localhost:7860/client | None                                                |
+| Daily        | `python bot.py -t daily`                            | http://localhost:7860        | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional) |
+| Daily Direct | `python bot.py -d`                                  | Direct connection            | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional) |
+| Twilio       | `python bot.py -t twilio -x proxy.ngrok.io`         | Phone calls                  | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`           |
+| Telnyx       | `python bot.py -t telnyx -x proxy.ngrok.io`         | Phone calls                  | `TELNYX_API_KEY`                                    |
+| Plivo        | `python bot.py -t plivo -x proxy.ngrok.io`          | Phone calls                  | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                 |
+| ESP32 WebRTC | `python bot.py -t webrtc --esp32 --host <ESP32_IP>` | ESP32 WebRTC connection      | None                                                |
 
 ## Examples
 
