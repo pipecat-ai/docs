@@ -1,0 +1,285 @@
+---
+title: Using Datadog
+description: "How to add Datadog logging, traces, and custom metrics to your Pipecat Cloud agents"
+---
+
+This guide explains how to use [Datadog](https://www.datadoghq.com/) with your Pipecat Cloud agents for logging, traces, and custom metrics.
+
+<Warning>
+  This guide is a work in progress and may have some sharp edges. However, it
+  has been vetted for basic usage.
+</Warning>
+
+## Prerequisites
+
+- Have a Datadog account and API key.
+- Use at least version `0.0.7` of the Pipecat Cloud base image:
+
+```dockerfile
+# dailyco/pipecat-base:latest should also work
+FROM dailyco/pipecat-base:0.0.7
+```
+
+## Add Datadog API key as a secret
+
+If you're using keeping your secrets in an `.env` file [as recommended](/quickstart#add-secrets), add your Datadog API key to that file:
+
+```bash
+DD_API_KEY=<your-datadog-api-key>
+```
+
+Then update your secret set from that file:
+
+```bash
+pcc secrets set <your-agent-secrets> --file .env
+```
+
+See [Secrets](/agents/secrets) for more details.
+
+## Create `datadog.yaml`
+
+This file contains the Datadog Agent configuration.
+
+The configuration shown below assumes you want all Datadog features covered in this guide (logging, traces, and custom metrics).
+
+```yaml
+site: <your-datadog-site> # e.g. us5.datadoghq.com
+hostname: pipecat.daily.co # (or whatever would be useful for you to see in the Datadog dashboards)
+
+# Include the following line only if you need logging (see "Enabling Logging")
+logs_enabled: true
+
+# Uncomment the below lines if you DON'T need traces (see "Enabling Traces")
+# apm_config:
+#   enabled: false
+
+# Uncomment the below lines if you DON'T need custom metrics (see "Enabling Custom Metrics")
+# use_dogstatsd: false
+
+kubelet_tls_verify: false
+autoconfig_exclude_features:
+  - kubernetes
+  - orchestratorexplorer
+```
+
+## Create `pre-app.sh`
+
+This script runs before the agent launcher runs.
+
+The file shown below assumes you want all Datadog features covered in this guide (logging, traces, and custom metrics).
+
+```bash
+#!/bin/bash
+
+# Write the Datadog API key to the config file
+echo "api_key: $DD_API_KEY" >> /etc/datadog-agent/datadog.yaml
+
+# Start the Datadog Agent service
+service datadog-agent start || true
+
+# Include the below line only if you need traces (see "Enabling Traces")
+# HACK: here we restart the Datadog Trace Agent specifically, since we know it failed to start above
+service datadog-agent-trace restart || true
+
+## DEBUGGING
+
+# Check the status of the Datadog Agent subsystems for logging, custom metrics, and traces
+# service datadog-agent status
+# service datadog-agent-trace status
+# datadog-agent status
+
+# Display the Datadog agent log
+# cat /var/log/datadog/agent.log
+```
+
+<Warning>
+  You may see `Starting Datadog Agent: datadog-agent failed!` in your logs,
+  triggered by `service datadog-agent start`. You can safely ignore this! As
+  long as `service datadog-agent status` and `service datadog-agent-trace
+  status` indicate that both of those services end up running, then we should
+  have no trouble sending logs, traces, and custom metrics to Datadog.
+</Warning>
+
+## Update `Dockerfile` with the Datadog Agent
+
+The snippet shown below assumes you want all Datadog features covered in this guide (logging, traces, and custom metrics).
+
+```dockerfile
+# Install the Datadog Agent
+# (note that you can literally use "dummy"—or anything else—as the API key)
+RUN apt-get -y update; apt-get -y install curl
+RUN DD_API_KEY=dummy \
+    DD_INSTALL_ONLY=true \
+    bash -c "$(curl -L https://install.datadoghq.com/scripts/install_script_agent7.sh)"
+
+# Configure Datadog Agent
+COPY ./datadog.yaml /etc/datadog-agent
+# Include the below line if you need logging (see "Enabling Logging")
+COPY ./python.d /etc/datadog-agent/conf.d/python.d
+
+# Include the below lines only if you need traces or custom metrics (see "Enabling Traces" or "Enabling Custom Metrics")
+# Prepare file system for the Datadog Agent to use for Unix Sockets
+RUN mkdir -p /var/run/datadog/
+RUN chown dd-agent:dd-agent /var/run/datadog/
+
+# Start Datadog Agent (move pre-app script to expected place where it'll be invoked by Pipecat Cloud base image)
+COPY --chmod=755 ./pre-app.sh /app/
+```
+
+## Enabling logging
+
+### Enable logging in `datadog.yaml`
+
+Ensure the following is present in your [`datadog.yaml`](#create-datadog-yaml):
+
+```yaml
+logs_enabled: true
+```
+
+### Create `python.d/conf.yaml`
+
+Configure log collection for your agent:
+
+```yaml
+# Use whatever agent name would be useful for you to see in the Datadog dashboard
+logs:
+  - type: file
+    path: /var/log/<my-agent-name>/datadog.log
+    service: <my-agent-name>
+    source: python
+    sourcecategory: sourcecode
+```
+
+### Update `Dockerfile` for logging
+
+Ensure the following is present in your [`Dockerfile`](#update-dockerfile-with-the-datadog-agent):
+
+```dockerfile
+COPY ./python.d /etc/datadog-agent/conf.d/python.d
+```
+
+This configures the Datadog Agent to collect logs from your agent.
+
+### Configure `logger` in `bot.py`
+
+Add a Datadog sink to your logger.
+
+This sink will write log lines into a file that your Datadog Agent will read from, in a Datadog-friendly format.
+
+```python
+import json
+
+# Format log lines so that:
+# - Datadog can parse and display log levels, messages, and timestamps
+# - You can search Datadog logs by session_id
+def datadog_format(record):
+    format_string_safe_message = (
+        json.dumps(record["message"]).replace("{", "{{").replace("}", "}}")
+    )
+    session_id = record["extra"].get("session_id", "")
+    return (
+        "{{"
+        '"timestamp":"{time:YYYY-MM-DD HH:mm:ss.SSS}",'
+        '"levelname":"{level}",'
+        '"name":"{name}",'
+        '"function":"{function}",'
+        '"line":{line},'
+        f'"message":{format_string_safe_message},'
+        f'"session_id": "{session_id}"'
+        "}}\n"
+    )
+
+async def bot(args: DailySessionArguments):
+    # Add Datadog-specific sink
+    logger.add(
+        "/var/log/<my-agent-name>/datadog.log", # Use same path as in python.d/conf.yaml
+        rotation="10 MB",
+        retention="7 days",
+        format=datadog_format,
+    )
+    # ...
+```
+
+## Enabling traces
+
+### Enable traces in `datadog.yaml`
+
+Ensure `apm_config.enabled` is NOT set to `false` in your [`datadog.yaml`](#create-datadog-yaml):
+
+```yaml
+# DELETE or COMMENT OUT the following lines, if they're present
+# apm_config:
+#  enabled: false
+```
+
+### Start the Datadog Trace Agent in `pre-app.sh`
+
+Ensure the following is present in your [`pre-app.sh`](#create-pre-app-sh):
+
+```bash
+service datadog-agent-trace restart || true
+```
+
+### Prepare file system in `Dockerfile`
+
+Ensure the following is present in your [`Dockerfile`](#update-dockerfile-with-the-datadog-agent):
+
+```dockerfile
+RUN mkdir -p /var/run/datadog/
+RUN chown dd-agent:dd-agent /var/run/datadog/
+```
+
+### Add `ddtrace` Python library
+
+In your `requirements.txt`:
+
+```
+ddtrace
+```
+
+### Record traces in `bot.py`
+
+```python
+from ddtrace import tracer
+
+@tracer.wrap()
+def my_function_call():
+    # ...
+```
+
+## Enabling custom metrics
+
+### Enable custom metrics in `datadog.yaml`
+
+Ensure `use_dogstatsd` is NOT set to `false` in your [`datadog.yaml`](#create-datadog-yaml):
+
+```yaml
+# DELETE or COMMENT OUT the following line, if it's present
+# use_dogstatsd: false
+```
+
+### Prepare file system in `Dockerfile`
+
+Ensure the following is present in your [`Dockerfile`](#update-dockerfile-with-the-datadog-agent):
+
+```dockerfile
+RUN mkdir -p /var/run/datadog/
+RUN chown dd-agent:dd-agent /var/run/datadog/
+```
+
+### Add `datadog` Python library
+
+In your `requirements.txt`:
+
+```
+datadog
+```
+
+### Record custom metrics in `bot.py`
+
+```python
+from datadog import statsd
+
+def my_function_call():
+    statsd.increment("myagent.my_function_call")
+```

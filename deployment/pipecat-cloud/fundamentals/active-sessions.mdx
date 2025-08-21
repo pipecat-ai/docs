@@ -1,0 +1,323 @@
+---
+title: Starting Sessions
+description: "Serving user requests with active sessions."
+---
+
+Once you have made a successful deployment, you can start on-demand sessions to begin interacting with your agent.
+
+An active session is a running instance of your agent code that connects with you or your end-users.
+Sessions are created in response to a request and scaled up or down based on your deployment configuration (see [Scaling](/agents/scaling)).
+
+<Info>
+  You must have an active billing account to start sessions. Usage is billed for
+  the duration of each session, please refer to
+  [pricing](https://www.daily.co/pricing/pipecat-cloud) for more information.
+</Info>
+
+Starting active sessions can be achieved programmatically via the REST API and Python library or directly via the CLI.
+
+## Running an agent
+
+Requests to start an agent requires passing a [public API key](/accounts-and-organizations#api-keys). Keys are used to ensure that only authorized users or apps can start sessions and can be cycled or revoked at any time.
+
+### Development pattern
+
+A typical application will start a session in response to a user request (via a web UI, mobile app, phone call or other client). Pipecat Cloud takes care of your session infrastructure and scaling, so you can focus on building your application logic.
+
+Developers should:
+
+1. Provide a secure endpoint to receive requests that keeps your API key secret
+
+2. Pass any required data to the agent when starting a session (such as pipeline configuration, transport session data, etc.)
+
+3. Handle any errors that may occur during the start process
+
+### Using REST
+
+The Pipecat Cloud REST API provides an endpoint to start a session with your agent over HTTP:
+
+<CodeGroup>
+```bash cURL
+curl --location --request POST 'https://api.pipecat.daily.co/v1/public/{agent_name}/start' \
+  --header 'Authorization: Bearer PUBLIC_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+    "createDailyRoom": true,
+    "body": {"custom": "data"}
+  }'
+```
+
+```python Python
+endpoint = "https://api.pipecat.daily.co/v1/public/{service}/start"
+agent_name = "my-first-agent"
+api_key = "pk_..."
+
+async with aiohttp.ClientSession() as session:
+    response = await session.post(
+        f"{endpoint.format(service=agent_name)}",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "createDailyRoom": True,  # Creates a Daily room
+            "body": {"custom": "data"}  # Data to pass to your agent
+        }
+    )
+```
+
+</CodeGroup>
+
+### Using Python
+
+The Pipecat Python library provides helper methods to start a session with your agent:
+
+```python
+import asyncio
+
+from pipecatcloud.exception import AgentStartError
+from pipecatcloud.session import Session, SessionParams
+
+
+async def main():
+    try:
+        # Create session object
+        session = Session(
+            agent_name="my-first-agent",
+            api_key=API_KEY,  # Replace with your actual API key
+            params=SessionParams(
+                use_daily=True,  # Optional: Creates a Daily room
+                daily_room_properties={"start_video_off": False},
+                data={"key": "value"},
+            ),
+        )
+
+        # Start the session
+        response = await session.start()
+
+        # Get Daily room URL
+        daily_url = f"{response['dailyRoom']}?t={response['dailyToken']}"
+        print(f"Join Daily room: {daily_url}")
+
+    except AgentStartError as e:
+        print(f"Error starting agent: {e}")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+
+
+# Run the async function
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Using the CLI
+
+To start an agent via the command line interface:
+
+```shell
+pcc agent start my-first-agent --api-key pk_...
+```
+
+You can select and use a default API key for the agent start command:
+
+```shell
+pcc organizations keys use my-default-key
+```
+
+See the [CLI reference](/cli-reference/agent#start) for more information.
+
+## Passing data
+
+Most agents will require some initial data, such pipeline configuration, transport session credentials, etc.
+
+For sensitive data, we recommend using [secrets](/agents/secrets) to store and access your data securely.
+
+You pass a data blob through to the start request (please note that the data must be JSON-serializable):
+
+```bash
+pcc agent start my-first-agent --data '{"room": "my-room"}'
+
+# or from a file
+pcc agent start my-first-agent --data-file data.json
+```
+
+Data passed to your session can be accessed in your agent code via the `bot()` method, which receives session arguments:
+
+<Tabs>
+  <Tab title="Standard Session">
+  
+    ```python
+    # bot.py
+    from pipecatcloud.agent import PipecatSessionArguments
+    
+    async def bot(args: PipecatSessionArguments):
+        # Access the session ID
+        logger.info(f"Session started with ID: {args.session_id}")
+        
+        # Access the custom data passed to the session
+        logger.info(f"Session data: {args.body}")
+        
+        # ...
+    ```
+
+  </Tab>
+  <Tab title="Daily Voice Session">
+
+    ```python
+    # bot.py for voice agent
+    from loguru import logger
+    from pipecatcloud.agent import DailySessionArguments
+
+    async def bot(args: DailySessionArguments):
+        """Main bot entry point compatible with the FastAPI route handler.
+
+        Args:
+            room_url: The Daily room URL
+            token: The Daily room token
+            body: The configuration object from the request body
+        """
+        logger.info(f"Bot process initialized {args.room_url} {args.token}")
+        logger.info(f"Custom data: {args.body}")
+        logger.info(f"Session ID: {args.session_id}")
+
+        try:
+            await main(args.room_url, args.token)
+            logger.info("Bot process completed")
+        except Exception as e:
+            logger.exception(f"Error in bot process: {str(e)}")
+            raise
+    ```
+
+  </Tab>
+  <Tab title="WebSocket Session">
+
+    ```python
+    # bot.py for WebSocket agent
+    from loguru import logger
+    from pipecatcloud.agent import WebSocketSessionArguments
+
+    async def bot(args: WebSocketSessionArguments):
+        """Main bot entry point for WebSocket connections.
+
+        Args:
+            ws: The WebSocket connection
+        """
+        logger.info("WebSocket bot process initialized")
+        logger.info(f"Custom data: {args.body}")
+        logger.info(f"Session ID: {args.session_id}")
+
+        try:
+            await main(args.websocket)
+            logger.info("WebSocket bot process completed")
+        except Exception as e:
+            logger.exception(f"Error in WebSocket bot process: {str(e)}")
+            raise
+    ```
+
+  </Tab>
+</Tabs>
+
+For more advanced data requirements, your application should run its own data fetching logic before a session request is made.
+
+If you require your agent to fetch it's own data, be mindful of any blocking requests that could slow down the start process.
+
+## Agent capacity
+
+Deployments have an upper limit for the number of sessions that can be started concurrently.
+This helps developers implement cost control and workload management and can be adjusted per deployment.
+
+See [Scaling](/agents/scaling) for more information.
+
+<Warning>
+  While in beta, the default instance pool capacity is **50 active sessions per
+  deployment**. Please contact us at help@daily.co or via
+  [Discord](https://discord.gg/dailyco) if you require more capacity.
+</Warning>
+
+Developers are responsible for handling capacity errors when starting sessions. When your instance pool is at capacity, the start request will fail with a `429` status and code.
+
+Here is a simple example of how to handle a capacity error:
+
+<CodeGroup>
+
+```bash REST
+curl --location --request POST 'https://api.pipecat.daily.co/v1/public/{agent_name}/start' \
+--header 'Authorization: Bearer PUBLIC_API_KEY' \
+--header 'Content-Type: application/json' \
+--data-raw '{}'
+
+>> {
+>>	"status": 429,
+>>	"code": "429",
+>>	"message": "Rate limit exceeded. Please try again later"
+>> }
+```
+
+```python Python
+from pipecatcloud import Session, SessionParams
+from pipecatcloud.exception import AgentStartError
+
+try:
+    session = Session(
+        agent_name="my-first-agent",
+        api_key="pk_...",
+        params=SessionParams(
+            use_daily=False,
+            data={}
+        )
+    )
+except AgentStartError as e:
+    # This will catch capacity errors and other start failures
+    print(f"Error starting agent: {e}")
+except Exception as e:
+    print(f"Unexpected error: {e}")
+```
+
+</CodeGroup>
+
+## Logging and monitoring
+
+Session observability can be accessed via the [Dashboard <Icon icon="arrow-up-right-from-square" iconType="solid" />](https://pipecat.daily.co) or from the CLI.
+
+### Active sessions
+
+To view active sessions via the CLI:
+
+```shell
+pcc agent sessions [my-first-agent]
+```
+
+This command will list all active sessions for the specified agent, alongside a session ID.
+
+### Session logs
+
+<Warning>Session logs are not available in beta.</Warning>
+
+To view individual session logs, use the following command:
+
+```shell
+pcc agent logs [my-first-agent] --session [session-id]
+```
+
+For more information, see [Logging and Observability](/agents/logging).
+
+## Stopping sessions
+
+<Warning>Session termination is not available in beta.</Warning>
+
+You can issue a termination request to stop an active session. This will immediately stop the instance so be aware of disrupting any ongoing user interactions.
+
+```shell
+pcc agent stop my-first-agent --session [session-id]
+```
+
+Deleting an agent deployment will block any new sessions from starting, but will not stop any active sessions. You must stop each session individually.
+
+## Usage
+
+You are charged for the duration of each session, see [pricing](https://www.daily.co/pricing/pipecat-cloud).
+
+The exact duration of session is calculated based on:
+
+- Time spent instantiating the agent
+- Time spent running the agent
+- Time spent tearing down the agent
+
+You can monitor your usage on your [Dashboard <Icon icon="arrow-up-right-from-square" iconType="solid" />](https://pipecat.daily.co).
