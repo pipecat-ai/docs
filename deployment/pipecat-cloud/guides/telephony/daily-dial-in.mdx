@@ -1,0 +1,127 @@
+---
+title: Daily Dial-in
+description: "Using Daily's Transport to receive calls from external SIP Addresses and PSTN numbers"
+---
+
+When a user calls one of your purchased phone numbers, the call is received by Daily’s infrastructure and placed on hold. This triggers a webhook that initializes the Pipecat Bot.
+
+There are two ways to handle this initialization:
+
+1. **Host the webhook yourself** in your application infrastructure.
+2. **Let Daily handle the webhook** (coming soon).
+
+For most use cases, letting Daily manage the webhook should be sufficient. However, if you need to customize the bot’s behavior—for example, based on the caller's number or the number dialed—you’ll need to host the webhook yourself to apply that logic.
+
+We provide example servers built with `Next.js` and `FastAPI` to help you get started with your own implementation.
+
+<CardGroup cols={2}>
+  <Card
+    title="FastAPI Webhook Server"
+    icon="server"
+    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/deployment/pipecat-cloud-daily-pstn-server/fastapi-webhook-server"
+  >
+    Python-based webhook server implementation using FastAPI for handling
+    dial-in calls
+  </Card>
+  <Card
+    title="Next.js Webhook Server"
+    icon="js"
+    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/deployment/pipecat-cloud-daily-pstn-server/nextjs-webhook-server"
+  >
+    JavaScript-based webhook server implementation using Next.js for handling
+    dial-in calls
+  </Card>
+</CardGroup>
+
+### Handling Dial-In Webhook (`room_creation_api`)
+
+To support inbound calls, you currently need to host a server that handles incoming call webhooks. In the near future, Daily will support managing incoming calls directly and provide an endpoint—similar to `{service}/start`—to handle this automatically.
+
+When someone calls your purchased number, Daily sends a webhook request containing information about the call. Your server can use this data to take the call off hold and connect it to a Pipecat Bot.
+
+Here’s a sample of the webhook payload:
+
+```js
+{
+  "To": "+1CALLER",
+  "From": "+1PURCHASED",
+  "callId": "string-contains-uuid",
+  "callDomain": "string-contains-uuid"
+}
+```
+
+Your webhook handler should then forward this data to the [{service}/start](../../fundamentals/active-sessions#using-rest) endpoint to initialize the session. Here are the required fields to set:
+
+- Set `createDailyRoom` to true
+- Configure `dailyRoomProperties` with the following `sip` settings:
+  - `sip_mode`: "dial-in"
+  - `num_endpoints`: 1 (set to 2 for call transfers)
+  - `display_name`: typically set to the `From` number
+- In the body, map the webhook payload to `dialin_settings` and convert camelCase to snake_case (e.g., `callId` → `call_id`).
+
+```bash
+curl --request POST \
+--url https://api.pipecat.daily.co/v1/public/{service}/start \
+--header 'Authorization: Bearer $API_KEY' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    'createDailyRoom': true,
+    'dailyRoomProperties': {
+        'sip': {'display_name': '+1CALLER', 'sip_mode': 'dial-in', 'num_endpoints': 1},
+        'exp': 1742353314
+    },
+    'body': {
+        'dialin_settings': {
+            'from': '+1CALLER',
+            'to': '+1PURCHASED',
+            'call_id': 'callid-uuid',
+            'call_domain': 'domain-uui'
+        }
+    }
+}
+```
+
+### Receiving a Call on the Bot
+
+The `{service}/start` endpoint creates a Pipecat bot instance and forwards the incoming request to it. Within the bot, pass the `dialin_settings` from the request body to the `DailyTransport`, see example below. The incoming PSTN or SIP call will then be automatically routed to the bot.
+
+```python
+transport = DailyTransport(
+    room_url,
+    token,
+    "Voice AI Bot",
+    DailyParams(
+        api_key=os.getenv("DAILY_API_KEY"),  # Required for dial-in
+        dialin_settings=dialin_settings,     # Received from the {service}/start body
+        audio_out_enabled=True,
+        vad_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+        vad_audio_passthrough=True,
+    ),
+)
+```
+
+Since this is an inbound call, the bot should begin speaking as soon as the remote user joins the call.
+
+```python
+ @transport.event_handler("on_first_participant_joined")
+    async def on_first_participant_joined(transport, participant):
+        if dialin_settings:
+            # the bot will start to speak as soon as the call connects
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+## Next Steps
+
+After setting up your webhook server, you can implement a Pipecat bot that handles the call interactions:
+
+<Card
+  title="Dial-in/Dial-out Bot Example"
+  icon="phone"
+  href="https://github.com/daily-co/pipecat-cloud-images/blob/main/pipecat-starters/pstn_sip/bot.py"
+>
+  Complete example of a Pipecat bot implementation that handles both incoming
+  (dial-in) and outgoing (dial-out) calls
+</Card>
+
+This starter template provides all the necessary components to build a production-ready telephony bot.
