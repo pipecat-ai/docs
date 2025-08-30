@@ -1,0 +1,213 @@
+---
+title: "IVRNavigator"
+description: "AI-powered Interactive Voice Response system navigation with automatic classification and goal-oriented decision making"
+---
+
+## Overview
+
+The `IVRNavigator` is a pipeline component that provides intelligent navigation of IVR phone systems. It combines LLM-based decision making with DTMF tone generation to automatically traverse phone menus toward specified goals. The navigator includes automatic classification between IVR systems and human conversations, enabling flexible call handling scenarios.
+
+## Constructor
+
+```python
+from pipecat.extensions.ivr.ivr_navigator import IVRNavigator, IVRStatus
+
+IVRNavigator(
+    llm,
+    ivr_prompt,
+    ivr_vad_params=None
+)
+```
+
+### Parameters
+
+<ParamField path="llm" type="LLMService" required>
+  The LLM service instance used for text generation and navigation decision
+  making.
+</ParamField>
+
+<ParamField path="ivr_prompt" type="str" required>
+  The navigation goal that will be integrated with the base IVR navigation
+  instructions. This should clearly describe what you want to accomplish (e.g.,
+  "Navigate to billing support to discuss account charges").
+</ParamField>
+
+<ParamField
+  path="ivr_vad_params"
+  type="Optional[VADParams]"
+  default="VADParams(stop_secs=2.0)"
+>
+  Voice Activity Detection parameters optimized for IVR navigation. The default
+  2.0 second stop time allows the system to hear complete menu options before
+  responding, improving navigation success rates.
+</ParamField>
+
+## Navigation Commands
+
+The IVRNavigator processes several XML-tagged commands from LLM responses:
+
+### DTMF Commands
+
+```xml
+<dtmf>1</dtmf>        <!-- Single keypress -->
+<dtmf>1</dtmf><dtmf>2</dtmf><dtmf>3</dtmf>  <!-- Sequence entry -->
+```
+
+Valid DTMF values: `0-9`, `*`, `#`
+
+### IVR Status Commands
+
+```xml
+<ivr>detected</ivr>   <!-- IVR system detected, switch to navigation mode -->
+<ivr>completed</ivr>  <!-- Navigation goal achieved -->
+<ivr>stuck</ivr>      <!-- Unable to proceed -->
+<ivr>wait</ivr>       <!-- Waiting for more complete information -->
+```
+
+### Mode Classification
+
+```xml
+<mode>ivr</mode>          <!-- Classified as IVR system -->
+<mode>conversation</mode> <!-- Classified as human conversation -->
+```
+
+## Event Handlers
+
+The navigator supports two primary event handlers for different interaction scenarios.
+
+### on_conversation_detected
+
+Triggered when the system classifies incoming audio as a human conversation rather than an IVR system.
+
+```python
+@ivr_navigator.event_handler("on_conversation_detected")
+async def on_conversation_detected(processor, conversation_history: List[dict]):
+    # Handle human conversation scenario
+    # conversation_history contains previous interaction context
+    pass
+```
+
+**Parameters:**
+
+- `processor`: The IVRProcessor instance
+- `conversation_history`: List of message dictionaries from previous context (excluding system messages)
+
+### on_ivr_status_changed
+
+Triggered when IVR navigation status changes during the navigation process.
+
+```python
+@ivr_navigator.event_handler("on_ivr_status_changed")
+async def on_ivr_status_changed(processor, status: IVRStatus):
+    # Handle navigation status changes
+    if status == IVRStatus.COMPLETED:
+        # Navigation successful
+        pass
+    elif status == IVRStatus.STUCK:
+        # Navigation failed
+        pass
+```
+
+**Parameters:**
+
+- `processor`: The IVRProcessor instance
+- `status`: IVRStatus enum value (`DETECTED`, `COMPLETED`, `STUCK`)
+
+## IVRStatus Enumeration
+
+```python
+from pipecat.extensions.ivr.ivr_navigator import IVRStatus
+
+class IVRStatus(Enum):
+    DETECTED = "detected"    # IVR system detected and navigation started
+    COMPLETED = "completed"  # Navigation goal successfully achieved
+    STUCK = "stuck"         # Navigation unable to proceed
+    WAIT = "wait"           # Waiting for more complete information
+```
+
+## Built-in Prompts
+
+The IVRNavigator includes sophisticated built-in prompts that handle classification and navigation logic automatically.
+
+### Classification Prompt
+
+The navigator starts with an automatic classification system that distinguishes between:
+
+**IVR System Indicators:**
+
+- Menu options ("Press 1 for billing", "Press 2 for support")
+- Automated instructions ("Please enter your account number")
+- System prompts ("Thank you for calling [company]")
+- Hold messages ("Please continue to hold")
+
+**Human Conversation Indicators:**
+
+- Personal greetings ("Hello, this is Sarah")
+- Interactive responses ("Who am I speaking with?")
+- Natural speech patterns and conversational flow
+- Direct engagement ("I can help with that")
+
+### Navigation Prompt
+
+Once IVR is detected, the system uses your provided goal with comprehensive navigation instructions that include:
+
+- **Decision making logic** for menu option selection
+- **DTMF sequence handling** for data entry (dates, account numbers, phone numbers)
+- **Verbal response generation** for conversational prompts
+- **Completion detection** for successful navigation
+- **Stuck state recognition** for error scenarios
+- **Wait state management** for incomplete transcriptions
+
+## Advanced Usage
+
+### Context Preservation
+
+The navigator automatically preserves conversation context when switching between modes:
+
+```python
+# Context is automatically saved and restored during mode transitions
+# No manual intervention required for basic scenarios
+
+# For advanced context manipulation:
+@ivr_navigator.event_handler("on_conversation_detected")
+async def handle_conversation(processor, conversation_history):
+    # conversation_history contains preserved context
+    # Add additional context as needed
+    enhanced_context = [
+        {"role": "system", "content": "You are a customer service representative."},
+        *conversation_history,
+        {"role": "assistant", "content": "How can I help you today?"}
+    ]
+
+    await task.queue_frame(LLMMessagesUpdateFrame(messages=enhanced_context, run_llm=True))
+```
+
+### VAD Parameter Management
+
+```python
+# Switch to conversation-optimized timing
+@ivr_navigator.event_handler("on_conversation_detected")
+async def optimize_for_conversation(processor, conversation_history):
+    # Reduce response delay for natural conversation flow
+    conversation_vad = VADParams(stop_secs=0.8)
+    await task.queue_frame(VADParamsUpdateFrame(params=conversation_vad))
+```
+
+## Integration Examples
+
+### Basic Pipeline Integration
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.ivr.ivr_navigator import IVRNavigator
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    ivr_navigator,    # Add in place of LLM
+    tts,
+    transport.output(),
+    context_aggregator.assistant()
+])
+```
