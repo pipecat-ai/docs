@@ -1,0 +1,189 @@
+---
+
+title: "RTVIClient Migration Guide for IOS"
+sidebarTitle: "Migration Guide"
+description: "A Guide to migrating from RTVIClient to PipecatClient for iOS"
+---
+
+This guide covers migrating from the `RTVIClient` to the new `PipecatClient` in an iOS (Swift) application. The new client introduces simplified configuration, modern messaging patterns, and improved function call handling. For an overview of the changes, see the top-level [RTVIClient Migration Guide](/client/migration-guide).
+
+## Key Changes
+
+### 1. Package and Class Names
+
+**Old**
+
+```swift
+import RTVIClient
+import RTVIClientIOSDaily
+```
+
+**New**
+
+```swift
+import PipecatClientIOS
+import PipecatClientIOSDaily
+```
+
+### 2. Client and Transport Configuration
+
+Previously, the client constructor accepted parameters like pipeline or endpoint configuration. Now, the configuration is passed explicitly to the `startBotAndConnect()` or `connect()` methods, and the constructor takes only transport options.
+
+**Old**
+
+```swift
+let client = RTVIClient(params: ...)
+```
+
+**New**
+
+```swift
+let pipecatClientOptions = PipecatClientOptions(
+    transport: DailyTransport(),
+    enableMic: true,
+    enableCam: false
+)
+
+let client = PipecatClient(options: pipecatClientOptions)
+```
+
+### 3. Connection Method
+
+The connection process is now explicit and supports modern async handling.
+
+**Old**
+
+```swift
+client.connect()
+```
+
+**New**
+
+```swift
+let startBotParams = APIRequest(endpoint: URL(string: "https://your-server/connect")!)
+client.startBotAndConnect(startBotParams: startBotParams) { result in
+    switch result {
+    case .success(let connectionParams):
+        print("Connected successfully: \(connectionParams)")
+    case .failure(let error):
+        print("Connection failed: \(error)")
+    }
+}
+```
+
+### 4. Function Call Handling
+
+Helpers like `LLMHelper` have been removed. You now register function call handlers directly on the `PipecatClient`.
+
+**Old**
+
+```swift
+let llmHelper = LLMHelper()
+client.registerHelper("llm", llmHelper)
+llmHelper?.delegate = self
+
+extension CallContainerModel: LLMHelperDelegate {
+    enum ToolsFunctions: String {
+        case getMyCurrentLocation = "get_my_current_location"
+        case setRestaurantLocation = "set_restaurant_location"
+    }
+    func onLLMFunctionCall(functionCallData: LLMFunctionCallData, onResult: ((Value) async -> Void)) async {
+        var result = Value.object([:])
+        if let selectedFunction = ToolsFunctions(rawValue: functionCallData.functionName) {
+            // Use a switch to handle the different enum cases
+            switch selectedFunction {
+            case .getMyCurrentLocation:
+                result = await self.getCurrentLocation()
+            case .setRestaurantLocation:
+                self.handleRestaurantLocation(restaurantInfo: functionCallData.args)
+                result = .string("success")
+            }
+        } else {
+            print("Invalid function received \(functionCallData.functionName)")
+        }
+        await onResult(result)
+    }
+}
+
+```
+
+**New**
+
+```swift
+client.registerFunctionCallHandler(functionName: "get_my_current_location") { functionCallData, onResult in
+    let location = await getCurrentLocation()
+    await onResult(location)
+}
+
+client.registerFunctionCallHandler(functionName: "set_restaurant_location") { functionCallData, onResult in
+    handleRestaurantLocation(functionCallData.args)
+    await onResult(.string("success"))
+}
+```
+
+### 5. Pipeline Configuration Initialization
+
+Previously, you could provide a pipeline configuration as part of the `RTVIClient` constructor and it was expected to be in a specific format. Now, if you would like to pass any initial pipeline configurations, you do so as `requestData` added to the endpoint you provide to `startBot()` or `startBotAndConnect()`. In both cases, you would need server-side code to parse and apply these settings, but now you can define the structure and what pieces of configuration you want to send.
+
+Check out [this section of docs](../js/api-reference/messages#connection-time-configuration) for an example, complete with server-side code showing how to initialize the pipeline configuration at connection time.
+
+### 6. LLM Context Updates
+
+Previously, context updates were done via helpers. Now, use `appendToContext()`:
+
+```swift
+client.appendToContext(
+    role: "user",
+    content: "Tell me a joke.",
+    run_immediately: true
+)
+```
+
+### 7. Pipeline Configuration Updates
+
+Previously, the client supported updating the pipeline configuration using a specific method that took a configuration object in a generic format. Dynamic and predefined configuration updates, however, are a security concern, allowing clients to override settings and potentially abuse API keys. For this reason, it has been removed and most configuration updates need to be handled custom by your application. To do so, you should take advantage of the client-server messaging system, which allows you to send messages to the server and handle responses. This way, you can implement your own logic for updating configurations securely.
+
+New messaging types replace old action/config helpers:
+
+```swift
+try client.sendClientMessage(msgType: "set-voice", data: .string("Janice"))
+
+let llmVendor = try await client.sendClientRequest(msgType: "get-llm-vendor").d?.asString
+print("LLM Vendor: \(llmVendor ?? "")")
+```
+
+Check out [this section of docs](../js/api-reference/messages#sending-custom-messages-to-the-server) for a more complete example, along with an example on making a request (`sendClientRequest()`) to wait for a response.
+
+### 8. Disconnecting
+
+```swift
+client.unregisterAllFunctionCallHandlers()
+client.disconnect(completion: nil)
+```
+
+## Breaking Changes
+
+1. **Constructor Params Removed**: No pipeline or endpoint config in constructor.
+2. **Helpers Removed**: RTVIClientHelper, LLMHelper are gone.
+3. **Configs Removed**: All configuration-related methods, events, and types have been removed: `getConfig()`, `updateConfig()`, `describeConfig()`, `onConfigUpdated`, `onConfigDescribed`, etc.
+4. **Actions Removed**: All actions-related methods, events, and types have been removed: `action()`, `describeActions()`, `onActionsAvailable`, etc.
+8. **New Messaging Methods**:
+
+   * `appendToContext()`
+   * `sendClientRequest()`
+   * `sendClientMessage()`
+   * `disconnectBot()`
+   * `registerFunctionCallHandler()` / `unregisterFunctionCallHandler()` / `unregisterAllFunctionCallHandlers()`
+
+## Migration Steps
+
+1. Update imports to `PipecatClientIOS` and `PipecatClientIOSDaily`.
+2. Move connection configuration from constructor to `startBotAndConnect()` or `connect()` methods.
+3. Replace helper-based function calls with `registerFunctionCallHandler()`.
+4. Replace context updates with `appendToContext()`.
+5. Replace all action and config related methods, events, and types with `sendClientMessage()` or `sendClientRequest()` for custom messages.
+6. Ensure proper disconnection via `unregisterAllFunctionCallHandlers()` and `disconnect()`.
+
+---
+
+For detailed examples, see [Travel Companion iOS Example](https://github.com/pipecat-ai/pipecat-examples/blob/main/travel-companion/client/ios/TravelCompanion/model/CallContainerModel.swift).
