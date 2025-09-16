@@ -1,0 +1,132 @@
+---
+title: "Voicemail Detection"
+description: "Automatically classify outbound calls as conversation or voicemail and respond appropriately"
+---
+
+## Overview
+
+The VoicemailDetector classifies incoming communication as either live conversation or voicemail systems. This module is built primarily for voice AI bots that perform outbound calling, enabling them to respond appropriately based on whether a human answered or the call went to voicemail.
+
+The detector is optimized for fast conversation response times, where TTS output is generated immediately but held in a gate until the classification decision is made. This ensures minimal latency for live conversations while preventing inappropriate responses to voicemail systems.
+
+## How It Works
+
+The VoicemailDetector uses a parallel pipeline architecture to perform real-time classification without interrupting conversation flow. It analyzes the initial response from the called party and determines whether it's a human greeting or an automated voicemail system.
+
+Key features:
+
+- **Real-time classification** - Determines conversation vs voicemail as soon as audio is received
+- **TTS gating** - Holds generated audio until classification is complete
+- **Event-driven** - Triggers custom handlers when voicemail is detected
+- **Configurable timing** - Adjustable delay for voicemail response timing
+
+## Basic Setup
+
+### 1. Initialize the Detector
+
+```python
+from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
+from pipecat.services.openai.llm import OpenAILLMService
+
+# Create an LLM for classification
+classifier_llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize the detector
+voicemail_detector = VoicemailDetector(
+    llm=classifier_llm,
+    voicemail_response_delay=2.0  # Default: 2 seconds
+)
+```
+
+<Note>
+  The VoicemailDetector works with two LLMs: your main conversation LLM (which
+  must be text-based) and the classifier LLM (which can be either text-based or
+  realtime with a `text` output modality). Realtime LLMs are not compatible for
+  the main conversation LLM due to output control requirements.
+</Note>
+
+### 2. Configure the Pipeline
+
+The VoicemailDetector requires two components in your pipeline:
+
+- `detector()`: between STT and user context aggregator
+- `gate()`: immediately after TTS service
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    voicemail_detector.detector(),    # Between STT and user context aggregator
+    context_aggregator.user(),
+    llm,
+    tts,
+    voicemail_detector.gate(),        # Immediately after TTS service
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+### 3. Handle Voicemail Events
+
+When a voicemail is detected, the `on_voicemail_detected` event is triggered. In your event handler, you have access to `processor`, which is a FrameProcessor instance, allowing you to push frames to the pipeline. For example, you may want to have the bot output a pre-canned message and then end the call.
+
+```python
+@voicemail_detector.event_handler("on_voicemail_detected")
+async def handle_voicemail(processor):
+    logger.info("Voicemail detected! Leaving a message...")
+
+    # Leave a voicemail message
+    await processor.push_frame(
+        TTSSpeakFrame("Hello, this is Jamie calling about your appointment. Please call me back at 555-0123.")
+    )
+
+    # Optionally end the call after leaving the message
+    await processor.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+```
+
+## Detecting a Conversation
+
+When a conversation is detected, no additional processing is required by the VoicemailDetector. Once the VoicemailDetector classifies the call as a conversation, the TTSGate will be flushed, allowing the conversation to continue.
+
+## Configuration Options
+
+### Custom System Prompt
+
+For specialized use cases, you can provide a custom classification prompt. The prompt must instruct the LLM to respond with exactly "CONVERSATION" or "VOICEMAIL":
+
+```python
+custom_prompt = """
+Your custom classification logic here.
+Consider factors like business hours, call patterns, etc.
+""" + VoicemailDetector.CLASSIFIER_RESPONSE_INSTRUCTION
+
+voicemail_detector = VoicemailDetector(
+    llm=classifier_llm,
+    custom_system_prompt=custom_prompt
+)
+```
+
+<Note>
+  The `CLASSIFIER_RESPONSE_INSTRUCTION` constant contains the required response
+  format: `'Respond with ONLY "CONVERSATION" if a person answered, or
+  "VOICEMAIL" if it\'s voicemail/recording.'`
+</Note>
+
+For most use cases, the default classifier prompt will work effectively. If you need to customize the behavior, reference the built-in prompt as a starting point and modify from there.
+
+### Response Timing
+
+The `voicemail_response_delay` parameter controls how long to wait after the user stops speaking before triggering the voicemail event:
+
+```python
+voicemail_detector = VoicemailDetector(
+    llm=classifier_llm,
+    voicemail_response_delay=3.0  # Wait 3 seconds instead of default 2
+)
+```
+
+This delay ensures:
+
+- Voicemail greetings have finished playing
+- The response occurs during the recording period
+- Proper timing for different voicemail system behaviors

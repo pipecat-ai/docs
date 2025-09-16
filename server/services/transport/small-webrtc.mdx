@@ -88,7 +88,94 @@ No API keys are required since this is a peer-to-peer transport implementation.
 
 SmallWebRTCTransport requires two components working together: a **signaling server** to handle the WebRTC handshake, and your **Pipecat bot** that processes the media streams. Unlike other transports, you cannot use SmallWebRTCTransport without implementing both parts.
 
-### 1. Signaling Server (Required)
+### Using the Development Runner (Recommended)
+
+The easiest way to get started is using Pipecat's development runner, which handles all the server infrastructure automatically:
+
+```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
+
+async def run_bot(transport):
+    """Your core bot logic - works with any transport."""
+    # Your services (STT, LLM, TTS, etc.)
+    # ...
+
+    # Create pipeline
+    pipeline = Pipeline([
+        transport.input(),              # Receive audio from client
+        stt,                            # Convert speech to text
+        context_aggregator.user(),      # Add user messages to context
+        llm,                            # Process text with LLM
+        tts,                            # Convert text to speech
+        transport.output(),             # Send audio responses to client
+        context_aggregator.assistant(), # Add assistant responses to context
+    ])
+
+    # Event handlers
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        # Start conversation when client connects
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await task.cancel()
+
+    # Run the pipeline
+    # ...
+
+# The `bot()` function is the entry point for the development runner.
+async def bot(runner_args: RunnerArguments):
+    """Entry point called by the development runner."""
+
+    # RunnerArguments are types that can be used to configure the transport.
+    # The SmallWebRTCRunnerArguments contains the WebRTC connection
+    # parameters needed to establish the connection.
+    if isinstance(runner_args, SmallWebRTCRunnerArguments):
+        transport = SmallWebRTCTransport(
+            webrtc_connection=runner_args.webrtc_connection,
+            params=TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                vad_analyzer=SileroVADAnalyzer(),
+            ),
+        )
+        await run_bot(transport)
+
+if __name__ == "__main__":
+    # Run the bot using the development runner
+    from pipecat.runner.run import main
+    main()
+```
+
+Run your bot with:
+
+```bash
+python bot.py --transport webrtc
+# Opens http://localhost:7860/client
+```
+
+The development runner automatically:
+
+- Creates a FastAPI server with WebRTC signaling endpoints
+- Serves a built-in web interface for testing
+- Handles WebRTC connection management and cleanup
+- Spawns your bot for each new connection
+
+<Tip>
+  The development runner is the recommended approach for development and can
+  also be used in production with Pipecat Cloud.
+</Tip>
+
+### Manual Server Implementation
+
+For advanced use cases or custom deployment requirements, you can implement the server infrastructure manually:
+
+#### 1. Signaling Server (Required)
 
 First, create a web server to handle WebRTC connection establishment. This server receives offers from clients and creates the WebRTC connections that your bot will use:
 
@@ -146,7 +233,7 @@ async def handle_offer(request: dict, background_tasks: BackgroundTasks):
 # Run with: uvicorn server:app --host 0.0.0.0 --port 7860
 ```
 
-### 2. Pipecat Bot Implementation
+#### 2. Pipecat Bot Implementation
 
 Next, implement your bot function that receives the WebRTC connection from the server and creates the transport:
 
@@ -186,7 +273,7 @@ async def run_bot(webrtc_connection):
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         # Start conversation when client connects
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
+        await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -302,6 +389,16 @@ webrtc_connection = SmallWebRTCConnection(
 )
 ```
 
+### ESP32 Compatibility
+
+For ESP32 WebRTC connections, use the development runner with ESP32 mode:
+
+```bash
+python bot.py -t webrtc --esp32 --host 192.168.1.100
+```
+
+This enables SDP munging required for ESP32 WebRTC compatibility.
+
 ## Troubleshooting
 
 If clients have trouble connecting or streaming:
@@ -310,3 +407,15 @@ If clients have trouble connecting or streaming:
 2. Ensure you're using HTTPS in production (required for WebRTC)
 3. For testing across networks, consider using Daily which provides TURN servers
 4. Verify browser permissions for camera and microphone
+5. Try the development runner first to isolate connection issues
+
+## Additional Notes
+
+- **HTTPS Requirement**: WebRTC requires HTTPS in production environments
+- **Browser Compatibility**: Modern browsers support WebRTC natively
+- **Firewall Considerations**: May need TURN servers for restrictive network environments
+- **Latency**: Direct peer-to-peer connections typically provide lower latency than server-mediated solutions
+- **Scalability**: Each connection is independent; consider connection pooling for high-traffic applications
+- **Development**: Use the development runner for rapid prototyping and testing
+
+For comparing with other transport options, see the [transport comparison guide](https://www.daily.co/blog/you-dont-need-a-webrtc-server-for-your-voice-agents/).

@@ -1,0 +1,156 @@
+---
+
+title: "RTVIClient Migration Guide for Android"
+sidebarTitle: "Migration Guide"
+description: "A Guide to migrating from RTVIClient to PipecatClient for Android"
+---
+
+This guide covers migrating from the `RTVIClient` to the new `PipecatClient` in an Android application. The new client introduces simplified configuration, modern messaging patterns, and improved function call handling. For an overview of the changes, see the top-level [RTVIClient Migration Guide](/client/migration-guide).
+
+## Key Changes
+
+### 1. Package and Class Names
+
+**Old**
+
+```kotlin
+import ai.pipecat.client.RTVIClient
+import ai.pipecat.client.RTVIClientOptions
+import ai.pipecat.client.RTVIClientParams
+import ai.pipecat.client.RTVIEventCallbacks
+```
+
+**New**
+
+```kotlin
+import ai.pipecat.client.PipecatClient
+import ai.pipecat.client.PipecatClientOptions
+// RTVIClientParams has been removed
+import ai.pipecat.client.PipecatEventCallbacks
+
+// Type alias for a Pipecat client using the Daily transport
+import ai.pipecat.client.daily.PipecatClientDaily
+```
+
+### 2. Client and Transport Configuration
+
+Previously, the `RTVIClient` constructor accepted a transport factory parameter, whereas in v1.0.0 the transport is passed in directly.
+
+Parameters such as the connection URL are no longer passed in at construction time. These should be given to `startBot()`, `startBotAndConnect()`, or `connect()`.
+
+**Old**
+
+```kotlin
+val options = RTVIClientOptions(
+    params = RTVIClientParams(
+        baseUrl = baseUrl,
+        endpoints = RTVIURLEndpoints(),
+    )
+)
+
+val client = RTVIClient(DailyTransport.Factory(context), callbacks, options)
+```
+
+**New**
+
+```kotlin
+val options = PipecatClientOptions(callbacks = callbacks)
+val client = PipecatClient(DailyTransport(context), options)
+```
+
+### 3. Connection
+
+Previously, the `connect()` method did a POST request to your bot's HTTP endpoint, which returned the connection details (such as room URL and token), before making the actual connection.
+
+This functionality has been split out into `startBot()`, which provides more flexibility in how the request is performed.
+
+A helper method `startBotAndConnect()` unifies the two steps and is the equivalent of the original `connect()` method. You can call `connect()` directly if you wish to skip the POST step.
+
+**Old**
+
+```kotlin
+// Uses parameters passed into the constructor
+client.connect().await()
+```
+
+**New**
+
+```kotlin
+// Parameters now passed in at connection time
+client.startBotAndConnect(
+    APIRequest(
+        endpoint = url,
+        requestData = Value.Object()
+    )
+).await()
+```
+
+### 4. Function Call Handling
+
+Helpers like `LLMHelper` have been removed. You now register function call handlers directly on the `PipecatClient`.
+
+```kotlin
+client.registerFunctionCallHandler("get_my_current_location") { data, onResult ->
+    thread {
+        val location = getCurrentLocation(data.args)
+        onResult(location)
+    }
+}
+```
+
+
+### 5. Pipeline Configuration Initialization
+
+Previously, you could provide a pipeline configuration as part of the `RTVIClient` constructor, and it was expected to be in a specific format. Now, if you would like to pass any initial pipeline configurations, you do so as `requestData` added to the endpoint you provide to `startBot()` or `startBotAndConnect()`. In both cases, you would need server-side code to parse and apply these settings, but now you can define the structure and what pieces of configuration you want to send.
+
+Check out [this section of docs](../js/api-reference/messages#connection-time-configuration) for an example, complete with server-side code showing how to initialize the pipeline configuration at connection time.
+
+### 6. LLM Context Updates
+
+Previously, context updates were done via helpers. Now, use `appendToContext()`:
+
+```kotlin
+client.appendToContext(
+    message = LLMContextMessage(
+        role = LLMContextMessage.Role.User,
+        content = "Tell me a joke.",
+        runImmediately = true
+    )
+)
+```
+
+### 7. Pipeline Configuration Updates
+
+Previously, the client supported updating the pipeline configuration using a specific method that took a configuration object in a generic format. Dynamic and predefined configuration updates, however, are a security concern, allowing clients to override settings and potentially abuse API keys. For this reason, it has been removed and most configuration updates need to be handled custom by your application. To do so, you should take advantage of the client-server messaging system, which allows you to send messages to the server and handle responses. This way, you can implement your own logic for updating configurations securely.
+
+New messaging types replace old action/config helpers:
+
+```kotlin
+client.sendClientMessage(msgType = "set-voice", data = Value.Str("Janice")).await()
+
+val llmVendor = client.sendClientRequest(msgType = "get-llm-vendor").await().data?.content
+Log.i("Example", "LLM Vendor: $llmVendor")
+```
+
+Check out [this section of docs](../js/api-reference/messages#sending-custom-messages-to-the-server) for a more complete example, along with an example on making a request (`sendClientRequest()`) to wait for a response.
+
+### 8. Disconnecting
+
+```kotlin
+client.unregisterFunctionCallHandler()
+client.disconnect().await()
+```
+
+## Breaking Changes
+
+1. **Constructor Params Removed**: No pipeline or endpoint config in constructor.
+2. **Helpers Removed**: RTVIClientHelper, LLMHelper are gone.
+3. **Configs Removed**: All configuration-related methods, events, and types have been removed: `getConfig()`, `updateConfig()`, `describeConfig()`, `onConfigUpdated`, `onConfigDescribed`, etc.
+4. **Actions Removed**: All actions-related methods, events, and types have been removed: `action()`, `describeActions()`, `onActionsAvailable`, etc.
+8. **New Messaging Methods**:
+
+   * `appendToContext()`
+   * `sendClientRequest()`
+   * `sendClientMessage()`
+   * `disconnectBot()`
+   * `registerFunctionCallHandler()` / `unregisterFunctionCallHandler()` / `unregisterAllFunctionCallHandlers()`

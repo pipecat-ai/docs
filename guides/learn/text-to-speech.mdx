@@ -1,0 +1,234 @@
+---
+title: "Text to Speech"
+description: "Learn how to configure speech synthesis to convert text into natural-sounding audio in your voice AI pipeline"
+---
+
+**Text to Speech (TTS)** services are responsible for converting text into natural-sounding speech audio. They receive text input from LLMs and other sources, then generate audio output that users can hear through their connected devices.
+
+## Pipeline Placement
+
+TTS processors must be positioned correctly in your pipeline to receive text and generate audio frames:
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,                           # Generates LLMTextFrames
+    tts,                           # Processes text → creates TTSAudioRawFrames
+    transport.output(),            # Sends audio to user
+    context_aggregator.assistant(), # Processes TTSTextFrames for context
+])
+```
+
+**Placement requirements:**
+
+- **After LLM processing**: TTS needs `LLMTextFrame`s from language model responses
+- **Before transport output**: Audio must be generated before sending to user
+- **Before assistant context aggregator**: Ensures spoken text is captured in conversation history
+
+### Frame Processing Flow
+
+**TTS generates speech through two primary mechanisms:**
+
+1. **Streamed LLM tokens** via `LLMTextFrame`s:
+
+   - TTS aggregates streaming tokens into complete sentences
+   - Sentences are sent to TTS service for audio generation
+   - Audio bytes stream back and play immediately
+   - End-to-end latency often under 200ms
+
+2. **Direct speech requests** via `TTSSpeakFrame`s:
+   - Bypasses LLM and context aggregators
+   - Immediate audio generation for specific text
+   - Useful for system messages or prompts
+
+**Frame output:**
+
+- `TTSAudioRawFrame`s: Raw audio data for playback
+- `TTSTextFrame`s: Text that was actually spoken (for context updates)
+- `TTSStartedFrame`/`TTSStoppedFrame`: Speech boundary markers
+
+## Supported TTS Services
+
+Pipecat supports a wide range of TTS providers with different capabilities and performance characteristics:
+
+<Card
+  title="Supported TTS Services"
+  icon="list"
+  href="/server/services/supported-services#text-to-speech"
+>
+  View the complete list of supported text-to-speech providers
+</Card>
+
+### Service Categories
+
+**WebSocket-Based Services (Recommended):**
+
+- **Cartesia**: Ultra-low latency with word timestamps
+- **ElevenLabs**: High-quality voices with emotion control
+- **Rime**: Ultra-realistic voices with advanced features
+
+**HTTP-Based Services:**
+
+- **OpenAI TTS**: High-quality synthesis with multiple voices
+- **Azure Speech**: Enterprise-grade with extensive language support
+- **Google Text-to-Speech**: Reliable with WaveNet voices
+
+**Advanced Features:**
+
+- **Word timestamps**: Enable word-level accuracy for context and subtitles
+- **Voice cloning**: Custom voice creation from samples
+- **Emotion control**: Dynamic emotional expression
+- **SSML support**: Fine-grained pronunciation control
+
+<Note>
+  WebSocket services typically provide the lowest latency, while HTTP services
+  may have intermittent higher latency due to their request/response nature.
+</Note>
+
+## TTS Configuration
+
+### Service-Specific Configuration
+
+Each TTS service has its own configuration options. Here's an example with Cartesia:
+
+```python
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.transcriptions.language import Language
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    voice_id="voice-id-here",
+    model="sonic-2",              # TTS model to use
+    params=CartesiaTTSService.InputParams(
+        language=Language.EN,     # Speech language
+        speed="normal",           # Speech rate control
+    ),
+    # Word timestamps automatically enabled for precise context updates
+)
+```
+
+**Word timestamps:** Services like Cartesia, ElevenLabs, and Rime provide word-level timestamps that enable precise context updates during interruptions and better synchronization with other pipeline components. For example, if an interruption occurs while the bot is speaking, the word timestamps allow you to accurately capture which words were spoken up to that point, enabling better context management and user experience. Additionally, transcription events streamed from server to client can be done in sync with the audio output, allowing for real-time subtitles or captions.
+
+<Card
+  title="Individual TTS Services"
+  icon="settings"
+  href="/server/services/supported-services#text-to-speech"
+>
+  Explore configuration options for each supported TTS provider
+</Card>
+
+### Pipeline-Level Audio Configuration
+
+Set consistent audio settings across your entire pipeline:
+
+```python
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        audio_in_sample_rate=16000,   # Input audio quality
+        audio_out_sample_rate=24000,  # Output audio quality (TTS)
+    ),
+)
+```
+
+<Tip>
+  Set the `audio_out_sample_rate` to match your TTS service's requirements for
+  optimal quality. This is preferred to setting the sample_rate directly in the
+  TTS service as the PipelineParam ensures that all output sample_rates match.
+</Tip>
+
+## Text Processing and Filtering
+
+### Custom Text Aggregation
+
+Control how streaming text is processed before synthesis:
+
+```python
+from pipecat.utils.text.pattern_pair_aggregator import PatternPairAggregator
+
+# Custom aggregator for voice switching
+pattern_aggregator = PatternPairAggregator()
+pattern_aggregator.add_pattern_pair(
+    pattern_id="voice_tag",
+    start_pattern="<voice>",
+    end_pattern="</voice>",
+    remove_match=True,
+)
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    voice_id="default-voice",
+    text_aggregator=pattern_aggregator,  # Custom processing
+)
+```
+
+### Text Filters
+
+Apply preprocessing to text before synthesis:
+
+```python
+from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
+
+tts = YourTTSService(
+    # ... other options
+    text_filters=[
+        MarkdownTextFilter(),     # Remove markdown formatting
+        CustomTextFilter(),       # Your custom processing
+    ],
+)
+```
+
+**Common filters:**
+
+- **MarkdownTextFilter**: Strips markdown formatting from LLM responses
+- **Custom filters**: Implement your own text preprocessing logic
+
+## Advanced TTS Features
+
+### Direct Speech Commands
+
+Use `TTSSpeakFrame` for immediate speech synthesis:
+
+```python
+from pipecat.frames.frames import TTSSpeakFrame
+
+# Make bot speak directly
+await tts.queue_frame(TTSSpeakFrame("Hello, how can I help you?"))
+```
+
+### Dynamic Settings Updates
+
+Update TTS settings during conversation:
+
+```python
+from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+# Change voice speed during conversation
+await task.queue_frames([
+    TTSUpdateSettingsFrame({"speed": "fast"}),
+    TTSSpeakFrame("I'm speaking faster now!")
+])
+```
+
+## Key Takeaways
+
+- **Pipeline placement matters** - TTS must come after LLM, before transport output
+- **Service types differ** - WebSocket services provide lower latency than HTTP
+- **Text processing affects quality** - use aggregation and filters for better results
+- **Word timestamps enable precision** - better interruption handling and context accuracy
+- **Configuration impacts performance** - balance quality, latency, and bandwidth needs
+- **Services are modular** - easily swap providers without changing pipeline code
+
+## What's Next
+
+You've now learned how to build a complete voice AI pipeline! Let's explore some additional topics to enhance your implementation.
+
+<Card
+  title="Pipeline Termination"
+  icon="arrow-right"
+  href="/learn/pipeline-termination"
+>
+  Learn how to terminate your voice AI pipeline at the end of a conversation
+</Card>

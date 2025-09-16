@@ -1,0 +1,155 @@
+---
+title: Plivo Websocket Transport
+description: "Using Plivo's WebSocket Transport for your Pipecat Cloud agents"
+---
+
+Native support for Plivo's WebSocket Transport with Pipecat Cloud allows you to connect your AI agents with Plivo's voice infrastructure. This integration enables your Pipecat bots to handle real phone calls using Plivo's WebSocket streaming.
+
+## How It Works
+
+Pipecat Cloud implements Plivo's bidirectional [Media Streaming protocol](https://www.plivo.com/docs/voice/guides/stream-audio/). While audio streams flow through WebSockets, the call session is controlled by XML responses that tell Plivo how to handle each call.
+
+When Pipecat Cloud receives an incoming WebSocket connection from Plivo, it processes the `start` message to initialize a new bot instance. All WebSocket messages are forwarded to your bot, including call information such as the caller's number and call UUID. This allows your bot to leverage Plivo's Voice API for advanced call control - such as recording conversations, transferring to human agents, or implementing complex call flows.
+
+## Prerequisites
+
+Before setting up this integration, ensure you have:
+
+- A Plivo account with voice capabilities
+- A Pipecat Cloud account with a Plivo WebSocket-compatible bot
+- A web server to host XML responses (we'll show you how to set this up)
+
+A ready-to-build example of a Plivo websockets bot with complete source code is available on our [Github](https://github.com/daily-co/pipecat-cloud-images/tree/main/pipecat-starters/plivo). Follow the steps to [build and deploy the image](../../quickstart#deploy-the-agent).
+
+## Plivo Setup
+
+To connect your Pipecat Cloud bot to Plivo's voice network:
+
+1. [Purchase a phone number from Plivo](https://www.plivo.com/docs/numbers/quickstart/) if you haven't already. Ensure the number has voice capabilities.
+
+2. Retrieve your Pipecat Cloud organization name using the `pipecatcloud` CLI. This information is required when creating the XML configuration.
+
+```bash
+$ pcc organizations list
+```
+
+This command will output a list of organizations associated with your account. For example:
+
+```bash
+Organization        Name
+──────────────────────────────────────
+Default Workspace   three-random-words-randomnumber (active)
+```
+
+3. Set up an XML server to respond to Plivo webhooks. Unlike Twilio's TwiML Bins, Plivo requires a web server to host your XML responses.
+
+Create a file called `server.py`:
+
+```python
+from fastapi import FastAPI, Query, HTTPException
+from starlette.responses import Response
+import uvicorn
+
+app = FastAPI(title="Plivo XML Server", description="Serves XML for Plivo WebSocket streaming")
+
+@app.get("/plivo-xml")
+async def plivo_xml(
+    agent: str = Query(..., description="Agent name"),
+    org: str = Query(..., description="Organization name"),
+    # Optional Plivo parameters that are automatically passed by Plivo
+    CallUUID: str = Query(None, description="Plivo call UUID"),
+    From: str = Query(None, description="Caller's phone number"),
+    To: str = Query(None, description="Called phone number"),
+):
+    """
+    Returns XML for Plivo to start WebSocket streaming to Pipecat Cloud
+
+    Required parameters:
+    - agent: Your deployed agent name
+    - org: Your Pipecat Cloud organization name
+
+    Example: /plivo-xml?agent=my-bot&org=my-org-123
+    """
+    # Log call details (optional - useful for debugging)
+    if CallUUID:
+        print(f"Plivo call: {From} → {To}, UUID: {CallUUID}")
+
+    # Basic validation
+    if not agent or not org:
+        raise HTTPException(status_code=400, detail="Both 'agent' and 'org' parameters are required")
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">
+    wss://api.pipecat.daily.co/ws/plivo?serviceHost={agent}.{org}
+  </Stream>
+</Response>"""
+
+    return Response(content=xml, media_type="application/xml")
+
+if __name__ == "__main__":
+    # Run the server on port 7860
+    # Use with ngrok: ngrok http 7860
+    uvicorn.run(app, host="0.0.0.0", port=7860)
+```
+
+4. Install dependencies and run your XML server:
+
+```bash
+pip install fastapi uvicorn
+python server.py
+```
+
+5. Make your server publicly accessible. For testing, you can use ngrok:
+
+```bash
+ngrok http 7860
+```
+
+This will give you a public URL like `https://abc123.ngrok.io`.
+
+<Tip>
+  When testing using ngrok, use a `--subdomain` arg to keep your ngrok URL
+  consistent.
+</Tip>
+
+6. Create your XML application in the Plivo dashboard:
+   - Navigate to Voice → XML in your Plivo dashboard
+   - Select Add New Application
+     - Enter a name for your application (e.g., "Pipecat WebSocket")
+     - Set the **Answer URL** to your ngrok URL with agent and organization parameters:
+       ```bash
+       https://abc123.ngrok.io/plivo-xml?agent=AGENT_NAME&org=ORGANIZATION_NAME
+       ```
+       - Replace `AGENT_NAME` with your deployed bot's name (e.g., `my-first-agent`)
+       - Replace `ORGANIZATION_NAME` with your organization name from step 2 (e.g., `three-random-words-randomnumber`)
+     - Set **HTTP Method** to `GET`
+     - Click Create Application to create your application
+7. Configure your Plivo phone number to use your XML application:
+   - Navigate to Phone Numbers and select your phone number from the list
+   - Select XML Application as the Application Type
+   - Select your XML Application from the Plivo Application dropdown
+   - Click Update to apply your changes
+
+## Making and Receiving Calls
+
+### Receiving Inbound Calls
+
+To test your integration, simply dial your Plivo phone number from any phone. The call will connect to your Pipecat Cloud bot, which will respond according to your bot's configuration.
+
+## Advanced Call Control
+
+Your bot can control the active call by leveraging Plivo's Voice API with the `CallUUID` that's automatically provided to your bot. This enables capabilities such as:
+
+- Recording conversations
+- Playing audio prompts
+- Gathering DTMF input (keypad presses)
+- Ending calls programmatically
+
+For examples of these advanced features, refer to the [sample implementation on GitHub](https://github.com/daily-co/pipecat-cloud-images/tree/main/pipecat-starters/plivo) and Plivo's [Voice API documentation](https://www.plivo.com/docs/voice/api/).
+
+## Production Deployment
+
+For production use, deploy your XML server to a reliable hosting platform instead of using ngrok.
+
+Update your Plivo phone number configuration to use your production server URL.

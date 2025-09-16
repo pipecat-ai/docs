@@ -1,0 +1,225 @@
+---
+title: "IVR Navigation"
+description: "Automatically navigate phone system menus using AI-powered decision making"
+---
+
+## Overview
+
+The `IVRNavigator` enables your bot to automatically navigate Interactive Voice Response (IVR) phone systems to reach specific goals. Instead of manually programming navigation paths, you provide an end goal and the bot handles the complex decision-making required to traverse phone menus using DTMF tones and conversational responses.
+
+## How IVR Navigation Works
+
+The IVRNavigator combines several intelligent capabilities:
+
+1. **Goal-oriented navigation**: You specify what you want to accomplish (e.g., "reach billing support")
+2. **Automatic classification**: Detects whether incoming audio is an IVR system or human conversation
+3. **Smart decision making**: Analyzes menu options and selects the best path toward your goal
+4. **Multi-modal responses**: Uses both DTMF tones for menu selection, natural language for prompts, and waits when no input is appropriate
+5. **Status tracking**: Monitors progress and reports completion, waiting, or stuck states
+
+## Navigation Outcomes
+
+The `IVRNavigator` can reach several outcomes during navigation:
+
+### Completed ✅
+
+The navigator successfully reaches its goal and is ready for the next step. Common actions:
+
+- [Terminate the pipeline](https://docs.pipecat.ai/guides/learn/pipeline-termination) if the goal is complete
+- Transfer the call to a human agent
+- Allow your bot to start a conversation with the reached department
+
+```python
+@ivr_navigator.event_handler("on_ivr_status_changed")
+async def handle_ivr_status(processor, status):
+    if status == IVRStatus.COMPLETED:
+        logger.info("Successfully navigated to target department")
+        # Start conversation
+        # Replace the context with new messages for the upcoming conversation
+        messages = [{"role": "system", "content": "You are a helpful customer service assistant."}]
+        await task.queue_frame(LLMMessagesUpdateFrame(messages))
+        # Adjust VAD stop_secs for conversation
+        vad_params = VADParams(stop_secs=0.8)
+        await task.queue_frame(VADParamsUpdateFrame(vad_params))
+```
+
+### Stuck ⚠️
+
+The navigator cannot find a path forward in the IVR system. This might happen when:
+
+- Required information (account numbers, PINs) isn't available
+- The menu options don't align with the stated goal
+- The system encounters errors or invalid selections
+
+```python
+@ivr_navigator.event_handler("on_ivr_status_changed")
+async def handle_ivr_status(processor, status):
+    if status == IVRStatus.STUCK:
+        logger.warning("IVR navigation stuck - terminating call")
+        # Log the issue and clean up
+        await log_navigation_failure()
+        await task.queue_frame(EndFrame())
+```
+
+## Flexible Entry Points
+
+One of the `IVRNavigator`'s key features is flexible entry point handling. When you dial a phone number, you might encounter either:
+
+- An IVR system with menu options
+- A direct connection to a human
+
+The navigator automatically detects which scenario occurs and emits appropriate events:
+
+### Human Conversation Detected
+
+When a human answers instead of an IVR system, an `on_conversation_detected` event is emitted. You can handle that event to transition to a conversation.
+
+```python
+@ivr_navigator.event_handler("on_conversation_detected")
+async def on_conversation_detected(processor, conversation_history):
+    # Set up conversation prompt and preserve conversation history
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an assistant calling to check on the prescription for John Smith, date of birth 01/01/1990.",
+        }
+    ]
+
+    # Add preserved conversation history if available
+    if conversation_history:
+        messages.extend(conversation_history)
+
+    await task.queue_frame(LLMMessagesUpdateFrame(messages=messages, run_llm=True))
+```
+
+Note that the `on_conversation_detected` event also emits a `conversation_history` parameter that contains the previous conversation history. This allows you to build a prompt that includes your conversation system prompt plus any conversation history up to that point in time.
+
+### IVR System Detected
+
+When an IVR system is detected, the IVR Navigator automatically transitions into navigation mode:
+
+- **System prompt**: Updates to use your specified navigation goal
+- **VAD timing**: Adjusts to `stop_secs=2.0` (or your custom `ivr_vad_params`) to allow time for complete menu announcements
+- **Navigation logic**: Begins analyzing menu options and making decisions toward your goal
+
+No additional code is required. The navigator handles this transition automatically.
+
+**Optional Event Handling**
+
+If you need to log the detection or perform custom actions, you can handle the `on_ivr_status_changed` event:
+
+```python
+@ivr_navigator.event_handler("on_ivr_status_changed")
+async def on_ivr_status_changed(processor, status):
+    if status == IVRStatus.DETECTED:
+        logger.info("IVR system detected - beginning navigation")
+        # Optional: Add analytics tracking, custom setup, etc.
+```
+
+## Basic Implementation
+
+### Step 1: Create the IVR Navigator
+
+```python
+from pipecat.extensions.ivr.ivr_navigator import IVRNavigator
+from pipecat.audio.vad.vad_analyzer import VADParams
+
+# Define your navigation goal
+ivr_goal = "Navigate to the billing department to discuss my account balance"
+
+# Create navigator with extended response time for IVR systems
+ivr_vad_params = VADParams(stop_secs=2.0)  # Longer wait for IVR menus
+
+ivr_navigator = IVRNavigator(
+    llm=your_llm_service,
+    ivr_prompt=ivr_goal,
+    ivr_vad_params=ivr_vad_params
+)
+```
+
+### Step 2: Set Up Event Handlers
+
+```python
+from pipecat.frames.frames import LLMMessagesUpdateFrame
+from pipecat.extensions.ivr.ivr_navigator import IVRStatus
+
+@ivr_navigator.event_handler("on_conversation_detected")
+async def on_conversation_detected(processor, conversation_history):
+    """Handle when a human conversation is detected instead of IVR"""
+    logger.info("Human conversation detected")
+
+    # Set up conversation context
+    messages = [
+        {"role": "system", "content": "You are a customer service representative."}
+    ]
+    if conversation_history:
+        messages.extend(conversation_history)
+
+    await task.queue_frame(LLMMessagesUpdateFrame(messages=messages, run_llm=True))
+
+@ivr_navigator.event_handler("on_ivr_status_changed")
+async def on_ivr_status_changed(processor, status):
+    """Handle IVR navigation status changes"""
+    if status == IVRStatus.COMPLETED:
+        logger.info("IVR navigation completed successfully")
+        # Your success handling logic here
+
+    elif status == IVRStatus.STUCK:
+        logger.warning("IVR navigation got stuck")
+        # Your error handling logic here
+        await handle_navigation_failure()
+```
+
+### Step 3: Add to Pipeline
+
+Add the IVR Navigator to your pipeline in the place where you would normally add the LLM. The IVR Navigator contains your LLM and will perform the same functions as an LLM would, but in addition it will navigate the IVR system.
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+
+pipeline = Pipeline([
+    transport.input(),
+    stt_service,
+    ivr_navigator,  # Add the navigator to your pipeline
+    tts_service,
+    transport.output()
+])
+```
+
+## VAD Parameter Optimization
+
+The IVRNavigator automatically optimizes Voice Activity Detection (VAD) parameters for different scenarios:
+
+### IVR Navigation Mode
+
+- **Default**: `stop_secs=2.0`
+- **Purpose**: Allows time to hear complete menu options before responding
+- **Result**: Higher navigation success rates
+
+### Conversation Mode
+
+- **Recommended**: `stop_secs=0.8`
+- **Purpose**: Enables natural conversation flow with quick responses
+- **Implementation**: Push `VADParamsUpdateFrame` when transitioning to conversation
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Pipeline Termination"
+    icon="stop"
+    href="https://docs.pipecat.ai/guides/learn/pipeline-termination"
+  >
+    Learn how to properly terminate pipelines when IVR navigation completes
+  </Card>
+
+  <Card
+    title="Pipecat Flows"
+    icon="flow"
+    href="https://docs.pipecat.ai/guides/features/pipecat-flows"
+  >
+    Integrate structured conversation flows after successful IVR navigation
+  </Card>
+</CardGroup>
+
+The IVRNavigator provides a powerful foundation for automating phone system interactions, allowing your bots to handle the complex task of menu navigation while you focus on the core conversation logic.

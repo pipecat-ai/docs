@@ -1,0 +1,528 @@
+---
+title: "Function Calling"
+description: "Enable LLMs to interact with external services and APIs in your voice AI pipeline"
+---
+
+**Function calling** (also known as tool calling) allows LLMs to request information from external services and APIs during conversations. This extends your voice AI bot's capabilities beyond its training data to access real-time information and perform actions.
+
+## Pipeline Integration
+
+Function calling works seamlessly within your existing pipeline structure. The LLM service handles function calls automatically when they're needed:
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),     # Collects user transcriptions
+    llm,                          # Processes context, calls functions when needed
+    tts,
+    transport.output(),
+    context_aggregator.assistant(), # Collects function results and responses
+])
+```
+
+**Function call flow:**
+
+1. User asks a question requiring external data
+2. LLM recognizes the need and calls appropriate function
+3. Your function handler executes and returns results
+4. LLM incorporates results into its response
+5. Response flows to TTS and user as normal
+
+**Context integration:** Function calls and their results are automatically stored in conversation context by the context aggregators, maintaining complete conversation history.
+
+## Understanding Function Calling
+
+Function calling allows your bot to access real-time data and perform actions that aren't part of its training data.
+
+For example, you could give your bot the ability to:
+
+- Check current weather conditions
+- Look up stock prices
+- Query a database
+- Control smart home devices
+- Schedule appointments
+
+Here's how it works:
+
+1. You define functions the LLM can use and register them to the LLM service used in your pipeline
+2. When needed, the LLM requests a function call
+3. Your application executes any corresponding functions
+4. The result is sent back to the LLM
+5. The LLM uses this information in its response
+
+## Implementation
+
+### 1. Define Functions
+
+Pipecat provides a standardized `FunctionSchema` that works across all supported LLM providers. This makes it easy to define functions once and use them with any provider.
+
+As a shorthand, you could also bypass specifying a function configuration at all and instead use "direct" functions. Under the hood, these are converted to `FunctionSchema`s.
+
+#### Using the Standard Schema (Recommended)
+
+```python
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+# Define a function using the standard schema
+weather_function = FunctionSchema(
+    name="get_current_weather",
+    description="Get the current weather in a location",
+    properties={
+        "location": {
+            "type": "string",
+            "description": "The city and state, e.g. San Francisco, CA",
+        },
+        "format": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"],
+            "description": "The temperature unit to use.",
+        },
+    },
+    required=["location", "format"]
+)
+
+# Create a tools schema with your functions
+tools = ToolsSchema(standard_tools=[weather_function])
+
+# Pass this to your LLM context
+context = OpenAILLMContext(
+    messages=[{"role": "system", "content": "You are a helpful assistant."}],
+    tools=tools
+)
+```
+
+The `ToolsSchema` will be automatically converted to the correct format for your LLM provider through adapters.
+
+#### Using Direct Functions (Shorthand)
+
+You can bypass specifying a function configuration (as a `FunctionSchema` or in a provider-specific format) and instead pass the function directly to your `ToolsSchema`. Pipecat will auto-configure the function, gathering relevant metadata from its signature and docstring. Metadata includes:
+
+- name
+- description
+- properties (including individual property descriptions)
+- list of required properties
+
+Note that the function signature is a bit different when using direct functions. The first parameter is `FunctionCallParams`, followed by any others necessary for the function.
+
+```python
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.llm_service import FunctionCallParams
+
+# Define a direct function
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
+    """
+    weather_data = {"conditions": "sunny", "temperature": "75"}
+    await params.result_callback(weather_data)
+
+# Create a tools schema, passing your function directly to it
+tools = ToolsSchema(standard_tools=[get_current_weather])
+
+# Pass this to your LLM context
+context = OpenAILLMContext(
+    messages=[{"role": "system", "content": "You are a helpful assistant."}],
+    tools=tools
+)
+```
+
+#### Using Provider-Specific Formats (Alternative)
+
+You can also define functions in the provider-specific format if needed:
+
+<CodeGroup>
+
+```python OpenAI
+from openai.types.chat import ChatCompletionToolParam
+
+# OpenAI native format
+tools = [
+    ChatCompletionToolParam(
+        type="function",
+        function={
+            "name": "get_current_weather",
+            "description": "Get the current weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state, e.g. San Francisco, CA",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "The temperature unit to use.",
+                    },
+                },
+                "required": ["location", "format"],
+            },
+        },
+    )
+]
+```
+
+```python Anthropic
+# Anthropic native format
+tools = [
+    {
+        "name": "get_weather",
+        "description": "Get the weather in a given location",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "The city, e.g. San Francisco",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["celsius", "fahrenheit"],
+                    "description": "The temperature unit to use.",
+                },
+            },
+            "required": ["location", "format"],
+        },
+    }
+]
+```
+
+```python Gemini
+# Gemini native format
+tools = [
+    {
+        "function_declarations": [
+            {
+                "name": "get_weather_current",
+                "description": "Get the current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "Location as 'city,state,country'",
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"],
+                            "description": "The temperature unit to use.",
+                        },
+                    },
+                    "required": ["location", "format"],
+                },
+            }
+        ]
+    }
+]
+```
+
+</CodeGroup>
+
+#### Provider-Specific Custom Tools
+
+Some providers support unique tools that don't fit the standard function schema. For these cases, you can add custom tools:
+
+```python
+from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+
+# Standard functions
+weather_function = FunctionSchema(
+    name="get_current_weather",
+    description="Get the current weather",
+    properties={"location": {"type": "string"}},
+    required=["location"]
+)
+
+# Custom Gemini search tool
+gemini_search_tool = {
+    "web_search": {
+        "description": "Search the web for information"
+    }
+}
+
+# Create a tools schema with both standard and custom tools
+tools = ToolsSchema(
+    standard_tools=[weather_function],
+    custom_tools={
+        AdapterType.GEMINI: [gemini_search_tool]
+    }
+)
+```
+
+<Tip>
+  See the provider-specific documentation for details on custom tools and their
+  formats.
+</Tip>
+
+### 2. Register Function Handlers
+
+Register handlers for your functions using one of these [LLM service methods](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#llm-service):
+
+- `register_function`
+- `register_direct_function`
+
+Which one you use depends on whether your function is a ["direct" function](#using-direct-functions-shorthand).
+
+<CodeGroup>
+
+```python Non-Direct Function
+from pipecat.services.llm_service import FunctionCallParams
+
+llm = OpenAILLMService(api_key="your-api-key")
+
+# Main function handler - called to execute the function
+async def fetch_weather_from_api(params: FunctionCallParams):
+    # Fetch weather data from your API
+    weather_data = {"conditions": "sunny", "temperature": "75"}
+    await params.result_callback(weather_data)
+
+# Register the function
+llm.register_function(
+    "get_current_weather",
+    fetch_weather_from_api,
+    cancel_on_interruption=True,  # Cancel if user interrupts (default: True)
+)
+```
+
+```python Direct Function
+from pipecat.services.llm_service import FunctionCallParams
+
+llm = OpenAILLMService(api_key="your-api-key")
+
+# Direct function
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
+    """
+    weather_data = {"conditions": "sunny", "temperature": "75"}
+    await params.result_callback(weather_data)
+
+# Register direct function
+llm.register_direct_function(
+    get_current_weather,
+    cancel_on_interruption=False,  # Don't cancel on interruption
+)
+```
+
+</CodeGroup>
+
+**Key registration options:**
+
+- **`cancel_on_interruption=True`** (default): Function call is cancelled if user interrupts
+- **`cancel_on_interruption=False`**: Function call continues even if user interrupts
+
+Use `cancel_on_interruption=False` for critical operations that should complete even if the user starts speaking. Function calls are async, so you can continue the conversation while the function executes. Once the result returns, the LLM will automatically incorporate it into the conversation context. LLMs vary in terms of how well they incorporate changes to _previous_ messages, so you may need to experiment with your LLM provider to see how it handles this.
+
+### 3. Create the Pipeline
+
+Include your LLM service in your pipeline with the registered functions:
+
+```python
+# Initialize the LLM context with your function schemas
+context = OpenAILLMContext(
+    messages=[{"role": "system", "content": "You are a helpful assistant."}],
+    tools=tools
+)
+
+# Create the context aggregator to collect the user and assistant context
+context_aggregator = llm.create_context_aggregator(context)
+
+# Create the pipeline
+pipeline = Pipeline([
+    transport.input(),               # Input from the transport
+    stt,                             # STT processing
+    context_aggregator.user(),       # User context aggregation
+    llm,                             # LLM processing
+    tts,                             # TTS processing
+    transport.output(),              # Output to the transport
+    context_aggregator.assistant(),  # Assistant context aggregation
+])
+```
+
+## Function Handler Details
+
+### FunctionCallParams
+
+Every function handler receives a `FunctionCallParams` object containing all the information needed for execution:
+
+```python
+@dataclass
+class FunctionCallParams:
+    function_name: str                          # Name of the called function
+    tool_call_id: str                           # Unique identifier for this call
+    arguments: Mapping[str, Any]                # Arguments from the LLM
+    llm: LLMService                             # Reference to the LLM service
+    context: OpenAILLMContext                   # Current conversation context
+    result_callback: FunctionCallResultCallback # Return results here
+```
+
+**Using the parameters:**
+
+```python
+async def example_function_handler(params: FunctionCallParams):
+    # Access function details
+    print(f"Called function: {params.function_name}")
+    print(f"Call ID: {params.tool_call_id}")
+
+    # Extract arguments
+    location = params.arguments["location"]
+
+    # Access LLM context for conversation history
+    messages = params.context.messages
+
+    # Use LLM service for additional operations
+    await params.llm.push_frame(TTSSpeakFrame("Looking up weather data..."))
+
+    # Return results
+    await params.result_callback({"conditions": "nice", "temperature": "75"})
+```
+
+See the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#pipecat.services.llm_service.FunctionCallParams) for complete details.
+
+### Handler Structure
+
+Your function handler should:
+
+1. Receive necessary arguments, either:
+   - From `params.arguments`
+   - Directly from function arguments, if using [direct functions](#using-direct-functions-shorthand)
+2. Process data or call external services
+3. Return results via `params.result_callback(result)`
+
+<CodeGroup>
+
+```python Non-Direct Function
+async def fetch_weather_from_api(params: FunctionCallParams):
+    try:
+        # Extract arguments
+        location = params.arguments.get("location")
+        format_type = params.arguments.get("format", "celsius")
+
+        # Call external API
+        api_result = await weather_api.get_weather(location, format_type)
+
+        # Return formatted result
+        await params.result_callback({
+            "location": location,
+            "temperature": api_result["temp"],
+            "conditions": api_result["conditions"],
+            "unit": format_type
+        })
+    except Exception as e:
+        # Handle errors
+        await params.result_callback({
+            "error": f"Failed to get weather: {str(e)}"
+        })
+```
+
+```python Direct Function
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
+    """
+    try:
+        # Call external API
+        api_result = await weather_api.get_weather(location, format)
+
+        # Return formatted result
+        await params.result_callback({
+            "location": location,
+            "temperature": api_result["temp"],
+            "conditions": api_result["conditions"],
+            "unit": format
+        })
+    except Exception as e:
+        # Handle errors
+        await params.result_callback({
+            "error": f"Failed to get weather: {str(e)}"
+        })
+```
+
+</CodeGroup>
+
+## Controlling Function Call Behavior (Advanced)
+
+When returning results from a function handler, you can control how the LLM processes those results using a `FunctionCallResultProperties` object passed to the result callback.
+
+### Properties
+
+`FunctionCallResultProperties` provides fine-grained control over LLM execution:
+
+```python
+@dataclass
+class FunctionCallResultProperties:
+    run_llm: Optional[bool] = None                 # Whether to run LLM after this result
+    on_context_updated: Optional[Callable] = None  # Callback when context is updated
+```
+
+**Property options:**
+
+- **`run_llm=True`**: Run LLM after function call (default behavior)
+- **`run_llm=False`**: Don't run LLM after function call (useful for chained calls)
+- **`on_context_updated`**: Async callback executed after the function result is added to context
+
+<Tip>
+  Skip LLM execution (`run_llm=False`) when you have back-to-back function
+  calls. If you skip a completion, you must manually trigger one from the
+  context aggregator.
+</Tip>
+
+See the [API reference](https://reference-server.pipecat.ai/en/latest/api/pipecat.frames.frames.html#pipecat.frames.frames.FunctionCallResultProperties) for complete details.
+
+### Example Usage
+
+```python
+from pipecat.frames.frames import FunctionCallResultProperties
+from pipecat.services.llm_service import FunctionCallParams
+
+async def fetch_weather_from_api(params: FunctionCallParams):
+    # Fetch weather data
+    weather_data = {"conditions": "sunny", "temperature": "75"}
+
+    # Don't run LLM after this function call
+    properties = FunctionCallResultProperties(run_llm=False)
+
+    await params.result_callback(weather_data, properties=properties)
+
+async def query_database(params: FunctionCallParams):
+    # Query database
+    results = await db.query(params.arguments["query"])
+
+    async def on_update():
+        await notify_system("Database query complete")
+
+    # Run LLM after function call and notify when context is updated
+    properties = FunctionCallResultProperties(
+        run_llm=True,
+        on_context_updated=on_update
+    )
+
+    await params.result_callback(results, properties=properties)
+```
+
+## Key Takeaways
+
+- **Function calling extends LLM capabilities** beyond training data to real-time information
+- **Context integration is automatic** - function calls and results are stored in conversation history
+- **Multiple definition approaches** - use standard schema for portability, direct functions for simplicity
+- **Pipeline integration is seamless** - functions work within your existing voice AI architecture
+- **Advanced control available** - fine-tune LLM execution and monitor function call lifecycle
+
+## What's Next
+
+Now that you understand function calling, let's explore how to configure text-to-speech services to convert your LLM's responses (including function call results) into natural-sounding speech.
+
+<Card title="Text to Speech" icon="arrow-right" href="/learn/text-to-speech">
+  Learn how to configure speech synthesis in your voice AI pipeline
+</Card>
