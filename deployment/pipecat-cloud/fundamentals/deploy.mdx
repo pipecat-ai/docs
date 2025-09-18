@@ -65,6 +65,176 @@ pcc agent status my-first-agent
 
 If a deployment was successful and ready to be started, you should see a `ready` status.
 
+## Private Container Registry Deployments
+
+When using private container registries, you'll need to configure image pull secrets to authenticate with your registry. Below are guides for the most common cloud platforms.
+
+### GCP Artifact Registry
+
+For GCP Artifact Registry, you can use a service account JSON key to authenticate:
+
+```bash
+# First, authenticate Docker with your service account key
+cat key-file.json | docker login -u _json_key --password-stdin https://LOCATION-docker.pkg.dev
+
+# Create image credentials in Pipecat Cloud using the same service account
+pcc image-credentials create my-gcp-credentials \
+  --registry https://LOCATION-docker.pkg.dev \
+  --username _json_key \
+  --password "$(cat key-file.json)"
+```
+
+Replace:
+
+- `LOCATION` with your Artifact Registry location (e.g., `us-central1`, `asia-east1`)
+- `key-file.json` with the path to your service account JSON key file
+
+Reference the image credentials in your `pcc-deploy.toml` file:
+
+```toml
+agent_name = "my-first-agent"
+image = "LOCATION-docker.pkg.dev/PROJECT-ID/REPO-NAME/my-first-agent:0.1"
+secret_set = "my-first-agent-secrets"
+image_credentials = "my-gcp-credentials"
+
+[scaling]
+    min_instances = 0
+```
+
+Or specify it directly in the CLI:
+
+```bash
+pcc deploy my-first-agent LOCATION-docker.pkg.dev/PROJECT-ID/REPO-NAME/my-first-agent:0.1 \
+  --secret-set my-first-agent-secrets \
+  --image-credentials my-gcp-credentials
+```
+
+<Note>
+  The service account used for image credentials should have the `Artifact
+  Registry Reader` role or equivalent permissions to pull images from your
+  private repository.
+</Note>
+
+### AWS ECR
+
+If you're using AWS ECR with private repositories for Pipecat Cloud deployments, you'll need to configure image pull secrets to authenticate with your registry. ECR tokens expire every 12 hours, so you'll also need to set up automatic token refresh.
+
+Build and tag your Docker image, then push to ECR:
+
+```bash
+# Build and tag your image
+docker build --platform=linux/arm64 -t my-agent:latest .
+docker tag my-agent:latest <aws_account_id>.dkr.ecr.<region>.amazonaws.com/your-repo:tag
+
+# Push to ECR
+docker push <aws_account_id>.dkr.ecr.<region>.amazonaws.com/your-repo:tag
+```
+
+<Note>
+  Pipecat Cloud may pull your image on deploy and again during scale-outs, so
+  credentials must be valid whenever new pods start.
+</Note>
+
+Use the Pipecat Cloud REST API to store your ECR registry credentials:
+
+```bash
+# Get ECR login token
+ECR_TOKEN=$(aws ecr get-login-password --region <region>)
+
+# Create image pull secret using REST API
+curl --request PUT \
+  --url https://api.pipecat.daily.co/v1/secrets/my-ecr-credentials \
+  --header 'Authorization: Bearer <your-private-api-token>' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "secrets": [
+      {
+        "secretKey": "username",
+        "secretValue": "AWS"
+      },
+      {
+        "secretKey": "password",
+        "secretValue": "'$ECR_TOKEN'"
+      },
+      {
+        "secretKey": "registry",
+        "secretValue": "<aws_account_id>.dkr.ecr.<region>.amazonaws.com"
+      }
+    ]
+  }'
+```
+
+Replace:
+
+- `<region>` with your AWS region (e.g., `us-east-1`, `us-west-2`)
+- `<aws_account_id>` with your AWS account ID
+- `<your-private-api-token>` with your Pipecat Cloud private API token
+
+Reference the image credentials in your `pcc-deploy.toml` file:
+
+```toml
+agent_name = "my-ecr-agent"
+image = "<aws_account_id>.dkr.ecr.<region>.amazonaws.com/your-repo:tag"
+secret_set = "my-agent-secrets"
+image_credentials = "my-ecr-credentials"
+
+[scaling]
+    min_instances = 0
+```
+
+Or specify it directly in the CLI:
+
+```bash
+pcc deploy my-ecr-agent <aws_account_id>.dkr.ecr.<region>.amazonaws.com/your-repo:tag \
+  --secret-set my-agent-secrets \
+  --image-credentials my-ecr-credentials
+```
+
+ECR passwords expire every 12 hours, so set up a scheduled job to refresh the token:
+
+```bash
+#!/bin/bash
+# refresh-ecr-token.sh
+
+# Get fresh ECR token
+ECR_TOKEN=$(aws ecr get-login-password --region <region>)
+
+# Update the existing image pull secret
+curl --request PUT \
+  --url https://api.pipecat.daily.co/v1/secrets/my-ecr-credentials \
+  --header 'Authorization: Bearer <your-private-api-token>' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "secrets": [
+      {
+        "secretKey": "username",
+        "secretValue": "AWS"
+      },
+      {
+        "secretKey": "password",
+        "secretValue": "'$ECR_TOKEN'"
+      },
+      {
+        "secretKey": "registry",
+        "secretValue": "<aws_account_id>.dkr.ecr.<region>.amazonaws.com"
+      }
+    ]
+  }'
+```
+
+Schedule this script to run every 6-8 hours using cron or your preferred scheduler.
+
+Operational tips:
+
+- Image pulls can happen during scale-outs, not just at initial deploy—keep the secret valid continuously
+- If you see agents failing to become ready with no logs, check that your ECR credentials aren't expired
+- Consider setting up monitoring alerts for ECR token expiration
+
+<Note>
+  Ensure your AWS credentials have the necessary permissions to access ECR,
+  including `ecr:GetAuthorizationToken` and `ecr:BatchGetImage` policies.
+</Note>
+
 ## Modifying a deployment
 
 Agents are referenced as a mutable manifest in Pipecat Cloud.
