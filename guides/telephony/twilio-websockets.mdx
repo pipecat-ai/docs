@@ -1,346 +1,389 @@
 ---
-title: "Dial-in: Twilio (Media Streams)"
-description: "Call your Pipecat bot over websockets using Twilio"
+title: "Twilio WebSocket Integration"
+sidebarTitle: "Twilio WebSocket"
+description: "Complete guide to using Twilio Media Streams with Pipecat for dial-in and dial-out functionality"
 ---
-
-This guide walks through creating a voice AI agent that users can reach by dialing a Twilio phone number. We'll integrate Twilio Media Streams via WebSockets with a Pipecat pipeline to create a fully functional voice AI experience.
 
 ## Things you'll need
 
-- An active [Twilio](https://www.twilio.com) account with at least one phone number
-- A public-facing server or a tunneling service like [ngrok](https://ngrok.com/)
+- An active [Twilio](https://www.twilio.com) account with API credentials
+- One or more Twilio provisioned phone numbers
+- A public-facing server or tunneling service like [ngrok](https://ngrok.com/)
 - API keys for speech-to-text, text-to-speech, and LLM services
 
-<Card
-  title="Complete example code on GitHub"
-  icon="code"
-  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot"
->
-  The full source code for this example is available in the Pipecat repository.
-</Card>
+<CardGroup cols={2}>
+  <Card
+    title="Twilio Dial-in Example"
+    icon="phone-arrow-down-left"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot/inbound"
+  >
+    Complete dial-in implementation using Twilio Media Streams over WebSocket
+  </Card>
 
-## Architecture Overview
+  <Card
+    title="Twilio Dial-out Example"
+    icon="phone-arrow-up-right"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot/outbound"
+  >
+    Outbound calling using Twilio Media Streams with WebSocket transport
+  </Card>
+</CardGroup>
 
-When a user dials your Twilio phone number:
+## Phone Number Setup
 
-1. Twilio calls your server's endpoint, which returns TwiML that establishes a WebSocket connection
-2. Twilio sends real-time audio data over the WebSocket, and your server processes it using the Pipecat pipeline
-3. Your Pipecat agent processes the audio which is sent to the pipeline, which then outputs audio data back to Twilio
-4. Twilio plays this audio to the caller in real-time
+You'll need Twilio phone numbers for both dial-in and dial-out functionality:
 
-## Server Implementation
+- Visit [console.twilio.com](https://console.twilio.com) and purchase phone numbers
+- Ensure your numbers support Voice capabilities
+- Configure webhook URLs for dial-in numbers (covered below)
 
-The server needs to:
+## Environment Setup
 
-1. Serve TwiML in response to Twilio's HTTP requests
-2. Handle WebSocket connections
-3. Process audio with the Pipecat pipeline
+Configure your environment variables for Twilio and AI services:
 
-Let's look at the key components:
-
-### FastAPI Server Setup
-
-```python
-from fastapi import FastAPI, WebSocket
-from starlette.responses import HTMLResponse
-
-app = FastAPI()
-
-@app.post("/")
-async def start_call():
-    return HTMLResponse(
-        content=open("templates/streams.xml").read(),
-        media_type="application/xml"
-    )
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-
-    # Read initial WebSocket messages
-    start_data = ws.iter_text()
-    await start_data.__anext__()
-
-    # Second message contains the call details
-    call_data = json.loads(await start_data.__anext__())
-
-    # Extract both StreamSid and CallSid
-    stream_sid = call_data["start"]["streamSid"]
-    call_sid = call_data["start"]["callSid"]
-
-    # Run your Pipecat bot
-    await run_bot(websocket, stream_sid, call_sid, app.state.testing)
+```shell .env
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+OPENAI_API_KEY=...
+DEEPGRAM_API_KEY=...
+CARTESIA_API_KEY=...
 ```
 
-This server has two main endpoints:
+## Dial-in
 
-- `POST /` - Returns TwiML instructions to Twilio
-- `WebSocket /ws` - Handles the WebSocket connection for real-time audio
+Dial-in allows users to call your Twilio number and connect to your Pipecat bot via WebSocket Media Streams.
 
-### TwiML Configuration
+### How It Works
 
-The TwiML tells Twilio to establish a WebSocket connection with your server:
+Here's the sequence of events when someone calls your Twilio number:
 
-```xml
+1. **Twilio receives an incoming call** to your phone number
+2. **Twilio calls your webhook server** with call details
+3. **Your server responds with TwiML** that establishes a WebSocket connection
+4. **Twilio opens a WebSocket** to your server with real-time audio
+5. **Your bot processes the audio** using the Pipecat pipeline
+6. **The bot responds with audio** sent back to Twilio over WebSocket
+7. **Twilio plays the audio** to the caller in real-time
+
+### Set up your webhook server
+
+Your server handles Twilio webhooks and WebSocket connections for real-time audio streaming. When Twilio receives a call, your server:
+
+1. **Receives the webhook** with call details (CallSid, caller information)
+2. **Returns TwiML** that establishes a WebSocket connection to your server
+3. **Accepts the WebSocket** connection from Twilio
+4. **Parses call data** including custom parameters from the WebSocket
+5. **Runs the Pipecat bot** with the parsed call information
+
+The server orchestrates the real-time audio streaming between Twilio's telephony infrastructure and your Pipecat bot pipeline.
+
+### Custom Parameters with TwiML
+
+Twilio's `<Parameter>` noun allows you to pass custom information to your bot through the WebSocket connection. This is essential for passing caller details, user IDs, or other contextual information:
+
+```xml TwiML with custom parameters
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://<your server url>/ws"></Stream>
+    <Stream url="wss://your-server.com/ws">
+      <Parameter name="caller_id" value="+1234567890" />
+      <Parameter name="user_id" value="user_123" />
+      <Parameter name="session_type" value="support" />
+    </Stream>
   </Connect>
   <Pause length="40"/>
 </Response>
 ```
 
-<Note>
-  Replace `<your server url>` with your server's publicly accessible domain. The `Pause` element keeps the call alive for a maximum of 40 seconds. Adjust this value based on your expected conversation length.
-</Note>
+These parameters are accessible in your bot through Pipecat's built-in WebSocket parser, which extracts them from the `customParameters` field in the WebSocket data.
 
-### Pipecat Bot Implementation
+<Card
+  title="Complete Server Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/twilio-chatbot/inbound/server.py"
+>
+  See the full FastAPI server code with TwiML generation and WebSocket handling
+</Card>
 
-The `run_bot` function creates and connects all the components in the Pipecat pipeline:
+### Configure your Pipecat bot for dial-in
 
-```python
-async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, testing: bool):
-    # Initialize the Twilio serializer with stream and call SIDs
-    serializer = TwilioFrameSerializer(
-        stream_sid=stream_sid,
-        call_sid=call_sid,
-        account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
-        auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
-    )
+Your bot receives the WebSocket connection and parses the call data to extract custom parameters and call information. The key components are:
 
-    # Create the WebSocket transport
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket_client,
-        params=FastAPIWebsocketParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            add_wav_header=False,
-            vad_analyzer=SileroVADAnalyzer(),
-            serializer=serializer,
-        ),
-    )
+**WebSocket Parsing**: Pipecat's built-in parser extracts call data from Twilio's WebSocket messages:
 
-    # Initialize AI services
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), audio_passthrough=True)
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-        push_silence_after_stop=testing,
-    )
+```python bot.py
+from pipecat.runner.utils import parse_telephony_websocket
 
-    # Create the initial conversation prompt
-    messages = [
-        {
-            "role": "system",
-            "content": "You are an elementary teacher in an audio call. Your output will be converted to audio so don't include special characters in your answers. Respond to what the student said in a short short sentence.",
-        },
-    ]
+async def run_bot(websocket: WebSocket):
+    # Parse Twilio WebSocket data
+    transport_type, call_data = await parse_telephony_websocket(websocket)
 
-    # Setup the context aggregator
-    context = OpenAILLMContext(messages)
-    context_aggregator = llm.create_context_aggregator(context)
+    # Extract call information
+    stream_id = call_data["stream_id"]
+    call_id = call_data["call_id"]
 
-    # Create an audio buffer processor to capture conversation audio
-    audiobuffer = AudioBufferProcessor(user_continuous_stream=not testing)
-
-    # Build the pipeline
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Websocket input from client
-            stt,  # Speech-To-Text
-            context_aggregator.user(),
-            llm,  # LLM
-            tts,  # Text-To-Speech
-            transport.output(),  # Websocket output to client
-            audiobuffer,  # Used to buffer the audio in the pipeline
-            context_aggregator.assistant(),
-        ]
-    )
-
-    # Create a pipeline task with appropriate parameters
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=8000,  # Twilio uses 8kHz audio
-            audio_out_sample_rate=8000,
-            allow_interruptions=True,
-        ),
-    )
-
-    # Setup event handlers
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        # Start recording
-        await audiobuffer.start_recording()
-        # Kickstart the conversation
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
-        await task.queue_frames([LLMRunFrame()])
-
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        await task.cancel()
-
-    @audiobuffer.event_handler("on_audio_data")
-    async def on_audio_data(buffer, audio, sample_rate, num_channels):
-        server_name = f"server_{websocket_client.client.port}"
-        await save_audio(server_name, audio, sample_rate, num_channels)
-
-    # Run the pipeline
-    runner = PipelineRunner(handle_sigint=False, force_gc=True)
-    await runner.run(task)
+    # Access custom parameters from TwiML
+    custom_params = call_data["body"]  # Contains all <Parameter> values
+    caller_id = custom_params.get("caller_id")
+    user_id = custom_params.get("user_id")
+    session_type = custom_params.get("session_type")
 ```
 
-## Key Technical Considerations
+```python bot.py
+# Create Twilio serializer with call details
+serializer = TwilioFrameSerializer(
+    stream_sid=stream_id,
+    call_sid=call_id,
+    account_sid=os.getenv("TWILIO_ACCOUNT_SID"),
+    auth_token=os.getenv("TWILIO_AUTH_TOKEN"),
+)
+
+# Configure WebSocket transport
+transport = FastAPIWebsocketTransport(
+    websocket=websocket,
+    params=FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        add_wav_header=False,
+        vad_analyzer=SileroVADAnalyzer(),
+        serializer=serializer,
+    ),
+)
+
+# Your bot pipeline setup here...
+```
+
+**Custom Parameter Usage**: Use the extracted parameters to customize your bot's behavior:
+
+```python bot.py
+# Customize bot behavior based on parameters
+if session_type == "support":
+    system_prompt = "You are a helpful customer support agent..."
+elif session_type == "sales":
+    system_prompt = "You are a friendly sales representative..."
+else:
+    system_prompt = "You are a general assistant..."
+
+# Use caller_id for personalization
+greeting = f"Hello! I see you're calling from {caller_id}. How can I help you today?"
+```
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/twilio-chatbot/inbound/bot.py"
+>
+  See the full bot.py with WebSocket parsing, transport setup, and pipeline
+  configuration
+</Card>
+
+### Set up Twilio webhook
+
+Configure your Twilio phone number to use your server's webhook URL:
+
+1. Go to the [Twilio Console](https://console.twilio.com)
+2. Navigate to Phone Numbers → Manage → Active Numbers
+3. Click on your phone number
+4. Under "Configure", set "A Call Comes In" to:
+   - Webhook: `https://your-server.com/` (your server's URL)
+   - HTTP Method: POST
+
+### Run the Example
+
+For local development, use [ngrok](https://ngrok.com/) to expose your local server:
+
+```shell
+# Start your server
+python server.py
+
+# In another terminal, start ngrok
+ngrok http 8000
+
+# Use the ngrok URL as your Twilio webhook
+```
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot/inbound"
+>
+  See the full README with step-by-step setup, webhook configuration, and
+  testing
+</Card>
+
+## Dial-out
+
+Dial-out allows your bot to initiate calls to phone numbers using Twilio's outbound calling capabilities with WebSocket Media Streams.
+
+### How It Works
+
+Here's the sequence of events for dial-out calls:
+
+1. **Your application triggers a dial-out** (via API call or user action)
+2. **Server initiates a Twilio call** to the target phone number
+3. **Twilio establishes the call** and opens a WebSocket connection
+4. **Your bot joins the WebSocket** and sets up the pipeline
+5. **The recipient answers** and is connected to your bot
+6. **The bot handles the conversation** with real-time audio streaming
+
+### Set up your server for dial-out
+
+The dial-out server creates outbound calls and manages WebSocket connections. When you trigger a dial-out call, your server:
+
+1. **Receives the dial-out request** with target phone number and parameters
+2. **Creates a Twilio call** using the REST API with TwiML that establishes WebSocket
+3. **Accepts the WebSocket** connection from Twilio
+4. **Parses call data** including any custom parameters
+5. **Runs the Pipecat bot** with the call information
+
+<Card
+  title="Complete Server Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/twilio-chatbot/outbound/server.py"
+>
+  See the full FastAPI server code with outbound call creation and WebSocket
+  handling
+</Card>
+
+### Configure your Pipecat bot for dial-out
+
+The dial-out bot configuration is similar to dial-in, but you can pass custom parameters when creating the outbound call:
+
+**Custom Parameters for Dial-out**: Pass information to your bot through TwiML parameters:
+
+```python server.py
+# When creating the outbound call, include custom parameters
+twiml = f"""
+<Response>
+  <Connect>
+    <Stream url="wss://your-server.com/ws">
+      <Parameter name="campaign_id" value="summer_sale" />
+      <Parameter name="customer_id" value="{customer_id}" />
+      <Parameter name="call_type" value="outbound" />
+    </Stream>
+  </Connect>
+</Response>
+"""
+
+# Create the outbound call
+call = twilio_client.calls.create(
+    to=target_number,
+    from_=your_twilio_number,
+    twiml=twiml
+)
+```
+
+**Bot Configuration**: The bot receives and uses these parameters:
+
+```python bot.py
+# Parse WebSocket data (same as dial-in)
+transport_type, call_data = await parse_telephony_websocket(websocket)
+
+# Access custom parameters
+custom_params = call_data["body"]
+campaign_id = custom_params.get("campaign_id")
+customer_id = custom_params.get("customer_id")
+
+# Customize bot behavior for outbound calls
+if campaign_id == "summer_sale":
+    greeting = f"Hi! I'm calling about our summer sale promotion..."
+```
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/twilio-chatbot/outbound/bot.py"
+>
+  See the full bot.py with outbound call handling and parameter usage
+</Card>
+
+### Run the Example
+
+To test dial-out functionality:
+
+1. **Start your server**: Run your FastAPI server
+2. **Trigger a call**: Make an API request to start an outbound call
+3. **Answer your phone**: The bot will call the specified number
+4. **Talk to your bot**: Have a conversation with your AI agent
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot/outbound"
+>
+  See the full README with step-by-step setup, API usage, and outbound call
+  configuration
+</Card>
+
+## Key Features
 
 ### Audio Format and Sample Rate
 
-Twilio Media Streams uses 8kHz mono audio with 16-bit PCM encoding. Make sure your pipeline is configured correctly:
+Twilio Media Streams uses 8kHz mono audio with 16-bit PCM encoding. To avoid resampling, set the audio input and outputsample rate to 8000 Hz:
 
 ```python
 task = PipelineTask(
     pipeline,
     params=PipelineParams(
-        audio_in_sample_rate=8000,  # Twilio's audio format
+        audio_in_sample_rate=8000,
         audio_out_sample_rate=8000,
         allow_interruptions=True,
     ),
 )
 ```
 
-### Serialization and Call Control
+### Automatic Call Termination
 
-The `TwilioFrameSerializer` handles the protocol specifics for communicating with Twilio's Media Streams:
+When you provide Twilio credentials to the `TwilioFrameSerializer`, it automatically ends calls when your pipeline ends:
 
 ```python
 serializer = TwilioFrameSerializer(
-    stream_sid=stream_sid,
-    call_sid=call_sid,
-    account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
-    auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
+    stream_sid=stream_id,
+    call_sid=call_id,
+    account_sid=os.getenv("TWILIO_ACCOUNT_SID"),
+    auth_token=os.getenv("TWILIO_AUTH_TOKEN"),
 )
 ```
-
-<Tip>
-  When you provide the `account_sid` and `auth_token` to the
-  `TwilioFrameSerializer`, it will automatically end the call via Twilio's REST
-  API when the pipeline ends. This ensures clean call termination when your bot
-  finishes its conversation.
-</Tip>
 
 ### Voice Activity Detection
 
-The SileroVAD analyzer helps determine when a user has finished speaking:
+The `SileroVADAnalyzer` helps determine when users have finished speaking, enabling natural conversation flow.
 
-```python
-params=FastAPIWebsocketParams(
-    audio_in_enabled=True,
-    audio_out_enabled=True,
-    add_wav_header=False,
-    vad_analyzer=SileroVADAnalyzer(),
-    serializer=serializer,
-)
+## Deployment
+
+### Local Development
+
+Use [ngrok](https://ngrok.com/) to expose your local server for testing:
+
+```shell
+python server.py
+ngrok http 8000
+# Use the ngrok URL as your Twilio webhook
 ```
 
-## Configuring Twilio
+### Pipecat Cloud Deployment
 
-To set up your Twilio phone number to use your server:
+For production deployment without managing your own infrastructure, use Pipecat Cloud:
 
-1. Purchase a phone number in your Twilio account
-2. Navigate to the Phone Numbers section and select your number
-3. Under "Voice & Fax", set the webhook for "A Call Comes In" to your server's URL (e.g., `https://your-server.com/`)
-4. Make sure the request type is set to HTTP POST
-5. Save your changes
+<Card
+  title="Twilio WebSocket on Pipecat Cloud"
+  icon="cloud"
+  href="/deployment/pipecat-cloud/guides/telephony/twilio-websocket"
+>
+  Deploy Twilio WebSocket bots with automatic scaling and managed infrastructure
+</Card>
 
-<Note>
-  If you're using ngrok for local development, your webhook URL will look like
-  `https://abc123.ngrok.io/`. Remember to update your TwiML template with the
-  correct WebSocket URL as well.
-</Note>
+### Self-Hosted Production Deployment
 
-## Testing Your Implementation
+For fully self-hosted production deployment, ensure your servers are:
 
-### Local Testing Without Phone Calls
-
-The example includes a test client that can simulate phone calls without actually using Twilio:
-
-```python
-python server.py -t  # Start server in testing mode
-python client.py -u http://localhost:8765 -c 2  # Start 2 test clients
-```
-
-The `-t` flag puts the server in testing mode, and the test client creates virtual clients that communicate with your server as if they were Twilio Media Streams.
-
-### Using the Phone
-
-To test with an actual phone call:
-
-1. Make sure your server is running and accessible via the internet
-2. Configure Twilio as described above
-3. Dial your Twilio phone number from any phone
-4. You should hear your AI agent respond!
-
-## Ending a Conversation
-
-There are two primary ways to end a conversation:
-
-1. **Automatic termination**: If you provided Twilio credentials to the `TwilioFrameSerializer`, the call will be ended automatically when your pipeline ends:
-
-```python
-# End the conversation programmatically
-await task.queue_frame(EndFrame())
-```
-
-2. **Manual termination**: You can also end the call explicitly through Twilio's REST API. This is useful for implementing custom hang-up logic:
-
-```python
-from twilio.rest import Client
-
-client = Client(account_sid, auth_token)
-client.calls(call_sid).update(status="completed")
-```
-
-## Scaling Considerations
-
-For production deployments, consider:
-
-1. **Multiple concurrent calls**: Each bot instance should run in its own process to handle concurrent calls efficiently. The example server can spawn individual bot processes for each call:
-
-```python
-proc = subprocess.Popen(
-    [
-        f"python3 -m bot_twilio --stream-sid {stream_sid} --call-sid {call_sid}"
-    ],
-    shell=True,
-    bufsize=1,
-    cwd=os.path.dirname(os.path.abspath(__file__))
-)
-```
-
-2. **Error handling**: Add robust error handling for network issues, service outages, etc.
-
-3. **Logging and monitoring**: Implement detailed logging to track call quality and agent performance.
-
-4. **Security**: Add authentication to your endpoints and use environment variables for all sensitive credentials.
+- Publicly accessible with HTTPS
+- Able to handle concurrent WebSocket connections
+- Properly configured with Twilio API credentials
+- Implementing proper error handling and logging
 
 ## Next Steps
 
-<CardGroup>
-  <Card
-    title="Try the complete example"
-    icon="code"
-    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot"
-  >
-    Clone the full working Twilio chatbot example from GitHub and run it
-    yourself.
-  </Card>
-  <Card
-    title="Deploy to Pipecat Cloud"
-    icon="cloud"
-    href="/deployment/pipecat-cloud/guides/telephony/twilio-websocket"
-  >
-    Learn how to deploy your Twilio voice AI agent to production with Pipecat
-    Cloud's managed infrastructure.
-  </Card>
-</CardGroup>
+- Explore the [complete examples](https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot) for full implementations
+- Learn about [Daily + Twilio SIP integration](./twilio-daily-sip) for advanced telephony scenarios
+- Check out [Daily PSTN integration](./daily-pstn) for direct phone number provisioning
