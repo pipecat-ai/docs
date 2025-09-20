@@ -1,0 +1,357 @@
+---
+title: "Telnyx WebSocket Integration"
+sidebarTitle: "Telnyx WebSocket"
+description: "Complete guide to using Telnyx Media Streaming with Pipecat for dial-in and dial-out functionality"
+---
+
+## Things you'll need
+
+- An active [Telnyx](https://telnyx.com) account with API credentials
+- One or more Telnyx provisioned phone numbers
+- A public-facing server or tunneling service like [ngrok](https://ngrok.com/) (for dial-out only)
+- API keys for speech-to-text, text-to-speech, and LLM services
+
+<CardGroup cols={2}>
+  <Card
+    title="Telnyx Dial-in Example"
+    icon="phone-arrow-down-left"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/telnyx-chatbot/inbound"
+  >
+    Complete dial-in implementation using Telnyx Media Streaming over WebSocket
+  </Card>
+
+  <Card
+    title="Telnyx Dial-out Example"
+    icon="phone-arrow-up-right"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/telnyx-chatbot/outbound"
+  >
+    Outbound calling using Telnyx Media Streaming with WebSocket transport
+  </Card>
+</CardGroup>
+
+## Phone Number Setup
+
+You'll need Telnyx phone numbers for both dial-in and dial-out functionality:
+
+- Visit [telnyx.com](https://telnyx.com) and purchase phone numbers
+- Ensure your numbers support Voice capabilities
+- Configure TeXML applications for dial-in numbers (covered below)
+
+## Environment Setup
+
+Configure your environment variables for Telnyx and AI services:
+
+```shell .env
+TELNYX_API_KEY=...
+OPENAI_API_KEY=...
+DEEPGRAM_API_KEY=...
+CARTESIA_API_KEY=...
+```
+
+## Dial-in
+
+Dial-in allows users to call your Telnyx number and connect to your Pipecat bot via WebSocket Media Streaming. Unlike Twilio, Telnyx automatically provides caller information (to/from numbers) in the WebSocket messages, so no custom server is needed for basic dial-in functionality.
+
+### How It Works
+
+Here's the sequence of events when someone calls your Telnyx number:
+
+1. **Telnyx receives an incoming call** to your phone number
+2. **Telnyx executes your TeXML application** which establishes a WebSocket connection
+3. **Telnyx opens a WebSocket** to your server with real-time audio and call metadata
+4. **Your bot processes the audio** using the Pipecat pipeline
+5. **The bot responds with audio** sent back to Telnyx over WebSocket
+6. **Telnyx plays the audio** to the caller in real-time
+
+### Set up your TeXML application
+
+Telnyx uses TeXML (Telnyx Extensible Markup Language) to control call flow. For dial-in, you create a TeXML application that establishes a WebSocket connection directly to your bot:
+
+```xml TeXML for dial-in
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://your-server.com/ws" bidirectionalMode="rtp"></Stream>
+  </Connect>
+  <Pause length="40"/>
+</Response>
+```
+
+The `bidirectionalMode="rtp"` parameter enables real-time audio streaming in both directions.
+
+### Configure your Pipecat bot for dial-in
+
+Your bot receives the WebSocket connection and automatically gets call information from Telnyx's WebSocket messages. The key components are:
+
+**WebSocket Parsing**: Pipecat's built-in parser extracts call data from Telnyx's WebSocket messages:
+
+```python bot.py
+from pipecat.runner.utils import parse_telephony_websocket
+
+async def run_bot(websocket: WebSocket):
+    # Parse Telnyx WebSocket data
+    transport_type, call_data = await parse_telephony_websocket(websocket)
+
+    # Extract call information (automatically provided by Telnyx)
+    stream_id = call_data["stream_id"]
+    call_control_id = call_data["call_control_id"]
+    outbound_encoding = call_data["outbound_encoding"]
+    from_number = call_data["from"]  # Caller's number
+    to_number = call_data["to"]      # Your Telnyx number
+```
+
+**Transport Creation**: Configure the WebSocket transport with Telnyx serialization:
+
+```python bot.py
+# Create Telnyx serializer with call details
+serializer = TelnyxFrameSerializer(
+    stream_id=stream_id,
+    call_control_id=call_control_id,
+    api_key=os.getenv("TELNYX_API_KEY"),
+)
+
+# Configure WebSocket transport
+transport = FastAPIWebsocketTransport(
+    websocket=websocket,
+    params=FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        add_wav_header=False,
+        vad_analyzer=SileroVADAnalyzer(),
+        serializer=serializer,
+    ),
+)
+
+# Your bot pipeline setup here...
+```
+
+**Call Information Usage**: Use the extracted call information to personalize your bot's behavior:
+
+```python bot.py
+# Customize bot behavior based on call information
+greeting = f"Hello! I see you're calling from {from_number}. How can I help you today?"
+
+# Use call information for logging or routing
+logger.info(f"Incoming call from {from_number} to {to_number}")
+```
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/telnyx-chatbot/inbound/bot.py"
+>
+  See the full bot.py with WebSocket parsing, transport setup, and pipeline
+  configuration
+</Card>
+
+### Set up Telnyx TeXML application
+
+Configure your Telnyx phone number to use your TeXML application:
+
+1. Go to the [Telnyx Portal](https://portal.telnyx.com)
+2. Navigate to Voice → Programmable Voice → TeXML Applications
+3. Create a new TeXML Application with your WebSocket URL
+4. Assign the TeXML Application to your phone number
+
+### Run the Example
+
+For dial-in, you can run your bot directly without a separate server:
+
+```shell
+# Start your bot directly
+python bot.py
+
+# For local development, use ngrok to expose your WebSocket
+ngrok http 8000
+# Use the ngrok WebSocket URL (wss://abc123.ngrok.io/ws) in your TeXML
+```
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/telnyx-chatbot/inbound"
+>
+  See the full README with step-by-step setup, TeXML configuration, and testing
+</Card>
+
+## Dial-out
+
+Dial-out allows your bot to initiate calls to phone numbers using Telnyx's outbound calling capabilities with WebSocket Media Streaming.
+
+### How It Works
+
+Here's the sequence of events for dial-out calls:
+
+1. **Your application triggers a dial-out** (via API call or user action)
+2. **Server initiates a Telnyx call** using the Call Control API
+3. **Telnyx establishes the call** and opens a WebSocket connection
+4. **Your bot joins the WebSocket** and sets up the pipeline
+5. **The recipient answers** and is connected to your bot
+6. **The bot handles the conversation** with real-time audio streaming
+
+### Set up your server for dial-out
+
+The dial-out server creates outbound calls and manages WebSocket connections. When you trigger a dial-out call, your server:
+
+1. **Receives the dial-out request** with target phone number and parameters
+2. **Creates a Telnyx call** using the Call Control API with a webhook URL
+3. **Accepts the WebSocket** connection from Telnyx
+4. **Parses call data** including call control information
+5. **Runs the Pipecat bot** with the call information
+
+<Card
+  title="Complete Server Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/telnyx-chatbot/outbound/server.py"
+>
+  See the full FastAPI server code with outbound call creation and WebSocket
+  handling
+</Card>
+
+### Configure your Pipecat bot for dial-out
+
+The dial-out bot configuration is similar to dial-in, with Telnyx automatically providing call information:
+
+**Call Information**: Telnyx provides call details in the WebSocket messages:
+
+```python bot.py
+# Parse WebSocket data (same as dial-in)
+transport_type, call_data = await parse_telephony_websocket(websocket)
+
+# Extract call information
+stream_id = call_data["stream_id"]
+call_control_id = call_data["call_control_id"]
+from_number = call_data["from"]  # Your Telnyx number
+to_number = call_data["to"]      # Target number you're calling
+
+# Customize bot behavior for outbound calls
+greeting = f"Hi! This is an automated call from {from_number}. How are you today?"
+```
+
+**Transport Configuration**: Same transport setup as dial-in:
+
+```python bot.py
+# Create Telnyx serializer
+serializer = TelnyxFrameSerializer(
+    stream_id=stream_id,
+    call_control_id=call_control_id,
+    api_key=os.getenv("TELNYX_API_KEY"),
+)
+
+# Configure transport
+transport = FastAPIWebsocketTransport(
+    websocket=websocket,
+    params=FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        add_wav_header=False,
+        vad_analyzer=SileroVADAnalyzer(),
+        serializer=serializer,
+    ),
+)
+```
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/telnyx-chatbot/outbound/bot.py"
+>
+  See the full bot.py with outbound call handling and call information usage
+</Card>
+
+### Run the Example
+
+To test dial-out functionality:
+
+1. **Start your server**: Run your FastAPI server
+2. **Trigger a call**: Make an API request to start an outbound call
+3. **Answer your phone**: The bot will call the specified number
+4. **Talk to your bot**: Have a conversation with your AI agent
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/telnyx-chatbot/outbound"
+>
+  See the full README with step-by-step setup, API usage, and outbound call
+  configuration
+</Card>
+
+## Key Features
+
+### Audio Format and Sample Rate
+
+Telnyx Media Streaming uses 8kHz mono audio with 16-bit PCM encoding. Configure your pipeline accordingly:
+
+```python
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        audio_in_sample_rate=8000,
+        audio_out_sample_rate=8000,
+        allow_interruptions=True,
+    ),
+)
+```
+
+### Automatic Call Termination
+
+When you provide Telnyx API credentials to the `TelnyxFrameSerializer`, it automatically ends calls when your pipeline ends:
+
+```python
+serializer = TelnyxFrameSerializer(
+    stream_id=stream_id,
+    call_control_id=call_control_id,
+    api_key=os.getenv("TELNYX_API_KEY"),  # Enables auto-termination
+)
+```
+
+### Built-in Call Information
+
+Unlike other providers, Telnyx automatically includes caller information (to/from numbers) in the WebSocket messages, eliminating the need for custom webhook servers in basic dial-in scenarios.
+
+### Voice Activity Detection
+
+The `SileroVADAnalyzer` helps determine when users have finished speaking, enabling natural conversation flow.
+
+## Deployment
+
+### Local Development
+
+Use [ngrok](https://ngrok.com/) to expose your local server for testing:
+
+```shell
+python server.py  # For dial-out
+# OR
+python bot.py     # For dial-in
+
+ngrok http 8000
+# Use the ngrok URL in your TeXML application
+```
+
+### Pipecat Cloud Deployment
+
+For production deployment without managing your own infrastructure, use Pipecat Cloud:
+
+<Card
+  title="Telnyx WebSocket on Pipecat Cloud"
+  icon="cloud"
+  href="/deployment/pipecat-cloud/guides/telephony/telnyx-websocket"
+>
+  Deploy Telnyx WebSocket bots with automatic scaling and managed infrastructure
+</Card>
+
+### Self-Hosted Production Deployment
+
+For fully self-hosted production deployment, ensure your servers are:
+
+- Publicly accessible with HTTPS
+- Able to handle concurrent WebSocket connections
+- Properly configured with Telnyx API credentials
+- Implementing proper error handling and logging
+
+## Next Steps
+
+- Explore the [complete examples](https://github.com/pipecat-ai/pipecat-examples/tree/main/telnyx-chatbot) for full implementations
+- Learn about [Daily + Twilio SIP integration](./twilio-daily-sip) for advanced telephony scenarios
+- Check out [Daily PSTN integration](./daily-pstn) for direct phone number provisioning
