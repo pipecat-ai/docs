@@ -1,0 +1,361 @@
+---
+title: "Daily + Twilio SIP Integration"
+description: "Complete guide to using Daily's WebRTC transport with Twilio's SIP services for dial-in and dial-out"
+---
+
+## Things you'll need
+
+- An active [Twilio](https://www.twilio.com) developer account with API credentials
+- One or more Twilio provisioned phone numbers
+- Daily API key for WebRTC transport
+- The Twilio Python client library (`pip install twilio`)
+
+<CardGroup cols={2}>
+  <Card
+    title="SIP Dial-in Example"
+    icon="phone-arrow-down-left"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-in"
+  >
+    Complete dial-in implementation using Twilio SIP with Daily WebRTC transport
+  </Card>
+
+  <Card
+    title="SIP Dial-out Example"
+    icon="phone-arrow-up-right"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-out"
+  >
+    Outbound calling using Daily WebRTC transport with Twilio SIP routing
+  </Card>
+</CardGroup>
+
+## Phone Number Setup
+
+You'll need Twilio phone numbers for both dial-in and dial-out functionality:
+
+- Visit [console.twilio.com](https://console.twilio.com) and purchase phone numbers
+- Ensure your numbers support Voice capabilities
+- Configure webhook URLs for dial-in numbers (covered below)
+
+## Environment Setup
+
+Configure your environment variables for both Twilio and Daily:
+
+```shell .env
+DAILY_API_KEY=...
+DAILY_API_URL=https://api.daily.co/v1
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+OPENAI_API_KEY=...
+CARTESIA_API_KEY=...
+```
+
+## Dial-in
+
+Dial-in allows users to call your Twilio number and connect to your Pipecat bot via Daily's WebRTC transport.
+
+### How It Works
+
+Here's the sequence of events when someone calls your Twilio number:
+
+1. **Twilio receives an incoming call** to your phone number
+2. **Twilio calls your webhook server** (`/call` endpoint)
+3. **Your server creates a Daily room** with SIP capabilities
+4. **Your server starts the bot process** with the room details
+5. **Your server responds to Twilio** with TwiML that puts the caller on hold with music
+6. **Upon receiving the `on_dialin_ready` event**, the bot forwards the call to the Daily SIP endpoint
+7. **The caller and bot are connected**, and the bot handles the conversation
+
+### Set up your webhook server
+
+Your server acts as the orchestrator between Twilio's telephony infrastructure and Daily's WebRTC transport. When Twilio receives a call, it sends a webhook to your server. Your server then:
+
+1. **Extracts call information** from Twilio's webhook (CallSid, caller details)
+2. **Creates a Daily room** with SIP capabilities enabled
+3. **Spawns a bot process** with the room details and call information
+4. **Responds to Twilio** with TwiML that puts the caller on hold with music
+5. **Coordinates the connection** between Twilio SIP and Daily WebRTC
+
+The server handles the complex orchestration between two different telephony systems, ensuring seamless audio quality through Daily's WebRTC transport while leveraging Twilio's robust SIP infrastructure.
+
+<Card
+  title="Complete Server Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/phone-chatbot/daily-twilio-sip-dial-in/server.py"
+>
+  See the full FastAPI server code with Twilio webhook handling and Daily room
+  creation
+</Card>
+
+### Configure your Pipecat bot for dial-in
+
+The bot receives arguments from the server process and uses them to coordinate between Daily's WebRTC transport and Twilio's SIP infrastructure. The key components are:
+
+**Bot Entry Point**: The bot receives arguments containing:
+
+- `room_url`: Daily room URL for the WebRTC connection
+- `token`: Daily room token for authentication
+- `call_sid`: Twilio call identifier for SIP forwarding
+- `sip_endpoint`: Daily's SIP endpoint URL for call routing
+
+**Transport Creation**: These arguments are used to configure the `DailyTransport` for WebRTC:
+
+```python bot.py
+from pipecat.transports.daily import DailyTransport, DailyParams
+
+async def run_bot(room_url: str, token: str, call_sid: str, sip_endpoint: str):
+    # Create Daily WebRTC transport
+    transport = DailyTransport(
+        room_url,
+        token,
+        "Voice Bot",
+        DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            video_out_enabled=False,
+            vad_analyzer=SileroVADAnalyzer(),
+            transcription_enabled=True,
+        )
+    )
+
+    # Handle when Daily SIP endpoint is ready for call forwarding
+    @transport.event_handler("on_dialin_ready")
+    async def on_dialin_ready(transport, cdata):
+        # Forward the Twilio call to Daily's SIP endpoint
+        twilio_client.calls(call_sid).update(
+            twiml=f"<Response><Dial><Sip>{sip_endpoint}</Sip></Dial></Response>"
+        )
+        logger.info("Call forwarded from Twilio to Daily SIP endpoint")
+
+    # Your bot pipeline setup here...
+```
+
+**Call Forwarding Flow**: The `on_dialin_ready` event is crucial. It signals when Daily's SIP infrastructure is ready to receive the call. At this point, the bot uses Twilio's API to update the call with new TwiML that forwards the audio from Twilio's SIP to Daily's SIP endpoint, completing the connection.
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/phone-chatbot/daily-twilio-sip-dial-in/bot.py"
+>
+  See the full bot.py with Daily transport setup and Twilio call forwarding
+</Card>
+
+### Set up Twilio webhook
+
+Configure your Twilio phone number to use your server's webhook URL:
+
+1. Go to the [Twilio Console](https://console.twilio.com)
+2. Navigate to Phone Numbers → Manage → Active Numbers
+3. Click on your phone number
+4. Under "Configure", set "A Call Comes In" to:
+   - Webhook: `https://your-server.com/call` (your server's URL)
+   - HTTP Method: POST
+
+### Run the Example
+
+For local development, you can use [ngrok](https://ngrok.com/) to expose your local server:
+
+```shell
+# Start your server
+python server.py
+
+# In another terminal, start ngrok
+ngrok http 8000
+
+# Use the ngrok URL (e.g., https://a1b2c3.ngrok.io/call) as your webhook
+```
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-in"
+>
+  See the full README with step-by-step setup, webhook configuration, and
+  troubleshooting
+</Card>
+
+## Dial-out
+
+Dial-out allows your bot to initiate calls through Twilio's SIP infrastructure using Daily's WebRTC transport.
+
+### How It Works
+
+Here's the sequence of events for dial-out calls:
+
+1. **Your application triggers a dial-out** (via API call or user action)
+2. **Server creates a Daily room** with SIP capabilities
+3. **Bot joins the Daily room** and sets up the WebRTC transport
+4. **Bot initiates SIP call** through Twilio to the target number
+5. **Twilio routes the call** to the destination phone number
+6. **The recipient answers** and is connected to your bot via Daily WebRTC
+7. **The bot handles the conversation** with high-quality WebRTC audio
+
+### Set up your server for dial-out
+
+The dial-out server orchestrates outbound calls by coordinating between your application, Daily's WebRTC transport, and Twilio's SIP infrastructure. When you trigger a dial-out call, your server:
+
+1. **Receives the dial-out request** with target phone number and call parameters
+2. **Creates a Daily room** with SIP capabilities and dial-out enabled
+3. **Spawns a bot process** with the room details and target phone number
+4. **Initiates the SIP call** through Twilio to the destination number
+5. **Manages the connection** between Daily WebRTC and Twilio SIP routing
+6. **Handles call events** like answered, busy, or failed connections
+
+The server simplifies outbound calling by abstracting the complexity of coordinating between WebRTC transport and SIP telephony, providing high-quality audio through Daily while leveraging Twilio's reliable call routing.
+
+<Card
+  title="Complete Server Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/phone-chatbot/daily-twilio-sip-dial-out/server.py"
+>
+  See the full FastAPI server code with Daily room creation and SIP dial-out
+  management
+</Card>
+
+### Configure your Pipecat bot for dial-out
+
+The dial-out bot receives arguments from the server process and uses them to initiate outbound calls through Twilio's SIP infrastructure via Daily's WebRTC transport. The key components are:
+
+**Bot Entry Point**: The bot receives arguments containing:
+
+- `room_url`: Daily room URL for the WebRTC connection
+- `token`: Daily room token for authentication
+- `target_number`: Phone number to call via Twilio SIP
+- `sip_uri`: Twilio SIP URI for routing the outbound call
+
+**Transport Creation**: These arguments are used to configure the `DailyTransport` for dial-out:
+
+```python bot.py
+from pipecat.transports.daily import DailyTransport, DailyParams
+
+async def run_bot(room_url: str, token: str, target_number: str, sip_uri: str):
+    # Create Daily WebRTC transport
+    transport = DailyTransport(
+        room_url,
+        token,
+        "Voice Bot",
+        DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            video_out_enabled=False,
+            vad_analyzer=SileroVADAnalyzer(),
+            transcription_enabled=True,
+        )
+    )
+
+    # Initiate the outbound call through Twilio SIP
+    await transport.start_dialout(sip_uri)
+
+    # Your bot pipeline setup here...
+```
+
+**Dial-out Flow**: The `start_dialout()` method initiates the call by connecting Daily's WebRTC transport to Twilio's SIP infrastructure. The `sip_uri` parameter contains the Twilio SIP endpoint configured with the target phone number, allowing Daily to route the call through Twilio's telephony network to reach the destination.
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/phone-chatbot/daily-twilio-sip-dial-out/bot.py"
+>
+  See the full bot.py with WebRTC transport setup and SIP dial-out configuration
+</Card>
+
+### Run the Example
+
+To test dial-out functionality:
+
+1. **Start your server**: Run your FastAPI server
+2. **Trigger a call**: Make an API request to start a dial-out call
+3. **Answer your phone**: The bot will call the specified number via Twilio
+4. **Talk to your bot**: Have a conversation with high-quality WebRTC audio
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-out"
+>
+  See the full README with step-by-step setup, API usage, and SIP configuration
+</Card>
+
+## Best Practices
+
+### Hold Music for Initialization
+
+Always respond to Twilio's initial webhook with hold music to give your bot time to initialize:
+
+```python
+resp = VoiceResponse()
+resp.play(url="https://your-hold-music.mp3", loop=10)
+return str(resp)
+```
+
+**Avoid using `<Pause>`** - Twilio's pause duration is limited and may not provide enough time for Daily SIP setup.
+
+### Handle Multiple Events
+
+Use a flag to ensure you only forward calls once when handling multiple `on_dialin_ready` events:
+
+```python
+call_already_forwarded = False
+
+@transport.event_handler("on_dialin_ready")
+async def on_dialin_ready(transport, cdata):
+    nonlocal call_already_forwarded
+    if call_already_forwarded:
+        return
+    # Forward the call...
+    call_already_forwarded = True
+```
+
+## Deployment
+
+### Local Development
+
+Use [ngrok](https://ngrok.com/) to expose your local server for testing:
+
+```shell
+python server.py
+ngrok http 8000
+# Use the ngrok URL as your Twilio webhook
+```
+
+### Pipecat Cloud Deployment
+
+For production deployment on Pipecat Cloud, your webhook server calls the `/{agent}/start` endpoint instead of spawning local bot processes:
+
+```python
+# Instead of subprocess.Popen(bot_cmd)
+response = await httpx.post(
+    f"https://api.pipecat.daily.co/v1/public/{agent_id}/start",
+    headers={"Authorization": f"Bearer {pipecat_api_key}"},
+    json={
+        "createDailyRoom": True,
+        "dailyRoomProperties": {
+            "sip": {"sip_mode": "dial-in", "num_endpoints": 1}
+        },
+        "body": {
+            "room_url": room_url,
+            "token": token,
+            "call_sid": call_sid,  # For dial-in
+            "sip_endpoint": sip_endpoint,
+            # Or for dial-out:
+            # "target_number": target_number,
+            # "sip_uri": sip_uri
+        }
+    }
+)
+```
+
+The room information and call parameters are passed in the `body` field, which your Pipecat Cloud bot receives as arguments.
+
+### Self-Hosted Production Deployment
+
+For self-hosted production deployment, ensure your servers are:
+
+- Publicly accessible with HTTPS
+- Able to handle concurrent webhook requests
+- Properly configured with both Twilio and Daily API credentials
+
+## Next Steps
+
+- Explore the [complete examples](https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot) for full implementations
+- Learn about [Daily PSTN integration](./daily-pstn) for direct phone number provisioning
+- Check out [Twilio WebSocket integration](./twilio-websockets) for simpler telephony workflows
