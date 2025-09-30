@@ -167,6 +167,13 @@ export const methods = () => {
         oai: "1.0.0",
         gem: "1.0.0",
     },{
+        name: "sendText",
+        dt: "1.4.0",
+        swrtc: "1.5.0",
+        ws: "1.4.0",
+        oai: "1.3.0",
+        gem: "1.3.0",
+    },{
         name: "appendToContext",
         dt: "1.0.0",
         swrtc: "1.0.0",
