@@ -7,64 +7,64 @@ Pipecat's architecture is made up of a Pipeline, FrameProcessors, and Frames. Se
 
 Pipecat comes with many FrameProcessors built in. These consist of services, like `OpenAILLMService` or `CartesiaTTSService`, utilities, like `UserIdleProcessor`, and other things. Largely, you can build most of your application with these built-in FrameProcessors, but commonly, your application code may require custom frame processing logic. For example, you may want to perform an action as a result of a frame that's pushed in the pipeline.
 
-## Example: ImageSyncAggregator
+## Example: MetricsFrame logger
 
-Let's look at an example custom FrameProcessor that synchronizes images with bot speech:
+This custom FrameProcessor format and logs MetricsFrames:
 
 ```python
-class ImageSyncAggregator(FrameProcessor):
-    def __init__(self, speaking_path: str, waiting_path: str):
-        super().__init__()
-        self._speaking_image = Image.open(speaking_path)
-        self._speaking_image_format = self._speaking_image.format
-        self._speaking_image_bytes = self._speaking_image.tobytes()
+class MetricsFrameLogger(FrameProcessor):
+    """MetricsFrameLogger formats and logs all MetericsFrames"""
 
-        self._waiting_image = Image.open(waiting_path)
-        self._waiting_image_format = self._waiting_image.format
-        self._waiting_image_bytes = self._waiting_image.tobytes()
+    def __init__(self):
+        super().__init__()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, BotStartedSpeakingFrame):
-            await self.push_frame(
-                OutputImageRawFrame(
-                    image=self._speaking_image_bytes,
-                    size=(1024, 1024),
-                    format=self._speaking_image_format,
-                )
-            )
+        if isinstance(frame, MetricsFrame):
+            logger.info(f"{frame.name}\n    {format_metrics(frame.data)}")
+            await self.push_frame(frame, direction)
 
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            await self.push_frame(
-                OutputImageRawFrame(
-                    image=self._waiting_image_bytes,
-                    size=(1024, 1024),
-                    format=self._waiting_image_format,
-                )
-            )
-
-        await self.push_frame(frame, direction)
+        # ALWAYS push all frames
+        else:
+            # SUPER IMPORTANT: always push every frame!
+            await self.push_frame(frame, direction)
 ```
 
-This example custom FrameProcessor looks for `BotStartedSpeakingFrame` and `BotStoppedSpeakingFrame`. When it sees a `BotStartedSpeakingFrame`, it will show an image that says the bot is speaking. When it sees a `BotStoppedSpeakingFrame`, it will show an image that says the bot is not speaking.
+This frame processor looks for `MetricsFrames`. When it sees one, it formats the data and logs it.
+
+It uses this `format_metrics` function:
+```python
+def format_metrics(metrics, indent=0):
+    lines = []
+    tab = "\t" * indent
+
+    for metric in metrics:
+        lines.append(tab + type(metric).__name__)
+        for field, value in vars(metric).items():
+            if hasattr(value, "__dict__") and not isinstance(
+                value, (str, int, float, bool, type(None))
+            ):
+                lines.append(f"{tab}\t{field}={type(value).__name__}")
+                for k, v in vars(value).items():
+                    lines.append(f"{tab}\t\t{k}={repr(v)}")
+            else:
+                lines.append(f"{tab}\t{field}={repr(value)}")
+
+    return "\n".join(lines)
+```
 
 <Note>
   See this [working
-  example](https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/06a-image-sync.py)
-  using the `ImageSyncAggregator` FrameProcessor
+  example](https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/08-custom-frame-processor.py)
+  using the `MetricsFrameLogger` FrameProcessor
 </Note>
 
-## Adding to a Pipeline
-
-This custom FrameProcessor can be added to a Pipeline just before the transport output:
+## Add to a Pipeline
 
 ```python
 # Create and initialize the custom FrameProcessor
-image_sync_aggregator = ImageSyncAggregator(
-    os.path.join(os.path.dirname(__file__), "assets", "speaking.png"),
-    os.path.join(os.path.dirname(__file__), "assets", "waiting.png"),
-)
+metrics_frame_processor = MetricsFrameLogger()
 
 pipeline = Pipeline(
     [
@@ -73,14 +73,13 @@ pipeline = Pipeline(
         context_aggregator.user(),
         llm,
         tts,
-        image_sync_aggregator,  # Our custom FrameProcessor
         transport.output(),
         context_aggregator.assistant(),
+        metrics_frame_processor,  # Our custom FrameProcessor that pretty prints metrics frames
     ]
 )
-```
 
-With this positioning, the `ImageSyncAggregator` FrameProcessor will receive the `BotStartedSpeakingFrame` and `BotStoppedSpeakingFrame` outputted by the TTS processor and then push its own frame—`OutputImageRawFrame`—to the output transport.
+With this positioning, the `MetricsFrameLogger` FrameProcessor will receive every MetericsFrame in the pipeline.
 
 ## Key Requirements
 
@@ -117,7 +116,7 @@ class MyCustomProcessor(FrameProcessor):
 
 FrameProcessors receive **all** frames that are pushed through the pipeline. This gives them a lot of power, but also a great responsibility. Critically, they must push all frames through the pipeline; if they don't, they block frames from moving through the Pipeline, which will cause issues in how your application functions.
 
-You can see this at work in the `ImageSyncAggregator`'s `process_frame()` method. It handles both bot speaking frames and also has an `await self.push_frame(frame, direction)` which pushes the frame through to the next processor in the pipeline.
+As well as formatting and logging MetricsFrames, `MetricsFrameLogger` also has an `await self.push_frame(frame, direction)` which pushes the frame through to the next processor in the pipeline.
 
 ## Frame Direction
 
