@@ -8,7 +8,7 @@ description: "Complete guide to using Twilio Media Streams with Pipecat for dial
 
 - An active [Twilio](https://www.twilio.com) account with API credentials
 - One or more Twilio provisioned phone numbers
-- A public-facing server or tunneling service like [ngrok](https://ngrok.com/)
+- A tunneling service like [ngrok](https://ngrok.com/) for local development
 - API keys for speech-to-text, text-to-speech, and LLM services
 
 <CardGroup cols={2}>
@@ -57,158 +57,113 @@ Dial-in allows users to call your Twilio number and connect to your Pipecat bot 
 
 Here's the sequence of events when someone calls your Twilio number:
 
-1. **Twilio receives an incoming call** to your phone number
-2. **Twilio calls your webhook server** with call details
-3. **Your server responds with TwiML** that establishes a WebSocket connection
-4. **Twilio opens a WebSocket** to your server with real-time audio
-5. **Your bot processes the audio** using the Pipecat pipeline
-6. **The bot responds with audio** sent back to Twilio over WebSocket
-7. **Twilio plays the audio** to the caller in real-time
+1. **Twilio sends WebSocket messages**: Twilio processes the associated TwiML Bin and starts a WebSocket stream to your bot (local or Pipecat Cloud)
+2. **Parse the WebSocket messages**: Your bot parses the WebSocket connection messages to set up the corresponding Pipecat transport
+3. **(Optional) Look up the caller**: Optionally, look up the caller using Twilio's REST API to retrieve custom information about the call and personalize your bot's behavior
+4. **Bot starts responding**: Once the pipeline is started, your bot will initiate the conversation
 
-### Set up your webhook server
+### Setting Up Twilio
 
-Your server handles Twilio webhooks and WebSocket connections for real-time audio streaming. When Twilio receives a call, your server:
+#### 1. Create a TwiML Bin
 
-1. **Receives the webhook** with call details (CallSid, caller information)
-2. **Returns TwiML** that establishes a WebSocket connection to your server
-3. **Accepts the WebSocket** connection from Twilio
-4. **Parses call data** including custom parameters from the WebSocket
-5. **Runs the Pipecat bot** with the parsed call information
-
-The server orchestrates the real-time audio streaming between Twilio's telephony infrastructure and your Pipecat bot pipeline.
-
-### Custom Parameters with TwiML
-
-Twilio's `<Parameter>` noun allows you to pass custom information to your bot through the WebSocket connection. This is essential for passing caller details, user IDs, or other contextual information:
-
-```xml TwiML with custom parameters
-<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://your-server.com/ws">
-      <Parameter name="caller_id" value="+1234567890" />
-      <Parameter name="user_id" value="user_123" />
-      <Parameter name="session_type" value="support" />
-    </Stream>
-  </Connect>
-  <Pause length="40"/>
-</Response>
-```
-
-These parameters are accessible in your bot through Pipecat's built-in WebSocket parser, which extracts them from the `customParameters` field in the WebSocket data.
-
-<Card
-  title="Complete Server Implementation"
-  icon="code"
-  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/twilio-chatbot/inbound/server.py"
->
-  See the full FastAPI server code with TwiML generation and WebSocket handling
-</Card>
-
-### Configure your Pipecat bot for dial-in
-
-Your bot receives the WebSocket connection and parses the call data to extract custom parameters and call information. The key components are:
-
-**WebSocket Parsing**: Pipecat's built-in parser extracts call data from Twilio's WebSocket messages:
-
-```python bot.py
-from pipecat.runner.utils import parse_telephony_websocket
-
-async def run_bot(websocket: WebSocket):
-    # Parse Twilio WebSocket data
-    transport_type, call_data = await parse_telephony_websocket(websocket)
-
-    # Extract call information
-    stream_id = call_data["stream_id"]
-    call_id = call_data["call_id"]
-
-    # Access custom parameters from TwiML
-    custom_params = call_data["body"]  # Contains all <Parameter> values
-    caller_id = custom_params.get("caller_id")
-    user_id = custom_params.get("user_id")
-    session_type = custom_params.get("session_type")
-```
-
-```python bot.py
-# Create Twilio serializer with call details
-serializer = TwilioFrameSerializer(
-    stream_sid=stream_id,
-    call_sid=call_id,
-    account_sid=os.getenv("TWILIO_ACCOUNT_SID"),
-    auth_token=os.getenv("TWILIO_AUTH_TOKEN"),
-)
-
-# Configure WebSocket transport
-transport = FastAPIWebsocketTransport(
-    websocket=websocket,
-    params=FastAPIWebsocketParams(
-        audio_in_enabled=True,
-        audio_out_enabled=True,
-        add_wav_header=False,
-        vad_analyzer=SileroVADAnalyzer(),
-        serializer=serializer,
-    ),
-)
-
-# Your bot pipeline setup here...
-```
-
-**Custom Parameter Usage**: Use the extracted parameters to customize your bot's behavior:
-
-```python bot.py
-# Customize bot behavior based on parameters
-if session_type == "support":
-    system_prompt = "You are a helpful customer support agent..."
-elif session_type == "sales":
-    system_prompt = "You are a friendly sales representative..."
-else:
-    system_prompt = "You are a general assistant..."
-
-# Use caller_id for personalization
-greeting = f"Hello! I see you're calling from {caller_id}. How can I help you today?"
-```
-
-<Card
-  title="Complete Bot Implementation"
-  icon="code"
-  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/twilio-chatbot/inbound/bot.py"
->
-  See the full bot.py with WebSocket parsing, transport setup, and pipeline
-  configuration
-</Card>
-
-### Set up Twilio webhook
-
-Configure your Twilio phone number to use your server's webhook URL:
+A TwiML Bin tells Twilio how to handle incoming calls. You'll create one that establishes a WebSocket connection to your bot.
 
 1. Go to the [Twilio Console](https://console.twilio.com)
-2. Navigate to Phone Numbers → Manage → Active Numbers
-3. Click on your phone number
-4. Under "Configure", set "A Call Comes In" to:
-   - Webhook: `https://your-server.com/` (your server's URL)
-   - HTTP Method: POST
+2. Navigate to **TwiML Bins** → **My TwiML Bins**
+3. Click the **+** to create a new TwiML Bin
+4. Name your bin and add the TwiML:
 
-### Run the Example
+  <Tabs>
+    <Tab title="Local Development">
+      ```xml
+      <?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Connect>
+          <Stream url="wss://your-url.ngrok.io/ws" />
+        </Connect>
+      </Response>
+      ```
 
-For local development, use [ngrok](https://ngrok.com/) to expose your local server:
+      Replace `your-url.ngrok.io` with your ngrok URL.
 
-```shell
-# Start your server
-python server.py
+    </Tab>
 
-# In another terminal, start ngrok
-ngrok http 8000
+    <Tab title="Pipecat Cloud">
+      ```xml
+      <?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Connect>
+          <Stream url="wss://api.pipecat.daily.co/ws/twilio">
+            <Parameter name="_pipecatCloudServiceHost"
+              value="AGENT_NAME.ORGANIZATION_NAME"/>
+          </Stream>
+        </Connect>
+      </Response>
+      ```
 
-# Use the ngrok URL as your Twilio webhook
-```
+      Replace:
+      - `AGENT_NAME` with the name of the agent you deployed to Pipecat Cloud
+      - `ORGANIZATION_NAME` with the name of your Pipecat Cloud organization
+
+    </Tab>
+
+  </Tabs>
+
+5. Click **Save**
+
+#### 2. Assign TwiML Bin to Your Phone Number
+
+1. Navigate to **Phone Numbers** → **Manage** → **Active Numbers**
+2. Click on your Twilio phone number
+3. In the "Voice Configuration" section:
+   - Set "A call comes in" to **TwiML Bin**
+   - Select the TwiML Bin you created
+4. Click **Save configuration**
+
+### Running the Example
+
+You'll need two terminal windows to run the example.
+
+1. In your first terminal, start ngrok to expose your local server:
+
+   ```shell
+   ngrok http 7860
+   ```
+
+   > Tip: Use the `--subdomain` flag for a reusable ngrok URL.
+
+2. In your second terminal, install dependencies:
+
+   ```shell
+   uv sync
+   ```
+
+3. Then run the bot:
+
+   ```shell
+   uv run bot.py -t twilio
+   ```
+
+4. Call your bot by placing a call to the number associated with your bot. The bot will answer and start the conversation.
+
+### Personalizing Your Bot with Caller Information
+
+When a call comes in, your bot receives a Call SID from Twilio. You can use this Call SID to fetch caller information from Twilio's REST API, including the caller's phone number. With this information, you can:
+
+- Look up customer information in your database
+- Personalize greetings and responses based on caller identity
+- Route calls to different bot behaviors (e.g., VIP handling, support vs sales)
+- Implement custom business logic based on the caller
+
+The example bot demonstrates how to fetch caller information asynchronously using `aiohttp` to avoid blocking the event loop, ensuring your bot remains responsive even with multiple concurrent calls.
 
 <Card
-  title="Complete Setup Instructions"
-  icon="book-open"
+  title="Complete Dial-in Example"
+  icon="code"
   href="https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot/inbound"
 >
-  See the full README with step-by-step setup, webhook configuration, and
-  testing
+  See the full implementation with WebSocket parsing, REST API integration, and
+  caller personalization
 </Card>
 
 ## Dial-out
@@ -319,7 +274,7 @@ To test dial-out functionality:
 
 ### Audio Format and Sample Rate
 
-Twilio Media Streams uses 8kHz mono audio with 16-bit PCM encoding. To avoid resampling, set the audio input and outputsample rate to 8000 Hz:
+Twilio Media Streams uses 8kHz mono audio with 16-bit PCM encoding. To avoid resampling, set the audio input and output sample rate to 8000 Hz:
 
 ```python
 task = PipelineTask(
@@ -346,16 +301,6 @@ serializer = TwilioFrameSerializer(
 ```
 
 ## Deployment
-
-### Local Development
-
-Use [ngrok](https://ngrok.com/) to expose your local server for testing:
-
-```shell
-python server.py
-ngrok http 8000
-# Use the ngrok URL as your Twilio webhook
-```
 
 ### Pipecat Cloud Deployment
 
