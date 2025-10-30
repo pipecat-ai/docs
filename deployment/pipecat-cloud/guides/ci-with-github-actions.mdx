@@ -1,0 +1,249 @@
+---
+title: "CI with GitHub Actions"
+description: "Automate image builds and deploys for continuous integration"
+---
+
+Automate your Pipecat Cloud deployment workflow using GitHub Actions. This guide shows you how to automatically build and deploy your agent whenever you push changes to your main branch.
+
+## Prerequisites
+
+Before setting up your GitHub Actions workflow, ensure you have:
+
+- A Pipecat Cloud account with an API token
+- A Docker Hub account (or another container registry)
+- An image pull secret configured in Pipecat Cloud
+- A secret set configured for your agent
+
+## Configure GitHub Secrets
+
+Add the following secrets to your GitHub repository settings (Settings → Secrets and variables → Actions):
+
+- `DOCKERHUB_USERNAME`: Your Docker Hub username
+- `DOCKERHUB_TOKEN`: Your Docker Hub access token
+- `PCC_API_KEY`: Your Pipecat Cloud private API token
+
+<Note>
+  For Docker Hub access tokens, create a personal access token from your Docker
+  Hub account settings rather than using your password.
+</Note>
+
+## Basic Workflow Configuration
+
+Create a file at `.github/workflows/deploy.yml` in your repository:
+
+```yml
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Get date
+      id: date
+      run: echo "date=$(date +'%F')" >> $GITHUB_OUTPUT
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and Push
+      uses: docker/build-push-action@v5
+      with:
+        platforms: linux/arm64
+        context: .
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+          ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.date.outputs.date }}
+
+    - name: Deploy to Pipecat Cloud
+      run: |
+        curl -X POST https://api.pipecat.daily.co/v1/agents/${{ github.event.repository.name }} \
+          -H "Authorization: Bearer ${{ secrets.PCC_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "image": "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.date.outputs.date }}",
+            "imagePullSecretSet": "my-image-pull-secret",
+            "secretSet": "my-secret-set",
+            "enableKrisp": true,
+            "autoScaling": {
+              "minAgents": 0,
+              "maxAgents": 10
+            }
+          }'
+```
+
+This workflow will:
+
+1. Trigger on every push to the `main` branch
+2. Build your Docker image for `linux/arm64` platform
+3. Push the image with both `latest` and date-based tags
+4. Deploy the new image to Pipecat Cloud
+
+## Image Tagging Strategy
+
+The example workflow creates two tags for each build:
+
+- `latest`: Always points to the most recent build
+- Date-based (e.g., `2025-10-30`): Specific version tied to the build date
+
+<Warning>
+  Avoid pushing multiple builds to the same image tag. Pipecat Cloud instances
+  may cache older versions of an image tag, which can cause running agents to
+  use outdated code even after redeployment. Use unique tags (like date-based or
+  commit SHA tags) for each build.
+</Warning>
+
+If you deploy more frequently than once per day, consider using commit SHA-based tags instead:
+
+```yml
+- name: Build and Push
+  uses: docker/build-push-action@v5
+  with:
+    platforms: linux/arm64
+    context: .
+    push: true
+    tags: |
+      ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+      ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ github.sha }}
+```
+
+Then update the deployment step to use `${{ github.sha }}` as the tag.
+
+## Monorepo Configuration
+
+If your agent code lives in a subdirectory (e.g., `/bot`), modify the workflow to set the working directory and build context:
+
+```yml
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'bot/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./bot
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Get date
+      id: date
+      run: echo "date=$(date +'%F')" >> $GITHUB_OUTPUT
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and Push
+      uses: docker/build-push-action@v5
+      with:
+        platforms: linux/arm64
+        context: ./bot
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+          ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.date.outputs.date }}
+
+    - name: Deploy to Pipecat Cloud
+      run: |
+        curl -X POST https://api.pipecat.daily.co/v1/agents/${{ github.event.repository.name }} \
+          -H "Authorization: Bearer ${{ secrets.PCC_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "image": "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.date.outputs.date }}",
+            "imagePullSecretSet": "my-image-pull-secret",
+            "secretSet": "my-secret-set",
+            "enableKrisp": true,
+            "autoScaling": {
+              "minAgents": 0,
+              "maxAgents": 10
+            }
+          }'
+```
+
+The `paths` filter ensures the workflow only runs when files in the `bot/` directory change, preventing unnecessary builds.
+
+## Platform Considerations
+
+Pipecat Cloud requires images built for the `linux/arm64` platform. The workflow uses QEMU to enable ARM64 builds on GitHub's x64 runners.
+
+<Note>
+  As of 2025-10-30, GitHub does not provide ARM runners for private
+  repositories. The workflow uses QEMU emulation, which can significantly
+  increase build times. If you have a public repository or when GitHub makes ARM
+  runners available, you can remove the QEMU setup step and use native ARM
+  runners for faster builds.
+</Note>
+
+To use native ARM runners when available:
+
+```yml
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04-arm  # Use ARM runner
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Remove the "Set up QEMU" step entirely
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      # ... rest of workflow
+```
+
+## Customizing Deployment Configuration
+
+The deployment step in the workflow configures your agent using the Pipecat Cloud REST API. You can customize the following parameters:
+
+- `image`: The Docker image tag to deploy
+- `imagePullSecretSet`: Reference to your image pull credentials (replace `my-image-pull-secret` with your actual secret name)
+- `secretSet`: Reference to your environment secrets (replace `my-secret-set` with your actual secret set name)
+- `enableKrisp`: Enable or disable Krisp noise suppression
+- `autoScaling.minAgents`: Minimum number of agent instances to maintain
+- `autoScaling.maxAgents`: Maximum number of agent instances allowed
+
+<Tip>
+  Adjust the `minAgents` and `maxAgents` values based on your expected traffic
+  patterns. See our [Capacity Planning guide](./capacity-planning) for guidance
+  on optimizing these settings.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Secrets Management" icon="key" href="../fundamentals/secrets">
+    Learn how to securely manage image pull secrets and environment variables.
+  </Card>
+
+  <Card title="Scaling Configuration" icon="chart-line" href="../fundamentals/scaling">
+    Configure auto-scaling to handle varying traffic loads.
+  </Card>
+</CardGroup>
