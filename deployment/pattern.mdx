@@ -126,25 +126,29 @@ Let's assume we have a fully service-driven `bot.py` that connects to a WebRTC s
 We'll also use Silero voice activity detection, to better know when the user has stopped talking.
 
 ```python bot.py
+import argparse
 import asyncio
-import aiohttp
 import os
 import sys
-import argparse
 
+import aiohttp
+from dotenv import load_dotenv
+from loguru import logger
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import EndFrame, LLMContextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_response import LLMAssistantResponseAggregator, LLMUserResponseAggregator
-from pipecat.frames.frames import LLMMessagesFrame, EndFrame
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantResponseAggregator,
+    LLMUserResponseAggregator,
+)
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
-from pipecat.vad.silero import SileroVADAnalyzer
 
-from loguru import logger
-
-from dotenv import load_dotenv
 load_dotenv(override=True)
 
 logger.remove(0)
@@ -168,7 +172,7 @@ async def main(room_url: str, token: str):
                 video_out_enabled=False,
                 vad_analyzer=SileroVADAnalyzer(),
                 transcription_enabled=True,
-            )
+            ),
         )
 
         tts = ElevenLabsTTSService(
@@ -177,9 +181,7 @@ async def main(room_url: str, token: str):
             voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
         )
 
-        llm = OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model="gpt-4o")
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
 
         messages = [
             {
@@ -191,21 +193,23 @@ async def main(room_url: str, token: str):
         tma_in = LLMUserResponseAggregator(messages)
         tma_out = LLMAssistantResponseAggregator(messages)
 
-        pipeline = Pipeline([
-            transport.input(),
-            tma_in,
-            llm,
-            tts,
-            transport.output(),
-            tma_out,
-        ])
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                tma_in,
+                llm,
+                tts,
+                transport.output(),
+                tma_out,
+            ]
+        )
 
         task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant):
             transport.capture_participant_transcription(participant["id"])
-            await task.queue_frames([LLMMessagesFrame(messages)])
+            await task.queue_frames([LLMContextFrame(LLMContext(messages))])
 
         @transport.event_handler("on_participant_left")
         async def on_participant_left(transport, participant, reason):
@@ -228,7 +232,6 @@ if __name__ == "__main__":
     config = parser.parse_args()
 
     asyncio.run(main(config.u, config.t))
-
 ```
 
 ### HTTP API
