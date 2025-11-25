@@ -409,7 +409,13 @@ export const callbacks = () => {
         oai: "1.0.0",
         gem: "1.0.0",
     },{
+        name: "onBotOutput",
+        dt: "1.5.0",
+        swrtc: "1.8.0",
+        ws: "1.5.0",
+    },{
         name: "onBotTranscript",
+        deprecated: true,
         dt: "1.0.0",
         swrtc: "1.0.0",
         rn: "1.0.0",
@@ -479,7 +485,7 @@ export const TransportTable = (rows) => {
             </tr>
             {rows.rows.map((entry) => (
                 <tr key={entry.name}>
-                    <td>{entry.name}()</td>
+                    <td>{entry.name}() {entry.deprecated ? "⚠️ [DEPRECATED]" : ""}</td>
                     <td className={entry.dt ? 'supported' : 'unsupported'}>{entry.dt || '❌'}</td>
                     <td className={entry.swrtc ? 'supported' : 'unsupported'}>{entry.swrtc || '❌'}</td>
                     <td className={entry.rn ? 'supported' : 'unsupported'}>{entry.rn || '❌'}</td>
