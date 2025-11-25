@@ -143,28 +143,89 @@ task = PipelineTask(
 
 ### Custom Text Aggregation
 
-Control how streaming text is processed before synthesis:
+By default, TTS services have a built-in text aggregator that collects streaming text into sentences before passing them to the underlying service. However, you can customize this behavior by inserting an [`LLMTextProcessor`](/server/utilities/frame/llm-text-processor) with a different text aggregator before the TTS in your pipeline. This allows the ability to categorize and structure text into logical units beyond simple sentences, such as code blocks, URLs, or custom tags. You can then configure the TTS to handle these different text types appropriately, such as skipping code blocks or transforming them in a just-in-time manner before speaking.
+
+### Skipping Text Aggregations
+
+To skip certain text aggregations (e.g., code snippets or URLs) and keep them from being spoken, use a custom text aggregator like [`PatternPairAggregator`](/server/utilities/text/pattern-pair-aggregator) within an [`LLMTextProcessor`](/server/utilities/frame/llm-text-processor), and configure it to identify and handle specific patterns in the text stream. With this, you can then pass any aggregated types you want to skip (like "code") to the TTS service's `skip_aggregator_types` parameter.
 
 ```python
-from pipecat.utils.text.pattern_pair_aggregator import PatternPairAggregator
+# Create pattern aggregator
+data_extractor = PatternPairAggregator()
 
-# Custom aggregator for voice switching
-pattern_aggregator = PatternPairAggregator()
-pattern_aggregator.add_pattern_pair(
-    pattern_id="voice_tag",
-    start_pattern="<voice>",
-    end_pattern="</voice>",
-    remove_match=True,
+# Add pattern for JSON data
+data_extractor.add_pattern(
+    type="code",
+    start_pattern="<code>",
+    end_pattern="</code>",
+    action=MatchAction.AGGREGATE
 )
 
+# Set the aggregator on an LLMTextProcessor
+llm_text_processor = LLMTextProcessor(text_aggregator=pattern_aggregator)
+
+# Initialize TTS service, and don't speak JSON data
 tts = CartesiaTTSService(
     api_key=os.getenv("CARTESIA_API_KEY"),
-    voice_id="default-voice",
-    text_aggregator=pattern_aggregator,  # Custom processing
+    skip_aggregator_types=["code"], # The strings here should match the types defined in the PatternPairAggregator
 )
+
+# add the llm_text_processor to your pipeline after the llm and before the tts
+# llm -> llm_text_processor -> tts
+```
+
+### Text Transforms
+
+For TTS-specific text preprocessing, you can provide custom text transforms that modify text in a just-in-time manner before sending the text off to the TTS service. This is useful for handling special text segments that need to be altered for better pronunciation or clarity, such as spelling out phone numbers, removing URLs, or expanding abbreviations. These text transforms can be mapped to a specific text aggregation type, like with `skip_aggregator_types`, or applied globally to all text using `'*'` as the type.
+
+<Note>
+  The intentions of text transforms are meant to be TTS-specific modifications that do not affect the underlying LLM text or context. That said, since the context aggregator attempts to base its context on what was actually spoken, these transforms will indirectly affect context for services that support word timestamps, like Cartesia, ElevenLabs, and Rime.
+</Note>
+
+```python
+# Create pattern aggregator
+pattern_aggregator = PatternPairAggregator()
+
+# Add patterns for different parts of an explanation
+pattern_aggregator.add_pattern(
+    type="phone_number",
+    start_pattern="<pnum>",
+    end_pattern="</pnum>",
+    action=MatchAction.AGGREGATE
+)
+
+# Set the aggregator on an LLMTextProcessor
+llm_text_processor = LLMTextProcessor(text_aggregator=pattern_aggregator)
+
+# Text-to-Speech service
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+)
+
+# Text transformers for TTS
+# This will insert Cartesia's spell tags around the provided text.
+async def spell_out_text(text: str, type: str) -> str:
+    # CartesiaTTSService provides a helper for this along with other common transforms
+    return CartesiaTTSService.SPELL(text)
+
+async def replace_acronyms(text: str, type: str) -> str:
+    # Replace "SEC" with "Southeastern Conference"
+    return text.replace(" SEC ", " Southeastern Conference ")
+
+# Setup the text transformers in TTS to spell out phone numbers and replace
+# acronyms. The string below matches the type defined in the PatternPairAggregator
+# above so that whenever those segments are encountered, this transform
+# is applied
+tts.add_text_transformer(spell_out_text, "phone_number")
+tts.add_text_transformer(replace_acronyms, "*")  # Apply to all text
+
+# add the llm_text_processor to your pipeline after the llm and before the tts
+#   llm -> llm_text_processor -> tts
 ```
 
 ### Text Filters
+
+<Warning>Text filters are no longer the preferred method for text preprocessing and will be deprecated in future releases. Instead, you should use one of the methods described above.</Warning>
 
 Apply preprocessing to text before synthesis:
 
