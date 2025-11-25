@@ -485,7 +485,7 @@ export const TransportTable = (rows) => {
             </tr>
             {rows.rows.map((entry) => (
                 <tr key={entry.name}>
-                    <td>{entry.name}() {entry.deprecated ? "⚠️ [DEPRECATED]" : ""}</td>
+                    <td>{entry.name}() {entry.deprecated ? "⚠️ DEPRECATED" : ""}</td>
                     <td className={entry.dt ? 'supported' : 'unsupported'}>{entry.dt || '❌'}</td>
                     <td className={entry.swrtc ? 'supported' : 'unsupported'}>{entry.swrtc || '❌'}</td>
                     <td className={entry.rn ? 'supported' : 'unsupported'}>{entry.rn || '❌'}</td>
