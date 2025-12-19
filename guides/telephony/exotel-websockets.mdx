@@ -1,0 +1,344 @@
+---
+title: "Exotel WebSocket Integration"
+sidebarTitle: "Exotel WebSocket"
+description: "Complete guide to using Exotel Voice Streaming with Pipecat for dial-in and dial-out functionality"
+---
+
+## Things you'll need
+
+- An active [Exotel](https://exotel.com) account with voice streaming enabled
+- One or more Exotel provisioned phone numbers
+- A public-facing server or tunneling service like [ngrok](https://ngrok.com/) (for dial-out only)
+- API keys for speech-to-text, text-to-speech, and LLM services
+
+<CardGroup cols={2}>
+  <Card
+    title="Exotel Dial-in Example"
+    icon="phone-arrow-down-left"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/exotel-chatbot/inbound"
+  >
+    Complete dial-in implementation using Exotel Voice Streaming over WebSocket
+  </Card>
+
+  <Card
+    title="Exotel Dial-out Example"
+    icon="phone-arrow-up-right"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/exotel-chatbot/outbound"
+  >
+    Outbound calling using Exotel Voice Streaming with WebSocket transport
+  </Card>
+</CardGroup>
+
+## Phone Number Setup
+
+You'll need Exotel phone numbers for both dial-in and dial-out functionality:
+
+- Visit [exotel.com](https://exotel.com) and purchase phone numbers
+- Complete KYC verification if required
+- Ensure voice streaming is enabled on your account (contact Exotel support if needed)
+
+## Environment Setup
+
+Configure your environment variables for Exotel and AI services:
+
+```shell .env
+EXOTEL_ACCOUNT_SID=...
+EXOTEL_API_KEY=...
+EXOTEL_API_TOKEN=...
+OPENAI_API_KEY=...
+DEEPGRAM_API_KEY=...
+CARTESIA_API_KEY=...
+```
+
+## Dial-in
+
+Dial-in allows users to call your Exotel number and connect to your Pipecat bot via WebSocket Voice Streaming. Unlike other providers, Exotel automatically provides caller information (to/from numbers) in the WebSocket messages, so no custom server is needed for basic dial-in functionality.
+
+### How It Works
+
+Here's the sequence of events when someone calls your Exotel number:
+
+1. **Exotel receives an incoming call** to your phone number
+2. **Exotel executes your App Bazaar flow** which includes a Voicebot applet
+3. **Exotel opens a WebSocket** to your server with real-time audio and call metadata
+4. **Your bot processes the audio** using the Pipecat pipeline
+5. **The bot responds with audio** sent back to Exotel over WebSocket
+6. **Exotel plays the audio** to the caller in real-time
+
+### Set up your App Bazaar flow
+
+Exotel uses App Bazaar to configure call flows. For dial-in, you create an app with a Voicebot applet that establishes a WebSocket connection directly to your bot:
+
+1. **Navigate to App Bazaar** in your Exotel dashboard
+2. **Create a new app** or edit an existing one
+3. **Add a Voicebot applet** (not "Stream" or "Passthru")
+4. **Configure the WebSocket URL**: `wss://your-server.com/ws`
+5. **Add a Hangup applet** at the end to properly terminate calls
+
+Your flow should look like: `Call Start → [Voicebot Applet] → [Hangup Applet]`
+
+### Personalizing Your Bot with Caller Information
+
+Exotel automatically includes caller information (to/from numbers) in the WebSocket messages. You can use the caller's phone number to:
+
+- Look up customer information in your database
+- Personalize greetings and responses based on caller identity
+- Route calls to different bot behaviors (e.g., VIP handling, support vs sales)
+- Implement custom business logic based on the caller
+
+The example bot demonstrates how to extract caller information from Exotel's WebSocket messages and use it to personalize the conversation.
+
+### Configure your Pipecat bot for dial-in
+
+Your bot receives the WebSocket connection and automatically gets call information from Exotel's WebSocket messages. The key components are:
+
+**WebSocket Parsing**: Pipecat's built-in parser extracts call data from Exotel's WebSocket messages:
+
+```python bot.py
+from pipecat.runner.utils import parse_telephony_websocket
+
+async def run_bot(websocket: WebSocket):
+    # Parse Exotel WebSocket data
+    transport_type, call_data = await parse_telephony_websocket(websocket)
+
+    # Extract call information (automatically provided by Exotel)
+    # Data format: {
+    #     "stream_id": str,
+    #     "call_id": str,
+    #     "account_sid": str,
+    #     "from": str,
+    #     "to": str,
+    # }
+    stream_id = call_data["stream_id"]
+    call_id = call_data["call_id"]  # Exotel's CallSid
+    account_sid = call_data["account_sid"]
+    from_number = call_data["from"]  # Caller's number
+    to_number = call_data["to"]      # Your Exotel number
+```
+
+**Transport Creation**: Configure the WebSocket transport with Exotel serialization:
+
+```python bot.py
+# Create Exotel serializer with call details
+serializer = ExotelFrameSerializer(
+    stream_id=stream_id,
+    call_id=call_id,
+    account_sid=account_sid,
+    api_key=os.getenv("EXOTEL_API_KEY"),
+    api_token=os.getenv("EXOTEL_API_TOKEN"),
+)
+
+# Configure WebSocket transport
+transport = FastAPIWebsocketTransport(
+    websocket=websocket,
+    params=FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        add_wav_header=False,
+        vad_analyzer=SileroVADAnalyzer(),
+        serializer=serializer,
+    ),
+)
+
+# Your bot pipeline setup here...
+```
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/exotel-chatbot/inbound/bot.py"
+>
+  See the full bot.py with WebSocket parsing, transport setup, and pipeline
+  configuration
+</Card>
+
+### Set up Exotel phone number
+
+Configure your Exotel phone number to use your App Bazaar flow:
+
+1. Go to the [Exotel Dashboard](https://my.exotel.com)
+2. Navigate to ExoPhones
+3. Find your phone number and click the edit icon
+4. Under "App", select your App Bazaar flow
+5. Save the configuration
+
+### Run the Example
+
+For dial-in, you can run your bot directly without a separate server:
+
+```shell
+# Start your bot directly
+python bot.py
+
+# For local development, use ngrok to expose your WebSocket
+ngrok http 8000
+# Use the ngrok WebSocket URL (wss://abc123.ngrok.io/ws) in your App Bazaar flow
+```
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/exotel-chatbot/inbound"
+>
+  See the full README with step-by-step setup, App Bazaar configuration, and
+  testing
+</Card>
+
+## Dial-out
+
+Dial-out allows your bot to initiate calls to phone numbers using Exotel's outbound calling capabilities with WebSocket Voice Streaming.
+
+### How It Works
+
+Here's the sequence of events for dial-out calls:
+
+1. **Your application triggers a dial-out** (via API call or user action)
+2. **Server initiates an Exotel call** using the Voice API
+3. **Exotel establishes the call** and opens a WebSocket connection
+4. **Your bot joins the WebSocket** and sets up the pipeline
+5. **The recipient answers** and is connected to your bot
+6. **The bot handles the conversation** with real-time audio streaming
+
+### Set up your server for dial-out
+
+The dial-out server creates outbound calls and manages WebSocket connections. When you trigger a dial-out call, your server:
+
+1. **Receives the dial-out request** with target phone number and parameters
+2. **Creates an Exotel call** using the Voice API with a callback URL
+3. **Accepts the WebSocket** connection from Exotel
+4. **Parses call data** from the WebSocket messages
+5. **Runs the Pipecat bot** with the call information
+
+<Card
+  title="Complete Server Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/exotel-chatbot/outbound/server.py"
+>
+  See the full FastAPI server code with outbound call creation and WebSocket
+  handling
+</Card>
+
+### Configure your Pipecat bot for dial-out
+
+The dial-out bot configuration is similar to dial-in, with Exotel automatically providing call information.
+
+**Call Information**: Extract call details from Exotel's WebSocket messages:
+
+```python bot.py
+# Parse WebSocket data (same as dial-in)
+transport_type, call_data = await parse_telephony_websocket(websocket)
+
+# Extract call information
+stream_id = call_data["stream_id"]
+call_id = call_data["call_id"]
+account_sid = call_data["account_sid"]
+from_number = call_data["from"]  # Your Exotel number
+to_number = call_data["to"]      # Target number you're calling
+
+# Customize bot behavior for outbound calls
+greeting = f"Hi! This is an automated call from {from_number}. How are you today?"
+```
+
+**Custom Data Limitations for Dial-out**:
+
+<Warning>
+  Currently, there are limitations with passing custom data through query
+  parameters in Exotel's WebSocket URLs. While the platform theoretically
+  supports query parameters, they may be stripped during call processing. This
+  is an ongoing limitation that may be addressed in future Exotel updates.
+</Warning>
+
+If you need to pass custom data for dial-out, consider these alternatives:
+
+- Use different WebSocket endpoints for different call types
+- Configure multiple App Bazaar flows for different scenarios
+- Handle customization based on the called number (available in WebSocket messages)
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/exotel-chatbot/outbound/bot.py"
+>
+  See the full bot.py with outbound call handling and call information usage
+</Card>
+
+### Run the Example
+
+To test dial-out functionality:
+
+1. **Start your server**: Run your FastAPI server
+2. **Trigger a call**: Make an API request to start an outbound call
+3. **Answer your phone**: The bot will call the specified number
+4. **Talk to your bot**: Have a conversation with your AI agent
+
+<Card
+  title="Complete Setup Instructions"
+  icon="book-open"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/exotel-chatbot/outbound"
+>
+  See the full README with step-by-step setup, API usage, and outbound call
+  configuration
+</Card>
+
+## Key Features
+
+### Audio Format and Sample Rate
+
+Exotel Voice Streaming uses 8kHz mono audio with 16-bit PCM encoding. Configure your pipeline accordingly:
+
+```python
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        audio_in_sample_rate=8000,
+        audio_out_sample_rate=8000,
+        allow_interruptions=True,
+    ),
+)
+```
+
+### Built-in Call Information
+
+Like Telnyx, Exotel automatically includes comprehensive call information (to/from numbers, account details) in the WebSocket messages, eliminating the need for custom webhook servers in basic dial-in scenarios.
+
+## Deployment
+
+### Local Development
+
+Use [ngrok](https://ngrok.com/) to expose your local server for testing:
+
+```shell
+python server.py  # For dial-out
+# OR
+python bot.py     # For dial-in
+
+ngrok http 8000
+# Use the ngrok URL in your App Bazaar Voicebot applet
+```
+
+### Pipecat Cloud Deployment
+
+For production deployment without managing your own infrastructure, use Pipecat Cloud:
+
+<Card
+  title="Exotel WebSocket on Pipecat Cloud"
+  icon="cloud"
+  href="/deployment/pipecat-cloud/guides/telephony/exotel-websocket"
+>
+  Deploy Exotel WebSocket bots with automatic scaling and managed infrastructure
+</Card>
+
+### Self-Hosted Production Deployment
+
+For fully self-hosted production deployment, ensure your servers are:
+
+- Publicly accessible with HTTPS
+- Able to handle concurrent WebSocket connections
+- Properly configured with Exotel API credentials
+- Implementing proper error handling and logging
+
+## Next Steps
+
+- Explore the [complete examples](https://github.com/pipecat-ai/pipecat-examples/tree/main/exotel-chatbot) for full implementations
+- Learn about [Daily + Twilio SIP integration](./twilio-daily-sip) for advanced telephony scenarios
+- Check out [Daily PSTN integration](./daily-pstn) for direct phone number provisioning
