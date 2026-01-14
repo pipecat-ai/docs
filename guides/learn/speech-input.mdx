@@ -1,19 +1,24 @@
 ---
 title: "Speech Input & Turn Detection"
-description: "Learn how Pipecat detects when users start and stop speaking, and manages conversation turns"
+description: "Learn how Pipecat detects user turns using VAD, transcriptions, and turn detection models"
 ---
 
-Understanding how your bot detects and processes user speech is crucial for creating natural conversations. Pipecat provides sophisticated Voice Activity Detection (VAD) and turn detection to handle the complex timing of real-time conversations.
+A key to natural conversations is properly detecting when the user starts and stops speaking. This is more nuanced than simply detecting audio; a brief pause doesn't always mean the user is done talking.
 
 ## Overview
 
-Speech input processing involves three key components:
+Pipecat uses [user turn strategies](/server/utilities/user-turn-strategies) to determine when user turns start and end. These strategies can use different techniques:
 
-- **VAD Analyzer**: Detects when users start and stop speaking
-- **Turn Analyzer**: Determines when users have finished their turn
-- **Speech Events**: System frames that coordinate pipeline behavior
+**For detecting turn start:**
+- Voice Activity Detection (VAD): triggers when speech is detected
+- Transcription-based (fallback): triggers when transcription is received but VAD didn't detect speech
+- Minimum words: waits for a minimum number of spoken words before triggering
 
-These components work together to create natural conversation flow and enable interruptions.
+**For detecting turn end:**
+- Transcription-based: analyzes transcription to determine when the user is done
+- Turn detection model: uses AI to understand if the user has finished their thought
+
+Custom strategies can also be implemented for specific use cases. By combining these techniques, you can create responsive yet natural conversations that don't interrupt users mid-sentence or wait too long after they've finished.
 
 ## Voice Activity Detection (VAD)
 
@@ -75,115 +80,81 @@ transport = YourTransport(
   optimal performance across different audio environments and use cases.
 </Warning>
 
-## Turn Detection
+## User Turn Detection
 
-### Beyond Simple VAD
+While VAD detects speech vs. silence, it can't understand linguistic context. A pause doesn't mean the user is done. User turn strategies interpret VAD signals and transcriptions to determine actual turn boundaries.
 
-While VAD detects speech vs. silence, it can't understand linguistic context. Humans use grammar, tone, pace, and semantic cues to determine conversation turns. Pipecat's turn detection brings this sophistication to voice AI.
+### How It Works
 
-### smart-turn Model
+1. **Turn Start**: When VAD detects speech (or transcription arrives), the start strategy emits `UserStartedSpeakingFrame` and optionally triggers an interruption
+2. **Turn End**: When the stop strategy determines the user is done, it emits `UserStoppedSpeakingFrame`
 
-Pipecat integrates with the [smart-turn model](https://github.com/pipecat-ai/smart-turn), an open-source native audio turn detection model:
+<Note>
+VAD also emits its own frames (`VADUserStartedSpeakingFrame`, `VADUserStoppedSpeakingFrame`) which indicate raw speech/silence detection. These are inputs to the turn strategies, not the final turn decisions.
+</Note>
+
+### Detecting Turn End
+
+Turn end detection uses transcription to understand what the user said:
+
+**Transcription-based (Default)**: Analyzes transcription to determine when the user has finished speaking.
+
+```python
+from pipecat.turns.user_stop import TranscriptionUserTurnStopStrategy
+
+stop_strategy = TranscriptionUserTurnStopStrategy()
+```
+
+**Smart Turn Model**: Uses an AI model to analyze audio and determine if the user has finished their thought.
 
 ```python
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 
-transport = YourTransport(
-    params=TransportParams(
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(),  # Requires VAD to be configured at 0.2s
-    ),
+stop_strategy = TurnAnalyzerUserTurnStopStrategy(
+    turn_analyzer=LocalSmartTurnAnalyzerV3()
 )
 ```
 
-**Smart Turn v3 features:**
-
-- Support for 23 languages
-- Runs on CPU (no GPU required)
-- Community-driven development
-- BSD 2-clause license (truly open)
-
-### VAD + Turn Detection Integration
-
-When using turn detection, VAD and turn analyzer work together:
-
-1. **VAD detects speech segments** with low `stop_secs` (recommended: 0.2)
-2. **Turn model analyzes audio** to determine if turn is complete or incomplete
-3. **VAD behavior adjusts** based on turn model results:
-   - **Complete**: Normal VAD stop behavior
-   - **Incomplete**: Extends waiting time (default: 3.0 seconds)
-
-**Recommended VAD configuration with turn detection:**
-
-```python
-# Configure VAD for responsive turn detection
-vad_params = VADParams(
-    stop_secs=0.2,  # Low value for quick turn model analysis
-)
-
-vad_analyzer = SileroVADAnalyzer(params=vad_params)
-```
-
-Learn more about the VAD and Turn Analyzers in the server utilities documentation:
+When using Smart Turn, configure VAD with a low `stop_secs` (0.2) so the model can analyze speech quickly.
 
 <CardGroup cols={2}>
 <Card
-  title="VAD Documentation"
-  icon="microphone"
-  href="/server/utilities/audio/silero-vad-analyzer"
+  title="User Turn Strategies"
+  icon="arrows-turn-to-dots"
+  href="/server/utilities/user-turn-strategies"
 >
-  Complete VAD configuration reference
+  Complete reference for start and stop strategies
 </Card>
 
 <Card
-  title="Turn Detection Guide"
-  icon="comments"
+  title="Smart Turn Overview"
+  icon="brain"
   href="/server/utilities/smart-turn/smart-turn-overview"
 >
-  Detailed turn detection implementation guide
+  Smart Turn model implementation guide
 </Card>
 </CardGroup>
 
-## Speech Events & Pipeline Coordination
+### Interruptions
 
-### System Frames for Speech Events
+Interruptions stop the bot when the user starts speaking. This is controlled by the `enable_interruptions` parameter on start strategies (enabled by default).
 
-When VAD detects speech activity, the transport emits system frames that coordinate pipeline behavior:
+When a user turn starts with interruptions enabled:
+1. Bot immediately stops speaking
+2. Pending audio and text is cleared
+3. Pipeline ready for new user input
 
-**When speech starts:**
-
-- `UserStartedSpeakingFrame`: Informs processors that user began speaking
-- `StartInterruptionFrame`: Triggers interruption handling (if enabled)
-
-**When speech stops:**
-
-- `UserStoppedSpeakingFrame`: Signals end of user input
-- `StopInterruptionFrame`: Resumes normal processing
-
-### Interruption Handling
-
-Interruptions are a critical feature for natural conversations:
+To disable interruptions:
 
 ```python
-task = PipelineTask(
-    pipeline,
-    params=PipelineParams(
-        allow_interruptions=True,  # Default: True (strongly recommended)
-    ),
-)
+from pipecat.turns.user_start import VADUserTurnStartStrategy
+
+start_strategy = VADUserTurnStartStrategy(enable_interruptions=False)
 ```
 
-**How interruptions work:**
-
-1. User starts speaking → `StartInterruptionFrame` emitted
-2. System frame processed immediately (bypasses normal queues)
-3. Current processors stop and clear their queues
-4. Pipeline resets, ready for new user input
-
 <Note>
-  Keep `allow_interruptions=True` (default) for natural conversations. This
-  enables users to interrupt the bot mid-sentence, just like human
-  conversations.
+Keep interruptions enabled (default) for natural conversations. This enables users to interrupt the bot mid-sentence, just like human conversations.
 </Note>
 
 ## Best Practices
@@ -193,28 +164,39 @@ task = PipelineTask(
 **For most voice AI use cases:**
 
 ```python
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
 # Responsive VAD with turn detection
 vad_params = VADParams(
     start_secs=0.2,
     stop_secs=0.2 if using_turn_detection else 0.8,
 )
 
-smart_turn_analyzer = LocalSmartTurnAnalyzerV3()
-
 transport = YourTransport(
     params=TransportParams(
         vad_analyzer=SileroVADAnalyzer(params=vad_params),
-        turn_analyzer=smart_turn_analyzer if using_smart_turn_detection else None,
     ),
 )
 
-# Enable interruptions for natural flow
-task = PipelineTask(
-    pipeline,
-    params=PipelineParams(
-        allow_interruptions=True, # Default is True
+# Configure Smart Turn via user turn strategies (if using turn detection)
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            stop=[TurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=LocalSmartTurnAnalyzerV3()
+            )]
+        ) if using_smart_turn_detection else None,
     ),
 )
+
+task = PipelineTask(pipeline)
 ```
 
 ### Performance Considerations
