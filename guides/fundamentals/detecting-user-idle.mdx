@@ -5,92 +5,114 @@ description: "Learn how to detect and respond when users are inactive in convers
 
 ## Overview
 
-In conversational applications, it's important to handle situations where users go silent or inactive. Pipecat's `UserIdleProcessor` helps you detect when users haven't spoken for a defined period, allowing your bot to respond appropriately.
+In conversational applications, it's important to handle situations where users go silent or inactive. Pipecat provides built-in idle detection through `LLMUserAggregator` and `UserTurnProcessor`, allowing your bot to respond appropriately when users haven't spoken for a defined period.
 
 ## How It Works
 
-The `UserIdleProcessor` monitors user activity and:
+Idle detection monitors user activity and:
 
 1. Starts tracking after the first interaction (user or bot speaking)
-2. Resets a timer whenever the user speaks
-3. Calls your custom callback function when the user is idle for longer than the timeout period
-4. Provides a retry counter to track consecutive idle periods
-5. Allows you to implement escalating responses or gracefully end the conversation
+2. Resets a timer whenever the user or bot speaks
+3. Pauses during function calls (which may take longer than the timeout)
+4. Emits an `on_user_turn_idle` event when the user is idle for longer than the timeout period
+5. Allows you to implement escalating responses or gracefully end the conversation in your application code
 
 <Note>
-  The processor uses speech events (not audio frames) to detect activity, so it
-  requires an active speech-to-text service or a transport with built-in speech
-  detection.
+  Idle detection uses continuous activity frames (`UserSpeakingFrame`,
+  `BotSpeakingFrame`) to track real-time conversation activity. It requires an
+  active speech-to-text service or a transport with built-in speech detection.
 </Note>
 
 ## Basic Implementation
 
-### Step 1: Create a Handler Function
+### Step 1: Enable Idle Detection
 
-First, create a callback function that will be triggered when the user is idle:
+Enable idle detection by setting the `user_idle_timeout` parameter when creating your aggregator:
 
 ```python
-# Simple handler that doesn't use retry count
-async def handle_user_idle(processor):
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_idle_timeout=5.0,  # Detect idle after 5 seconds
+    ),
+)
+```
+
+### Step 2: Handle Idle Events
+
+Create an event handler to respond when the user becomes idle:
+
+```python
+@user_aggregator.event_handler("on_user_turn_idle")
+async def on_user_turn_idle(aggregator):
     # Send a reminder to the user
-    await processor.push_frame(TTSSpeakFrame("Are you still there?"))
-
-# OR
-
-# Advanced handler with retry logic
-async def handle_user_idle(processor, retry_count):
-    if retry_count == 1:
-        # First attempt - gentle reminder
-        await processor.push_frame(TTSSpeakFrame("Are you still there?"))
-        return True  # Continue monitoring
-    elif retry_count == 2:
-        # Second attempt - more direct prompt
-        await processor.push_frame(TTSSpeakFrame("Would you like to continue our conversation?"))
-        return True  # Continue monitoring
-    else:
-        # Third attempt - end conversation
-        await processor.push_frame(TTSSpeakFrame("I'll leave you for now. Have a nice day!"))
-        await processor.push_frame(EndFrame(), FrameDirection.UPSTREAM)
-        return False  # Stop monitoring
+    message = {
+        "role": "system",
+        "content": "The user has been quiet. Politely ask if they're still there.",
+    }
+    await aggregator.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
 ```
 
-### Step 2: Create the Idle Processor
+### Step 3: Implement Retry Logic (Optional)
 
-Initialize the processor with your callback and desired timeout:
-
-```python
-from pipecat.processors.user_idle_processor import UserIdleProcessor
-
-user_idle = UserIdleProcessor(
-    callback=handle_user_idle,  # Your callback function
-    timeout=5.0,               # Seconds of inactivity before triggering
-)
-```
-
-### Step 3: Add to Your Pipeline
-
-Place the processor after speech detection but before context handling:
+For escalating responses, track retry count in your application:
 
 ```python
-pipeline = Pipeline(
-    [
-        transport.input(),
-        stt,                         # Speech-to-text
-        user_idle,                   # Add idle detection here
-        context_aggregator.user(),
-        llm,
-        tts,
-        transport.output(),
-        context_aggregator.assistant(),
-    ]
-)
+class IdleHandler:
+    def __init__(self):
+        self._retry_count = 0
+
+    def reset(self):
+        self._retry_count = 0
+
+    async def handle_idle(self, aggregator):
+        self._retry_count += 1
+
+        if self._retry_count == 1:
+            # First attempt - gentle reminder
+            message = {
+                "role": "system",
+                "content": "The user has been quiet. Politely ask if they're still there.",
+            }
+            await aggregator.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+        elif self._retry_count == 2:
+            # Second attempt - more direct
+            message = {
+                "role": "system",
+                "content": "The user is still inactive. Ask if they'd like to continue.",
+            }
+            await aggregator.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+        else:
+            # Third attempt - end conversation
+            await aggregator.push_frame(
+                TTSSpeakFrame("It seems like you're busy. Have a nice day!")
+            )
+            await aggregator.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+
+# Use the handler
+idle_handler = IdleHandler()
+
+@user_aggregator.event_handler("on_user_turn_idle")
+async def on_user_turn_idle(aggregator):
+    await idle_handler.handle_idle(aggregator)
+
+@user_aggregator.event_handler("on_user_turn_started")
+async def on_user_turn_started(aggregator, strategy):
+    idle_handler.reset()  # Reset retry count when user speaks
 ```
 
 ## Best Practices
 
 - **Set appropriate timeouts**: Shorter timeouts (5-10 seconds) work well for voice conversations
 - **Use escalating responses**: Start with gentle reminders and gradually become more direct
-- **Limit retry attempts**: After 2-3 unsuccessful attempts, consider [ending the conversation](/guides/learn/pipeline-termination) gracefully by pushing an `EndFrame`
+- **Limit retry attempts**: After 2-3 unsuccessful attempts, consider [ending the conversation](/guides/learn/pipeline-termination) gracefully by pushing an `EndTaskFrame`
+- **Reset on user activity**: Use the `on_user_turn_started` event to reset your retry counter when the user speaks
+- **Let the LLM respond naturally**: Use system messages to prompt the LLM rather than hardcoded TTS responses for more natural interactions
 
 ## Next Steps
 
@@ -106,13 +128,12 @@ pipeline = Pipeline(
   </Card>
 
   <Card
-    title="UserIdleProcessor Reference"
+    title="Turn Events"
     icon="book"
     iconType="duotone"
-    href="/server/utilities/user-idle-processor"
+    href="/server/utilities/turn-management/turn-events"
   >
-    Read the complete API reference documentation for advanced configuration
-    options and callback patterns.
+    Learn about all available turn events and their parameters.
   </Card>
 </CardGroup>
 
