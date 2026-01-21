@@ -1,0 +1,314 @@
+---
+title: "User Turn Strategies"
+description: "Configure how user turns are detected and managed in conversations"
+---
+
+## Overview
+
+User turn strategies provide fine-grained control over how user speaking turns are detected in conversations. They determine when a user's turn starts (user begins speaking) and when it stops (user finishes speaking and expects a response).
+
+By default, Pipecat uses a combination of VAD (Voice Activity Detection) and transcription-based detection:
+
+- **Start**: VAD detection or transcription received
+- **Stop**: Transcription received after VAD indicates silence
+
+You can customize this behavior by providing your own strategies for more sophisticated turn detection, such as requiring a minimum number of words before triggering a turn, or using AI-powered turn detection models.
+
+## How It Works
+
+1. **Turn Start Detection**: When any start strategy triggers, the user aggregator:
+
+   - Marks the start of a user turn
+   - Optionally emits `UserStartedSpeakingFrame`
+   - Optionally emits an interruption frame (if the bot is speaking)
+
+2. **During User Turn**: The aggregator collects transcriptions and audio frames.
+
+3. **Turn Stop Detection**: When a stop strategy triggers, the user aggregator:
+
+   - Marks the end of the user turn
+   - Emits `UserStoppedSpeakingFrame`
+   - Pushes the aggregated user message to the LLM context
+
+4. **Timeout Handling**: If no stop strategy triggers within `user_turn_stop_timeout` seconds (default: 5.0), the turn is automatically ended.
+
+## Configuration
+
+User turn strategies are configured via `LLMUserAggregatorParams` when creating an `LLMContextAggregatorPair`:
+
+```python
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+context = LLMContext(messages)
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            start=[...],  # List of start strategies
+            stop=[...],   # List of stop strategies
+        ),
+    ),
+)
+```
+
+## Start Strategies
+
+Start strategies determine when a user's turn begins. Multiple strategies can be provided, and the first one to trigger will signal the start of a user turn.
+
+### Base Parameters
+
+All start strategies inherit these parameters:
+
+<ParamField path="enable_interruptions" type="bool" default="True">
+  If True, the user aggregator will emit an interruption frame when the user
+  turn starts, allowing the user to interrupt the bot.
+</ParamField>
+
+<ParamField path="enable_user_speaking_frames" type="bool" default="True">
+  If True, the user aggregator will emit frames indicating when the user starts
+  speaking. Disable this if another component (e.g., an STT service) already
+  generates these frames.
+</ParamField>
+
+### VADUserTurnStartStrategy
+
+Triggers a user turn start based on Voice Activity Detection. This is the most responsive strategy, detecting speech as soon as the VAD indicates the user has started speaking.
+
+```python
+from pipecat.turns.user_start import VADUserTurnStartStrategy
+
+strategy = VADUserTurnStartStrategy()
+```
+
+### TranscriptionUserTurnStartStrategy
+
+Triggers a user turn start when a transcription is received. This serves as a fallback for scenarios where VAD-based detection fails (e.g., when the user speaks very softly) but the STT service still produces transcriptions.
+
+<ParamField path="use_interim" type="bool" default="True">
+  Whether to trigger on interim (partial) transcription frames for earlier
+  detection.
+</ParamField>
+
+```python
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
+
+strategy = TranscriptionUserTurnStartStrategy(use_interim=True)
+```
+
+### MinWordsUserTurnStartStrategy
+
+Requires the user to speak a minimum number of words before triggering a turn start. This is useful for preventing brief utterances like "okay" or "yeah" from triggering responses.
+
+<ParamField path="min_words" type="int" required>
+  Minimum number of spoken words required to trigger the start of a user turn.
+</ParamField>
+
+<ParamField path="use_interim" type="bool" default="True">
+  Whether to consider interim transcription frames for earlier detection.
+</ParamField>
+
+```python
+from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
+
+# Require at least 3 words to start a turn
+strategy = MinWordsUserTurnStartStrategy(min_words=3)
+```
+
+<Note>
+  When the bot is not speaking, this strategy will trigger after just 1 word.
+  The `min_words` threshold only applies when the bot is actively speaking,
+  preventing short affirmations from interrupting the bot.
+</Note>
+
+### ExternalUserTurnStartStrategy
+
+Delegates turn start detection to an external processor. This strategy listens for `UserStartedSpeakingFrame` frames emitted by other components in the pipeline (such as speech-to-speech services).
+
+```python
+from pipecat.turns.user_start import ExternalUserTurnStartStrategy
+
+strategy = ExternalUserTurnStartStrategy()
+```
+
+<Note>
+  This strategy automatically sets `enable_interruptions=False` and
+  `enable_user_speaking_frames=False` since these are expected to be handled by
+  the external processor.
+</Note>
+
+## Stop Strategies
+
+Stop strategies determine when a user's turn ends and the bot should respond.
+
+### Base Parameters
+
+All stop strategies inherit these parameters:
+
+<ParamField path="enable_user_speaking_frames" type="bool" default="True">
+  If True, the aggregator will emit frames indicating when the user stops
+  speaking. Disable this if another component already generates these frames.
+</ParamField>
+
+### TranscriptionUserTurnStopStrategy
+
+The default stop strategy that signals the end of a user turn when transcription is received and VAD indicates silence.
+
+<ParamField path="timeout" type="float" default="0.5">
+  A short delay in seconds used to handle consecutive or slightly delayed
+  transcriptions gracefully.
+</ParamField>
+
+```python
+from pipecat.turns.user_stop import TranscriptionUserTurnStopStrategy
+
+strategy = TranscriptionUserTurnStopStrategy(timeout=0.5)
+```
+
+### TurnAnalyzerUserTurnStopStrategy
+
+Uses an AI-powered turn detection model to determine when the user has finished speaking. This provides more intelligent end-of-turn detection that can understand conversational context.
+
+<ParamField path="turn_analyzer" type="BaseTurnAnalyzer" required>
+  The turn detection analyzer instance to use for end-of-turn detection.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="0.5">
+  A short delay in seconds used to handle consecutive or slightly delayed
+  transcriptions.
+</ParamField>
+
+```python
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+
+strategy = TurnAnalyzerUserTurnStopStrategy(
+    turn_analyzer=LocalSmartTurnAnalyzerV3()
+)
+```
+
+<Tip>
+  See the [Smart Turn
+  Detection](/server/utilities/smart-turn/smart-turn-overview) documentation for
+  more information on available turn analyzers.
+</Tip>
+
+### ExternalUserTurnStopStrategy
+
+Delegates turn stop detection to an external processor. This strategy listens for `UserStoppedSpeakingFrame` frames emitted by other components in the pipeline.
+
+<ParamField path="timeout" type="float" default="0.5">
+  A short delay in seconds used to handle consecutive or slightly delayed
+  transcriptions.
+</ParamField>
+
+```python
+from pipecat.turns.user_stop import ExternalUserTurnStopStrategy
+
+strategy = ExternalUserTurnStopStrategy()
+```
+
+## UserTurnStrategies
+
+Container for configuring user turn start and stop strategies.
+
+<ParamField
+  path="start"
+  type="List[BaseUserTurnStartStrategy]"
+  default="[VADUser...(), TranscriptionUser...()]"
+>
+  List of strategies used to detect when the user starts speaking. The first
+  strategy to trigger will signal the start of the user's turn.
+</ParamField>
+
+<ParamField
+  path="stop"
+  type="List[BaseUserTurnStopStrategy]"
+  default="[TranscriptionUserTurnStopStrategy()]"
+>
+  List of strategies used to detect when the user stops speaking and expects a
+  response.
+</ParamField>
+
+## ExternalUserTurnStrategies
+
+A convenience class that preconfigures `UserTurnStrategies` with external strategies for both start and stop detection. Use this when an external processor (such as a speech-to-speech service) controls turn management.
+
+```python
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=ExternalUserTurnStrategies(),
+    ),
+)
+```
+
+## Usage Examples
+
+### Default Behavior
+
+The default configuration uses VAD and transcription for turn detection:
+
+```python
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+# This is equivalent to the default behavior
+strategies = UserTurnStrategies(
+    start=[VADUserTurnStartStrategy(), TranscriptionUserTurnStartStrategy()],
+    stop=[TranscriptionUserTurnStopStrategy()],
+)
+```
+
+### Minimum Words for Interruption
+
+Require users to speak at least 3 words before they can interrupt the bot:
+
+```python
+from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
+from pipecat.turns.user_stop import TranscriptionUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            start=[MinWordsUserTurnStartStrategy(min_words=3)],
+            stop=[TranscriptionUserTurnStopStrategy()],
+        ),
+    ),
+)
+```
+
+### Local Smart Turn Detection
+
+Use a local turn detection model instead of a cloud service:
+
+```python
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            stop=[
+                TurnAnalyzerUserTurnStopStrategy(
+                    turn_analyzer=LocalSmartTurnAnalyzerV3()
+                )
+            ]
+        ),
+    ),
+)
+```
+
+## Related
+
+- [User Input Muting](/guides/fundamentals/user-input-muting) - Control when user input is ignored
+- [Smart Turn Detection](/server/utilities/smart-turn/smart-turn-overview) - AI-powered turn detection
