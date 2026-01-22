@@ -1,0 +1,204 @@
+---
+title: "Turn Events"
+description: "Handle user and assistant turn lifecycle events for transcriptions and turn tracking"
+---
+
+## Overview
+
+Turn events provide hooks into the conversation turn lifecycle, allowing you to know when users and assistants start or stop speaking. These events are emitted by the context aggregators (`LLMUserAggregator` and `LLMAssistantAggregator`) and are particularly useful for:
+
+- **Collecting transcriptions** - Get complete user and assistant transcripts when turns end
+- **Turn tracking** - Monitor conversation flow and timing
+- **Analytics** - Measure turn durations, detect timeouts, and track conversation patterns
+
+## Events Summary
+
+| Event                       | Emitter                | Description                                         |
+| --------------------------- | ---------------------- | --------------------------------------------------- |
+| `on_user_turn_started`      | `user_aggregator`      | User begins speaking                                |
+| `on_user_turn_stopped`      | `user_aggregator`      | User finishes speaking (includes transcript)        |
+| `on_user_turn_stop_timeout` | `user_aggregator`      | User turn ended due to timeout                      |
+| `on_user_turn_idle`         | `user_aggregator`      | User has been idle (not speaking) for timeout       |
+| `on_assistant_turn_started` | `assistant_aggregator` | Assistant begins responding                         |
+| `on_assistant_turn_stopped` | `assistant_aggregator` | Assistant finishes responding (includes transcript) |
+
+## User Turn Events
+
+User turn events are registered on the `user_aggregator` from an `LLMContextAggregatorPair`.
+
+### on_user_turn_started
+
+Fired when a user turn is detected to have started, based on the configured [start strategies](/server/utilities/turn-management/user-turn-strategies#start-strategies).
+
+```python
+@user_aggregator.event_handler("on_user_turn_started")
+async def on_user_turn_started(aggregator, strategy):
+    print(f"User started speaking (detected by {strategy})")
+```
+
+**Parameters:**
+
+| Parameter    | Type                        | Description                                |
+| ------------ | --------------------------- | ------------------------------------------ |
+| `aggregator` | `LLMUserAggregator`         | The user aggregator instance               |
+| `strategy`   | `BaseUserTurnStartStrategy` | The strategy that triggered the turn start |
+
+### on_user_turn_stopped
+
+Fired when a user turn is detected to have ended, based on the configured [stop strategies](/server/utilities/turn-management/user-turn-strategies#stop-strategies). This event includes the complete user transcript for the turn.
+
+```python
+@user_aggregator.event_handler("on_user_turn_stopped")
+async def on_user_turn_stopped(aggregator, strategy, message: UserTurnStoppedMessage):
+    print(f"User said: {message.content}")
+    print(f"Turn started at: {message.timestamp}")
+    if message.user_id:
+        print(f"User ID: {message.user_id}")
+```
+
+**Parameters:**
+
+| Parameter    | Type                       | Description                                 |
+| ------------ | -------------------------- | ------------------------------------------- |
+| `aggregator` | `LLMUserAggregator`        | The user aggregator instance                |
+| `strategy`   | `BaseUserTurnStopStrategy` | The strategy that triggered the turn stop   |
+| `message`    | `UserTurnStoppedMessage`   | Contains the user's transcript and metadata |
+
+### on_user_turn_stop_timeout
+
+Fired when a user turn times out without any stop strategy triggering. This is a fallback mechanism that ends the turn after a configurable timeout period (default: 5.0 seconds) when the user has stopped speaking according to VAD but no transcription-based stop has occurred. Commonly, this event is used to retrigger the LLM response after the user has stopped speaking.
+
+```python
+@user_aggregator.event_handler("on_user_turn_stop_timeout")
+async def on_user_turn_stop_timeout(aggregator):
+    message = {
+        "role": "system",
+        "content": "Continue.",
+    }
+    await user_aggregator.queue_frame(LLMMessagesAppendFrame([message], run_llm=True))
+```
+
+**Parameters:**
+
+| Parameter    | Type                | Description                  |
+| ------------ | ------------------- | ---------------------------- |
+| `aggregator` | `LLMUserAggregator` | The user aggregator instance |
+
+<Note>
+  After `on_user_turn_stop_timeout` fires, `on_user_turn_stopped` will also be
+  called with the accumulated transcript.
+</Note>
+
+### on_user_turn_idle
+
+Fired when the user has been idle (not speaking) for a configured timeout period. This event is useful for re-engaging users who may have stepped away or need a prompt to continue the conversation. The idle timer only starts after the first conversation activity and does not trigger while the bot is speaking or function calls are in progress.
+
+```python
+@user_aggregator.event_handler("on_user_turn_idle")
+async def on_user_turn_idle(aggregator):
+    # Re-engage the user with a contextual prompt
+    message = {
+        "role": "system",
+        "content": "The user has been quiet. Politely and briefly ask if they're still there.",
+    }
+    await aggregator.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+```
+
+**Parameters:**
+
+| Parameter    | Type                | Description                  |
+| ------------ | ------------------- | ---------------------------- |
+| `aggregator` | `LLMUserAggregator` | The user aggregator instance |
+
+<Note>
+  The idle timer resets on user or bot speaking activity, and does not trigger
+  during function call execution. This event can fire multiple times if the user
+  remains idle.
+</Note>
+
+## Assistant Turn Events
+
+Assistant turn events are registered on the `assistant_aggregator` from an `LLMContextAggregatorPair`.
+
+### on_assistant_turn_started
+
+Fired when the assistant begins generating a response.
+
+```python
+@assistant_aggregator.event_handler("on_assistant_turn_started")
+async def on_assistant_turn_started(aggregator):
+    print("Assistant started responding")
+```
+
+**Parameters:**
+
+| Parameter    | Type                     | Description                       |
+| ------------ | ------------------------ | --------------------------------- |
+| `aggregator` | `LLMAssistantAggregator` | The assistant aggregator instance |
+
+### on_assistant_turn_stopped
+
+Fired when the assistant finishes responding or is interrupted. This event includes the complete assistant transcript for the turn.
+
+```python
+@assistant_aggregator.event_handler("on_assistant_turn_stopped")
+async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+    print(f"Assistant said: {message.content}")
+    print(f"Turn started at: {message.timestamp}")
+```
+
+**Parameters:**
+
+| Parameter    | Type                          | Description                                      |
+| ------------ | ----------------------------- | ------------------------------------------------ |
+| `aggregator` | `LLMAssistantAggregator`      | The assistant aggregator instance                |
+| `message`    | `AssistantTurnStoppedMessage` | Contains the assistant's transcript and metadata |
+
+<Note>
+  This event fires when the LLM response completes, when the user interrupts, or
+  when a user image is appended to context.
+</Note>
+
+## Message Types
+
+### UserTurnStoppedMessage
+
+Contains the user's complete transcript when their turn ends.
+
+```python
+from pipecat.processors.aggregators.llm_response_universal import UserTurnStoppedMessage
+```
+
+<ParamField path="content" type="str">
+  The complete transcribed text from the user's turn.
+</ParamField>
+
+<ParamField path="timestamp" type="str">
+  ISO 8601 timestamp indicating when the user turn started.
+</ParamField>
+
+<ParamField path="user_id" type="Optional[str]">
+  Optional identifier for the user, if available from the transport.
+</ParamField>
+
+### AssistantTurnStoppedMessage
+
+Contains the assistant's complete transcript when their turn ends.
+
+```python
+from pipecat.processors.aggregators.llm_response_universal import AssistantTurnStoppedMessage
+```
+
+<ParamField path="content" type="str">
+  The complete text content from the assistant's turn.
+</ParamField>
+
+<ParamField path="timestamp" type="str">
+  ISO 8601 timestamp indicating when the assistant turn started.
+</ParamField>
+
+## Related
+
+- [Transcriptions](/server/utilities/turn-management/transcriptions) - Collect conversation transcripts using turn events
+- [User Turn Strategies](/server/utilities/turn-management/user-turn-strategies) - Configure turn detection behavior
+- [Turn Tracking Observer](/server/utilities/observers/turn-tracking-observer) - Track complete turn cycles with timing

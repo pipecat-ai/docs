@@ -7,7 +7,7 @@ description: "Complete guide to Daily's PSTN capabilities including dial-in, dia
 
 - An active [Daily](https://www.daily.co) developer account with API key
 - At least one phone number purchased through Daily (covered below)
-- A server to handle webhooks (we'll show local development with ngrok)
+- For local development: ngrok to expose your bot to the Internet
 
 <CardGroup cols={3}>
   <Card
@@ -15,7 +15,7 @@ description: "Complete guide to Daily's PSTN capabilities including dial-in, dia
     icon="phone-arrow-down-left"
     href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-pstn-dial-in"
   >
-    Complete dial-in implementation with webhook handling
+    Complete dial-in implementation with the Pipecat development runner
   </Card>
 
 <Card
@@ -57,17 +57,51 @@ Dial-in allows users to call your phone number and connect directly to your Pipe
 Here's the sequence of events when someone calls your Daily phone number:
 
 1. **Daily receives an incoming call** to your phone number
-2. **Daily calls your webhook server** (`/start` endpoint)
-3. **The server creates a Daily room** with dial-in capabilities
-4. **The server starts the bot process** with the room details
+2. **Daily calls your webhook endpoint**
+3. **The webhook creates a Daily room** with SIP configuration
+4. **The webhook starts your bot** with the room details and caller information
 5. **The caller is put on hold** with music
 6. **The bot joins the Daily room** and signals readiness
 7. **Daily forwards the call** to the Daily room
-8. **The caller and the bot are connected**, and the bot handles the conversation
+8. **The caller and bot are connected** for the conversation
 
-### Create a pinless dial-in configuration
+### Local Development
 
-A pinless dial-in configuration connects your purchased phone number to a webhook URL. When someone calls your number, Daily will send a webhook to your server with call details.
+The Pipecat development runner provides built-in webhook handling for Daily PSTN dial-in, eliminating the need for a separate webhook server.
+
+#### 1. Run your bot with dial-in support
+
+```bash
+uv run bot.py -t daily --dialin
+```
+
+This starts a FastAPI server on port 7860 with a `/daily-dialin-webhook` endpoint.
+
+#### 2. Expose your bot to the internet
+
+```bash
+ngrok http 7860
+```
+
+Copy the ngrok URL (e.g., `https://abc123.ngrok.io`).
+
+<Tip>Use `ngrok http 7860 --subdomain your-subdomain` for a reusable URL.</Tip>
+
+#### 3. Configure your Daily phone number
+
+Set your phone number's `room_creation_api` webhook to:
+
+```
+https://your-ngrok-url.ngrok.io/daily-dialin-webhook
+```
+
+<Card
+  title="Daily Dial-in Config API"
+  icon="link"
+  href="https://docs.daily.co/reference/rest-api/domainDialinConfig"
+>
+  Instructions for configuring the webhook URL for your phone number
+</Card>
 
 ```shell Create pinless dial-in config
 curl --location 'https://api.daily.co/v1' \
@@ -78,83 +112,63 @@ curl --location 'https://api.daily.co/v1' \
         "pinless_dialin": [
             {
                 "phone_number": "DAILY_PROVISIONED_NUMBER_HERE",
-                "room_creation_api": "BOT_RUNNER_URL/start_bot"
+                "room_creation_api": "https://your-ngrok-url.ngrok.io/daily-dialin-webhook"
             }
         ]
     }
 }'
 ```
 
-### Set up your webhook server
-
-Your server acts as the orchestrator for incoming calls. When Daily receives a call, it sends a webhook to your server with call details (`callId` and `callDomain`). Your server then:
-
-1. **Creates a Daily room** with SIP dial-in capabilities
-2. **Spawns a bot process** with the room details and call information
-3. **Returns success** to Daily, which keeps the caller on hold until the bot is ready
-
-The server handles the coordination between Daily's telephony infrastructure and your Pipecat bot instances. Each incoming call gets its own dedicated room and bot process.
-
-<Card
-  title="Complete Server Implementation"
-  icon="code"
-  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/phone-chatbot/daily-pstn-dial-in/server.py"
->
-  See the full FastAPI server code with room creation, process management, and
-  error handling
-</Card>
-
-For local development, expose your server using [ngrok](https://ngrok.com/):
-
-```shell
-python server.py
-ngrok http 8000
-# Use the ngrok URL in your dialin config
-```
-
-<Tip>Use `--subdomain` to get a reusable URL for your ngrok tunnel.</Tip>
+<Warning>
+  Ensure your `DAILY_API_KEY` has the phone number associated with it. This is
+  required for the `pinlessCallUpdate` API call that connects the caller to the
+  room.
+</Warning>
 
 ### Configure your Pipecat bot for dial-in
 
-The bot receives arguments from the server process and uses them to create the Daily transport. The key components are:
-
-**Bot Entry Point**: The `bot()` method receives `RunnerArguments` containing:
+The bot receives dial-in information through `RunnerArguments` containing:
 
 - `room_url`: Daily room URL for the call
 - `token`: Daily room token for authentication
-- `call_id` and `call_domain`: Call identifiers from Daily's webhook
+- `body`: Contains `DailyDialinRequest` with call details
 
-**Transport Creation**: These arguments are used to configure the `DailyTransport`:
+**Bot Entry Point**:
 
 ```python bot.py
+from pipecat.runner.types import DailyDialinRequest, RunnerArguments
 from pipecat.transports.daily import DailyTransport, DailyParams, DailyDialinSettings
 
-async def bot(args: RunnerArguments):
+async def bot(runner_args: RunnerArguments):
+    # Parse dial-in request from runner
+    request = DailyDialinRequest.model_validate(runner_args.body)
+
     # Configure dial-in settings with webhook data
     daily_dialin_settings = DailyDialinSettings(
-        call_id=args.call_id,
-        call_domain=args.call_domain
+        call_id=request.dialin_settings.call_id,
+        call_domain=request.dialin_settings.call_domain
     )
 
     # Create transport with dial-in configuration
     transport = DailyTransport(
-        args.room_url,
-        args.token,
+        runner_args.room_url,
+        runner_args.token,
         "Voice Bot",
         DailyParams(
-            api_url=os.getenv("DAILY_API_URL", "https://api.daily.co/v1"),
-            api_key=os.getenv("DAILY_API_KEY"),
+            api_key=request.daily_api_key,
+            api_url=request.daily_api_url,
             dialin_settings=daily_dialin_settings,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            video_out_enabled=False,
             vad_analyzer=SileroVADAnalyzer(),
-            transcription_enabled=True,
         )
     )
 
-    # Pass transport to your bot pipeline
     # Your bot setup and pipeline creation here...
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+    main()
 ```
 
 <Card
@@ -166,14 +180,35 @@ async def bot(args: RunnerArguments):
   configuration
 </Card>
 
+### Customize Your Bot with Caller Information
+
+Use the caller's phone number to personalize the conversation:
+
+```python
+async def bot(runner_args: RunnerArguments):
+    # Parse dial-in request
+    request = DailyDialinRequest.model_validate(runner_args.body)
+
+    # Get caller's phone number
+    caller_phone = request.dialin_settings.From
+
+    # Look up customer information from your database
+    customer = await get_customer_by_phone(caller_phone)
+
+    # Customize the system prompt
+    messages = [
+        {
+            "role": "system",
+            "content": f"You are a helpful assistant for {customer.name}. "
+                      f"Their account status is {customer.status}. "
+                      "Keep responses concise and conversational."
+        }
+    ]
+
+    # Use the customized context in your bot...
+```
+
 ### Run the Example
-
-Once you have your webhook server configured and your bot ready, you can test the complete dial-in flow:
-
-1. **Start your server**: Run your FastAPI webhook server
-2. **Expose with ngrok**: Make your local server publicly accessible
-3. **Configure Daily**: Set up the pinless dial-in configuration with your webhook URL
-4. **Call your number**: Dial your Daily phone number to connect with your bot
 
 <Card
   title="Complete Setup Instructions"
@@ -239,20 +274,20 @@ from pipecat.transports.daily import DailyTransport, DailyParams
 
 async def bot(args: RunnerArguments):
     # Create transport for dial-out (no dial-in settings needed)
-        transport = DailyTransport(
+    transport = DailyTransport(
         args.room_url,
         args.token,
         "Voice Bot",
-            DailyParams(
+        DailyParams(
             api_url=os.getenv("DAILY_API_URL", "https://api.daily.co/v1"),
             api_key=os.getenv("DAILY_API_KEY"),
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                video_out_enabled=False,
-                vad_analyzer=SileroVADAnalyzer(),
-                transcription_enabled=True,
-            )
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            video_out_enabled=False,
+            vad_analyzer=SileroVADAnalyzer(),
+            transcription_enabled=True,
         )
+    )
 
     # Start the dial-out call
     await transport.start_dialout(args.phone_number)
@@ -344,7 +379,7 @@ async def on_dialout_answered(transport, data):
 
 ### Pipecat Cloud
 
-For production deployment without managing your own infrastructure, use Pipecat Cloud:
+For production deployment without managing your own infrastructure, use Pipecat Cloud. Pipecat Cloud handles all webhook infrastructure, room creation, and bot scaling automatically.
 
 <CardGroup cols={2}>
   <Card
@@ -352,15 +387,14 @@ For production deployment without managing your own infrastructure, use Pipecat 
     icon="phone-arrow-down-left"
     href="/deployment/pipecat-cloud/guides/telephony/daily-dial-in"
   >
-    Deploy dial-in bots with webhook handling and automatic scaling
+    Complete guide for deploying dial-in bots with automatic webhook handling
   </Card>
-
   <Card
     title="Daily Dial-out on Pipecat Cloud"
     icon="phone-arrow-up-right"
     href="/deployment/pipecat-cloud/guides/telephony/daily-dial-out"
   >
-    Deploy dial-out bots with caller ID management and voicemail detection
+    Complete guide for deploying dial-out bots with caller ID management
   </Card>
 </CardGroup>
 
@@ -374,6 +408,6 @@ For self-hosted production deployment, ensure your servers are:
 
 ## Next Steps
 
-- Explore the [complete examples](https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot) for full implementations
+- Explore the [complete examples](https://github.com/pipecat-ai/pipecat/tree/main/examples) for full implementations
 - Learn about [Daily's SIP integration](./twilio-daily-sip) for more advanced telephony scenarios
 - Check out [Daily's REST API documentation](https://docs.daily.co/reference) for additional configuration options
