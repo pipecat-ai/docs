@@ -1,0 +1,300 @@
+---
+title: "Filter Incomplete User Turns"
+description: "Use LLM-based detection to suppress responses when users are cut off mid-thought"
+---
+
+## Overview
+
+Filter Incomplete Turns is an LLM-powered feature that detects when a user's conversational turn was incomplete (they were cut off or need time to think) and suppresses the bot's response accordingly. Instead of responding to partial input, the bot waits for the user to continue, then automatically re-engages if they remain silent.
+
+This creates more natural conversations by:
+
+- Preventing the bot from responding to incomplete thoughts
+- Giving users time to finish speaking without interruption
+- Automatically prompting users to continue after pauses
+
+## How It Works
+
+When enabled, the LLM outputs a turn completion marker as the first character of every response:
+
+| Marker | Meaning | Bot Behavior |
+|--------|---------|--------------|
+| `✓` | **Complete** - User finished their thought | Respond normally |
+| `○` | **Incomplete Short** - User was cut off mid-sentence | Suppress response, wait 5s, then prompt |
+| `◐` | **Incomplete Long** - User needs time to think | Suppress response, wait 10s, then prompt |
+
+The system automatically:
+
+1. Injects turn completion instructions into the LLM's system prompt
+2. Detects markers in the LLM's streaming response
+3. Suppresses bot speech for incomplete turns
+4. Starts a timeout based on the incomplete type
+5. Re-prompts the LLM when the timeout expires
+
+## Configuration
+
+Enable the feature via `LLMUserAggregatorParams` when creating an `LLMContextAggregatorPair`:
+
+```python
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+
+context = LLMContext(messages)
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        filter_incomplete_user_turns=True,
+    ),
+)
+```
+
+### LLMUserAggregatorParams
+
+<ParamField path="filter_incomplete_user_turns" type="bool" default="False">
+  Enable LLM-based turn completion detection. When True, the system
+  automatically injects turn completion instructions into the LLM context and
+  configures the LLM service to process turn markers.
+</ParamField>
+
+<ParamField path="user_turn_completion_config" type="UserTurnCompletionConfig" default="None">
+  Optional configuration object for customizing turn completion behavior. If not
+  provided, default values are used.
+</ParamField>
+
+## UserTurnCompletionConfig
+
+Use `UserTurnCompletionConfig` to customize timeouts, prompts, and instructions:
+
+```python
+from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        filter_incomplete_user_turns=True,
+        user_turn_completion_config=UserTurnCompletionConfig(
+            incomplete_short_timeout=5.0,
+            incomplete_long_timeout=10.0,
+            incomplete_short_prompt="Custom prompt for short pauses...",
+            incomplete_long_prompt="Custom prompt for long pauses...",
+            instructions="Custom turn completion instructions...",
+        ),
+    ),
+)
+```
+
+### Parameters
+
+<ParamField path="incomplete_short_timeout" type="float" default="5.0">
+  Seconds to wait after detecting `○` (incomplete short) before re-prompting the
+  LLM. Use shorter values for more responsive re-engagement.
+</ParamField>
+
+<ParamField path="incomplete_long_timeout" type="float" default="10.0">
+  Seconds to wait after detecting `◐` (incomplete long) before re-prompting the
+  LLM. Use longer values to give users more time to think.
+</ParamField>
+
+<ParamField path="incomplete_short_prompt" type="str" default="...">
+  System prompt sent to the LLM when the short timeout expires. Should instruct
+  the LLM to generate a brief, natural prompt encouraging the user to continue.
+</ParamField>
+
+<ParamField path="incomplete_long_prompt" type="str" default="...">
+  System prompt sent to the LLM when the long timeout expires. Should instruct
+  the LLM to generate a friendly check-in message.
+</ParamField>
+
+<ParamField path="instructions" type="str" default="...">
+  Complete turn completion instructions appended to the system prompt. Override
+  this to customize how the LLM determines turn completeness.
+</ParamField>
+
+## Markers Explained
+
+### Complete (✓)
+
+The user has provided enough information for a meaningful response:
+
+```
+User: "I'd go to Japan because I love the culture and food."
+LLM: "✓ Japan is a wonderful choice! The blend of ancient traditions..."
+```
+
+The `✓` marker tells the system to push the response normally. The marker itself is not spoken (marked with `skip_tts`).
+
+### Incomplete Short (○)
+
+The user was cut off mid-sentence and will likely continue soon:
+
+```
+User: "I'd go to Japan because I love"
+LLM: "○"
+```
+
+The `○` marker suppresses the bot's response entirely. After 5 seconds (configurable), the LLM is prompted to re-engage with something like "Go ahead, I'm listening."
+
+### Incomplete Long (◐)
+
+The user needs more time to think or explicitly asked for time:
+
+```
+User: "That's a good question. Let me think..."
+LLM: "◐"
+```
+
+The `◐` marker also suppresses the response, but waits 15 seconds (configurable) before prompting. This handles cases like:
+
+- "Hold on a second"
+- "Let me think about that"
+- "Hmm, that's interesting..."
+
+## Usage Examples
+
+### Basic Usage
+
+Enable turn completion with default settings:
+
+```python
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+
+messages = [
+    {
+        "role": "system",
+        "content": "You are a helpful assistant...",
+    }
+]
+
+context = LLMContext(messages)
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        filter_incomplete_user_turns=True,
+    ),
+)
+```
+
+<Note>
+  You don't need to modify your system prompt. Turn completion instructions are
+  automatically appended when `filter_incomplete_user_turns` is enabled.
+</Note>
+
+### Custom Timeouts
+
+Adjust timeouts for your use case:
+
+```python
+from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        filter_incomplete_user_turns=True,
+        user_turn_completion_config=UserTurnCompletionConfig(
+            incomplete_short_timeout=3.0,  # More responsive
+            incomplete_long_timeout=20.0,  # More patient
+        ),
+    ),
+)
+```
+
+### Custom Prompts
+
+Customize what the LLM says when re-engaging:
+
+```python
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        filter_incomplete_user_turns=True,
+        user_turn_completion_config=UserTurnCompletionConfig(
+            incomplete_short_prompt="""The user paused briefly.
+Generate a contextual prompt to encourage them to continue.
+Respond with ✓ followed by your message.""",
+            incomplete_long_prompt="""The user has been quiet for a while.
+Generate a friendly check-in.
+Respond with ✓ followed by your message.""",
+        ),
+    ),
+)
+```
+
+<Warning>
+  Custom prompts must instruct the LLM to respond with `✓` followed by the
+  message. This ensures the re-engagement message is spoken normally.
+</Warning>
+
+### With Smart Turn Detection
+
+Combine with smart turn detection for better end-of-turn detection:
+
+```python
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            stop=[
+                TurnAnalyzerUserTurnStopStrategy(
+                    turn_analyzer=LocalSmartTurnAnalyzerV3()
+                )
+            ]
+        ),
+        filter_incomplete_user_turns=True,
+    ),
+)
+```
+
+<Tip>
+  Smart turn detection helps determine when the user stops speaking, while turn
+  completion filtering determines whether to respond. They work well together
+  for natural conversations.
+</Tip>
+
+## Transcripts
+
+Turn completion markers are automatically stripped from assistant transcripts emitted via the `on_assistant_turn_stopped` event. Your transcript handlers will receive clean text without markers:
+
+```python
+@assistant_aggregator.event_handler("on_assistant_turn_stopped")
+async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+    # message.content will be "Japan is a wonderful choice!"
+    # NOT "✓ Japan is a wonderful choice!"
+    print(f"Assistant: {message.content}")
+```
+
+## Supported LLM Services
+
+Turn completion detection works with any LLM service that inherits from `LLMService`:
+
+- OpenAI (`OpenAILLMService`)
+- Anthropic (`AnthropicLLMService`)
+- Google Gemini (`GoogleLLMService`)
+- AWS Bedrock (`AWSLLMService`)
+- And other compatible services
+
+## Graceful Degradation
+
+If the LLM fails to output a turn marker:
+
+1. The system logs a warning indicating markers were expected but not found
+2. The buffered text is pushed normally to avoid losing the response
+3. The conversation continues without interruption
+
+This ensures the feature doesn't break conversations if the LLM occasionally disobeys instructions.
+
+## Related
+
+- [User Turn Strategies](/server/utilities/turn-management/user-turn-strategies) - Configure turn detection
+- [Smart Turn Detection](/server/utilities/smart-turn/smart-turn-overview) - AI-powered end-of-turn detection
+- [Transcriptions](/server/utilities/turn-management/transcriptions) - Working with conversation transcripts
