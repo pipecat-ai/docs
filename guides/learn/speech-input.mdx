@@ -15,10 +15,10 @@ Pipecat uses [user turn strategies](/server/utilities/turn-management/user-turn-
 - Transcription-based (fallback): triggers when transcription is received but VAD didn't detect speech
 - Minimum words: waits for a minimum number of spoken words before triggering
 
-**For detecting turn end:**
+**For detecting turn end (default: Smart Turn):**
 
-- Transcription-based: analyzes transcription to determine when the user is done
-- Turn detection model: uses AI to understand if the user has finished their thought
+- Turn detection model (default): uses AI to understand if the user has finished their thought
+- Speech timeout: waits for silence after transcription to determine when the user is done
 
 Custom strategies can also be implemented for specific use cases. By combining these techniques, you can create responsive yet natural conversations that don't interrupt users mid-sentence or wait too long after they've finished.
 
@@ -50,7 +50,7 @@ vad_analyzer = SileroVADAnalyzer(
     params=VADParams(
         confidence=0.7,      # Minimum confidence for voice detection
         start_secs=0.2,      # Time to wait before confirming speech start
-        stop_secs=0.8,       # Time to wait before confirming speech stop
+        stop_secs=0.2,       # Time to wait before confirming speech stop
         min_volume=0.6,      # Minimum volume threshold
     )
 )
@@ -69,11 +69,11 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 - Lower values = more responsive, but may trigger on brief sounds
 - Higher values = less sensitive, but may miss quick utterances, like "yes", "no", or "ok"
 
-**`stop_secs` (default: 0.8)**
+**`stop_secs` (default: 0.2)**
 
 - How much silence must be detected before confirming speech has stopped
 - Critical for turn-taking behavior
-- Modified automatically when using turn detection
+- A short value (0.2s) allows STT services to finalize sooner, improving transcription speed
 
 **`confidence` and `min_volume`**
 
@@ -102,17 +102,9 @@ While VAD detects speech vs. silence, it can't understand linguistic context. A 
 
 ### Detecting Turn End
 
-Turn end detection uses transcription to understand what the user said:
+Turn end detection determines when the user has finished speaking and expects a response:
 
-**Transcription-based (Default)**: Analyzes transcription to determine when the user has finished speaking.
-
-```python
-from pipecat.turns.user_stop import TranscriptionUserTurnStopStrategy
-
-stop_strategy = TranscriptionUserTurnStopStrategy()
-```
-
-**Smart Turn Model**: Uses an AI model to analyze audio and determine if the user has finished their thought.
+**Smart Turn Model (Default)**: Uses an AI model to analyze audio and determine if the user has finished their thought. This is the default turn stop strategy.
 
 ```python
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -123,7 +115,13 @@ stop_strategy = TurnAnalyzerUserTurnStopStrategy(
 )
 ```
 
-When using Smart Turn, configure VAD with a low `stop_secs` (0.2) so the model can analyze speech quickly.
+**Speech Timeout**: Waits for silence after receiving a transcription. Useful as a simpler alternative to Smart Turn.
+
+```python
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+
+stop_strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)
+```
 
 <CardGroup cols={2}>
 <Card
@@ -170,42 +168,29 @@ start_strategy = VADUserTurnStartStrategy(enable_interruptions=False)
 
 ### Optimal Configuration
 
-**For most voice AI use cases:**
+**For most voice AI use cases, the defaults work well:**
 
 ```python
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
-)
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
-
-# Responsive VAD with turn detection
-vad_params = VADParams(
-    start_secs=0.2,
-    stop_secs=0.2 if using_turn_detection else 0.8,
 )
 
 transport = YourTransport(
     params=TransportParams(),
 )
 
-# Configure Smart Turn via user turn strategies (if using turn detection)
+# Default configuration: Smart Turn detection + VAD with stop_secs=0.2
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     context,
-    user_params=LLMUserAggregatorParams(
-        user_turn_strategies=UserTurnStrategies(
-            stop=[TurnAnalyzerUserTurnStopStrategy(
-                turn_analyzer=LocalSmartTurnAnalyzerV3()
-            )]
-        ) if using_smart_turn_detection else None,
-        vad_analyzer=SileroVADAnalyzer(params=vad_params),
-    ),
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
 )
 
 task = PipelineTask(pipeline)
 ```
+
+The defaults use `TurnAnalyzerUserTurnStopStrategy` with `LocalSmartTurnAnalyzerV3` for turn detection and `SileroVADAnalyzer` with `stop_secs=0.2` for voice activity detection.
 
 ### Performance Considerations
 
