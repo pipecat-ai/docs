@@ -65,3 +65,169 @@ Before using Grok Realtime services, you need:
 - **Function Calling**: Seamless support for external functions and tool integration
 - **Multiple Voice Options**: Various voice personalities available
 - **WebSocket Support**: Real-time bidirectional audio streaming
+
+## Configuration
+
+### GrokRealtimeLLMService
+
+<ParamField path="api_key" type="str" required>
+  xAI API key for authentication.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="wss://api.x.ai/v1/realtime">
+  WebSocket base URL for the Grok Realtime API. Override for custom deployments.
+</ParamField>
+
+<ParamField path="session_properties" type="SessionProperties" default="None">
+  Configuration properties for the realtime session. If `None`, uses default `SessionProperties` with voice `"Ara"` and server-side VAD enabled. See [SessionProperties](#sessionproperties) below.
+</ParamField>
+
+<ParamField path="start_audio_paused" type="bool" default="False">
+  Whether to start with audio input paused.
+</ParamField>
+
+### SessionProperties
+
+Session-level configuration passed via the `session_properties` constructor argument. These settings can be updated during the session using `LLMUpdateSettingsFrame`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `instructions` | `str` | `None` | System instructions for the assistant. |
+| `voice` | `Literal["Ara", "Rex", "Sal", "Eve", "Leo"]` | `"Ara"` | Voice the model uses to respond. |
+| `turn_detection` | `TurnDetection` | `TurnDetection(type="server_vad")` | Turn detection configuration. Set to `None` for manual turn detection. |
+| `audio` | `AudioConfiguration` | `None` | Configuration for input and output audio formats. |
+| `tools` | `List[GrokTool]` | `None` | Available tools: `web_search`, `x_search`, `file_search`, or custom `function` tools. |
+
+### AudioConfiguration
+
+The `audio` field in `SessionProperties` accepts an `AudioConfiguration` with `input` and `output` sub-configurations:
+
+**AudioInput** (`audio.input`):
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `format` | `AudioFormat` | `None` | Input audio format. Supports `PCMAudioFormat` (configurable rate), `PCMUAudioFormat` (8kHz), or `PCMAAudioFormat` (8kHz). |
+
+**AudioOutput** (`audio.output`):
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `format` | `AudioFormat` | `None` | Output audio format. Same format options as input. |
+
+Grok PCM audio supports sample rates: 8000, 16000, 21050, 24000, 32000, 44100, and 48000 Hz.
+
+### Built-in Tools
+
+Grok provides several built-in tools in addition to custom function tools:
+
+| Tool | Type | Description |
+| --- | --- | --- |
+| `WebSearchTool` | `web_search` | Search the web for current information |
+| `XSearchTool` | `x_search` | Search X (Twitter) for posts. Supports `allowed_x_handles` filter. |
+| `FileSearchTool` | `file_search` | Search uploaded document collections by `vector_store_ids` |
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+from pipecat.services.grok.realtime import GrokRealtimeLLMService
+
+llm = GrokRealtimeLLMService(
+    api_key=os.getenv("XAI_API_KEY"),
+)
+```
+
+### With Session Configuration
+
+```python
+from pipecat.services.grok.realtime import GrokRealtimeLLMService
+from pipecat.services.grok.realtime.events import (
+    SessionProperties,
+    TurnDetection,
+    AudioConfiguration,
+    AudioInput,
+    AudioOutput,
+    PCMAudioFormat,
+)
+
+session_properties = SessionProperties(
+    instructions="You are a helpful assistant.",
+    voice="Rex",
+    turn_detection=TurnDetection(type="server_vad"),
+    audio=AudioConfiguration(
+        input=AudioInput(format=PCMAudioFormat(rate=16000)),
+        output=AudioOutput(format=PCMAudioFormat(rate=16000)),
+    ),
+)
+
+llm = GrokRealtimeLLMService(
+    api_key=os.getenv("XAI_API_KEY"),
+    session_properties=session_properties,
+)
+```
+
+### With Built-in Tools
+
+```python
+from pipecat.services.grok.realtime.events import (
+    SessionProperties,
+    WebSearchTool,
+    XSearchTool,
+)
+
+session_properties = SessionProperties(
+    instructions="You are a helpful assistant with access to web search.",
+    voice="Ara",
+    tools=[
+        WebSearchTool(),
+        XSearchTool(allowed_x_handles=["@elonmusk"]),
+    ],
+)
+
+llm = GrokRealtimeLLMService(
+    api_key=os.getenv("XAI_API_KEY"),
+    session_properties=session_properties,
+)
+```
+
+### Updating Settings at Runtime
+
+```python
+from pipecat.frames.frames import LLMUpdateSettingsFrame
+
+await task.queue_frame(
+    LLMUpdateSettingsFrame(
+        settings={
+            "instructions": "Now speak in Spanish.",
+            "voice": "Eve",
+        }
+    )
+)
+```
+
+## Notes
+
+- **Audio format auto-configuration**: If audio format is not specified in `session_properties`, the service automatically configures PCM input/output using the pipeline's sample rates.
+- **Server-side VAD**: Enabled by default. When VAD is enabled, the server handles speech detection and turn management automatically. Set `turn_detection` to `None` to manage turns manually.
+- **Audio before setup**: Audio is not sent to Grok until the conversation setup is complete, preventing sample rate mismatches.
+- **Available voices**: Ara (default), Rex, Sal, Eve, and Leo.
+- **G.711 support**: PCMU and PCMA formats are supported at a fixed 8000 Hz rate, useful for telephony integrations.
+
+## Event Handlers
+
+| Event | Description |
+| --- | --- |
+| `on_conversation_item_created` | Called when a new conversation item is created in the session |
+| `on_conversation_item_updated` | Called when a conversation item is updated or completed |
+
+```python
+@llm.event_handler("on_conversation_item_created")
+async def on_item_created(service, item_id, item):
+    print(f"New conversation item: {item_id}")
+
+@llm.event_handler("on_conversation_item_updated")
+async def on_item_updated(service, item_id, item):
+    print(f"Conversation item updated: {item_id}")
+```
