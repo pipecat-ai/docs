@@ -459,6 +459,18 @@ export const callbacks = () => {
       gem: "1.0.0",
     },
     {
+      name: "onUserMuteStarted",
+      dt: "1.6.0",
+      swrtc: "1.9.0",
+      ws: "1.6.0",
+    },
+    {
+      name: "onUserMuteStopped",
+      dt: "1.6.0",
+      swrtc: "1.9.0",
+      ws: "1.6.0",
+    },
+    {
       name: "onUserTranscript",
       dt: "1.0.0",
       swrtc: "1.0.0",
