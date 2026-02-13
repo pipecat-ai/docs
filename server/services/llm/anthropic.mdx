@@ -54,8 +54,149 @@ Before using Anthropic LLM services, you need:
 
 1. **Anthropic Account**: Sign up at [Anthropic Console](https://console.anthropic.com/)
 2. **API Key**: Generate an API key from your console dashboard
-3. **Model Selection**: Choose from available Claude models (Claude 3.5 Sonnet, Claude 3 Opus, etc.)
+3. **Model Selection**: Choose from available Claude models (Claude Sonnet 4.5, Claude Opus 4.6, etc.)
 
 ### Required Environment Variables
 
 - `ANTHROPIC_API_KEY`: Your Anthropic API key for authentication
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  Anthropic API key for authentication.
+</ParamField>
+
+<ParamField path="model" type="str" default="claude-sonnet-4-5-20250929">
+  Claude model name to use (e.g., `"claude-sonnet-4-5-20250929"`, `"claude-opus-4-6-20250929"`).
+</ParamField>
+
+<ParamField path="params" type="InputParams" default="None">
+  Runtime-configurable model settings. See [InputParams](#inputparams) below.
+</ParamField>
+
+<ParamField path="client" type="AsyncAnthropic" default="None">
+  Optional custom Anthropic client instance. Useful for custom clients like `AsyncAnthropicBedrock` or `AsyncAnthropicVertex`.
+</ParamField>
+
+<ParamField path="retry_timeout_secs" type="float" default="5.0">
+  Request timeout in seconds. Used when `retry_on_timeout` is enabled to determine when to retry.
+</ParamField>
+
+<ParamField path="retry_on_timeout" type="bool" default="False">
+  Whether to retry the request once if it times out. The retry attempt has no timeout limit.
+</ParamField>
+
+### InputParams
+
+Model inference settings that can be set at initialization via the `params` constructor argument, or changed at runtime via [`UpdateSettingsFrame`](/server/utilities/frame-processor-events#updatesettingsframe).
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enable_prompt_caching` | `bool` | `None` | Whether to enable Anthropic's prompt caching feature. Reduces costs for repeated context. |
+| `max_tokens` | `int` | `4096` | Maximum tokens to generate. Must be at least 1. |
+| `temperature` | `float` | `NOT_GIVEN` | Sampling temperature (0.0 to 1.0). Lower values are more focused, higher values are more creative. |
+| `top_k` | `int` | `NOT_GIVEN` | Top-k sampling parameter. Limits tokens to the top k most likely. |
+| `top_p` | `float` | `NOT_GIVEN` | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output. |
+| `thinking` | `ThinkingConfig` | `NOT_GIVEN` | Extended thinking configuration. See [ThinkingConfig](#thinkingconfig) below. |
+| `extra` | `dict` | `{}` | Additional parameters passed directly to the API. |
+
+<Note>
+  `NOT_GIVEN` values are omitted from the API request entirely, letting the Anthropic API use its own defaults.
+</Note>
+
+### ThinkingConfig
+
+Configuration for Anthropic's extended thinking feature, which causes the model to spend more time reasoning before responding.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `type` | `"enabled"` or `"disabled"` | Whether extended thinking is enabled. |
+| `budget_tokens` | `int` | Maximum number of tokens for thinking. Minimum 1024 with current models. |
+
+When extended thinking is enabled, the service emits `LLMThoughtStartFrame`, `LLMThoughtTextFrame`, and `LLMThoughtEndFrame` during response generation.
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.services.anthropic import AnthropicLLMService
+
+llm = AnthropicLLMService(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    model="claude-sonnet-4-5-20250929",
+)
+```
+
+### With Custom Parameters
+
+```python
+from pipecat.services.anthropic import AnthropicLLMService
+
+llm = AnthropicLLMService(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    model="claude-sonnet-4-5-20250929",
+    params=AnthropicLLMService.InputParams(
+        enable_prompt_caching=True,
+        max_tokens=2048,
+        temperature=0.7,
+    ),
+)
+```
+
+### With Extended Thinking
+
+```python
+llm = AnthropicLLMService(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    model="claude-sonnet-4-5-20250929",
+    params=AnthropicLLMService.InputParams(
+        max_tokens=16384,
+        thinking=AnthropicLLMService.ThinkingConfig(
+            type="enabled",
+            budget_tokens=10000,
+        ),
+    ),
+)
+```
+
+### Updating Settings at Runtime
+
+Model settings can be changed mid-conversation using `UpdateSettingsFrame`:
+
+```python
+from pipecat.frames.frames import UpdateSettingsFrame
+
+await task.queue_frame(
+    UpdateSettingsFrame(
+        settings={
+            "llm": {
+                "temperature": 0.3,
+                "max_tokens": 1024,
+            }
+        }
+    )
+)
+```
+
+## Notes
+
+- **Prompt caching**: When `enable_prompt_caching` is enabled, Anthropic caches repeated context to reduce costs. Cache control markers are automatically added to the most recent user messages. This is most effective for conversations with large system prompts or long conversation histories.
+- **Extended thinking**: Enabling thinking increases response quality for complex tasks but adds latency. The `budget_tokens` value must be at least 1024 with current models. Extended thinking is disabled by default.
+- **Custom clients**: You can pass custom Anthropic client instances (e.g., `AsyncAnthropicBedrock` or `AsyncAnthropicVertex`) via the `client` parameter to use Anthropic models through other cloud providers.
+- **Retry behavior**: When `retry_on_timeout=True`, the first attempt uses the `retry_timeout_secs` timeout. If it times out, a second attempt is made with no timeout limit.
+
+## Event Handlers
+
+`AnthropicLLMService` supports the following event handlers, inherited from [LLMService](/server/utilities/service-events):
+
+| Event | Description |
+| --- | --- |
+| `on_completion_timeout` | Called when an LLM completion request times out |
+| `on_function_calls_started` | Called when function calls are received and execution is about to start |
+
+```python
+@llm.event_handler("on_completion_timeout")
+async def on_completion_timeout(service):
+    print("LLM completion timed out")
+```

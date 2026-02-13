@@ -56,3 +56,157 @@ Before using Gladia STT services, you need:
 
 - `GLADIA_API_KEY`: Your Gladia API key for authentication
 - `GLADIA_REGION`: Your preferred region (optional, defaults to "eu-west")
+
+## Configuration
+
+### GladiaSTTService
+
+<ParamField path="api_key" type="str" required>
+  Gladia API key for authentication.
+</ParamField>
+
+<ParamField path="region" type="Literal['us-west', 'eu-west']" default="None">
+  Region used to process audio. Defaults to `"eu-west"` when `None`.
+</ParamField>
+
+<ParamField path="url" type="str" default="https://api.gladia.io/v2/live">
+  Gladia API URL for session initialization.
+</ParamField>
+
+<ParamField path="confidence" type="float" default="None">
+  Minimum confidence threshold for transcriptions (0.0-1.0). Deprecated -- no confidence threshold is applied.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the pipeline's configured sample rate.
+</ParamField>
+
+<ParamField path="model" type="str" default="solaria-1">
+  Model to use for transcription.
+</ParamField>
+
+<ParamField path="params" type="GladiaInputParams" default="None">
+  Additional configuration parameters for the Gladia service. See [GladiaInputParams](#gladiainputparams) below.
+</ParamField>
+
+<ParamField path="max_buffer_size" type="int" default="20971520">
+  Maximum size of audio buffer in bytes (default 20MB).
+</ParamField>
+
+<ParamField path="should_interrupt" type="bool" default="True">
+  Whether the bot should be interrupted when Gladia VAD detects user speech.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="GLADIA_TTFS_P99">
+  P99 latency from speech end to final transcript in seconds. Override for your deployment.
+</ParamField>
+
+### GladiaInputParams
+
+Parameters passed via the `params` constructor argument. Import directly:
+
+```python
+from pipecat.services.gladia.config import GladiaInputParams
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `encoding` | `str` | `"wav/pcm"` | Audio encoding format. |
+| `bit_depth` | `int` | `16` | Audio bit depth. |
+| `channels` | `int` | `1` | Number of audio channels. |
+| `custom_metadata` | `Dict[str, Any]` | `None` | Additional metadata to include with requests. |
+| `endpointing` | `float` | `None` | Silence duration in seconds to mark end of speech. |
+| `maximum_duration_without_endpointing` | `int` | `5` | Maximum utterance duration (seconds) without silence. |
+| `language` | `Language` | `None` | Language code for transcription. Deprecated -- use `language_config` instead. |
+| `language_config` | `LanguageConfig` | `None` | Detailed language configuration with code switching support. |
+| `pre_processing` | `PreProcessingConfig` | `None` | Audio pre-processing options (audio enhancer, speech threshold). |
+| `realtime_processing` | `RealtimeProcessingConfig` | `None` | Real-time processing features (custom vocabulary, translation, NER, sentiment). |
+| `messages_config` | `MessagesConfig` | `None` | WebSocket message filtering options. |
+| `enable_vad` | `bool` | `False` | Enable Gladia VAD for end-of-utterance detection. Use without other VAD in the agent. |
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.services.gladia import GladiaSTTService
+
+stt = GladiaSTTService(
+    api_key=os.getenv("GLADIA_API_KEY"),
+)
+```
+
+### With Language Configuration
+
+```python
+from pipecat.services.gladia import GladiaSTTService
+from pipecat.services.gladia.config import GladiaInputParams, LanguageConfig
+
+stt = GladiaSTTService(
+    api_key=os.getenv("GLADIA_API_KEY"),
+    region="us-west",
+    model="solaria-1",
+    params=GladiaInputParams(
+        language_config=LanguageConfig(
+            languages=["en", "es"],
+            code_switching=True,
+        ),
+    ),
+)
+```
+
+### With Real-time Processing
+
+```python
+from pipecat.services.gladia import GladiaSTTService
+from pipecat.services.gladia.config import (
+    GladiaInputParams,
+    RealtimeProcessingConfig,
+    CustomVocabularyConfig,
+    CustomVocabularyItem,
+    TranslationConfig,
+)
+
+stt = GladiaSTTService(
+    api_key=os.getenv("GLADIA_API_KEY"),
+    params=GladiaInputParams(
+        realtime_processing=RealtimeProcessingConfig(
+            custom_vocabulary=True,
+            custom_vocabulary_config=CustomVocabularyConfig(
+                vocabulary=[
+                    CustomVocabularyItem(value="Pipecat", intensity=0.8),
+                    "Gladia",
+                ],
+            ),
+            translation=True,
+            translation_config=TranslationConfig(
+                target_languages=["fr", "de"],
+                model="enhanced",
+            ),
+        ),
+    ),
+)
+```
+
+## Notes
+
+- **Session-based connection**: Gladia uses a two-step connection process: first an HTTP POST to initialize a session, then a WebSocket connection to the returned session URL. The session URL and ID are managed automatically.
+- **Audio buffering**: The service buffers audio data locally and sends it when connected. If the connection drops and reconnects, buffered audio is automatically re-sent to minimize transcript gaps.
+- **Keepalive**: Empty audio chunks are sent periodically to keep the Gladia connection alive (keepalive interval: 5s, timeout: 20s).
+- **Built-in VAD**: Set `enable_vad=True` in `GladiaInputParams` to use Gladia's server-side VAD, which emits `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame`. When using this, do not enable another VAD in your pipeline.
+- **Translation**: Gladia supports real-time translation to multiple target languages. Translation results are pushed as `TranslationFrame`s.
+
+## Event Handlers
+
+Gladia STT supports the standard [service connection events](/server/utilities/service-events):
+
+| Event | Description |
+| --- | --- |
+| `on_connected` | Connected to Gladia WebSocket |
+| `on_disconnected` | Disconnected from Gladia WebSocket |
+
+```python
+@stt.event_handler("on_connected")
+async def on_connected(service):
+    print("Connected to Gladia")
+```
