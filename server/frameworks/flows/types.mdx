@@ -1,0 +1,354 @@
+---
+title: "Types"
+description: "Type definitions and configuration schemas for Pipecat Flows"
+---
+
+## NodeConfig
+
+Configuration for a single node in a conversation flow. `task_messages` is the only required field.
+
+<ParamField path="task_messages" type="List[dict]" required>
+  List of message dicts defining the current node's objectives. These tell the
+  LLM what to do in this conversation state.
+
+  ```python
+  "task_messages": [
+      {"role": "system", "content": "Ask the user for their name and email address."}
+  ]
+  ```
+</ParamField>
+
+<ParamField path="name" type="str">
+  Identifier for the node. Useful for debug logging. If not provided, a UUID is
+  generated automatically.
+</ParamField>
+
+<ParamField path="role_messages" type="List[Dict[str, Any]]">
+  List of message dicts defining the bot's role and personality. These persist
+  across nodes when using the `APPEND` context strategy and are placed before
+  task messages in the context.
+
+  ```python
+  "role_messages": [
+      {"role": "system", "content": "You are a friendly customer service agent."}
+  ]
+  ```
+</ParamField>
+
+<ParamField path="functions" type="List[Dict | FlowsFunctionSchema | FlowsDirectFunction]">
+  List of function definitions available in this node. Accepts provider-specific
+  dict format, [`FlowsFunctionSchema`](#flowsfunctionschema) objects, or
+  [direct functions](#flowsdirectfunction). See [Function
+  Types](/server/frameworks/flows/pipecat-flows#function-types).
+</ParamField>
+
+<ParamField path="pre_actions" type="List[ActionConfig]">
+  Actions to execute before LLM inference when transitioning to this node. See
+  [ActionConfig](#actionconfig).
+</ParamField>
+
+<ParamField path="post_actions" type="List[ActionConfig]">
+  Actions to execute after LLM inference when transitioning to this node. If
+  `respond_immediately` is `False`, post-actions are deferred until after the
+  first LLM response in this node. See [ActionConfig](#actionconfig).
+</ParamField>
+
+<ParamField path="context_strategy" type="ContextStrategyConfig">
+  Strategy for managing conversation context when transitioning to this node.
+  Overrides the default strategy set on
+  [FlowManager](/server/frameworks/flows/flow-manager). See
+  [ContextStrategyConfig](#contextstrategyconfig).
+</ParamField>
+
+<ParamField path="respond_immediately" type="bool" default="True">
+  Whether to trigger LLM inference immediately upon entering the node. Set to
+  `False` when you want to wait for user input before the LLM responds (e.g., after
+  a `tts_say` pre-action that asks a question).
+</ParamField>
+
+## FlowsFunctionSchema
+
+Dataclass for defining function call schemas with Flows-specific properties. Provides a uniform way to define functions that works across all LLM providers.
+
+<ParamField path="name" type="str" required>
+  Name of the function. This is used to identify the function in LLM tool calls.
+</ParamField>
+
+<ParamField path="description" type="str" required>
+  Description of what the function does. The LLM uses this to decide when to
+  call the function.
+</ParamField>
+
+<ParamField path="properties" type="Dict[str, Any]" required>
+  Dictionary defining the function's parameters using JSON Schema format.
+
+  ```python
+  "properties": {
+      "city": {
+          "type": "string",
+          "description": "The city to get weather for"
+      },
+      "units": {
+          "type": "string",
+          "enum": ["celsius", "fahrenheit"],
+          "description": "Temperature units"
+      }
+  }
+  ```
+</ParamField>
+
+<ParamField path="required" type="List[str]" required>
+  List of required parameter names from `properties`.
+</ParamField>
+
+<ParamField path="handler" type="FunctionHandler" default="None">
+  Function handler to process the function call. Can be a legacy handler
+  `(args)` or modern handler `(args, flow_manager)`. The handler should return a
+  [`FlowResult`](#flowresult) or a
+  [`ConsolidatedFunctionResult`](#consolidatedfunctionresult) tuple.
+</ParamField>
+
+<ParamField path="cancel_on_interruption" type="bool" default="True">
+  Whether to cancel this function call when the user interrupts. Set to `False`
+  for long-running operations that should complete even if the user speaks.
+</ParamField>
+
+### Methods
+
+#### to_function_schema
+
+```python
+schema.to_function_schema() -> FunctionSchema
+```
+
+Convert to a standard `FunctionSchema` for use with LLMs. Strips Flows-specific fields (`handler`, `cancel_on_interruption`).
+
+### Example
+
+```python
+from pipecat_flows import FlowsFunctionSchema, FlowResult
+
+async def handle_weather(args, flow_manager):
+    city = args["city"]
+    weather = await get_weather(city)
+    return {"status": "success", "weather": weather}
+
+weather_function = FlowsFunctionSchema(
+    name="get_weather",
+    description="Get current weather for a city",
+    properties={
+        "city": {"type": "string", "description": "City name"}
+    },
+    required=["city"],
+    handler=handle_weather,
+)
+```
+
+## ActionConfig
+
+TypedDict for configuring actions that execute during node transitions.
+
+<ParamField path="type" type="str" required>
+  Action type identifier. Must match a registered action handler. Built-in types
+  are `"tts_say"`, `"end_conversation"`, and `"function"`.
+</ParamField>
+
+<ParamField path="handler" type="Callable" default="None">
+  Action handler function. Required for custom action types if not previously
+  registered via
+  [`FlowManager.register_action()`](/server/frameworks/flows/flow-manager#register_action).
+  Can be a legacy handler `(action)` or modern handler `(action, flow_manager)`.
+</ParamField>
+
+<ParamField path="text" type="str" default="None">
+  Text content used by `tts_say` and optionally by `end_conversation` (as a
+  goodbye message).
+</ParamField>
+
+<Note>
+  Additional fields are allowed and passed through to the handler. For example, a
+  `"notify_slack"` action could include `"channel"` and `"text"` fields.
+</Note>
+
+### Built-in Action Types
+
+| Type | Description | Required Fields |
+|------|-------------|-----------------|
+| `tts_say` | Speak text using the pipeline's TTS service | `text` |
+| `end_conversation` | End the conversation, optionally speaking a goodbye message | `text` (optional) |
+| `function` | Execute a function inline in the pipeline | `handler` |
+
+### Example
+
+```python
+node_config: NodeConfig = {
+    "task_messages": [{"role": "system", "content": "Help the user."}],
+    "pre_actions": [
+        {"type": "tts_say", "text": "Welcome! Let me help you with that."},
+    ],
+    "post_actions": [
+        {"type": "end_conversation", "text": "Goodbye!"},
+    ],
+}
+```
+
+## ContextStrategy
+
+Enum defining strategies for managing conversation context during node transitions.
+
+| Value | Description |
+|-------|-------------|
+| `APPEND` | Append new messages to existing context. This is the default behavior. |
+| `RESET` | Reset context with new messages only. Previous conversation history is discarded. |
+| `RESET_WITH_SUMMARY` | Reset context but include an LLM-generated summary of the previous conversation. Requires `summary_prompt` in `ContextStrategyConfig`. |
+
+```python
+from pipecat_flows import ContextStrategy
+
+strategy = ContextStrategy.APPEND
+strategy = ContextStrategy.RESET
+strategy = ContextStrategy.RESET_WITH_SUMMARY
+```
+
+## ContextStrategyConfig
+
+Dataclass for configuring context management behavior.
+
+<ParamField path="strategy" type="ContextStrategy" required>
+  The context management strategy to use. See
+  [ContextStrategy](#contextstrategy).
+</ParamField>
+
+<ParamField path="summary_prompt" type="str" default="None">
+  Prompt text for generating a conversation summary. Required when using
+  `RESET_WITH_SUMMARY`. The LLM uses this prompt to summarize the conversation
+  before resetting context.
+</ParamField>
+
+**Raises:** `ValueError` if `summary_prompt` is not provided when using `RESET_WITH_SUMMARY`.
+
+### Example
+
+```python
+from pipecat_flows import ContextStrategy, ContextStrategyConfig
+
+# Append (default)
+config = ContextStrategyConfig(strategy=ContextStrategy.APPEND)
+
+# Reset
+config = ContextStrategyConfig(strategy=ContextStrategy.RESET)
+
+# Reset with summary
+config = ContextStrategyConfig(
+    strategy=ContextStrategy.RESET_WITH_SUMMARY,
+    summary_prompt="Summarize the key information collected so far.",
+)
+```
+
+## flows_direct_function Decorator
+
+Decorator that attaches metadata to a Pipecat direct function for use in Flows.
+
+```python
+@flows_direct_function(*, cancel_on_interruption: bool = True)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `cancel_on_interruption` | `bool` | `True` | Whether to cancel the function call when the user interrupts. |
+
+Direct functions have their schema automatically extracted from the function signature and docstring. The first parameter must be `flow_manager: FlowManager`, and all other parameters become the function's properties. The docstring provides the function description and parameter descriptions (Google-style).
+
+Direct functions must return a [`ConsolidatedFunctionResult`](#consolidatedfunctionresult) tuple.
+
+### Example
+
+```python
+from pipecat_flows import FlowManager, flows_direct_function, ConsolidatedFunctionResult
+
+@flows_direct_function(cancel_on_interruption=False)
+async def lookup_order(
+    flow_manager: FlowManager, order_id: str
+) -> ConsolidatedFunctionResult:
+    """Look up an order by its ID.
+
+    Args:
+        order_id: The order ID to look up.
+    """
+    order = await db.get_order(order_id)
+    flow_manager.state["order"] = order
+    result = {"status": "success", "order": order}
+    next_node = create_order_details_node(order)
+    return result, next_node
+```
+
+The function can then be passed directly in a node's `functions` list:
+
+```python
+node_config: NodeConfig = {
+    "task_messages": [{"role": "system", "content": "Ask for the order ID."}],
+    "functions": [lookup_order],
+}
+```
+
+## FlowsDirectFunction
+
+Protocol defining the interface for direct functions. Any async callable matching this signature can be used as a direct function in node configurations.
+
+```python
+class FlowsDirectFunction(Protocol):
+    def __call__(
+        self, flow_manager: FlowManager, **kwargs: Any
+    ) -> Awaitable[ConsolidatedFunctionResult]: ...
+```
+
+## Type Aliases
+
+### FlowResult
+
+```python
+class FlowResult(TypedDict, total=False):
+    status: str
+    error: str
+```
+
+Base return type for function results. The `status` field indicates the outcome. The optional `error` field contains an error message if execution failed. Additional fields are allowed and passed through to the LLM.
+
+### FlowArgs
+
+```python
+FlowArgs = Dict[str, Any]
+```
+
+Type alias for function handler arguments. Contains the parameters extracted from the LLM's function call.
+
+### ConsolidatedFunctionResult
+
+```python
+ConsolidatedFunctionResult = Tuple[Optional[FlowResult], Optional[NodeConfig]]
+```
+
+Return type for consolidated function handlers that both do work and specify the next node:
+
+- First element: The function result (or `None` for transition-only functions)
+- Second element: The next node as a `NodeConfig`, or `None` for node functions
+
+### FlowFunctionHandler
+
+```python
+FlowFunctionHandler = Callable[
+    [FlowArgs, FlowManager], Awaitable[FlowResult | ConsolidatedFunctionResult]
+]
+```
+
+Type for modern function handlers that receive both arguments and the `FlowManager` instance.
+
+### LegacyFunctionHandler
+
+```python
+LegacyFunctionHandler = Callable[
+    [FlowArgs], Awaitable[FlowResult | ConsolidatedFunctionResult]
+]
+```
+
+Type for legacy function handlers that only receive arguments. Both legacy and modern handlers are supported; the flow manager detects the signature automatically.

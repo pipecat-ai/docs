@@ -54,20 +54,6 @@ Pipecat Flows solves this by:
 - **Providing relevant tools only when needed** - Functions are available only in the appropriate context
 - **Giving clear, specific instructions** - Task messages focus the LLM on exactly what to do next
 
-## Selecting a Flows Pattern
-
-Pipecat Flows provides two general patterns for how to build your application: Dynamic Flows and Static Flows.
-
-- **Dynamic Flows (recommended)**: When conversation paths need to be determined at runtime based on user input, external data, or business logic.
-- **Static Flows**: When your conversation structure is known upfront and follows predefined paths.
-
-<Note>
-  Dynamic Flows can handle both simple and complex use cases. Selecting it
-  provides you with an option that can grow with the complexity of your
-  application. For these reasons, we strongly recommend it as the API pattern to
-  follow.
-</Note>
-
 ## Technical Overview
 
 Pipecat Flows represents a conversation as a graph, where each step of the conversation is represented by a node. Nodes are of type `NodeConfig`, and may contain the following properties:
@@ -184,10 +170,10 @@ async def record_favorite_color_and_set_next_node(
 
 #### Handler Return Values
 
-Function handlers must return a tuple containing:
+Function handlers return a tuple containing:
 
-- **Result**: Data provided to the LLM for context in subsequent completions
-- **Next Node**: The `NodeConfig` for Flows to transition to next
+- **Result**: Data provided to the LLM for context in subsequent completions, or `None`. This can be any serializable value — a string, dict, etc.
+- **Next Node**: The `NodeConfig` for Flows to transition to next, or `None`
 
 Some handlers may not want to transition conversational state, in which case you can return `None` for the next node. Other handlers may _only_ want to transition conversational state without doing other work, in which case you can return `None` for the result.
 
@@ -200,14 +186,13 @@ async def record_favorite_color(
     flow_manager: FlowManager,
     color: str
 ) -> tuple[FlowResult, NodeConfig]:
-    """
-    Record the color the user said is their favorite.
+    """Record the color the user said is their favorite.
 
     Args:
-        color (str): The user's favorite color
+        color: The user's favorite color.
     """
-    print(f"Your favorite color is: {args["color"]}")
-    return args["color"], create_end_node()
+    print(f"Your favorite color is: {color}")
+    return color, create_end_node()
 
 # Use directly in NodeConfig
 node_config = {
@@ -216,6 +201,25 @@ node_config = {
 ```
 
 This approach eliminates the need for separate `FlowsFunctionSchema` definitions while maintaining the same functionality.
+
+To control interruption behavior, use the `@flows_direct_function` decorator:
+
+```python
+from pipecat_flows import flows_direct_function
+
+@flows_direct_function(cancel_on_interruption=False)
+async def long_running_lookup(
+    flow_manager: FlowManager,
+    order_id: str
+) -> tuple[FlowResult, NodeConfig]:
+    """Look up an order that should not be cancelled if the user speaks.
+
+    Args:
+        order_id: The order ID to look up.
+    """
+    order = await db.get_order(order_id)
+    return {"status": "success"}, create_order_node(order)
+```
 
 ### Actions
 
@@ -266,6 +270,24 @@ Pipecat Flows includes several ready-to-use actions for common scenarios:
 #### Custom Actions
 
 You can define your own actions to handle specific business logic or integrations. In most cases, consider using a **function action** first, as it executes at the expected time in the pipeline.
+
+Register custom action handlers using `register_action()`:
+
+```python
+async def notify_slack(action: dict, flow_manager: FlowManager):
+    channel = action.get("channel", "#general")
+    await slack_client.post_message(channel=channel, text=action["text"])
+
+flow_manager.register_action("notify_slack", notify_slack)
+```
+
+Then use it in your node configuration:
+
+```python
+"pre_actions": [
+    {"type": "notify_slack", "channel": "#support", "text": "Session started"}
+]
+```
 
 Custom actions give you complete flexibility to execute any functionality your application needs, but require careful timing considerations.
 
@@ -365,8 +387,6 @@ NodeConfig(
 
 Initialize your flow by creating a `FlowManager` instance and calling `initialize()` to start the conversation.
 
-### Dynamic Flow
-
 First, create the FlowManager:
 
 ```python
@@ -388,31 +408,6 @@ async def on_client_connected(transport, client):
     await flow_manager.initialize(create_initial_node())
 ```
 
-### Static Flow
-
-First, create the FlowManager:
-
-```python
-flow_manager = FlowManager(
-    task=task,                              # PipelineTask
-    llm=llm,                                # LLMService
-    context_aggregator=context_aggregator,  # Context aggregator
-    flow_config=flow_config,                # FlowConfig
-)
-```
-
-Then initialize:
-
-```python
-@transport.event_handler("on_first_participant_joined")
-async def on_first_participant_joined(transport, participant):
-    await transport.capture_participant_transcription(participant["id"])
-    logger.debug("Initializing flow")
-    await flow_manager.initialize()
-```
-
-<Note>For Static Flows, `initialize()` does not take any args.</Note>
-
 ## Cross-Node Logic
 
 ### State
@@ -428,7 +423,7 @@ async def record_favorite_color_and_set_next_node(
     Here "record" means print to the console, but any logic could go here;
     Write to a database, make an API call, etc.
     """
-    flow_manager.state["color"] = args["color"] # Cross-node state setting
+    flow_manager.state["color"] = args["color"]  # Cross-node state setting
     print(f"Your favorite color is: {args['color']}")
     return args["color"], create_end_node()
 ```
@@ -447,9 +442,7 @@ flow_manager = FlowManager(
 )
 ```
 
-## Usage Examples:
-
-### Dynamic Flow (Recommended)
+## Usage Example
 
 Here's an example that ties together all the concepts we've covered:
 
@@ -486,10 +479,6 @@ def create_initial_node() -> NodeConfig:
         "functions": [record_favorite_color_func],
     }
 ```
-
-### Static Flow
-
-For static flows, you define your entire flow structure upfront using a `FlowConfig`. This follows the same rules as the NodeConfig, but is assembled as a single JSON object that defines the entire state of the program.
 
 ## Next Steps
 
