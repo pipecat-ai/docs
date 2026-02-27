@@ -26,10 +26,11 @@ task = PipelineTask(
 
 Once enabled, Pipecat logs the following metrics:
 
-| Metric          | Description                                     |
-| --------------- | ----------------------------------------------- |
-| TTFB            | Time To First Byte in seconds                   |
-| Processing Time | Time taken by the service to respond in seconds |
+| Metric               | Description                                                                  |
+| -------------------- | ---------------------------------------------------------------------------- |
+| TTFB                 | Time To First Byte in seconds                                                |
+| Processing Time      | Time taken by the service to respond in seconds (deprecated in 0.0.104)      |
+| Text Aggregation     | Time from first LLM token to first complete sentence in seconds              |
 
 ```console Sample output
 AnthropicLLMService#0 TTFB: 0.8378312587738037
@@ -57,6 +58,23 @@ task = PipelineTask(
 
 > **Note:** `enable_metrics=True` is required for this setting to have an
 > effect.
+
+### Disabling initial empty metrics
+
+By default, Pipecat sends an initial `MetricsFrame` with zero values for all
+services when the pipeline starts. To disable this behavior:
+
+```python Example config
+task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                ...
+                enable_metrics=True,
+                send_initial_empty_metrics=False,
+                ...
+            ),
+        )
+```
 
 ## Enabling LLM/TTS Usage Metrics
 
@@ -90,15 +108,43 @@ AnthropicLLMService#0 prompt tokens: 104, completion tokens: 53
 
 ## Capturing Metrics Data
 
-When metrics are enabled, Pipecat will emit a `MetricsFrame` for each interaction. The `MetricsFrame` contains:
+When metrics are enabled, Pipecat emits a `MetricsFrame` for each interaction. The `MetricsFrame` contains a list of metrics data objects, which can include:
 
-- TTFB data
-- Processing time
-- Token usage for LLMs
-- Character usage for TTS
-- Smart Turn prediction data
+- `TTFBMetricsData` — Time To First Byte
+- `ProcessingMetricsData` — Processing time (deprecated in 0.0.104)
+- `LLMUsageMetricsData` — LLM token usage
+- `TTSUsageMetricsData` — TTS character usage
+- `TextAggregationMetricsData` — Sentence aggregation latency
+- `TurnMetricsData` — Turn completion predictions
 
 You can access the metrics data by either adding a custom [FrameProcessor](/guides/fundamentals/custom-frame-processor) to your pipeline or adding an [observer](/server/utilities/observers/observer-pattern) to monitor `MetricsFrame`s.
+
+### Example: Using MetricsLogObserver
+
+The simplest way to log metrics is with the built-in `MetricsLogObserver`. Pass it as an observer when creating your `PipelineTask`:
+
+```python
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
+
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    observers=[MetricsLogObserver()],
+)
+```
+
+You can filter which metrics types are logged by passing `include_metrics`:
+
+```python
+from pipecat.metrics.metrics import LLMUsageMetricsData, TTSUsageMetricsData
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
+
+observers = [
+    MetricsLogObserver(
+        include_metrics={LLMUsageMetricsData, TTSUsageMetricsData}
+    )
+]
+```
 
 ### Example: Using a Custom FrameProcessor
 
@@ -127,9 +173,113 @@ class MetricsLogger(FrameProcessor):
                 elif isinstance(d, LLMUsageMetricsData):
                     tokens = d.value
                     print(
-                        f"!!! MetricsFrame: {frame}, tokens: {tokens.prompt_tokens}, characters: {tokens.completion_tokens}"
+                        f"!!! MetricsFrame: {frame}, prompt_tokens: {tokens.prompt_tokens}, completion_tokens: {tokens.completion_tokens}"
                     )
                 elif isinstance(d, TTSUsageMetricsData):
                     print(f"!!! MetricsFrame: {frame}, characters: {d.value}")
         await self.push_frame(frame, direction)
+```
+
+## Metrics Data Reference
+
+All metrics data classes inherit from `MetricsData`, which includes `processor` (the name of the processor that generated the metric) and an optional `model` field.
+
+### TTFBMetricsData
+
+Time To First Byte — measures how long until the first byte of a response is received from a service.
+
+| Field   | Type    | Description                     |
+| ------- | ------- | ------------------------------- |
+| `value` | `float` | TTFB measurement in seconds     |
+
+### ProcessingMetricsData (Deprecated)
+
+<Warning>
+`ProcessingMetricsData` is deprecated as of version 0.0.104 and will be removed in a future release.
+</Warning>
+
+Measures the total time taken by a service to process a request.
+
+| Field   | Type    | Description                          |
+| ------- | ------- | ------------------------------------ |
+| `value` | `float` | Processing time measurement in seconds |
+
+### TextAggregationMetricsData
+
+Measures the time from the first LLM token to the first complete sentence, representing the latency cost of sentence aggregation in the TTS pipeline.
+
+| Field   | Type    | Description                       |
+| ------- | ------- | --------------------------------- |
+| `value` | `float` | Aggregation time in seconds       |
+
+### LLMUsageMetricsData
+
+Token usage for an LLM interaction. The `value` field is an `LLMTokenUsage` object with:
+
+| Field                          | Type           | Description                                  |
+| ------------------------------ | -------------- | -------------------------------------------- |
+| `prompt_tokens`                | `int`          | Number of tokens in the input prompt         |
+| `completion_tokens`            | `int`          | Number of tokens in the generated completion |
+| `total_tokens`                 | `int`          | Total tokens used (prompt + completion)      |
+| `cache_read_input_tokens`      | `Optional[int]` | Tokens read from cache, if applicable        |
+| `cache_creation_input_tokens`  | `Optional[int]` | Tokens used to create cache entries          |
+| `reasoning_tokens`             | `Optional[int]` | Reasoning tokens (for reasoning models)      |
+
+### TTSUsageMetricsData
+
+Character usage for a TTS interaction.
+
+| Field   | Type  | Description                             |
+| ------- | ----- | --------------------------------------- |
+| `value` | `int` | Number of characters processed by TTS   |
+
+### TurnMetricsData
+
+Metrics from turn completion prediction, emitted by turn analyzers like Krisp Viva Turn and Smart Turn.
+
+| Field                     | Type    | Description                                              |
+| ------------------------- | ------- | -------------------------------------------------------- |
+| `is_complete`             | `bool`  | Whether the turn is predicted to be complete             |
+| `probability`             | `float` | Confidence probability of the prediction                 |
+| `e2e_processing_time_ms`  | `float` | End-to-end processing time in ms, from VAD speech-to-silence transition to turn completion |
+
+## Related Observers
+
+In addition to `MetricsLogObserver`, Pipecat provides observers that track higher-level conversational metrics.
+
+### UserBotLatencyObserver
+
+Measures the time between when a user stops speaking and when the bot starts speaking.
+
+```python
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+
+latency_observer = UserBotLatencyObserver()
+
+@latency_observer.event_handler("on_latency_measured")
+async def on_latency_measured(observer, latency_seconds):
+    print(f"User-to-bot latency: {latency_seconds:.3f}s")
+
+task = PipelineTask(pipeline, observers=[latency_observer])
+```
+
+### TurnTrackingObserver
+
+Tracks conversation turns, emitting events when turns start and end. Handles interruptions and configurable timeouts.
+
+```python
+from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
+
+turn_observer = TurnTrackingObserver(turn_end_timeout_secs=2.5)
+
+@turn_observer.event_handler("on_turn_started")
+async def on_turn_started(observer, turn_count):
+    print(f"Turn {turn_count} started")
+
+@turn_observer.event_handler("on_turn_ended")
+async def on_turn_ended(observer, turn_count, duration, was_interrupted):
+    status = "interrupted" if was_interrupted else "completed"
+    print(f"Turn {turn_count} {status} after {duration:.2f}s")
+
+task = PipelineTask(pipeline, observers=[turn_observer])
 ```
