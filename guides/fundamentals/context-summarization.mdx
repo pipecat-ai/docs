@@ -61,11 +61,14 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     assistant_params=LLMAssistantAggregatorParams(
         enable_context_summarization=True,
         context_summarization_config=LLMContextSummarizationConfig(
-            max_context_tokens=8000,           # Trigger at 8000 tokens
-            target_context_tokens=6000,        # Target summary size
-            max_unsummarized_messages=20,      # Or trigger after 20 new messages
-            min_messages_after_summary=4,      # Keep last 4 messages uncompressed
-            summarization_prompt=None,         # Custom prompt (optional)
+            max_context_tokens=8000,                                # Trigger at 8000 tokens
+            target_context_tokens=6000,                             # Target summary size
+            max_unsummarized_messages=20,                           # Or trigger after 20 new messages
+            min_messages_after_summary=4,                           # Keep last 4 messages uncompressed
+            summarization_prompt=None,                              # Custom prompt (optional)
+            summary_message_template="Conversation summary: {summary}",  # Format template
+            llm=None,                                               # Optional dedicated LLM
+            summarization_timeout=120.0,                            # Timeout in seconds
         ),
     ),
 )
@@ -73,13 +76,16 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 **Configuration parameters:**
 
-| Parameter                    | Default | Description                                                                |
-| ---------------------------- | ------- | -------------------------------------------------------------------------- |
-| `max_context_tokens`         | 8000    | Maximum context size (in estimated tokens) before triggering summarization |
-| `target_context_tokens`      | 6000    | Target token count for the generated summary                               |
-| `max_unsummarized_messages`  | 20      | Maximum new messages before triggering summarization                       |
-| `min_messages_after_summary` | 4       | Number of recent messages to preserve uncompressed                         |
-| `summarization_prompt`       | None    | Custom prompt for summary generation (uses built-in default if None)       |
+| Parameter                    | Default                           | Description                                                                          |
+| ---------------------------- | --------------------------------- | ------------------------------------------------------------------------------------ |
+| `max_context_tokens`         | 8000                              | Maximum context size (in estimated tokens) before triggering summarization           |
+| `target_context_tokens`      | 6000                              | Target token count for the generated summary                                         |
+| `max_unsummarized_messages`  | 20                                | Maximum new messages before triggering summarization                                 |
+| `min_messages_after_summary` | 4                                 | Number of recent messages to preserve uncompressed                                   |
+| `summarization_prompt`       | None                              | Custom prompt for summary generation (uses built-in default if None)                 |
+| `summary_message_template`   | `"Conversation summary: {summary}"` | Template for formatting the summary when injected into context                       |
+| `llm`                        | None                              | Optional separate LLM service for generating summaries (uses pipeline LLM if None)   |
+| `summarization_timeout`      | 120.0                             | Maximum time in seconds to wait for summary generation                               |
 
 ## What Gets Preserved
 
@@ -104,6 +110,76 @@ config = LLMContextSummarizationConfig(
 ```
 
 When no custom prompt is provided, Pipecat uses a built-in prompt that instructs the LLM to create a concise summary preserving key information, user preferences, and conversation flow.
+
+## Using a Dedicated LLM for Summarization
+
+For cost optimization, you can route summarization requests to a separate, cheaper/faster LLM while keeping your primary model for conversation:
+
+```python
+from pipecat.services.google import GoogleLLMService
+from pipecat.services.openai.llm import OpenAILLMService
+
+# Primary LLM for conversation (expensive, high-quality)
+llm = OpenAILLMService(
+    model="gpt-4o",
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+
+# Dedicated LLM for summarization (cheap, fast)
+summarization_llm = GoogleLLMService(
+    model="gemini-1.5-flash",
+    api_key=os.getenv("GOOGLE_API_KEY"),
+)
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    assistant_params=LLMAssistantAggregatorParams(
+        enable_context_summarization=True,
+        context_summarization_config=LLMContextSummarizationConfig(
+            llm=summarization_llm,  # Use dedicated LLM for summaries
+        ),
+    ),
+)
+```
+
+This approach reduces costs in long-running sessions where summarization happens frequently.
+
+## Customizing Summary Format
+
+Use `summary_message_template` to control how summaries are formatted when injected into context. This is useful for wrapping summaries in custom delimiters (e.g., XML tags) so system prompts can distinguish them from live conversation:
+
+```python
+config = LLMContextSummarizationConfig(
+    summary_message_template="<summary>{summary}</summary>",
+)
+```
+
+The template must contain `{summary}` as a placeholder for the generated summary text.
+
+## Monitoring Summarization
+
+Use the `on_summary_applied` event handler to track summarization activity and observe compression metrics:
+
+```python
+from pipecat.processors.aggregators.llm_context_summarizer import SummaryAppliedEvent
+
+# Access the summarizer from the assistant aggregator
+summarizer = assistant_aggregator._context_summarizer
+
+@summarizer.event_handler("on_summary_applied")
+async def on_summary_applied(summarizer, event: SummaryAppliedEvent):
+    logger.info(
+        f"Context compressed: {event.original_message_count} → {event.new_message_count} messages "
+        f"({event.summarized_message_count} summarized, {event.preserved_message_count} preserved)"
+    )
+```
+
+This event fires after each successful summarization and provides:
+
+- `original_message_count`: Total messages before summarization
+- `new_message_count`: Total messages after summarization
+- `summarized_message_count`: Number of messages compressed into the summary
+- `preserved_message_count`: Number of recent messages preserved uncompressed
 
 ## Next Steps
 
