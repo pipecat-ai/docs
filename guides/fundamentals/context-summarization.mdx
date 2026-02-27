@@ -6,7 +6,12 @@ description: "Automatically compress conversation history to manage token usage 
 
 ## Overview
 
-In long-running voice AI conversations, context grows with every exchange. This increases token usage, raises costs, and can eventually hit context window limits. Pipecat includes built-in context summarization that automatically compresses older conversation history while preserving recent messages and important context.
+In long-running voice AI conversations, context grows with every exchange. This increases token usage, raises costs, and can eventually hit context window limits. Pipecat includes built-in context summarization that compresses older conversation history while preserving recent messages and important context.
+
+Context summarization can work in two modes:
+
+- **Automatic**: Triggers automatically when token or message thresholds are reached
+- **Manual**: Triggered on-demand by pushing an `LLMSummarizeContextFrame` into the pipeline
 
 ## How It Works
 
@@ -28,9 +33,9 @@ When triggered, the system:
   with results and handles interruptions gracefully.
 </Note>
 
-## Enabling Context Summarization
+## Enabling Automatic Context Summarization
 
-Enable summarization by setting `enable_context_summarization=True` in `LLMAssistantAggregatorParams`:
+Enable automatic summarization by setting `enable_auto_context_summarization=True` in `LLMAssistantAggregatorParams`:
 
 ```python
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -38,48 +43,58 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
 
-# Create aggregators with summarization enabled
+# Create aggregators with automatic summarization enabled
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     context,
     assistant_params=LLMAssistantAggregatorParams(
-        enable_context_summarization=True,
+        enable_auto_context_summarization=True,
     ),
 )
 ```
 
-With the default configuration, summarization triggers at 8000 estimated tokens or after 20 new messages, whichever comes first.
+With the default configuration, automatic summarization triggers at 8000 estimated tokens or after 20 new messages, whichever comes first.
 
-## Customizing Behavior
+## Customizing Automatic Summarization
 
-Use `LLMContextSummarizationConfig` to control when and how summarization occurs:
+Use `LLMAutoContextSummarizationConfig` to control when automatic summarization is triggered and `LLMContextSummaryConfig` to control how summaries are generated:
 
 ```python
-from pipecat.utils.context.llm_context_summarization import LLMContextSummarizationConfig
+from pipecat.utils.context.llm_context_summarization import (
+    LLMAutoContextSummarizationConfig,
+    LLMContextSummaryConfig,
+)
 
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     context,
     assistant_params=LLMAssistantAggregatorParams(
-        enable_context_summarization=True,
-        context_summarization_config=LLMContextSummarizationConfig(
+        enable_auto_context_summarization=True,
+        auto_context_summarization_config=LLMAutoContextSummarizationConfig(
             max_context_tokens=8000,           # Trigger at 8000 tokens
-            target_context_tokens=6000,        # Target summary size
             max_unsummarized_messages=20,      # Or trigger after 20 new messages
-            min_messages_after_summary=4,      # Keep last 4 messages uncompressed
-            summarization_prompt=None,         # Custom prompt (optional)
+            summary_config=LLMContextSummaryConfig(
+                target_context_tokens=6000,        # Target summary size
+                min_messages_after_summary=4,      # Keep last 4 messages uncompressed
+                summarization_prompt=None,         # Custom prompt (optional)
+            ),
         ),
     ),
 )
 ```
 
-**Configuration parameters:**
+**Auto-trigger parameters (`LLMAutoContextSummarizationConfig`):**
 
-| Parameter                    | Default | Description                                                                |
-| ---------------------------- | ------- | -------------------------------------------------------------------------- |
-| `max_context_tokens`         | 8000    | Maximum context size (in estimated tokens) before triggering summarization |
-| `target_context_tokens`      | 6000    | Target token count for the generated summary                               |
-| `max_unsummarized_messages`  | 20      | Maximum new messages before triggering summarization                       |
-| `min_messages_after_summary` | 4       | Number of recent messages to preserve uncompressed                         |
-| `summarization_prompt`       | None    | Custom prompt for summary generation (uses built-in default if None)       |
+| Parameter                   | Default | Description                                                                |
+| --------------------------- | ------- | -------------------------------------------------------------------------- |
+| `max_context_tokens`        | 8000    | Maximum context size (in estimated tokens) before triggering summarization |
+| `max_unsummarized_messages` | 20      | Maximum new messages before triggering summarization                       |
+
+**Summary generation parameters (`LLMContextSummaryConfig`):**
+
+| Parameter                    | Default | Description                                                          |
+| ---------------------------- | ------- | -------------------------------------------------------------------- |
+| `target_context_tokens`      | 6000    | Target token count for the generated summary                         |
+| `min_messages_after_summary` | 4       | Number of recent messages to preserve uncompressed                   |
+| `summarization_prompt`       | None    | Custom prompt for summary generation (uses built-in default if None) |
 
 ## What Gets Preserved
 
@@ -104,6 +119,67 @@ config = LLMContextSummarizationConfig(
 ```
 
 When no custom prompt is provided, Pipecat uses a built-in prompt that instructs the LLM to create a concise summary preserving key information, user preferences, and conversation flow.
+
+## Manual Context Summarization
+
+In addition to automatic summarization, you can trigger context summarization on-demand by pushing an `LLMSummarizeContextFrame` into the pipeline. This is useful when you want explicit control over when summarization occurs, such as:
+
+- When a user explicitly requests to summarize the conversation (via a function call tool)
+- At specific conversation milestones or checkpoints
+- When transitioning between conversation topics
+
+```python
+from pipecat.frames.frames import LLMSummarizeContextFrame
+
+# Trigger manual summarization
+await llm.queue_frame(LLMSummarizeContextFrame())
+```
+
+### Manual Summarization with Function Calls
+
+A common pattern is to expose summarization as a tool that the LLM can call:
+
+```python
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.services.llm_service import FunctionCallParams
+
+async def summarize_conversation(params: FunctionCallParams):
+    """Trigger manual context summarization via a pipeline frame."""
+    await params.result_callback({"status": "summarization_requested"})
+    await params.llm.queue_frame(LLMSummarizeContextFrame())
+
+llm.register_function("summarize_conversation", summarize_conversation)
+
+summarize_function = FunctionSchema(
+    name="summarize_conversation",
+    description="Summarize and compress the conversation history",
+    properties={},
+    required=[],
+)
+```
+
+When the LLM calls this function, it will trigger an immediate context summarization, even if automatic thresholds haven't been reached.
+
+<Note>
+  Manual summarization uses the same `LLMContextSummaryConfig` settings as
+  automatic mode. You can optionally pass a custom config per request:
+  `LLMSummarizeContextFrame(config=LLMContextSummaryConfig(...))`.
+</Note>
+
+### Manual-Only Mode
+
+You can disable automatic summarization while still supporting manual requests by setting `enable_auto_context_summarization=False` (the default). The summarizer is always created internally, so manual `LLMSummarizeContextFrame` frames are always handled:
+
+```python
+# Manual summarization only - no automatic triggers
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    # enable_auto_context_summarization defaults to False
+)
+
+# Later, manually trigger summarization when needed
+await llm.queue_frame(LLMSummarizeContextFrame())
+```
 
 ## Next Steps
 
