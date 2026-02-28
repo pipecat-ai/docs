@@ -1,0 +1,192 @@
+---
+title: "MLflow"
+description: "Trace and analyze Pipecat voice agent conversations with MLflow"
+---
+
+## Overview
+
+[MLflow](https://mlflow.org/) is an [open-source](https://github.com/mlflow/mlflow) platform for managing the end-to-end machine learning and AI lifecycle. MLflow Tracing provides detailed observability into AI agent execution, capturing LLM calls, tool usage, and agent decisions with a rich visualization UI.
+
+Since Pipecat's built-in tracing uses [OpenTelemetry](/server/utilities/opentelemetry), you can send traces directly to MLflow's OTLP endpoint for visualization and analysis.
+
+<CardGroup cols={2}>
+  <Card
+    title="MLflow Tracing Docs"
+    icon="book"
+    href="https://mlflow.org/docs/latest/genai/tracing/"
+  >
+    Learn about MLflow's tracing capabilities
+  </Card>
+  <Card
+    title="MLflow Pipecat Integration"
+    icon="link"
+    href="https://mlflow.org/docs/latest/genai/tracing/integrations/listing/pipecat.html"
+  >
+    MLflow's guide for tracing Pipecat applications
+  </Card>
+  <Card
+    title="MLflow GitHub"
+    icon="github"
+    href="https://github.com/mlflow/mlflow"
+  >
+    Browse the MLflow open-source repository
+  </Card>
+  <Card
+    title="MLflow Platform"
+    icon="chart-line"
+    href="https://mlflow.org/"
+  >
+    Explore the MLflow platform
+  </Card>
+</CardGroup>
+
+## Installation
+
+Install Pipecat with tracing support and the OTLP HTTP exporter:
+
+```bash
+pip install "pipecat-ai[tracing]" mlflow opentelemetry-exporter-otlp-proto-http
+```
+
+## Prerequisites
+
+### Start MLflow
+
+The quickest way to start the MLflow tracking server is with `uvx` (no installation needed):
+
+```bash
+uvx mlflow server --port 5000
+```
+
+The MLflow UI will be available at [http://localhost:5000](http://localhost:5000).
+
+<Tip>
+For other setup options including Docker and pip, see the [MLflow environment setup guide](https://mlflow.org/docs/latest/genai/getting-started/connect-environment/).
+
+If you prefer a managed solution, [Managed MLflow](https://mlflow.org/docs/latest/genai/getting-started/databricks-trial/) on AWS SageMaker or Databricks provides a fully hosted MLflow experience with no infrastructure to manage.
+</Tip>
+
+### Key Features
+
+- **Trace visualization**: Inspect every LLM call, STT/TTS operation, and conversation turn in a hierarchical trace view
+- **Token usage tracking**: Monitor input/output token counts across conversations
+- **Performance metrics**: Track TTFB, processing duration, and latency for each service
+- **Evaluation framework**: Evaluate agent outputs using built-in LLM judges and custom scorers
+- **Open source**: Fully open-source with no vendor lock-in, self-host anywhere
+
+## Configuration
+
+Configure the OTLP HTTP exporter to send traces to MLflow:
+
+```python
+import os
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from pipecat.utils.tracing.setup import setup_tracing
+
+exporter = OTLPSpanExporter(
+    endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:5000/v1/traces"),
+)
+
+setup_tracing(
+    service_name="my-pipecat-bot",
+    exporter=exporter,
+)
+```
+
+Alternatively, configure with environment variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:5000"
+export OTEL_EXPORTER_OTLP_HEADERS="x-mlflow-experiment-id=0"
+```
+
+<Info>
+The `x-mlflow-experiment-id` header specifies which MLflow experiment to log traces to. Use `0` for the default experiment, or create a dedicated experiment:
+
+```bash
+mlflow experiments create --experiment-name "pipecat-traces"
+# Use the returned experiment ID in the header
+```
+
+</Info>
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+from dotenv import load_dotenv
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.utils.tracing.setup import setup_tracing
+
+load_dotenv()
+
+# Initialize tracing with MLflow exporter
+exporter = OTLPSpanExporter(
+    endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:5000/v1/traces"),
+)
+
+setup_tracing(
+    service_name="my-pipecat-bot",
+    exporter=exporter,
+)
+
+# Create your services
+stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    voice_id="your-voice-id",
+)
+
+# Build pipeline
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+
+# Create pipeline task with tracing enabled
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        enable_metrics=True,
+        enable_usage_metrics=True,
+    ),
+    enable_tracing=True,
+    enable_turn_tracking=True,
+)
+
+# Run the pipeline
+runner = PipelineRunner()
+await runner.run(task)
+```
+
+After running your Pipecat application, open the MLflow UI at [http://localhost:5000](http://localhost:5000) and navigate to the **Traces** tab to see detailed traces of your voice agent conversations, including STT, LLM, and TTS spans with latency and token usage.
+
+![Pipecat traces in MLflow](/images/mlflow-tracing.png)
+
+## Troubleshooting
+
+- **No traces visible**: Verify the MLflow server is running and the `OTEL_EXPORTER_OTLP_ENDPOINT` points to the correct address
+- **Missing service data**: Ensure `enable_metrics=True` is set in `PipelineParams`
+- **Connection errors**: Check that the MLflow server is accessible from your application and the endpoint URL is correct
+- **Wrong experiment**: Set the `x-mlflow-experiment-id` header to direct traces to the correct experiment
+
+## References
+
+- [MLflow Tracing Documentation](https://mlflow.org/docs/latest/genai/tracing/)
+- [MLflow OpenTelemetry Integration](https://mlflow.org/docs/latest/genai/tracing/app-instrumentation/opentelemetry.html)
+- [MLflow Pipecat Integration Guide](https://mlflow.org/docs/latest/genai/tracing/integrations/listing/pipecat.html)
+- [Pipecat OpenTelemetry Tracing](/server/utilities/opentelemetry)
