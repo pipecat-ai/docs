@@ -5,10 +5,11 @@ description: "Speech-to-text service implementations using Deepgram's real-time 
 
 ## Overview
 
-Deepgram provides two STT service implementations:
+Deepgram provides three STT service implementations:
 
 - `DeepgramSTTService` for real-time speech recognition using Deepgram's standard WebSocket API with support for interim results, language detection, and voice activity detection (VAD)
-- `DeepgramFluxSTTService` for advanced conversational AI with Flux capabilities including intelligent turn detection, eager end-of-turn events, and enhanced speech processing for improved response timing.
+- `DeepgramFluxSTTService` for advanced conversational AI with Flux capabilities including intelligent turn detection, eager end-of-turn events, and enhanced speech processing for improved response timing
+- `DeepgramSageMakerSTTService` for real-time speech recognition using Deepgram models deployed on AWS SageMaker endpoints via HTTP/2 bidirectional streaming
 
 <Note>
   Since Deepgram Flux provides its own user turn start and end detection, you
@@ -48,6 +49,13 @@ Deepgram provides two STT service implementations:
     Complete example with Deepgram Flux STT
   </Card>
   <Card
+    title="SageMaker Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/07c-interruptible-deepgram-sagemaker.py"
+  >
+    Complete example with Deepgram on SageMaker
+  </Card>
+  <Card
     title="Deepgram Documentation"
     icon="book"
     href="https://developers.deepgram.com/docs/pre-recorded-audio"
@@ -65,17 +73,23 @@ Deepgram provides two STT service implementations:
 
 ## Installation
 
-To use Deepgram services, install the required dependencies:
+To use Deepgram STT services, install the required dependencies:
 
 ```bash
 pip install "pipecat-ai[deepgram]"
+```
+
+For the SageMaker variant, install both the Deepgram and SageMaker dependencies:
+
+```bash
+pip install "pipecat-ai[deepgram,sagemaker]"
 ```
 
 ## Prerequisites
 
 ### Deepgram Account Setup
 
-Before using Deepgram STT services, you need:
+Before using `DeepgramSTTService` or `DeepgramFluxSTTService`, you need:
 
 1. **Deepgram Account**: Sign up at [Deepgram Console](https://console.deepgram.com/signup)
 2. **API Key**: Generate an API key from your console dashboard
@@ -84,6 +98,14 @@ Before using Deepgram STT services, you need:
 ### Required Environment Variables
 
 - `DEEPGRAM_API_KEY`: Your Deepgram API key for authentication
+
+### AWS SageMaker Setup
+
+Before using `DeepgramSageMakerSTTService`, you need:
+
+1. **AWS Account**: With credentials configured (via environment variables, AWS CLI, or instance metadata)
+2. **SageMaker Endpoint**: A deployed SageMaker endpoint with a [Deepgram model](https://developers.deepgram.com/docs/deploy-amazon-sagemaker)
+3. **Deepgram SDK**: The Deepgram SDK is required for `LiveOptions` configuration
 
 ## Configuration
 
@@ -178,6 +200,44 @@ Parameters passed via the `params` constructor argument for `DeepgramFluxSTTServ
 | `tag`                 | `list`  | `[]`    | Tags for request identification during usage reporting.                                                                                                   |
 | `min_confidence`      | `float` | `None`  | Minimum average confidence required to produce a `TranscriptionFrame`.                                                                                    |
 
+### DeepgramSageMakerSTTService
+
+<ParamField path="endpoint_name" type="str" required>
+  Name of the SageMaker endpoint with Deepgram model deployed.
+</ParamField>
+
+<ParamField path="region" type="str" required>
+  AWS region where the SageMaker endpoint is deployed (e.g., `"us-east-2"`).
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the value from `live_options` or
+  the pipeline's configured sample rate.
+</ParamField>
+
+<ParamField path="live_options" type="LiveOptions" default="None">
+  Deepgram `LiveOptions` for detailed configuration. When provided, these
+  settings are merged with the defaults. See [Deepgram
+  LiveOptions](https://developers.deepgram.com/docs/live-streaming-audio#live-streaming-options)
+  for available options.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="DEEPGRAM_SAGEMAKER_TTFS_P99">
+  P99 latency from speech end to final transcript in seconds. Override for your
+  deployment.
+</ParamField>
+
+The default `LiveOptions` for the SageMaker variant are:
+
+| Option            | Default        | Description                         |
+| ----------------- | -------------- | ----------------------------------- |
+| `encoding`        | `"linear16"`   | Audio encoding format.              |
+| `language`        | `Language.EN`  | Recognition language.               |
+| `model`           | `"nova-3"`     | Deepgram model to use.              |
+| `channels`        | `1`            | Number of audio channels.           |
+| `interim_results` | `True`         | Stream partial recognition results. |
+| `punctuate`       | `True`         | Add punctuation to transcripts.     |
+
 ## Usage
 
 ### Basic DeepgramSTTService
@@ -232,16 +292,36 @@ stt = DeepgramFluxSTTService(
 )
 ```
 
+### SageMaker Service
+
+```python
+from deepgram import LiveOptions
+from pipecat.services.deepgram.stt_sagemaker import DeepgramSageMakerSTTService
+
+stt = DeepgramSageMakerSTTService(
+    endpoint_name=os.getenv("SAGEMAKER_STT_ENDPOINT_NAME"),
+    region=os.getenv("AWS_REGION"),
+    live_options=LiveOptions(
+        model="nova-3",
+        language="en",
+        interim_results=True,
+        punctuate=True,
+    ),
+)
+```
+
 ## Notes
 
-- **Finalize on VAD stop**: When the pipeline's VAD detects the user has stopped speaking, `DeepgramSTTService` sends a [finalize](https://developers.deepgram.com/docs/finalize) request to Deepgram for faster final transcript delivery.
+- **Finalize on VAD stop**: When the pipeline's VAD detects the user has stopped speaking, `DeepgramSTTService` and `DeepgramSageMakerSTTService` send a [finalize](https://developers.deepgram.com/docs/finalize) request to Deepgram for faster final transcript delivery.
 - **Flux turn management**: `DeepgramFluxSTTService` provides its own turn detection via `StartOfTurn`/`EndOfTurn` events and broadcasts `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame` directly. Use `ExternalUserTurnStrategies` to avoid conflicting VAD-based turn management.
 - **EagerEndOfTurn**: In Flux, enabling `eager_eot_threshold` provides faster response times by predicting end-of-turn before it is confirmed. EagerEndOfTurn transcripts are pushed as `InterimTranscriptionFrame`s. If the user resumes speaking, a `TurnResumed` event is fired.
 - **Deprecated vad_events**: The `vad_events` option in standard `DeepgramSTTService` is deprecated. Use Silero VAD instead.
+- **SageMaker deployment**: The SageMaker service requires a Deepgram model deployed to an AWS SageMaker endpoint. See the [Deepgram SageMaker deployment guide](https://developers.deepgram.com/docs/deploy-amazon-sagemaker) for setup instructions.
+- **SageMaker keepalive**: The SageMaker service automatically sends KeepAlive messages every 5 seconds to maintain the connection during periods of silence.
 
 ## Event Handlers
 
-In addition to the standard [service connection events](/server/utilities/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`), Deepgram STT provides:
+All three services support the standard [service connection events](/server/utilities/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`). Additionally, `DeepgramSTTService` and `DeepgramFluxSTTService` provide service-specific events:
 
 ### DeepgramSTTService
 
