@@ -1,36 +1,48 @@
 ---
 title: "Context Summarization"
-description: "Reference for LLMContextSummarizationConfig, LLMContextSummarizer, and SummaryAppliedEvent"
+description: "Reference for LLMAutoContextSummarizationConfig, LLMContextSummaryConfig, LLMContextSummarizer, and SummaryAppliedEvent"
 ---
 
 ## Overview
 
-Context summarization automatically compresses older conversation history when token or message limits are reached. It is configured via `LLMContextSummarizationConfig` and managed by `LLMContextSummarizer`.
+Context summarization automatically compresses older conversation history when token or message limits are reached. It is configured via `LLMAutoContextSummarizationConfig` (auto-trigger thresholds) and `LLMContextSummaryConfig` (summary generation params), and managed by `LLMContextSummarizer`.
 
 For a walkthrough of how to enable and customize context summarization, see the [Context Summarization guide](/guides/fundamentals/context-summarization).
 
-## LLMContextSummarizationConfig
+## LLMAutoContextSummarizationConfig
 
 ```python
-from pipecat.utils.context.llm_context_summarization import LLMContextSummarizationConfig
+from pipecat.utils.context.llm_context_summarization import LLMAutoContextSummarizationConfig
 ```
 
-Controls when and how context summarization occurs.
+Controls when automatic context summarization triggers.
 
 <ParamField path="max_context_tokens" type="int" default="8000">
   Maximum context size in estimated tokens before triggering summarization.
   Tokens are estimated using the heuristic of 1 token per 4 characters.
 </ParamField>
 
+<ParamField path="max_unsummarized_messages" type="int" default="20">
+  Maximum number of new messages before triggering summarization, even if the
+  token limit has not been reached.
+</ParamField>
+
+<ParamField path="summary_config" type="LLMContextSummaryConfig" default="LLMContextSummaryConfig()">
+  Configuration for how summaries are generated. See below.
+</ParamField>
+
+## LLMContextSummaryConfig
+
+```python
+from pipecat.utils.context.llm_context_summarization import LLMContextSummaryConfig
+```
+
+Controls how summaries are generated. Used as `summary_config` inside `LLMAutoContextSummarizationConfig`, or passed directly to `LLMSummarizeContextFrame` for on-demand summarization.
+
 <ParamField path="target_context_tokens" type="int" default="6000">
   Target token count for the generated summary. Passed to the LLM as
   `max_tokens`. Auto-adjusted to 80% of `max_context_tokens` if it exceeds that
   value.
-</ParamField>
-
-<ParamField path="max_unsummarized_messages" type="int" default="20">
-  Maximum number of new messages before triggering summarization, even if the
-  token limit has not been reached.
 </ParamField>
 
 <ParamField path="min_messages_after_summary" type="int" default="4">
@@ -66,13 +78,50 @@ Controls when and how context summarization occurs.
   unblocked. Set to `None` to disable the timeout.
 </ParamField>
 
+## LLMSummarizeContextFrame
+
+```python
+from pipecat.frames.frames import LLMSummarizeContextFrame
+```
+
+Push this frame into the pipeline to trigger on-demand context summarization without waiting for automatic thresholds.
+
+<ParamField path="config" type="Optional[LLMContextSummaryConfig]" default="None">
+  Per-request override for summary generation settings (prompt, token budget,
+  messages to keep). When `None`, the summarizer's default
+  `LLMContextSummaryConfig` is used.
+</ParamField>
+
+On-demand summarization works even when `enable_auto_context_summarization` is `False` — the summarizer is always created internally to handle manually pushed frames.
+
+```python
+from pipecat.frames.frames import LLMSummarizeContextFrame
+
+# Trigger with default settings
+await llm.queue_frame(LLMSummarizeContextFrame())
+
+# Trigger with per-request overrides
+await llm.queue_frame(
+    LLMSummarizeContextFrame(
+        config=LLMContextSummaryConfig(
+            target_context_tokens=2000,
+            min_messages_after_summary=2,
+        )
+    )
+)
+```
+
+<Note>
+  If a summarization is already in progress, the manual request is ignored.
+</Note>
+
 ## LLMContextSummarizer
 
 ```python
 from pipecat.processors.aggregators.llm_context_summarizer import LLMContextSummarizer
 ```
 
-Monitors context size and orchestrates summarization. Created automatically by `LLMAssistantAggregator` when `enable_context_summarization=True`. Access it via `assistant_aggregator._summarizer`.
+Monitors context size and orchestrates summarization. Created automatically by `LLMAssistantAggregator` when `enable_auto_context_summarization=True`. Access it via `assistant_aggregator._summarizer`.
 
 ### Event Handlers
 
@@ -115,3 +164,41 @@ Event data emitted when context summarization completes successfully.
   Number of messages preserved uncompressed (system message plus recent
   messages).
 </ParamField>
+
+## Deprecated: LLMContextSummarizationConfig
+
+```python
+from pipecat.utils.context.llm_context_summarization import LLMContextSummarizationConfig
+```
+
+<Warning>
+  `LLMContextSummarizationConfig` is deprecated since v0.0.104. Use
+  `LLMAutoContextSummarizationConfig` with a nested `LLMContextSummaryConfig`
+  instead. The old class still works but emits a `DeprecationWarning`.
+</Warning>
+
+The old class flattened all parameters into a single object. Migrate by splitting trigger thresholds (`max_context_tokens`, `max_unsummarized_messages`) into `LLMAutoContextSummarizationConfig` and summary generation params into `LLMContextSummaryConfig`:
+
+```python
+# Before (deprecated)
+config = LLMContextSummarizationConfig(
+    max_context_tokens=4000,
+    target_context_tokens=3000,
+    max_unsummarized_messages=10,
+)
+
+# After
+config = LLMAutoContextSummarizationConfig(
+    max_context_tokens=4000,
+    max_unsummarized_messages=10,
+    summary_config=LLMContextSummaryConfig(
+        target_context_tokens=3000,
+    ),
+)
+```
+
+Similarly, the `LLMAssistantAggregatorParams` fields were renamed:
+- `enable_context_summarization` → `enable_auto_context_summarization`
+- `context_summarization_config` → `auto_context_summarization_config`
+
+The old field names still work with a `DeprecationWarning`.
