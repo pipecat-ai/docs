@@ -4,13 +4,17 @@ sidebarTitle: "Latency Observer"
 description: "Measure response time between user speech and bot responses in Pipecat"
 ---
 
-The `UserBotLatencyObserver` measures the time between when a user stops speaking and when the bot starts responding, emitting events for custom handling and optional OpenTelemetry tracing integration.
+The `UserBotLatencyObserver` measures the time between when a user stops speaking and when the bot starts responding, emitting events for custom handling and optional OpenTelemetry tracing integration. It also tracks first-bot-speech latency and provides detailed per-service latency breakdowns when metrics are enabled.
 
 ## Features
 
 - Tracks user speech start/stop timing using VAD frames
 - Measures bot response latency from the actual moment the user started speaking
+- Measures first bot speech latency (client connection to first speech)
+- Provides detailed latency breakdown with per-service TTFB, text aggregation, user turn duration, and function call metrics
 - Emits `on_latency_measured` events for custom processing
+- Emits `on_latency_breakdown` events with detailed per-service metrics
+- Emits `on_first_bot_speech_latency` event for greeting latency measurement
 - Automatically records latency as OpenTelemetry span attributes when tracing is enabled
 - Automatically resets between conversation turns
 
@@ -35,6 +39,30 @@ task = PipelineTask(
 )
 ```
 
+### Detailed Latency Breakdown
+
+Enable metrics to collect per-service latency breakdown:
+
+```python
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+
+latency_observer = UserBotLatencyObserver()
+
+@latency_observer.event_handler("on_latency_breakdown")
+async def on_latency_breakdown(observer, breakdown):
+    print(f"Latency breakdown ({len(breakdown.chronological_events())} events):")
+    for event in breakdown.chronological_events():
+        print(f"  {event}")
+
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        observers=[latency_observer],
+        enable_metrics=True,  # Required for breakdown metrics
+    ),
+)
+```
+
 ### OpenTelemetry Integration
 
 When tracing is enabled, latency measurements are automatically recorded as `turn.user_bot_latency_seconds` attributes on OpenTelemetry turn spans. No additional configuration is needed.
@@ -43,9 +71,12 @@ When tracing is enabled, latency measurements are automatically recorded as `tur
 
 The observer tracks conversation flow through these key events:
 
-1. **User starts speaking** (`VADUserStartedSpeakingFrame`) → Resets latency tracking
-2. **User stops speaking** (`VADUserStoppedSpeakingFrame`) → Records timestamp, accounting for VAD `stop_secs` delay
-3. **Bot starts speaking** (`BotStartedSpeakingFrame`) → Calculates latency and emits `on_latency_measured` event
+1. **Client connects** (`ClientConnectedFrame`) → Records timestamp for first-bot-speech measurement
+2. **User starts speaking** (`VADUserStartedSpeakingFrame`) → Resets latency tracking
+3. **User stops speaking** (`VADUserStoppedSpeakingFrame`) → Records timestamp, accounting for VAD `stop_secs` delay
+4. **Bot starts speaking** (`BotStartedSpeakingFrame`) → Calculates latency and emits `on_latency_measured` and `on_latency_breakdown` events
+
+When `enable_metrics=True` in `PipelineParams`, the observer also collects per-service metrics (TTFB, text aggregation, function call latency) from `MetricsFrame` instances and includes them in the latency breakdown.
 
 ## Event Handlers
 
@@ -60,6 +91,45 @@ async def on_latency_measured(observer, latency):
     logger.info(f"Response latency: {latency:.3f}s")
 ```
 
+### on_latency_breakdown
+
+Called alongside `on_latency_measured` with detailed per-service metrics collected during the user→bot cycle. The breakdown includes TTFB from each service, text aggregation latency, user turn duration, and function call timings.
+
+```python
+@latency_observer.event_handler("on_latency_breakdown")
+async def on_latency_breakdown(observer, breakdown):
+    # breakdown is a LatencyBreakdown object
+    logger.info("Latency breakdown:")
+    for event in breakdown.chronological_events():
+        logger.info(f"  {event}")
+```
+
+**LatencyBreakdown fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ttfb` | `List[TTFBBreakdownMetrics]` | Time-to-first-byte metrics from each service |
+| `text_aggregation` | `Optional[TextAggregationBreakdownMetrics]` | First text aggregation measurement (sentence aggregation latency) |
+| `user_turn_start_time` | `Optional[float]` | Unix timestamp when user turn started (adjusted for VAD stop_secs) |
+| `user_turn_secs` | `Optional[float]` | User turn duration including VAD silence detection, STT finalization, and turn analyzer wait |
+| `function_calls` | `List[FunctionCallMetrics]` | Latency for each function call executed during the cycle |
+
+The `breakdown.chronological_events()` method returns a human-readable list of all metrics sorted by start time, useful for logging and debugging.
+
+### on_first_bot_speech_latency
+
+Called once when the bot first speaks after client connection. Measures the time from `ClientConnectedFrame` to the first `BotStartedSpeakingFrame`. This is particularly useful for measuring greeting latency.
+
+```python
+@latency_observer.event_handler("on_first_bot_speech_latency")
+async def on_first_bot_speech_latency(observer, latency):
+    logger.info(f"First bot speech latency: {latency:.3f}s")
+```
+
+<Note>
+  The `on_latency_breakdown` event is also emitted for the first bot speech, allowing you to see the detailed breakdown of what contributed to the greeting latency.
+</Note>
+
 ## Deprecated: UserBotLatencyLogObserver
 
 <Warning>
@@ -67,7 +137,15 @@ async def on_latency_measured(observer, latency):
   directly with its `on_latency_measured` event handler instead.
 </Warning>
 
+## Configuration
+
+### Constructor Parameters
+
+<ParamField path="max_frames" type="int" default="100">
+  Maximum number of frame IDs to keep in history for duplicate detection. Prevents unbounded memory growth in long conversations.
+</ParamField>
+
 ## Limitations
 
-- Only measures speech-to-speech latency (not text processing time)
 - Requires proper frame sequencing to work accurately
+- Per-service metrics are only collected when `enable_metrics=True` in `PipelineParams`
