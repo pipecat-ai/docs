@@ -18,9 +18,9 @@ description: "Speech-to-text service implementation using AssemblyAI's real-time
   <Card
     title="Example Implementation"
     icon="play"
-    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/07o-interruptible-assemblyai.py"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/foundational/07o-interruptible-assemblyai-turn-detection.py"
   >
-    Complete example with interruption handling
+    Example with AssemblyAI built-in turn detection
   </Card>
   <Card
     title="AssemblyAI Documentation"
@@ -90,10 +90,26 @@ Before using AssemblyAI STT services, you need:
 </ParamField>
 
 <ParamField path="vad_force_turn_endpoint" type="bool" default="True">
-  Whether to force turn endpoint on VAD stop. When `True`, disables AssemblyAI's
-  model-based turn detection and relies on external VAD to trigger turn
-  endpoints. Automatically sets `end_of_turn_confidence_threshold=1.0` and
-  `max_turn_silence=2000` unless explicitly overridden.
+  Controls turn detection mode. When `True` (Pipecat mode, default): Forces
+  AssemblyAI to return finals ASAP so Pipecat's turn detection (e.g., Smart
+  Turn) decides when the user is done. VAD stop sends ForceEndpoint as ceiling.
+  No UserStarted/StoppedSpeakingFrame emitted from STT. When `False` (AssemblyAI
+  turn detection mode, u3-rt-pro only): AssemblyAI's model controls turn endings
+  using built-in turn detection. Uses AssemblyAI API defaults for all parameters
+  unless explicitly set. Emits UserStarted/StoppedSpeakingFrame from STT.
+</ParamField>
+
+<ParamField path="should_interrupt" type="bool" default="True">
+  Whether to interrupt the bot when the user starts speaking in AssemblyAI turn
+  detection mode (`vad_force_turn_endpoint=False`). Only applies when using
+  AssemblyAI's built-in turn detection.
+</ParamField>
+
+<ParamField path="speaker_format" type="Optional[str]" default="None">
+  Optional format string for speaker labels when diarization is enabled. Use
+  `{speaker}` for speaker label and `{text}` for transcript text. Example:
+  `"<{speaker}>{text}</{speaker}>"` or `"{speaker}: {text}"`. If None, transcript
+  text is not modified.
 </ParamField>
 
 <ParamField path="ttfs_p99_latency" type="float" default="ASSEMBLYAI_TTFS_P99">
@@ -105,17 +121,22 @@ Before using AssemblyAI STT services, you need:
 
 Connection-level parameters passed via the `connection_params` constructor argument.
 
-| Parameter                                | Type        | Default                         | Description                                                                                   |
-| ---------------------------------------- | ----------- | ------------------------------- | --------------------------------------------------------------------------------------------- |
-| `sample_rate`                            | `int`       | `16000`                         | Audio sample rate in Hz.                                                                      |
-| `encoding`                               | `Literal`   | `"pcm_s16le"`                   | Audio encoding format. Options: `"pcm_s16le"`, `"pcm_mulaw"`.                                 |
-| `formatted_finals`                       | `bool`      | `True`                          | Whether to enable transcript formatting.                                                      |
-| `word_finalization_max_wait_time`        | `int`       | `None`                          | Maximum time to wait for word finalization in milliseconds.                                   |
-| `end_of_turn_confidence_threshold`       | `float`     | `None`                          | Confidence threshold for end-of-turn detection.                                               |
-| `min_end_of_turn_silence_when_confident` | `int`       | `None`                          | Minimum silence duration (ms) when confident about end-of-turn.                               |
-| `max_turn_silence`                       | `int`       | `None`                          | Maximum silence duration (ms) before forcing end-of-turn.                                     |
-| `keyterms_prompt`                        | `List[str]` | `None`                          | List of key terms to guide transcription.                                                     |
-| `speech_model`                           | `Literal`   | `"universal-streaming-english"` | Speech model. Options: `"universal-streaming-english"`, `"universal-streaming-multilingual"`. |
+| Parameter                                | Type        | Default        | Description                                                                                                                             |
+| ---------------------------------------- | ----------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `sample_rate`                            | `int`       | `16000`        | Audio sample rate in Hz.                                                                                                                |
+| `encoding`                               | `Literal`   | `"pcm_s16le"`  | Audio encoding format. Options: `"pcm_s16le"`, `"pcm_mulaw"`.                                                                           |
+| `formatted_finals`                       | `bool`      | `True`         | Whether to enable transcript formatting.                                                                                                |
+| `word_finalization_max_wait_time`        | `int`       | `None`         | Maximum time to wait for word finalization in milliseconds.                                                                             |
+| `end_of_turn_confidence_threshold`       | `float`     | `None`         | Confidence threshold for end-of-turn detection.                                                                                         |
+| `min_turn_silence`                       | `int`       | `None`         | Minimum silence duration (ms) when confident about end-of-turn.                                                                         |
+| `min_end_of_turn_silence_when_confident` | `int`       | `None`         | **DEPRECATED**. Use `min_turn_silence` instead. Will be removed in a future version.                                                    |
+| `max_turn_silence`                       | `int`       | `None`         | Maximum silence duration (ms) before forcing end-of-turn.                                                                               |
+| `keyterms_prompt`                        | `List[str]` | `None`         | List of key terms to guide transcription. Will be JSON serialized before sending.                                                       |
+| `prompt`                                 | `str`       | `None`         | Optional text prompt to guide transcription. Only used when `speech_model` is `"u3-rt-pro"`. Cannot be used with `keyterms_prompt`.    |
+| `speech_model`                           | `Literal`   | `"u3-rt-pro"`  | Speech model. Options: `"universal-streaming-english"`, `"universal-streaming-multilingual"`, `"u3-rt-pro"`.                            |
+| `language_detection`                     | `bool`      | `None`         | Enable automatic language detection. Only applicable to `universal-streaming-multilingual`. Turn messages include language information. |
+| `format_turns`                           | `bool`      | `True`         | Whether to format transcript turns.                                                                                                     |
+| `speaker_labels`                         | `bool`      | `None`         | Enable speaker diarization. Final transcripts include a speaker field (e.g., "Speaker A", "Speaker B").                                 |
 
 ## Usage
 
@@ -141,17 +162,61 @@ stt = AssemblyAISTTService(
         sample_rate=16000,
         formatted_finals=True,
         keyterms_prompt=["Pipecat", "AssemblyAI"],
-        speech_model="universal-streaming-multilingual",
+        speech_model="u3-rt-pro",
     ),
     vad_force_turn_endpoint=True,
 )
 ```
 
+### With AssemblyAI Built-in Turn Detection
+
+AssemblyAI's u3-rt-pro model supports built-in turn detection for more natural conversation flow:
+
+```python
+from pipecat.services.assemblyai import AssemblyAISTTService
+from pipecat.services.assemblyai.models import AssemblyAIConnectionParams
+
+stt = AssemblyAISTTService(
+    api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+    vad_force_turn_endpoint=False,  # Use AssemblyAI's built-in turn detection
+    connection_params=AssemblyAIConnectionParams(
+        speech_model="u3-rt-pro",
+        # Optional: Tune turn detection timing
+        min_turn_silence=100,  # Minimum silence (ms) when confident about end-of-turn
+        max_turn_silence=1000,  # Maximum silence (ms) before forcing end-of-turn
+    ),
+)
+```
+
+### With Speaker Diarization
+
+Enable speaker identification for multi-party conversations:
+
+```python
+from pipecat.services.assemblyai import AssemblyAISTTService
+from pipecat.services.assemblyai.models import AssemblyAIConnectionParams
+
+stt = AssemblyAISTTService(
+    api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+    connection_params=AssemblyAIConnectionParams(
+        speech_model="u3-rt-pro",
+        speaker_labels=True,  # Enable speaker diarization
+    ),
+    speaker_format="{speaker}: {text}",  # Format transcripts with speaker labels
+)
+```
+
 ## Notes
 
-- **English only by default**: AssemblyAI's default model supports English. Use `speech_model="universal-streaming-multilingual"` in `connection_params` for multilingual support.
-- **VAD turn endpoint mode**: When `vad_force_turn_endpoint=True` (the default), AssemblyAI's model-based turn detection is disabled in favor of external VAD. This sends a `ForceEndpoint` message when the VAD detects the user has stopped speaking.
+- **u3-rt-pro model**: The default model is now `u3-rt-pro`, which provides the best performance and supports built-in turn detection. For multilingual support, use `speech_model="universal-streaming-multilingual"`.
+- **Turn detection modes**:
+  - **Pipecat mode** (`vad_force_turn_endpoint=True`, default): Forces AssemblyAI to return finals ASAP so Pipecat's turn detection (e.g., Smart Turn) decides when the user is done. The service sends a `ForceEndpoint` message when VAD detects the user has stopped speaking.
+  - **AssemblyAI mode** (`vad_force_turn_endpoint=False`, u3-rt-pro only): AssemblyAI's model controls turn endings using built-in turn detection. The service emits `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame` based on AssemblyAI's detection.
+- **Speaker diarization**: Enable `speaker_labels=True` in `connection_params` to automatically identify different speakers. Final transcripts will include a speaker field (e.g., "Speaker A", "Speaker B"). Use the `speaker_format` parameter to format transcripts with speaker labels.
+- **Language detection**: When using `universal-streaming-multilingual` with `language_detection=True`, Turn messages include `language_code` and `language_confidence` fields for automatic language detection.
+- **Prompting**: The `prompt` parameter (u3-rt-pro only) allows you to guide transcription for specific names, terms, or domain vocabulary. This is a beta feature - AssemblyAI recommends testing without a prompt first. Cannot be used with `keyterms_prompt`.
 - **Formatted finals**: When `formatted_finals=True`, the service waits for formatted transcripts before emitting final `TranscriptionFrame`s. This provides properly formatted text but may introduce a small delay.
+- **Dynamic settings updates**: You can update `keyterms_prompt`, `prompt`, `min_turn_silence`, and `max_turn_silence` at runtime using `STTUpdateSettingsFrame` without reconnecting.
 
 ## Event Handlers
 
