@@ -5,6 +5,8 @@ description: "Create or modify an agent deployment"
 
 The `deploy` command creates a new agent deployment or updates an existing one. It builds a deployment manifest with the provided parameters and monitors the deployment status until the agent is ready.
 
+When no image is specified, the CLI will offer to build your agent using [Pipecat Cloud Build](/deployment/pipecat-cloud/guides/cloud-builds). This handles Dockerfile generation, building, and deploying without requiring you to manage a container registry.
+
 If the agent name already exists, you'll be prompted to confirm the update unless the `--force` flag is used.
 
 This command will wait for the active deployment / revision to enter a ready state before returning. If the deployment fails, the command will exit with an [error](/deployment/pipecat-cloud/fundamentals/error-codes) with more information.
@@ -21,9 +23,10 @@ pipecat cloud deploy [ARGS] [OPTIONS]
   Unique string identifier for the agent deployment. Must not contain spaces.
 </ParamField>
 
-<ParamField path="image" type="string" required>
+<ParamField path="image" type="string">
   URL of the Docker image to deploy. Must be a valid Docker image URL. For
-  example: `docker.io/my-repo/my-image:latest`.
+  example: `docker.io/my-repo/my-image:latest`. Not required when using
+  [cloud builds](/deployment/pipecat-cloud/guides/cloud-builds) or `--build-id`.
 </ParamField>
 
 **Options:**
@@ -90,6 +93,28 @@ See [Agent Profiles](/deployment/pipecat-cloud/fundamentals/deploy#agent-profile
   Force deployment and skip confirmation prompts. Use with caution.
 </ParamField>
 
+<ParamField path="--yes / -y" type="boolean" default="false">
+  Skip all confirmation prompts, including cloud build prompts. Useful for
+  CI/CD pipelines. When used without an image, automatically triggers a cloud
+  build.
+</ParamField>
+
+<ParamField path="--build-id / -b" type="string">
+  Deploy using an existing cloud build ID instead of building a new image.
+  Cannot be used together with `--image`. You can find build IDs using
+  `pipecat cloud build list`.
+</ParamField>
+
+<ParamField path="--build-dir / -d" type="string">
+  Build context directory for cloud builds. Defaults to the current directory.
+</ParamField>
+
+<ParamField path="--dockerfile" type="string">
+  Path to Dockerfile for cloud builds. Defaults to `Dockerfile` in the build
+  context directory. If no Dockerfile exists, the CLI will offer to generate
+  one automatically.
+</ParamField>
+
 ## Examples
 
 **Deploy a new agent:**
@@ -140,6 +165,24 @@ pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --
 pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --krisp-viva-audio-filter tel
 ```
 
+**Deploy using cloud build (interactive):**
+
+```shell
+pipecat cloud deploy
+```
+
+**Deploy using cloud build in CI/CD (no prompts):**
+
+```shell
+pipecat cloud deploy --yes
+```
+
+**Deploy using an existing build:**
+
+```shell
+pipecat cloud deploy --build-id abc12345-6789-0abc-def0-123456789abc
+```
+
 ## Configuration File (pcc-deploy.toml)
 
 The `deploy` command supports a configuration file for repeatable deployments. Create a `pcc-deploy.toml` file in your project root to define deployment settings that can be shared across your team and version controlled.
@@ -172,8 +215,8 @@ agent_name = "my-voice-agent"
 
 </ParamField>
 
-<ParamField path="image" type="string" required>
-Docker image URL with tag.
+<ParamField path="image" type="string">
+Docker image URL with tag. Required when not using cloud builds or `build_id`.
 
 ```toml
 image = "your-dockername/my-agent:0.1"
@@ -181,7 +224,20 @@ image = "your-dockername/my-agent:0.1"
 
 </ParamField>
 
+<Note>
+  You must specify either `image` or `build_id`, or omit both to trigger a cloud build at deploy time.
+</Note>
+
 #### Optional Fields
+
+<ParamField path="build_id" type="string">
+An existing cloud build ID to deploy. Cannot be used together with `image`.
+
+```toml
+build_id = "abc12345-6789-0abc-def0-123456789abc"
+```
+
+</ParamField>
 
 <ParamField path="region" type="string">
 Region where the agent will be deployed. If not specified, uses your
@@ -277,33 +333,97 @@ audio_filter = "tel"
 
 </ParamField>
 
-### Complete Example
+#### Cloud Build Configuration
+
+Configure cloud build behavior in a `[build]` section:
+
+<ParamField path="build.context_dir" type="string" default=".">
+Directory to use as the build context. Defaults to the current directory.
 
 ```toml
-# Basic agent configuration
-agent_name = "my-voice-agent"
-image = "your-dockername/my-voice-agent:0.1"
-region = "us-west"
-
-# Secrets and credentials
-secret_set = "my-agent-secrets"
-image_credentials = "dockerhub-credentials"
-
-# Resource allocation
-agent_profile = "agent-1x"
-
-# Features
-enable_managed_keys = false
-
-# Auto-scaling configuration
-[scaling]
-min_agents = 1
-max_agents = 20
-
-# Krisp VIVA noise cancellation
-[krisp_viva]
-audio_filter = "tel"
+[build]
+context_dir = "."
 ```
+
+</ParamField>
+
+<ParamField path="build.dockerfile" type="string" default="Dockerfile">
+Path to the Dockerfile within the build context.
+
+```toml
+[build]
+dockerfile = "Dockerfile"
+```
+
+</ParamField>
+
+<ParamField path="build.exclude.patterns" type="string[]">
+Additional file patterns to exclude from the build context. Common patterns like `.git`, `.env`, `__pycache__`, and `.venv` are excluded automatically.
+
+```toml
+[build.exclude]
+patterns = ["*.md", "tests/", "docs/"]
+```
+
+</ParamField>
+
+### Complete Example
+
+<Tabs>
+  <Tab title="With cloud build">
+    ```toml
+    # Basic agent configuration
+    agent_name = "my-voice-agent"
+    region = "us-west"
+
+    # Secrets
+    secret_set = "my-agent-secrets"
+
+    # Resource allocation
+    agent_profile = "agent-1x"
+
+    # Auto-scaling configuration
+    [scaling]
+    min_agents = 1
+    max_agents = 20
+
+    # Cloud build configuration (optional, shown with defaults)
+    [build]
+    context_dir = "."
+    dockerfile = "Dockerfile"
+
+    [build.exclude]
+    patterns = ["*.md", "tests/"]
+    ```
+  </Tab>
+  <Tab title="With custom image">
+    ```toml
+    # Basic agent configuration
+    agent_name = "my-voice-agent"
+    image = "your-dockername/my-voice-agent:0.1"
+    region = "us-west"
+
+    # Secrets and credentials
+    secret_set = "my-agent-secrets"
+    image_credentials = "dockerhub-credentials"
+
+    # Resource allocation
+    agent_profile = "agent-1x"
+
+    # Features
+    enable_managed_keys = false
+
+    # Auto-scaling configuration
+    [scaling]
+    min_agents = 1
+    max_agents = 20
+
+    # Krisp VIVA noise cancellation
+    [krisp_viva]
+    audio_filter = "tel"
+    ```
+  </Tab>
+</Tabs>
 
 ### Using the Configuration File
 
