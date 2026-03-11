@@ -10,12 +10,13 @@ In Pipecat, **context** refers to the conversation history that the LLM uses to 
 ```python
 # Example context structure
 messages = [
-    {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Hello!"},
     {"role": "assistant", "content": "Hi there! How can I help you?"},
     # Context aggregators automatically add new messages here
 ]
 ```
+
+The system prompt is typically set via `system_instruction` in the LLM service's [Settings](/guides/fundamentals/service-settings), not as a message in the context. See [System Instruction vs Context System Messages](#system-instruction-vs-context-system-messages) below for details.
 
 Since Pipecat is a real-time voice AI framework, context management happens automatically as the conversation flows, but you can also control it manually when needed.
 
@@ -52,16 +53,17 @@ Pipecat includes a context aggregator that creates and manages context for both 
 ### 1. Create the Context and Context Aggregator
 
 ```python
-# Create LLM service
-llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+# Create LLM service with system instruction
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAILLMService.Settings(
+        model="gpt-4o",
+        system_instruction="You are a helpful voice assistant.",
+    ),
+)
 
-# Create context with initial messages
-messages = [
-    {"role": "system", "content": "You are a helpful voice assistant."}
-]
-
-# Create context (messages only)
-context = LLMContext(messages)
+# Create context (no system message needed — system_instruction handles it)
+context = LLMContext()
 
 # Create context aggregator instance
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
@@ -139,6 +141,50 @@ pipeline = Pipeline([
 ])
 ```
 
+## System Instruction vs Context System Messages
+
+There are two ways to provide a system prompt to your LLM:
+
+### Using `system_instruction` (recommended)
+
+Set the system prompt via the LLM service's Settings. The service automatically prepends it to the context messages on each request:
+
+```python
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAILLMService.Settings(
+        model="gpt-4o",
+        system_instruction="You are a helpful voice assistant.",
+    ),
+)
+
+# Context only needs conversation messages
+context = LLMContext()
+```
+
+This approach is recommended because:
+
+- **Survives context updates**: The system prompt is always prepended, even after `LLMMessagesUpdateFrame` replaces the context or context summarization compresses older messages.
+- **Shared context**: Multiple LLM services can share a single `LLMContext` while each provides its own system instruction.
+- **Runtime updates**: You can change the system prompt mid-conversation via `LLMUpdateSettingsFrame`.
+
+### Using a context system message
+
+You can also include a system message directly in the context messages:
+
+```python
+messages = [
+    {"role": "system", "content": "You are a helpful voice assistant."},
+]
+context = LLMContext(messages)
+```
+
+This works but has limitations: the system message can be lost during context summarization or full context replacement, and it cannot be shared across multiple LLM services with different system prompts.
+
+<Warning>
+  If both `system_instruction` and a system message in the context are set, `system_instruction` takes precedence and a warning is logged. Avoid using both at the same time.
+</Warning>
+
 ## Context Aggregator Placement
 
 The placement of context aggregator instances in your pipeline is **crucial** for proper operation:
@@ -171,8 +217,8 @@ You can programmatically add new messages to the context by pushing or queueing 
 - **`LLMMessagesUpdateFrame`**: Completely replaces the existing context with new messages
 
 ```python
-# Add a new system message to context
-new_message = {"role": "system", "content": "You are now in expert mode."}
+# Add a new user message to context and trigger a response
+new_message = {"role": "user", "content": "Tell me about your capabilities."}
 await task.queue_frames([
     LLMMessagesAppendFrame([new_message], run_llm=True), # Optionally trigger bot response, too
 ])
@@ -238,6 +284,7 @@ This gives you fine-grained control over when and how the bot responds during th
 ## Key Takeaways
 
 - **Context is conversation history** - automatically maintained as users and bots exchange messages
+- **Use `system_instruction` for system prompts** - set it in LLM Settings rather than as a context message for reliability across context updates and summarization
 - **Frame types matter** - `TranscriptionFrame` for users, `TTSTextFrame` for assistants
 - **Placement matters** - user aggregator after STT, assistant aggregator after transport output
 - **Tools are included** - function definitions and results are stored in context
