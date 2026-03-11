@@ -7,7 +7,7 @@ description: "Dynamically switch between different service instances at runtime 
 
 `ServiceSwitcher` is a specialized parallel pipeline that enables dynamic switching between multiple service instances at runtime. This is useful when you need to change between different STT providers, TTS providers, or other frame processors based on user preferences, costs, performance requirements, or other runtime conditions.
 
-The switcher uses a strategy pattern to determine which service is active. Currently, a manual switching strategy is provided, allowing explicit control over which service handles frames at any given time.
+The switcher uses a strategy pattern to determine which service is active. Two built-in strategies are provided: manual switching for explicit control, and automatic failover for handling service errors.
 
 ## How It Works
 
@@ -16,11 +16,16 @@ The switcher uses a strategy pattern to determine which service is active. Curre
 ## Constructor
 
 ```python
-from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyManual
+from pipecat.pipeline.service_switcher import ServiceSwitcher
 
+# Uses ServiceSwitcherStrategyManual by default
+switcher = ServiceSwitcher(services=[stt_service1, stt_service2])
+
+# Or explicitly specify a strategy
+from pipecat.pipeline.service_switcher import ServiceSwitcherStrategyFailover
 switcher = ServiceSwitcher(
     services=[stt_service1, stt_service2],
-    strategy_type=ServiceSwitcherStrategyManual
+    strategy_type=ServiceSwitcherStrategyFailover
 )
 ```
 
@@ -29,9 +34,13 @@ switcher = ServiceSwitcher(
   TTS, or custom processors).
 </ParamField>
 
-<ParamField path="strategy_type" type="Type[ServiceSwitcherStrategy]" required>
+<ParamField
+  path="strategy_type"
+  type="Type[ServiceSwitcherStrategy]"
+  default="ServiceSwitcherStrategyManual"
+>
   The strategy class to use for switching logic. Pass the class itself, not an
-  instance.
+  instance. Defaults to ``ServiceSwitcherStrategyManual``.
 </ParamField>
 
 ## Switching Strategies
@@ -44,9 +53,38 @@ The manual strategy allows explicit control over which service is active by push
 
 **Switching**: Push a `ManuallySwitchServiceFrame` with the desired service instance.
 
+### ServiceSwitcherStrategyFailover
+
+The failover strategy automatically switches to the next available service when the active service reports a non-fatal error. This enables automatic recovery from service failures without manual intervention.
+
+**Initial State**: The first service in the list is active by default.
+
+**Automatic Failover**: When the active service pushes a non-fatal `ErrorFrame`, the strategy automatically switches to the next service in the list (wrapping around to the first service if needed).
+
+**Recovery**: The failed service remains in the list and can be switched back to manually or via application logic in the `on_service_switched` event handler. This allows implementing custom recovery policies.
+
+```python
+from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
+
+switcher = ServiceSwitcher(
+    services=[primary_stt, backup_stt],
+    strategy_type=ServiceSwitcherStrategyFailover
+)
+
+@switcher.strategy.event_handler("on_service_switched")
+async def on_switched(strategy, service):
+    # Application decides when/how to recover the failed service
+    print(f"Switched to: {service.name}")
+```
+
 ### Custom Strategies
 
-You can create your own switching strategy by subclassing `ServiceSwitcherStrategy` and implementing the `handle_frame` method. This method receives a `ServiceSwitcherFrame` and should return the newly active service if a switch occurred, or `None` otherwise.
+You can create your own switching strategy by subclassing `ServiceSwitcherStrategy` and implementing the `handle_frame` and/or `handle_error` methods.
+
+- **`handle_frame(frame, direction)`**: Called for control frames (like `ManuallySwitchServiceFrame`). Should return the newly active service if a switch occurred, or `None` otherwise.
+- **`handle_error(error)`**: Called when the active service reports a non-fatal error. Override this to implement custom error-handling logic. Should return the newly active service if a switch occurred, or `None` otherwise.
+
+Additionally, if you want to maintain either manual switching or automatic failover as an option when writing a custom strategy, your new strategy should inherit from `ServiceSwitcherStrategyManual` or `ServiceSwitcherStrategyFailover`, respectively.
 
 ## Usage Examples
 
@@ -54,7 +92,7 @@ You can create your own switching strategy by subclassing `ServiceSwitcherStrate
 
 ```python
 from pipecat.frames.frames import ManuallySwitchServiceFrame
-from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyManual
+from pipecat.pipeline.service_switcher import ServiceSwitcher
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 
@@ -62,11 +100,8 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 elevenlabs = ElevenLabsTTSService(api_key=os.getenv("ELEVENLABS_API_KEY"), voice_id=os.getenv("ELEVENLABS_VOICE_ID"))
 cartesia = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=os.getenv("CARTESIA_VOICE_ID"))
 
-# Create switcher with both services
-tts_switcher = ServiceSwitcher(
-    services=[elevenlabs, cartesia],
-    strategy_type=ServiceSwitcherStrategyManual
-)
+# Create switcher with both services (uses ServiceSwitcherStrategyManual by default)
+tts_switcher = ServiceSwitcher(services=[elevenlabs, cartesia])
 
 # Use in pipeline
 pipeline = Pipeline([
