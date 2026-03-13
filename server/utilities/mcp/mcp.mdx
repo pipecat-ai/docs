@@ -21,21 +21,68 @@ You may also need to set environment variables as required by the specific MCP s
 
 ### Constructor Parameters
 
-You can connect to your MCP server via Stdio or SSE transport. See [here](https://modelcontextprotocol.io/docs/concepts/transports#built-in-transport-types) for more documentation on MCP transports.
+You can connect to your MCP server via Stdio, SSE, or Streamable HTTP transport. See [here](https://modelcontextprotocol.io/docs/concepts/transports#built-in-transport-types) for more documentation on MCP transports.
 
-<ParamField path="server_params" type="str | StdioServerParameters" required>
+<ParamField path="server_params" type="StdioServerParameters | SseServerParameters | StreamableHttpParameters" required>
 
-You can provide either:
+Connection parameters for the MCP server. Must be one of:
 
-- URL: "https://your.mcp.server/sse"
-- StdioServerParameters, which are defined as:
+- `StdioServerParameters` (from `mcp`): Connects to a local MCP server process via stdio.
 
 ```python
-  StdioServerParameters(
-        command="python",  # Executable
-        args=["example_server.py"],  # Optional command line arguments
-        env=None,  # Optional environment variables
-    )
+from mcp import StdioServerParameters
+
+StdioServerParameters(
+    command="python",       # Executable
+    args=["server.py"],     # Optional command line arguments
+    env=None,               # Optional environment variables
+)
+```
+
+- `SseServerParameters` (from `mcp.client.session_group`): Connects to a remote MCP server via Server-Sent Events.
+
+```python
+from mcp.client.session_group import SseServerParameters
+
+SseServerParameters(
+    url="https://your.mcp.server/sse",  # Server URL
+    headers=None,                        # Optional HTTP headers
+    timeout=5,                           # Connection timeout in seconds
+    sse_read_timeout=300,                # SSE read timeout in seconds
+)
+```
+
+- `StreamableHttpParameters` (from `mcp.client.session_group`): Connects to a remote MCP server via Streamable HTTP.
+
+```python
+from mcp.client.session_group import StreamableHttpParameters
+
+StreamableHttpParameters(
+    url="https://your.mcp.server/mcp/",  # Server URL
+    headers=None,                         # Optional HTTP headers
+    timeout=5,                            # Connection timeout in seconds
+    sse_read_timeout=300,                 # SSE read timeout in seconds
+    terminate_on_close=True,              # Terminate session on close
+)
+```
+
+</ParamField>
+
+<ParamField path="tools_filter" type="Optional[List[str]]" default="None">
+  Optional list of tool names to register. If `None`, all tools from the MCP
+  server are registered. Use this to limit which tools are exposed to the LLM.
+</ParamField>
+
+<ParamField path="tools_output_filters" type="Optional[Dict[str, Callable]]" default="None">
+  Optional dictionary mapping tool names to filter functions that post-process tool outputs. Each filter function receives the raw tool output and returns the processed output.
+
+```python
+mcp = MCPClient(
+    server_params=server_params,
+    tools_output_filters={
+        "search": lambda result: result[:500],  # Truncate long results
+    },
+)
 ```
 
 </ParamField>
@@ -44,35 +91,32 @@ You can provide either:
 
 See more information regarding server params [here](https://github.com/modelcontextprotocol/python-sdk?tab=readme-ov-file#writing-mcp-clients).
 
-## Usage Example
+## Usage Examples
 
-### MCP Stdio Transport Implementation
+### MCP Stdio Transport
 
 ```python
+import shutil
 
-# Import MCPClient and StdioServerParameters
-...
 from mcp import StdioServerParameters
 from pipecat.services.mcp_service import MCPClient
-...
 
 # Initialize an LLM
 llm = ...
 
 # Initialize and configure MCPClient with server parameters
 mcp = MCPClient(
-        server_params=StdioServerParameters(
-            command=shutil.which("npx"),
-            args=["-y", "@name/mcp-server-name@latest"],
-            env={"ENV_API_KEY": "<env_api_key>"},
-        )
+    server_params=StdioServerParameters(
+        command=shutil.which("npx"),
+        args=["-y", "@name/mcp-server-name@latest"],
+        env={"ENV_API_KEY": "<env_api_key>"},
     )
+)
 
 # Create tools schema from the MCP server and register them with llm
 tools = await mcp.register_tools(llm)
 
 # Create context with system message and tools
-# Tip: Let the LLM know it has access to tools from an MCP server by including it in the system prompt.
 context = LLMContext(
     messages=[
         {
@@ -84,26 +128,26 @@ context = LLMContext(
 )
 ```
 
-### MCP SSE Transport Implementation
+### MCP SSE Transport
 
 ```python
-
-# Import MCPClient
-...
+from mcp.client.session_group import SseServerParameters
 from pipecat.services.mcp_service import MCPClient
-...
 
 # Initialize an LLM
 llm = ...
 
-# Initialize and configure MCPClient with MCP SSE server url
-mcp = MCPClient(server_params="https://your.mcp.server/sse")
+# Initialize and configure MCPClient with SSE server parameters
+mcp = MCPClient(
+    server_params=SseServerParameters(
+        url="https://your.mcp.server/sse",
+    )
+)
 
 # Create tools schema from the MCP server and register them with llm
 tools = await mcp.register_tools(llm)
 
 # Create context with system message and tools
-# Tip: Let the LLM know it has access to tools from an MCP server by including it in the system prompt.
 context = LLMContext(
     messages=[
         {
@@ -113,17 +157,135 @@ context = LLMContext(
     ],
     tools=tools
 )
+```
+
+### MCP Streamable HTTP Transport
+
+```python
+import os
+
+from mcp.client.session_group import StreamableHttpParameters
+from pipecat.services.mcp_service import MCPClient
+
+# Initialize an LLM
+llm = ...
+
+# Initialize and configure MCPClient with Streamable HTTP parameters
+mcp = MCPClient(
+    server_params=StreamableHttpParameters(
+        url="https://api.githubcopilot.com/mcp/",
+        headers={"Authorization": f"Bearer {os.getenv('GITHUB_PERSONAL_ACCESS_TOKEN')}"},
+    )
+)
+
+# Create tools schema from the MCP server and register them with llm
+tools = await mcp.register_tools(llm)
+
+# Create context with tools
+context = LLMContext(tools=tools)
+```
+
+### Two-Step Registration
+
+Some LLM services (e.g. Gemini Live) require tools to be passed at construction time. Use `get_tools_schema()` to obtain the schema first, then `register_tools_schema()` to register handlers after the LLM is created.
+
+```python
+from mcp.client.session_group import StreamableHttpParameters
+from pipecat.services.mcp_service import MCPClient
+
+# Initialize MCPClient
+mcp = MCPClient(
+    server_params=StreamableHttpParameters(
+        url="https://api.githubcopilot.com/mcp/",
+        headers={"Authorization": f"Bearer {os.getenv('GITHUB_PERSONAL_ACCESS_TOKEN')}"},
+    )
+)
+
+# Step 1: Get tools schema without registering
+tools = await mcp.get_tools_schema()
+
+# Step 2: Create LLM with tools
+llm = GeminiLiveLLMService(
+    api_key=os.getenv("GOOGLE_API_KEY"),
+    system_instruction="You are a helpful assistant.",
+    tools=tools,
+)
+
+# Step 3: Register tool handlers with the LLM
+await mcp.register_tools_schema(tools, llm)
+```
+
+### Multiple MCP Servers
+
+You can combine tools from multiple MCP servers by merging their `ToolsSchema` objects.
+
+```python
+from mcp import StdioServerParameters
+from mcp.client.session_group import StreamableHttpParameters
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.mcp_service import MCPClient
+
+# Initialize an LLM
+llm = ...
+
+# Set up multiple MCP clients
+server_a = MCPClient(
+    server_params=StdioServerParameters(
+        command=shutil.which("npx"),
+        args=["-y", "mcp-server-a"],
+        env={"API_KEY": os.getenv("SERVER_A_API_KEY")},
+    )
+)
+
+server_b = MCPClient(
+    server_params=StreamableHttpParameters(
+        url="https://api.githubcopilot.com/mcp/",
+        headers={"Authorization": f"Bearer {os.getenv('GITHUB_PERSONAL_ACCESS_TOKEN')}"},
+    )
+)
+
+# Register tools from each server
+tools_a = await server_a.register_tools(llm)
+tools_b = await server_b.register_tools(llm)
+
+# Merge tools into a single schema
+all_tools = ToolsSchema(
+    standard_tools=tools_a.standard_tools + tools_b.standard_tools
+)
+
+# Create context with combined tools
+context = LLMContext(tools=all_tools)
 ```
 
 ## Methods
 
 <ResponseField name="register_tools" type="async method">
-  Converts MCP tools to Pipecat-friendly function definitions and registers the
-  functions with the llm.
+  Connects to the MCP server, discovers available tools, converts their schemas
+  to Pipecat format, and registers them with the LLM service. This is equivalent
+  to calling `get_tools_schema()` followed by `register_tools_schema()`.
 </ResponseField>
 
 ```python
-async def register_tools(self, llm) -> ToolsSchema:
+async def register_tools(self, llm: LLMService | LLMSwitcher) -> ToolsSchema
+```
+
+<ResponseField name="get_tools_schema" type="async method">
+  Connects to the MCP server, discovers available tools, and converts their
+  schemas to Pipecat format — without registering them with an LLM. Use this
+  when you need the tools schema before the LLM is created.
+</ResponseField>
+
+```python
+async def get_tools_schema(self) -> ToolsSchema
+```
+
+<ResponseField name="register_tools_schema" type="async method">
+  Registers a previously obtained `ToolsSchema` with an LLM service. Use this
+  after `get_tools_schema()` once the LLM is available.
+</ResponseField>
+
+```python
+async def register_tools_schema(self, tools_schema: ToolsSchema, llm: LLMService | LLMSwitcher) -> None
 ```
 
 ## Additional documentation
