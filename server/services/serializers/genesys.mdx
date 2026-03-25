@@ -1,0 +1,216 @@
+---
+title: "GenesysAudioHookSerializer"
+description: "Serializer for Genesys Cloud AudioHook WebSocket protocol"
+---
+
+## Overview
+
+`GenesysAudioHookSerializer` enables integration with Genesys Cloud Contact Center via the AudioHook protocol (v2), allowing your Pipecat application to handle contact center interactions with bidirectional audio streaming, DTMF event handling, barge-in support, and Architect flow variable passing.
+
+<CardGroup cols={2}>
+  <Card
+    title="Genesys Serializer API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.serializers.genesys.html"
+  >
+    Pipecat's API methods for Genesys AudioHook integration
+  </Card>
+  <Card
+    title="Genesys AudioHook Documentation"
+    icon="book"
+    href="https://developer.genesys.cloud/devapps/audiohook"
+  >
+    Official Genesys AudioHook protocol reference
+  </Card>
+</CardGroup>
+
+## Installation
+
+The `GenesysAudioHookSerializer` does not require any additional dependencies beyond the core Pipecat library:
+
+```bash
+pip install "pipecat-ai"
+```
+
+## Prerequisites
+
+### Genesys Cloud Setup
+
+Before using GenesysAudioHookSerializer, you need:
+
+1. **Genesys Cloud Organization**: Access to a Genesys Cloud org with AudioHook enabled
+2. **AudioHook Integration**: Configure an AudioHook integration in Genesys Cloud admin
+3. **Architect Flow**: Create an Architect flow that uses the AudioHook action to connect calls to your Pipecat application
+4. **WebSocket Endpoint**: A publicly accessible WebSocket endpoint for Genesys to connect to
+
+### Key Features
+
+- **Bidirectional Audio**: Stream audio between Genesys and Pipecat in PCMU format at 8kHz
+- **Protocol Handshake**: Automatic handling of open/opened, close/closed, and ping/pong messages
+- **DTMF Handling**: Process touch-tone events from callers
+- **Barge-in Support**: Notify Genesys when the user interrupts bot audio
+- **Pause/Resume**: Handle hold scenarios when audio streaming is temporarily suspended
+- **Architect Variables**: Pass input/output variables between Architect flows and your bot
+- **Stereo Support**: Process external (customer) audio, internal (agent) audio, or both channels
+
+## Configuration
+
+<ParamField path="params" type="InputParams" default="None">
+  Configuration parameters for audio and protocol behavior. See
+  [InputParams](#inputparams) below.
+</ParamField>
+
+### InputParams
+
+| Parameter               | Type                   | Default      | Description                                                                                         |
+| ----------------------- | ---------------------- | ------------ | --------------------------------------------------------------------------------------------------- |
+| `genesys_sample_rate`   | `int`                  | `8000`       | Sample rate used by Genesys (Hz).                                                                   |
+| `sample_rate`           | `int`                  | `None`       | Optional override for pipeline input sample rate. When `None`, uses the pipeline's configured rate. |
+| `channel`               | `AudioHookChannel`     | `"external"` | Which audio channels to process: `"external"` (customer), `"internal"` (agent), or `"both"` (stereo). |
+| `media_format`          | `AudioHookMediaFormat` | `"PCMU"`     | Audio format: `"PCMU"` (mu-law) or `"L16"` (16-bit linear PCM).                                    |
+| `process_external`      | `bool`                 | `True`       | Whether to process external (customer) audio.                                                       |
+| `process_internal`      | `bool`                 | `False`      | Whether to process internal (agent) audio.                                                          |
+| `supported_languages`   | `list[str]`            | `None`       | List of language codes the bot supports (e.g., `["en-US", "es-ES"]`).                               |
+| `selected_language`     | `str`                  | `None`       | Default language code to use.                                                                       |
+| `start_paused`          | `bool`                 | `False`      | Whether to start the session in paused state.                                                       |
+| `ignore_rtvi_messages`  | `bool`                 | `True`       | Whether to ignore RTVI protocol messages during serialization.                                      |
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.serializers.genesys import GenesysAudioHookSerializer
+from pipecat.transports.network.fastapi_websocket import (
+    FastAPIWebsocketTransport,
+    FastAPIWebsocketParams,
+)
+
+serializer = GenesysAudioHookSerializer()
+
+transport = FastAPIWebsocketTransport(
+    websocket=websocket,
+    params=FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        serializer=serializer,
+        audio_out_fixed_packet_size=1600,
+    ),
+)
+```
+
+### With Language Support
+
+```python
+serializer = GenesysAudioHookSerializer(
+    params=GenesysAudioHookSerializer.InputParams(
+        supported_languages=["en-US", "es-ES", "fr-FR"],
+        selected_language="en-US",
+    )
+)
+```
+
+### Accessing Call Metadata
+
+After the AudioHook session opens, you can access call metadata from the serializer:
+
+```python
+# Participant info (ani, dnis, etc.)
+participant = serializer.participant
+
+# Custom input variables from the Architect flow
+input_vars = serializer.input_variables
+
+# Conversation and session IDs
+conversation_id = serializer.conversation_id
+session_id = serializer.session_id
+```
+
+### Setting Output Variables
+
+Output variables are passed back to the Genesys Architect flow when the session closes, allowing your bot to influence downstream call routing and logic:
+
+```python
+# Set variables during the conversation
+serializer.set_output_variables({
+    "intent": "billing_inquiry",
+    "customer_verified": True,
+    "summary": "Customer asked about their bill",
+    "transfer_to": "billing_queue",
+})
+```
+
+### Server-Initiated Disconnect
+
+To disconnect the session from the server side (e.g., when the bot has finished):
+
+```python
+from pipecat.frames.frames import OutputTransportMessageUrgentFrame
+
+# Send a disconnect message through the pipeline
+disconnect_msg = serializer.create_disconnect_message(
+    reason="completed",
+    action="transfer",
+    output_variables={"intent": "resolved"},
+)
+await task.queue_frame(OutputTransportMessageUrgentFrame(message=disconnect_msg))
+```
+
+### Event Handlers
+
+The serializer emits events that you can handle for custom logic:
+
+```python
+@serializer.event_handler("on_open")
+async def on_open(serializer, message):
+    logger.info(f"Session opened: {serializer.conversation_id}")
+
+@serializer.event_handler("on_close")
+async def on_close(serializer, message):
+    logger.info("Session closing")
+
+@serializer.event_handler("on_dtmf")
+async def on_dtmf(serializer, message):
+    digit = message.get("parameters", {}).get("digit")
+    logger.info(f"DTMF digit pressed: {digit}")
+
+@serializer.event_handler("on_pause")
+async def on_pause(serializer, message):
+    logger.info("Audio paused (caller on hold)")
+```
+
+## Protocol Details
+
+### AudioHook v2 Protocol
+
+The Genesys AudioHook protocol uses WebSocket connections with two frame types:
+
+- **Text frames**: JSON control messages for session lifecycle (open, close, ping, pause, etc.)
+- **Binary frames**: Raw audio data in PCMU or L16 format
+
+### Message Flow
+
+A typical session follows this sequence:
+
+1. Genesys connects to your WebSocket endpoint
+2. Genesys sends an `open` message with session metadata
+3. The serializer automatically responds with `opened`
+4. Bidirectional audio streaming begins via binary frames
+5. Genesys sends periodic `ping` messages; the serializer responds with `pong`
+6. When the call ends, Genesys sends `close`; the serializer responds with `closed` (including any output variables)
+
+### Audio Format
+
+- **Default encoding**: PCMU (mu-law) at 8kHz mono
+- **Automatic resampling**: The serializer converts between the 8kHz Genesys format and your pipeline's sample rate using SOXR resampling
+- **Stereo handling**: When channel is set to `"both"`, Genesys sends stereo audio with external (customer) on the left channel and internal (agent) on the right. The serializer extracts the external channel for processing.
+
+## Notes
+
+- **Fixed packet size**: Set `audio_out_fixed_packet_size=1600` on your transport parameters. This batches outbound audio into consistent chunks and prevents 429 rate limiting from Genesys.
+- **No extra dependencies**: The serializer uses Pipecat's built-in audio conversion utilities (`pcm_to_ulaw`, `ulaw_to_pcm`) and SOXR resampler.
+- **Barge-in**: When the pipeline emits an `InterruptionFrame`, the serializer automatically sends a barge-in event to Genesys, which stops any queued audio playback on the Genesys side.
+- **Pause/resume**: When Genesys sends a `pause` message (e.g., caller placed on hold), audio processing is suspended. The serializer drops incoming and outgoing audio while paused. Use the `on_pause` event handler and `create_resumed_response()` to control when streaming resumes.
+- **Output variables**: Variables set via `set_output_variables()` are included in the `closed` response when Genesys terminates the session. These variables become available in the Architect flow for routing decisions.
+- **DTMF support**: Phone keypad events are converted to `InputDTMFFrame` objects and can be processed in your pipeline.
+- **L16 format**: While the serializer accepts `AudioHookMediaFormat.L16` as a configuration option, L16 support is not yet fully implemented. Use PCMU (the default) for production deployments.
