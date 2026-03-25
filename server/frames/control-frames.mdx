@@ -3,13 +3,15 @@ title: "Control Frames"
 description: "Reference for ControlFrame types: pipeline lifecycle, response boundaries, service settings, and runtime configuration"
 ---
 
-ControlFrames are queued and processed in order alongside data frames. They signal boundaries, state changes, and configuration updates within the pipeline. Unlike system frames, control frames respect ordering guarantees — they won't skip ahead of data frames already in the queue. Control frames are cancelled on user interruption unless combined with `UninterruptibleFrame`. See the [frames overview](/server/frames/overview) for base class details and the full frame hierarchy.
+ControlFrames signal boundaries, state changes, and configuration updates within the pipeline. They are queued and processed in order alongside DataFrames. ControlFrames are cancelled on `InterruptionFrame` unless combined with `UninterruptibleFrame`. See the [frames overview](/server/frames/overview) for base class details and the full frame hierarchy.
 
 ## Pipeline Lifecycle
 
 ### EndFrame
 
-Signals graceful pipeline shutdown. The transport stops sending, closes its threads, and the pipeline winds down completely. Inherits from both `ControlFrame` and `UninterruptibleFrame`, so it cannot be cancelled by interruption.
+Signals graceful pipeline shutdown. `EndFrame` is queued with other non-SystemFrames, which allows FrameProcessors to be shut down in order, allowing queued frames ahead of the `EndFrame` to be processed first.
+
+Inherits from `UninterruptibleFrame`, meaning it cannot be cancelled by `InterruptionFrame`.
 
 <ParamField path="reason" type="Optional[Any]" default="None">
   Optional reason for the shutdown, passed along for logging or inspection.
@@ -17,13 +19,13 @@ Signals graceful pipeline shutdown. The transport stops sending, closes its thre
 
 ### StopFrame
 
-Stops the pipeline but keeps processors in a running state. Useful when you need to halt frame flow without tearing down the entire processor graph. Inherits from `ControlFrame` and `UninterruptibleFrame`.
+Stops the pipeline but keeps processors in a running state. Like `EndFrame`, `StopFrame` is queued with other non-SystemFrames allowing frames preceding it to be processed first. Useful when you need to halt frame flow without tearing down the entire processor graph.
 
+Inherits from `UninterruptibleFrame`.
 
 ### OutputTransportReadyFrame
 
 Indicates that the output transport is ready to receive frames. Processors waiting on transport availability can use this as their signal to begin sending.
-
 
 ### HeartbeatFrame
 
@@ -37,12 +39,18 @@ Used for pipeline health monitoring. Processors can observe these to detect stal
 
 While a processor is paused, incoming frames accumulate in its internal queue rather than being dropped. Once the processor is resumed, it drains the queue and processes all buffered frames in the order they arrived.
 
-For example, the TTS service pauses itself while synthesizing a `TTSSpeakFrame`. If new text frames arrive during synthesis, they queue up instead of producing overlapping audio. The TTS resumes when `BotStoppedSpeakingFrame` (a system frame) arrives, and the buffered frames are processed in order.
+For example, the TTS service pauses itself while synthesizing a `TTSSpeakFrame`. If new text frames arrive during synthesis, they queue up instead of producing overlapping audio. The TTS resumes when `BotStoppedSpeakingFrame` (a `SystemFrame`) arrives, and the buffered frames are processed in order.
 
-Internally, each processor has two queues: a high-priority input queue for system frames and a process queue for everything else. Pausing blocks the process queue, but system frames continue to flow through the input queue. This is why the typical pattern is for a processor to pause itself and then resume in response to a system frame.
+Internally, each processor has two queues: a high-priority input queue for SystemFrames and a process queue for everything else. Pausing blocks the process queue, but SystemFrames continue to flow through the input queue. This is why the typical pattern is for a processor to pause itself and then resume in response to a `SystemFrame`.
 
 <Note>
-`FrameProcessorResumeFrame` is a control frame, which means it enters the same process queue that pausing blocks. If data frames have already queued up ahead of it, the resume frame will be stuck behind them and the processor will stay paused. To resume a paused processor from outside, use the system frame variant `FrameProcessorResumeUrgentFrame` instead — it bypasses the process queue entirely. See [System Frames](/server/frames/system-frames#processor-pauseresume-urgent).
+  `FrameProcessorResumeFrame` is a `ControlFrame`, which means it enters the
+  same process queue that pausing blocks. If DataFrames have already queued up
+  ahead of it, the resume frame will be stuck behind them and the processor will
+  stay paused. To resume a paused processor from outside, use the `SystemFrame`
+  variant `FrameProcessorResumeUrgentFrame` instead — it bypasses the process
+  queue entirely. See [System
+  Frames](/server/frames/system-frames#processor-pauseresume-urgent).
 </Note>
 
 ### FrameProcessorPauseFrame
@@ -62,7 +70,9 @@ Resumes a previously paused processor, releasing all buffered frames for process
 </ParamField>
 
 <Note>
-Because this is a control frame, it will be blocked behind any data frames that queued up while the processor was paused. Use `FrameProcessorResumeUrgentFrame` if the processor may have buffered frames.
+  Because this is a `ControlFrame`, it will be blocked behind any DataFrames
+  that queued up while the processor was paused. Use
+  `FrameProcessorResumeUrgentFrame` if the processor may have buffered frames.
 </Note>
 
 ## LLM Response Boundaries
@@ -73,26 +83,21 @@ These frames bracket LLM output, letting downstream processors (aggregators, TTS
 
 Marks the beginning of an LLM response. Followed by one or more `TextFrame`s and terminated by `LLMFullResponseEndFrame`.
 
-
 ### LLMFullResponseEndFrame
 
 Marks the end of an LLM response.
-
 
 ### VisionFullResponseStartFrame
 
 Beginning of a vision model response. Inherits from `LLMFullResponseStartFrame`.
 
-
 ### VisionFullResponseEndFrame
 
 End of a vision model response. Inherits from `LLMFullResponseEndFrame`.
 
-
 ### LLMAssistantPushAggregationFrame
 
 Forces the assistant aggregator to commit its buffered text to context immediately, rather than waiting for the normal end-of-response boundary.
-
 
 ## LLM Context Summarization
 
@@ -102,7 +107,11 @@ Frames that coordinate context summarization: compressing conversation history t
 
 Triggers manual context summarization. Push this frame to request that the LLM summarize the current conversation context.
 
-<ParamField path="config" type="Optional[LLMContextSummaryConfig]" default="None">
+<ParamField
+  path="config"
+  type="Optional[LLMContextSummaryConfig]"
+  default="None"
+>
   Optional configuration controlling summarization behavior.
 </ParamField>
 
@@ -136,7 +145,9 @@ Internal request from the aggregator to the LLM service, asking it to produce a 
 
 ### LLMContextSummaryResultFrame
 
-The LLM's summarization result, sent back to the aggregator. Inherits from both `ControlFrame` and `UninterruptibleFrame` to ensure the result is never dropped.
+The LLM's summarization result, sent back to the aggregator.
+
+Inherits from `UninterruptibleFrame` to ensure the result is never dropped.
 
 <ParamField path="request_id" type="str">
   Matches the originating request.
@@ -163,11 +174,13 @@ Bracket extended thinking output from LLMs that support it (e.g., Claude with ex
 Marks the beginning of LLM extended thinking content.
 
 <ParamField path="append_to_context" type="bool" default="False">
-  Whether to append thought content to the conversation context. Raises `ValueError` if set to `True` without specifying `llm`.
+  Whether to append thought content to the conversation context. Raises
+  `ValueError` if set to `True` without specifying `llm`.
 </ParamField>
 
 <ParamField path="llm" type="Optional[str]" default="None">
-  Identifier for the LLM producing the thought. Required when `append_to_context` is `True`.
+  Identifier for the LLM producing the thought. Required when
+  `append_to_context` is `True`.
 </ParamField>
 
 ### LLMThoughtEndFrame
@@ -175,14 +188,17 @@ Marks the beginning of LLM extended thinking content.
 Marks the end of LLM extended thinking content.
 
 <ParamField path="signature" type="Any" default="None">
-  Thought signature, if provided by the LLM. Anthropic models include a signature that must be preserved when appending thoughts back to context.
+  Thought signature, if provided by the LLM. Anthropic models include a
+  signature that must be preserved when appending thoughts back to context.
 </ParamField>
 
 ## Function Calling
 
 ### FunctionCallInProgressFrame
 
-Indicates that a function call is currently executing. Inherits from `ControlFrame` and `UninterruptibleFrame`, ensuring it reaches downstream processors even during interruption.
+Indicates that a function call is currently executing.
+
+Inherits from `UninterruptibleFrame`, ensuring it reaches downstream processors even during interruption.
 
 <ParamField path="function_name" type="str">
   Name of the function being called.
@@ -220,38 +236,39 @@ Signals the end of a TTS audio response.
 
 ## Service Settings
 
-Runtime settings updates for LLM, TTS, STT, and other services. These let you change service configuration mid-conversation without rebuilding the pipeline.
+Runtime settings updates for LLM, TTS, STT, and other services. These let you change service configuration mid-conversation without rebuilding the pipeline. Push an `LLMUpdateSettingsFrame`, `TTSUpdateSettingsFrame`, or `STTUpdateSettingsFrame` to update the corresponding service. See the [Changing Service Settings at Runtime](/server/frames/overview#changing-service-settings-at-runtime) pattern for an example.
 
 ### ServiceUpdateSettingsFrame
 
-Base frame for runtime service settings updates. Inherits from `ControlFrame` and `UninterruptibleFrame`.
+Base frame for runtime service settings updates.
+
+Inherits from `UninterruptibleFrame`.
 
 <ParamField path="settings" type="Mapping[str, Any]" default="{}">
   Dictionary of settings to update.
 </ParamField>
 
 <ParamField path="delta" type="Optional[ServiceSettings]" default="None">
-  Typed settings delta. Takes precedence over the `settings` dict when both are provided.
+  Typed settings delta. Takes precedence over the `settings` dict when both are
+  provided.
 </ParamField>
 
 <ParamField path="service" type="Optional[FrameProcessor]" default="None">
-  Target a specific service instance. When `None`, the frame applies to the first matching service in the pipeline.
+  Target a specific service instance. When `None`, the frame applies to the
+  first matching service in the pipeline.
 </ParamField>
 
 ### LLMUpdateSettingsFrame
 
 Update LLM service settings at runtime. Inherits from `ServiceUpdateSettingsFrame`.
 
-
 ### TTSUpdateSettingsFrame
 
 Update TTS service settings at runtime. Inherits from `ServiceUpdateSettingsFrame`.
 
-
 ### STTUpdateSettingsFrame
 
 Update STT service settings at runtime. Inherits from `ServiceUpdateSettingsFrame`.
-
 
 ## Audio Processing
 
@@ -266,7 +283,6 @@ Update Voice Activity Detection parameters at runtime.
 ### FilterControlFrame
 
 Base frame for audio filter control. Subclass this for custom filter commands.
-
 
 ### FilterUpdateSettingsFrame
 
@@ -287,7 +303,6 @@ Enable or disable an audio filter. Inherits from `FilterControlFrame`.
 ### MixerControlFrame
 
 Base frame for audio mixer control.
-
 
 ### MixerUpdateSettingsFrame
 
@@ -311,7 +326,6 @@ Enable or disable an audio mixer. Inherits from `MixerControlFrame`.
 
 Base frame for service switching operations.
 
-
 ### ManuallySwitchServiceFrame
 
 Request a manual switch to a different service instance. Inherits from `ServiceSwitcherFrame`.
@@ -334,8 +348,7 @@ Task frames are pushed upstream to the pipeline task, which converts them into t
 
 ### TaskFrame
 
-Base frame for task control. Inherits from `ControlFrame`.
-
+Base frame for task control.
 
 ### EndTaskFrame
 
