@@ -1,0 +1,478 @@
+---
+title: "System Frames"
+description: "Reference for SystemFrame types: pipeline lifecycle, interruptions, speaking state, input, and diagnostics"
+---
+
+SystemFrames have higher priority than DataFrames and ControlFrames and are never cancelled during user interruptions. They are queued and processed in order with other SystemFrames. They carry signals that must always be delivered: pipeline startup and teardown, error notifications, user input, and speaking state changes. See the [frames overview](/server/frames/overview) for base class details, mixin fields, and frame properties common to all frames.
+
+## Pipeline Lifecycle
+
+### StartFrame
+
+The first frame pushed into a pipeline, initializing all processors. Every processor receives this before any DataFrames or ControlFrames arrive.
+
+<ParamField path="audio_in_sample_rate" type="int" default="16000">
+  Input audio sample rate in Hz.
+</ParamField>
+
+<ParamField path="audio_out_sample_rate" type="int" default="24000">
+  Output audio sample rate in Hz.
+</ParamField>
+
+<ParamField path="allow_interruptions" type="bool" default="False">
+  Whether user interruptions are allowed. Deprecated since 0.0.99: use
+  interruption strategies instead.
+</ParamField>
+
+<ParamField path="enable_metrics" type="bool" default="False">
+  Enable performance metrics collection from processors.
+</ParamField>
+
+<ParamField path="enable_tracing" type="bool" default="False">
+  Enable tracing for pipeline execution.
+</ParamField>
+
+<ParamField path="enable_usage_metrics" type="bool" default="False">
+  Enable usage metrics (token counts, API calls) from services.
+</ParamField>
+
+<ParamField
+  path="interruption_strategies"
+  type="List[BaseInterruptionStrategy]"
+  default="[]"
+>
+  List of interruption strategies for the pipeline. Deprecated since 0.0.99.
+</ParamField>
+
+<ParamField path="report_only_initial_ttfb" type="bool" default="False">
+  When `True`, only report time-to-first-byte for the initial response rather
+  than every response.
+</ParamField>
+
+<ParamField
+  path="tracing_context"
+  type="Optional[TracingContext]"
+  default="None"
+>
+  Optional tracing context for distributed tracing integration.
+</ParamField>
+
+### CancelFrame
+
+Stops the pipeline immediately, skipping any queued non-SystemFrames. Use this when you need to abort without waiting for pending work to drain. For example, when the user has left the session.
+
+<ParamField path="reason" type="Optional[Any]" default="None">
+  Optional reason for the cancellation.
+</ParamField>
+
+## Errors
+
+### ErrorFrame
+
+Carries an error notification, typically pushed upstream so earlier processors can react.
+
+<ParamField path="error" type="str" required>
+  Human-readable error message.
+</ParamField>
+
+<ParamField path="fatal" type="bool" default="False">
+  Whether this error is fatal and requires the bot to shut down.
+</ParamField>
+
+<ParamField path="processor" type="Optional[FrameProcessor]" default="None">
+  The processor that raised the error.
+</ParamField>
+
+<ParamField path="exception" type="Optional[Exception]" default="None">
+  The underlying exception, if one was caught.
+</ParamField>
+
+### FatalErrorFrame
+
+An unrecoverable error requiring the bot to shut down. The `fatal` field is always `True`.
+
+Inherits from `ErrorFrame`.
+
+## Processor Pause/Resume (Urgent)
+
+These are the `SystemFrame` variants of `FrameProcessorPauseFrame` and `FrameProcessorResumeFrame`. As SystemFrames, they flow through the high-priority input queue rather than the process queue, so they are not blocked by paused state or buffered frames. This makes `FrameProcessorResumeUrgentFrame` the correct way to resume a processor externally — the `ControlFrame` variant (`FrameProcessorResumeFrame`) would get stuck behind any DataFrames that queued up during the pause. See [Control Frames](/server/frames/control-frames#processor-pauseresume) for the full explanation.
+
+### FrameProcessorPauseUrgentFrame
+
+Pauses a processor immediately, without waiting for queued frames to drain first.
+
+<ParamField path="processor" type="FrameProcessor">
+  The processor to pause.
+</ParamField>
+
+### FrameProcessorResumeUrgentFrame
+
+Resumes a paused processor immediately, releasing buffered frames. Use this instead of `FrameProcessorResumeFrame` when the processor may have frames queued up.
+
+<ParamField path="processor" type="FrameProcessor">
+  The processor to resume.
+</ParamField>
+
+## Interruptions
+
+### InterruptionFrame
+
+Interrupts the pipeline, discarding pending DataFrames and ControlFrames. Typically triggered when the user starts speaking during a bot response.
+
+## User Speaking State
+
+### UserStartedSpeakingFrame
+
+Indicates that a user turn has begun. By this point, transcriptions are usually already flowing through the pipeline.
+
+<ParamField path="emulated" type="bool" default="False">
+  Whether this event was emulated rather than detected by VAD. Deprecated since
+  0.0.99.
+</ParamField>
+
+### UserStoppedSpeakingFrame
+
+Marks the end of a user turn. The bot's response is triggered separately by the turn detection system.
+
+<ParamField path="emulated" type="bool" default="False">
+  Whether this event was emulated rather than detected by VAD. Deprecated since
+  0.0.99.
+</ParamField>
+
+### UserSpeakingFrame
+
+Emitted by the VAD processor while the user is actively speaking. Useful for UI feedback or suppressing idle timeouts.
+
+### UserMuteStartedFrame
+
+Broadcast when one or more [user mute strategies](/server/utilities/turn-management/user-mute-strategies) activate. User mute temporarily suppresses user input while the bot is speaking to prevent interruptions. While muted, the `LLMUserAggregator` drops incoming user frames (`InputAudioRawFrame`, `TranscriptionFrame`, `InterimTranscriptionFrame`, `UserStartedSpeakingFrame`, `UserStoppedSpeakingFrame`, VAD signals, and `InterruptionFrame`). Lifecycle frames (`StartFrame`, `EndFrame`, `CancelFrame`) are never muted.
+
+### UserMuteStoppedFrame
+
+Broadcast when all active [user mute strategies](/server/utilities/turn-management/user-mute-strategies) deactivate, allowing user input to be processed again.
+
+## VAD Events
+
+These frames are emitted directly by the Voice Activity Detection (VAD) processor and carry timing metadata. Higher-level speaking-state frames (`UserStartedSpeakingFrame`, `UserStoppedSpeakingFrame`) are derived from these.
+
+### VADUserStartedSpeakingFrame
+
+VAD confirmed that speech has started.
+
+<ParamField path="start_secs" type="float" default="0.0">
+  Timestamp in seconds when speech onset was detected.
+</ParamField>
+
+<ParamField path="timestamp" type="float" default="time.time()">
+  Wall-clock time when the frame was created.
+</ParamField>
+
+### VADUserStoppedSpeakingFrame
+
+VAD confirmed that speech has ended.
+
+<ParamField path="stop_secs" type="float" default="0.0">
+  Timestamp in seconds when speech ended.
+</ParamField>
+
+<ParamField path="timestamp" type="float" default="time.time()">
+  Wall-clock time when the frame was created.
+</ParamField>
+
+### SpeechControlParamsFrame
+
+Notifies processors that VAD or turn detection parameters have changed at runtime.
+
+<ParamField path="vad_params" type="Optional[VADParams]" default="None">
+  Updated VAD parameters.
+</ParamField>
+
+<ParamField path="turn_params" type="Optional[BaseTurnParams]" default="None">
+  Updated turn detection parameters.
+</ParamField>
+
+## Bot Speaking State
+
+### BotStartedSpeakingFrame
+
+Emitted by the output transport when the bot begins speaking. Broadcast in both directions so processors on either side of the transport can react.
+
+### BotStoppedSpeakingFrame
+
+Emitted by the output transport when the bot finishes speaking. Also broadcast in both directions.
+
+### BotSpeakingFrame
+
+Emitted continuously while the bot is speaking. Processors can use this to suppress idle timeouts or drive visual indicators.
+
+## Connection Status
+
+### BotConnectedFrame
+
+The bot has joined the transport room. Only relevant for SFU-based transports: Daily, LiveKit, HeyGen, and Tavus.
+
+### ClientConnectedFrame
+
+A client or participant has connected to the transport.
+
+## Input Frames
+
+Input frames carry raw data from transport sources into the pipeline. As `SystemFrame`s, they are never discarded during interruptions. Incoming user data must always be processed.
+
+### InputAudioRawFrame
+
+Raw audio received from the transport. Inherits the `audio`, `sample_rate`, `num_channels`, and `num_frames` fields from the [`AudioRawFrame`](/server/frames/overview#audiorawframe) mixin.
+
+Inherits from `AudioRawFrame`.
+
+### UserAudioRawFrame
+
+Audio from a specific user in a multi-participant session.
+
+Inherits from `InputAudioRawFrame`.
+
+<ParamField path="user_id" type="str" default='""'>
+  Identifier for the user who produced this audio.
+</ParamField>
+
+### InputImageRawFrame
+
+Raw image received from the transport. Inherits `image`, `size`, and `format` from the [`ImageRawFrame`](/server/frames/overview#imagerawframe) mixin.
+
+Inherits from `ImageRawFrame`.
+
+### UserImageRawFrame
+
+An image from a specific user, optionally tied to a pending image request.
+
+Inherits from `InputImageRawFrame`.
+
+<ParamField path="user_id" type="str" default='""'>
+  Identifier for the user who produced this image.
+</ParamField>
+
+<ParamField path="text" type="Optional[str]" default="None">
+  Optional text associated with the image.
+</ParamField>
+
+<ParamField path="append_to_context" type="Optional[bool]" default="None">
+  Whether to append this image to the LLM context.
+</ParamField>
+
+<ParamField
+  path="request"
+  type="Optional[UserImageRequestFrame]"
+  default="None"
+>
+  The original request frame that triggered this image capture.
+</ParamField>
+
+### InputTextRawFrame
+
+Text received from the transport, such as a user typing in a chat interface. Inherits the `text` field from `TextFrame`.
+
+Inherits from `TextFrame`.
+
+## DTMF Input
+
+### InputDTMFFrame
+
+A DTMF keypress received from the transport. Inherits the `button` field from the `DTMFFrame` mixin.
+
+Inherits from `DTMFFrame`.
+
+### OutputDTMFUrgentFrame
+
+A DTMF keypress for immediate output, bypassing the normal frame queue.
+
+Inherits from `DTMFFrame`.
+
+## Transport Messages
+
+### InputTransportMessageFrame
+
+A message received from an external transport. The message format is transport-specific.
+
+<ParamField path="message" type="Any" required>
+  The transport message payload.
+</ParamField>
+
+### OutputTransportMessageUrgentFrame
+
+An outbound transport message that bypasses the normal queue for immediate delivery.
+
+<ParamField path="message" type="Any" required>
+  The transport message payload.
+</ParamField>
+
+## Function Calling
+
+### FunctionCallsStartedFrame
+
+Signals that one or more function calls are about to begin executing.
+
+<ParamField path="function_calls" type="Sequence[FunctionCallFromLLM]" required>
+  Sequence of function calls that will be executed.
+</ParamField>
+
+### FunctionCallCancelFrame
+
+Signals that a function call was cancelled, typically due to user interruption when the function's `cancel_on_interruption` flag is set.
+
+<ParamField path="function_name" type="str" required>
+  Name of the function that was cancelled.
+</ParamField>
+
+<ParamField path="tool_call_id" type="str" required>
+  Unique identifier for the cancelled function call.
+</ParamField>
+
+## User Interaction
+
+### UserImageRequestFrame
+
+Requests an image from a specific user, typically to capture a camera frame for vision processing.
+
+<ParamField path="user_id" type="str" required>
+  Identifier for the user to capture from.
+</ParamField>
+
+<ParamField path="text" type="Optional[str]" default="None">
+  Optional text prompt associated with the image request.
+</ParamField>
+
+<ParamField path="append_to_context" type="Optional[bool]" default="None">
+  Whether to append the resulting image to the LLM context.
+</ParamField>
+
+<ParamField path="video_source" type="Optional[str]" default="None">
+  Specific video source to capture from.
+</ParamField>
+
+<ParamField path="function_name" type="Optional[str]" default="None">
+  Function name if this request originated from a tool call.
+</ParamField>
+
+<ParamField path="tool_call_id" type="Optional[str]" default="None">
+  Tool call identifier if this request originated from a tool call.
+</ParamField>
+
+<ParamField path="result_callback" type="Optional[Any]" default="None">
+  Callback to invoke with the captured image result.
+</ParamField>
+
+### STTMuteFrame
+
+Mutes or unmutes the STT service. While muted, incoming audio is not sent to the STT provider.
+
+<ParamField path="mute" type="bool" required>
+  `True` to mute, `False` to unmute.
+</ParamField>
+
+### UserIdleTimeoutUpdateFrame
+
+Updates the user idle timeout at runtime. Set to `0` to disable idle detection entirely.
+
+<ParamField path="timeout" type="float" required>
+  New idle timeout in seconds. `0` disables detection.
+</ParamField>
+
+## Diagnostics
+
+### MetricsFrame
+
+Performance metrics collected from processors. Emitted when metrics reporting is enabled via `StartFrame`.
+
+<ParamField path="data" type="List[MetricsData]" required>
+  List of metrics data entries.
+</ParamField>
+
+## Service Metadata
+
+### ServiceMetadataFrame
+
+Base metadata frame broadcast by services at startup, providing information about service capabilities and configuration.
+
+<ParamField path="service_name" type="str" required>
+  Name of the service that emitted this metadata.
+</ParamField>
+
+### STTMetadataFrame
+
+Metadata from an STT service, including latency characteristics used for turn detection tuning.
+
+Inherits from `ServiceMetadataFrame`.
+
+<ParamField path="ttfs_p99_latency" type="float" required>
+  P99 latency in seconds for time-to-final-segment. Used by turn detectors to
+  calibrate wait times.
+</ParamField>
+
+## RTVI
+
+Frames for the [Real-Time Voice Interface (RTVI)](/server/frameworks/rtvi) protocol, which bridges clients and the pipeline. These frames handle custom messaging between the client and server.
+
+### RTVIServerMessageFrame
+
+Sends a server message to the connected client.
+
+<ParamField path="data" type="Any" required>
+  The message data to send to the client.
+</ParamField>
+
+### RTVIClientMessageFrame
+
+A message received from the client, expecting a server response via `RTVIServerResponseFrame`.
+
+<ParamField path="msg_id" type="str" required>
+  Unique identifier for the client message.
+</ParamField>
+
+<ParamField path="type" type="str" required>
+  The message type.
+</ParamField>
+
+<ParamField path="data" type="Optional[Any]" default="None">
+  Optional message data from the client.
+</ParamField>
+
+### RTVIServerResponseFrame
+
+Responds to an `RTVIClientMessageFrame`. Include the original client message frame to ensure the response is properly correlated. Set the `error` field to respond with an error instead of a normal response.
+
+<ParamField path="client_msg" type="RTVIClientMessageFrame" required>
+  The original client message this response is for.
+</ParamField>
+
+<ParamField path="data" type="Optional[Any]" default="None">
+  Response data to send to the client.
+</ParamField>
+
+<ParamField path="error" type="Optional[str]" default="None">
+  Error message. When set, the client receives an `error-response` instead of a
+  `server-response`.
+</ParamField>
+
+## Task Frames
+
+Task frames provide a system-priority mechanism for requesting pipeline actions from outside the normal frame flow. They are converted into their corresponding standard frames when processed.
+
+### TaskSystemFrame
+
+Base class for system-priority task frames.
+
+### CancelTaskFrame
+
+Requests immediate pipeline cancellation. Converted to a `CancelFrame` when processed by the pipeline.
+
+Inherits from `TaskSystemFrame`.
+
+<ParamField path="reason" type="Optional[Any]" default="None">
+  Optional reason for the cancellation request.
+</ParamField>
+
+### InterruptionTaskFrame
+
+Requests a pipeline interruption. Converted to an `InterruptionFrame` when processed.
+
+Inherits from `TaskSystemFrame`.

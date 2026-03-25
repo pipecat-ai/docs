@@ -1,0 +1,363 @@
+---
+title: "Control Frames"
+description: "Reference for ControlFrame types: pipeline lifecycle, response boundaries, service settings, and runtime configuration"
+---
+
+ControlFrames signal boundaries, state changes, and configuration updates within the pipeline. They are queued and processed in order alongside DataFrames. ControlFrames are cancelled on `InterruptionFrame` unless combined with `UninterruptibleFrame`. See the [frames overview](/server/frames/overview) for base class details and the full frame hierarchy.
+
+## Pipeline Lifecycle
+
+### EndFrame
+
+Signals graceful pipeline shutdown. `EndFrame` is queued with other non-SystemFrames, which allows FrameProcessors to be shut down in order, allowing queued frames ahead of the `EndFrame` to be processed first.
+
+Inherits from `UninterruptibleFrame`, meaning it cannot be cancelled by `InterruptionFrame`.
+
+<ParamField path="reason" type="Optional[Any]" default="None">
+  Optional reason for the shutdown, passed along for logging or inspection.
+</ParamField>
+
+### StopFrame
+
+Stops the pipeline but keeps processors in a running state. Like `EndFrame`, `StopFrame` is queued with other non-SystemFrames allowing frames preceding it to be processed first. Useful when you need to halt frame flow without tearing down the entire processor graph.
+
+Inherits from `UninterruptibleFrame`.
+
+### OutputTransportReadyFrame
+
+Indicates that the output transport is ready to receive frames. Processors waiting on transport availability can use this as their signal to begin sending.
+
+### HeartbeatFrame
+
+Used for pipeline health monitoring. Processors can observe these to detect stalls or measure latency.
+
+<ParamField path="timestamp" type="int">
+  Timestamp value for the heartbeat.
+</ParamField>
+
+## Processor Pause/Resume
+
+While a processor is paused, incoming frames accumulate in its internal queue rather than being dropped. Once the processor is resumed, it drains the queue and processes all buffered frames in the order they arrived.
+
+For example, the TTS service pauses itself while synthesizing a `TTSSpeakFrame`. If new text frames arrive during synthesis, they queue up instead of producing overlapping audio. The TTS resumes when `BotStoppedSpeakingFrame` (a `SystemFrame`) arrives, and the buffered frames are processed in order.
+
+Internally, each processor has two queues: a high-priority input queue for SystemFrames and a process queue for everything else. Pausing blocks the process queue, but SystemFrames continue to flow through the input queue. This is why the typical pattern is for a processor to pause itself and then resume in response to a `SystemFrame`.
+
+<Note>
+  `FrameProcessorResumeFrame` is a `ControlFrame`, which means it enters the
+  same process queue that pausing blocks. If DataFrames have already queued up
+  ahead of it, the resume frame will be stuck behind them and the processor will
+  stay paused. To resume a paused processor from outside, use the `SystemFrame`
+  variant `FrameProcessorResumeUrgentFrame` instead — it bypasses the process
+  queue entirely. See [System
+  Frames](/server/frames/system-frames#processor-pauseresume-urgent).
+</Note>
+
+### FrameProcessorPauseFrame
+
+Pauses a specific processor. Queued in order, so the processor finishes handling any frames ahead of it before pausing.
+
+<ParamField path="processor" type="FrameProcessor">
+  The processor to pause.
+</ParamField>
+
+### FrameProcessorResumeFrame
+
+Resumes a previously paused processor, releasing all buffered frames for processing.
+
+<ParamField path="processor" type="FrameProcessor">
+  The processor to resume.
+</ParamField>
+
+<Note>
+  Because this is a `ControlFrame`, it will be blocked behind any DataFrames
+  that queued up while the processor was paused. Use
+  `FrameProcessorResumeUrgentFrame` if the processor may have buffered frames.
+</Note>
+
+## LLM Response Boundaries
+
+These frames bracket LLM output, letting downstream processors (aggregators, TTS services, transports) know when a response starts and ends.
+
+### LLMFullResponseStartFrame
+
+Marks the beginning of an LLM response. Followed by one or more `TextFrame`s and terminated by `LLMFullResponseEndFrame`.
+
+### LLMFullResponseEndFrame
+
+Marks the end of an LLM response.
+
+### VisionFullResponseStartFrame
+
+Beginning of a vision model response. Inherits from `LLMFullResponseStartFrame`.
+
+### VisionFullResponseEndFrame
+
+End of a vision model response. Inherits from `LLMFullResponseEndFrame`.
+
+### LLMAssistantPushAggregationFrame
+
+Forces the assistant aggregator to commit its buffered text to context immediately, rather than waiting for the normal end-of-response boundary.
+
+## LLM Context Summarization
+
+Frames that coordinate context summarization: compressing conversation history to stay within token limits.
+
+### LLMSummarizeContextFrame
+
+Triggers manual context summarization. Push this frame to request that the LLM summarize the current conversation context.
+
+<ParamField
+  path="config"
+  type="Optional[LLMContextSummaryConfig]"
+  default="None"
+>
+  Optional configuration controlling summarization behavior.
+</ParamField>
+
+### LLMContextSummaryRequestFrame
+
+Internal request from the aggregator to the LLM service, asking it to produce a summary. You typically won't push this yourself — the aggregator creates it in response to `LLMSummarizeContextFrame` or automatic summarization triggers.
+
+<ParamField path="request_id" type="str">
+  Unique identifier for this summarization request.
+</ParamField>
+
+<ParamField path="context" type="LLMContext">
+  The conversation context to summarize.
+</ParamField>
+
+<ParamField path="min_messages_to_keep" type="int">
+  Minimum number of recent messages to preserve after summarization.
+</ParamField>
+
+<ParamField path="target_context_tokens" type="int">
+  Target token count for the summarized context.
+</ParamField>
+
+<ParamField path="summarization_prompt" type="str">
+  Prompt instructing the LLM how to summarize.
+</ParamField>
+
+<ParamField path="summarization_timeout" type="Optional[float]">
+  Optional timeout in seconds for the summarization request.
+</ParamField>
+
+### LLMContextSummaryResultFrame
+
+The LLM's summarization result, sent back to the aggregator.
+
+Inherits from `UninterruptibleFrame` to ensure the result is never dropped.
+
+<ParamField path="request_id" type="str">
+  Matches the originating request.
+</ParamField>
+
+<ParamField path="summary" type="str">
+  The generated summary text.
+</ParamField>
+
+<ParamField path="last_summarized_index" type="int">
+  Index of the last message included in the summary.
+</ParamField>
+
+<ParamField path="error" type="Optional[str]">
+  Error message if summarization failed, otherwise `None`.
+</ParamField>
+
+## LLM Thought Frames
+
+Bracket extended thinking output from LLMs that support it (e.g., Claude with extended thinking enabled).
+
+### LLMThoughtStartFrame
+
+Marks the beginning of LLM extended thinking content.
+
+<ParamField path="append_to_context" type="bool" default="False">
+  Whether to append thought content to the conversation context. Raises
+  `ValueError` if set to `True` without specifying `llm`.
+</ParamField>
+
+<ParamField path="llm" type="Optional[str]" default="None">
+  Identifier for the LLM producing the thought. Required when
+  `append_to_context` is `True`.
+</ParamField>
+
+### LLMThoughtEndFrame
+
+Marks the end of LLM extended thinking content.
+
+<ParamField path="signature" type="Any" default="None">
+  Thought signature, if provided by the LLM. Anthropic models include a
+  signature that must be preserved when appending thoughts back to context.
+</ParamField>
+
+## Function Calling
+
+### FunctionCallInProgressFrame
+
+Indicates that a function call is currently executing.
+
+Inherits from `UninterruptibleFrame`, ensuring it reaches downstream processors even during interruption.
+
+<ParamField path="function_name" type="str">
+  Name of the function being called.
+</ParamField>
+
+<ParamField path="tool_call_id" type="str">
+  Unique identifier for this tool call.
+</ParamField>
+
+<ParamField path="arguments" type="Any">
+  Arguments passed to the function.
+</ParamField>
+
+<ParamField path="cancel_on_interruption" type="bool" default="False">
+  Whether the function call should be cancelled if the user interrupts.
+</ParamField>
+
+## TTS State
+
+### TTSStartedFrame
+
+Signals the beginning of a TTS audio response.
+
+<ParamField path="context_id" type="Optional[str]">
+  Identifier linking this TTS output to its originating context.
+</ParamField>
+
+### TTSStoppedFrame
+
+Signals the end of a TTS audio response.
+
+<ParamField path="context_id" type="Optional[str]">
+  Identifier linking this TTS output to its originating context.
+</ParamField>
+
+## Service Settings
+
+Runtime settings updates for LLM, TTS, STT, and other services. These let you change service configuration mid-conversation without rebuilding the pipeline. Push an `LLMUpdateSettingsFrame`, `TTSUpdateSettingsFrame`, or `STTUpdateSettingsFrame` to update the corresponding service. See the [Changing Service Settings at Runtime](/server/frames/overview#changing-service-settings-at-runtime) pattern for an example.
+
+### ServiceUpdateSettingsFrame
+
+Base frame for runtime service settings updates.
+
+Inherits from `UninterruptibleFrame`.
+
+<ParamField path="settings" type="Mapping[str, Any]" default="{}">
+  Dictionary of settings to update.
+</ParamField>
+
+<ParamField path="delta" type="Optional[ServiceSettings]" default="None">
+  Typed settings delta. Takes precedence over the `settings` dict when both are
+  provided.
+</ParamField>
+
+<ParamField path="service" type="Optional[FrameProcessor]" default="None">
+  Target a specific service instance. When `None`, the frame applies to the
+  first matching service in the pipeline.
+</ParamField>
+
+### LLMUpdateSettingsFrame
+
+Update LLM service settings at runtime. Inherits from `ServiceUpdateSettingsFrame`.
+
+### TTSUpdateSettingsFrame
+
+Update TTS service settings at runtime. Inherits from `ServiceUpdateSettingsFrame`.
+
+### STTUpdateSettingsFrame
+
+Update STT service settings at runtime. Inherits from `ServiceUpdateSettingsFrame`.
+
+## Audio Processing
+
+### VADParamsUpdateFrame
+
+Update Voice Activity Detection parameters at runtime.
+
+<ParamField path="params" type="VADParams">
+  New VAD parameters to apply.
+</ParamField>
+
+### FilterControlFrame
+
+Base frame for audio filter control. Subclass this for custom filter commands.
+
+### FilterUpdateSettingsFrame
+
+Update audio filter settings. Inherits from `FilterControlFrame`.
+
+<ParamField path="settings" type="Mapping[str, Any]">
+  Filter settings to update.
+</ParamField>
+
+### FilterEnableFrame
+
+Enable or disable an audio filter. Inherits from `FilterControlFrame`.
+
+<ParamField path="enable" type="bool">
+  `True` to enable the filter, `False` to disable it.
+</ParamField>
+
+### MixerControlFrame
+
+Base frame for audio mixer control.
+
+### MixerUpdateSettingsFrame
+
+Update audio mixer settings. Inherits from `MixerControlFrame`.
+
+<ParamField path="settings" type="Mapping[str, Any]">
+  Mixer settings to update.
+</ParamField>
+
+### MixerEnableFrame
+
+Enable or disable an audio mixer. Inherits from `MixerControlFrame`.
+
+<ParamField path="enable" type="bool">
+  `True` to enable the mixer, `False` to disable it.
+</ParamField>
+
+## Service Switching
+
+### ServiceSwitcherFrame
+
+Base frame for service switching operations.
+
+### ManuallySwitchServiceFrame
+
+Request a manual switch to a different service instance. Inherits from `ServiceSwitcherFrame`.
+
+<ParamField path="service" type="FrameProcessor">
+  The service to switch to.
+</ParamField>
+
+### ServiceSwitcherRequestMetadataFrame
+
+Request that a service re-emit its metadata. Useful after switching services to ensure downstream processors have current configuration.
+
+<ParamField path="service" type="FrameProcessor">
+  The service to request metadata from.
+</ParamField>
+
+## Task Frames
+
+Task frames are pushed upstream to the pipeline task, which converts them into the appropriate downstream frame. This indirection lets processors request pipeline-level actions without needing direct access to the pipeline task.
+
+### TaskFrame
+
+Base frame for task control.
+
+### EndTaskFrame
+
+Request graceful pipeline shutdown. The pipeline task converts this into an `EndFrame` and pushes it downstream. Inherits from `TaskFrame` and `UninterruptibleFrame`.
+
+<ParamField path="reason" type="Optional[Any]">
+  Optional reason for the shutdown request.
+</ParamField>
+
+### StopTaskFrame
+
+Request pipeline stop while keeping processors alive. Converted to a `StopFrame` downstream. Inherits from `TaskFrame` and `UninterruptibleFrame`.
