@@ -1,41 +1,26 @@
 ---
 title: "CI with GitHub Actions"
-description: "Automate image builds and deploys for continuous integration"
+description: "Automate builds and deploys with the official GitHub Action"
 ---
 
-This guide shows you how to automate Pipecat Cloud deployments from GitHub Actions using your own container registry.
-
-<Note>
-  If you don't need your own container registry, [cloud builds](./cloud-builds)
-  are the simpler option — no Docker, no registry setup. You can trigger cloud
-  builds from GitHub Actions using the [CLI](../../../cli/cloud/build) or the
-  [REST API](../rest-reference/endpoint/build-create).
-</Note>
+This guide shows you how to automate Pipecat Cloud deployments from GitHub Actions using the official [Deploy to Pipecat Cloud](https://github.com/daily-co/pipecat-cloud-deploy-action) action.
 
 ## Prerequisites
 
 Before setting up your workflow, ensure you have:
 
 - A Pipecat Cloud account with a **Private** API key
-- A Docker Hub account (or another container registry)
-- An image pull secret configured in Pipecat Cloud
 - A secret set configured for your agent
 
 ## Configure GitHub Secrets
 
-Add the following secrets to your repository (Settings → Secrets and variables → Actions):
+Add the following secret to your repository (Settings → Secrets and variables → Actions):
 
-- `DOCKERHUB_USERNAME`: Your Docker Hub username
-- `DOCKERHUB_TOKEN`: Your Docker Hub access token
 - `PCC_API_KEY`: Your Pipecat Cloud **Private** API key
 
-<Note>
-  For Docker Hub, use a [personal access
-  token](https://docs.docker.com/docker-hub/access-tokens/) rather than your
-  password.
-</Note>
+## Basic Workflow — Cloud Build
 
-## Basic Workflow Configuration
+The simplest setup uses [cloud builds](./cloud-builds) to build your image server-side. No Docker, no container registry, no extra infrastructure.
 
 Create `.github/workflows/deploy.yml` in your repository:
 
@@ -49,59 +34,51 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build and Deploy to Pipecat Cloud
-        uses: daily-co/pipecat-cloud-deploy-action@v1
+        uses: daily-co/pipecat-cloud-deploy-action@v2
         with:
           api-key: ${{ secrets.PCC_API_KEY }}
           agent-name: ${{ github.event.repository.name }}
-          build: true
-          image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
-          registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
-          registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          cloud-build: true
           secret-set: my-secret-set
-          image-credentials: my-image-pull-secret
-          min-agents: 0
-          max-agents: 10
+          region: us-east
 ```
 
 This workflow will:
 
 1. Trigger on every push to the `main` branch
-2. Build your Docker image for `linux/arm64` (the action sets this automatically)
-3. Push the image to Docker Hub with a tag defaulting to the commit SHA
-4. Deploy the new image to Pipecat Cloud and wait for readiness
+2. Create a build context from your repository
+3. Upload it to Pipecat Cloud and build the image server-side
+4. Deploy the new image and wait for readiness
 
-<Warning>
-  Avoid reusing the same image tag for multiple builds. The action defaults to tagging with `${{ github.sha }}` so each deploy uses a unique tag. If you override `tag`, use a value that changes per build (e.g. date or SHA) so Pipecat Cloud does not serve cached, outdated images.
-</Warning>
+<Tip>
+  Cloud builds automatically detect and reuse identical build contexts, so
+  re-deploying unchanged code is nearly instant.
+</Tip>
 
-## Image Tagging
+## Build Caching
 
-By default the action tags the image with the git commit SHA. To use a custom tag:
+Cloud builds use a content hash of your build context to detect cache hits. If the files haven't changed since the last successful build, the action skips the upload and build entirely and reuses the previous image.
+
+You can also reuse a specific build across workflows with the `build-id` input:
 
 ```yml
-- name: Build and Deploy to Pipecat Cloud
-  uses: daily-co/pipecat-cloud-deploy-action@v1
+- name: Deploy to Pipecat Cloud
+  uses: daily-co/pipecat-cloud-deploy-action@v2
   with:
     api-key: ${{ secrets.PCC_API_KEY }}
     agent-name: ${{ github.event.repository.name }}
-    build: true
-    image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
-    tag: ${{ github.ref_name }}-${{ github.sha }}
-    registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
-    registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
+    build-id: 14f5a062-7ecd-407a-b5f0-3ebba82e790b
     secret-set: my-secret-set
 ```
 
 ## Monorepo Configuration
 
-If your agent lives in a subdirectory (e.g. `server/`, as with Pipecat CLI–generated code), set the build context and optionally restrict the workflow to that path:
+If your agent lives in a subdirectory (e.g. `server/`), set the build context and optionally restrict the workflow to that path:
 
 ```yml
 name: Deploy to Pipecat Cloud
@@ -115,38 +92,27 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build and Deploy to Pipecat Cloud
-        uses: daily-co/pipecat-cloud-deploy-action@v1
+        uses: daily-co/pipecat-cloud-deploy-action@v2
         with:
           api-key: ${{ secrets.PCC_API_KEY }}
           agent-name: ${{ github.event.repository.name }}
-          build: true
-          image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
-          docker-context: ./server
-          dockerfile: ./server/Dockerfile
-          registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
-          registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          cloud-build: true
+          build-context: ./server
+          dockerfile: Dockerfile
           secret-set: my-secret-set
-          image-credentials: my-image-pull-secret
 ```
 
 The `paths` filter ensures the workflow runs only when files under `server/` change.
 
-## Platform and Build Behavior
-
-Pipecat Cloud requires images built for `linux/arm64`. When `build` is enabled, the action automatically passes `--platform linux/arm64` to Docker and sets up QEMU emulation on x64 runners, so no extra steps are needed.
-
 ## Customizing Deployment
 
-Configure the deployment via the action inputs:
+Configure the deployment via action inputs:
 
-- **image-credentials**: Name of the image pull secret set in Pipecat Cloud (for private registries)
 - **secret-set**: Name of the secret set used for runtime environment variables
 - **region**: Deployment region (uses your organization default if omitted)
 - **min-agents**: Minimum agents to keep warm (0–50)
@@ -160,20 +126,52 @@ Configure the deployment via the action inputs:
   Planning guide](./capacity-planning) for guidance.
 </Tip>
 
-## Deploying a Pre-built Image
+## Deploying from Your Own Container Registry
 
-If you build the image in another job or CI system, deploy by setting `build: false` and passing a fully tagged image:
+If you host images in your own container registry (e.g. Docker Hub, AWS ECR, GHCR), you can skip the cloud build and deploy a fully tagged image directly:
 
 ```yml
 - name: Deploy to Pipecat Cloud
+  uses: daily-co/pipecat-cloud-deploy-action@v2
+  with:
+    api-key: ${{ secrets.PCC_API_KEY }}
+    agent-name: ${{ github.event.repository.name }}
+    image: my-registry.example.com/my-agent:v1.2.3
+    image-credentials: my-image-pull-secret
+    secret-set: my-secret-set
+```
+
+<Note>
+  When deploying a pre-built image, you must provide an `image-credentials`
+  reference if the image is in a private registry. Pipecat Cloud requires images
+  built for `linux/arm64`.
+</Note>
+
+## Using v1 with Docker Build
+
+<Note>
+  **v1 is still available** for users who need the action to run `docker build`
+  and push to their own container registry. However, we recommend upgrading to
+  v2 with cloud builds for a simpler setup.
+</Note>
+
+The v1 action can build, tag, and push Docker images as part of the workflow. This requires registry credentials and the `packages: write` permission (for GHCR):
+
+```yml
+- name: Build and Deploy to Pipecat Cloud
   uses: daily-co/pipecat-cloud-deploy-action@v1
   with:
     api-key: ${{ secrets.PCC_API_KEY }}
     agent-name: ${{ github.event.repository.name }}
-    image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:v1.2.3
+    build: true
+    image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+    registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
+    registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
     secret-set: my-secret-set
     image-credentials: my-image-pull-secret
 ```
+
+See the [v1 README](https://github.com/daily-co/pipecat-cloud-deploy-action/tree/v1#readme) for full documentation of v1 inputs.
 
 ## Next Steps
 
