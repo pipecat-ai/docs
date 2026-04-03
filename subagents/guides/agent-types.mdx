@@ -1,0 +1,245 @@
+---
+title: "Agent Types"
+description: "Learn about BaseAgent, LLMAgent, and FlowsAgent in Pipecat Subagents."
+---
+
+Pipecat Subagents provides three agent types, each building on the previous:
+
+```
+BaseAgent                    — Pipeline lifecycle, parent-child, tasks, activation
+  ├─ LLMAgent                — LLM pipeline, @tool registration, message injection
+  └─ FlowsAgent              — Structured conversation flows via Pipecat Flows
+```
+
+## BaseAgent
+
+The foundation for all agents. Use `BaseAgent` when you need direct control over the pipeline — for transport-owning agents, workers, or custom processing.
+
+### Key Features
+
+- Optional pipeline via `build_pipeline()`
+- Parent-child agent tree
+- Activation/deactivation model
+- Task coordination (requester and worker)
+
+### Constructor
+
+```python
+from pipecat_subagents.agents import BaseAgent
+
+agent = BaseAgent(
+    name="my_agent",      # Unique agent name
+    bus=runner.bus,        # The AgentBus instance
+    active=True,           # Whether agent starts active (default: True)
+    bridged=None,          # Bridge configuration (see below)
+)
+```
+
+**Bridge configuration:**
+
+- `bridged=None` — Not bridged (no bus frame routing)
+- `bridged=()` — Bridged, accepts frames from all bridges
+- `bridged=("voice",)` — Bridged, accepts only frames from named bridges
+
+### Lifecycle Hooks
+
+Override these methods (always call `super()`):
+
+```python
+class MyAgent(BaseAgent):
+    async def on_ready(self):
+        await super().on_ready()
+        # Agent is registered and ready
+
+    async def on_activated(self, args=None):
+        await super().on_activated(args)
+        # Agent was activated, optionally with args
+
+    async def on_deactivated(self):
+        await super().on_deactivated()
+        # Agent was deactivated
+
+    async def on_finished(self):
+        await super().on_finished()
+        # Pipeline has completed
+
+    async def on_error(self, error, fatal):
+        await super().on_error(error, fatal)
+        # Pipeline error occurred
+```
+
+### Agent Discovery
+
+```python
+async def on_agent_ready(self, data):
+    """Called when a child or watched agent registers."""
+    if data.agent_name == "worker":
+        await self.activate_agent("worker")
+
+async def on_agent_error(self, error_info):
+    """Called when a child agent reports an error."""
+    logger.error(f"Child error: {error_info}")
+```
+
+### Agent Control
+
+```python
+# Add a child agent (private to this parent)
+await self.add_agent(child_agent)
+
+# Activate/deactivate
+await self.activate_agent("target_name", args=optional_args)
+await self.deactivate_agent("target_name")
+
+# Handoff: deactivate self, activate target
+await self.handoff_to("target_name", args=optional_args)
+
+# Watch for a specific agent to become ready
+self.watch_agent("remote_agent_name")
+
+# Escalate error to parent
+await self.send_error("Something went wrong")
+```
+
+## LLMAgent
+
+An agent with an LLM pipeline and automatic tool registration. Use `LLMAgent` for conversational agents that need an LLM with tools.
+
+### Key Differences from BaseAgent
+
+- Default `active=False` (activated by another agent)
+- Abstract `build_llm()` method
+- `@tool` decorator for automatic tool registration
+- Tool call deferral (frames queued during tool execution)
+- Message injection on activation
+
+### Usage
+
+```python
+from pipecat_subagents.agents import LLMAgent
+from pipecat_subagents.agents.llm_agent import LLMAgentActivationArgs
+from pipecat.services.openai.llm import OpenAILLMService
+
+
+class AssistantAgent(LLMAgent):
+    def __init__(self, name, *, bus):
+        super().__init__(
+            name,
+            bus=bus,
+            bridged=(),             # Accept frames from all bridges
+            defer_tool_frames=True,  # Queue frames during tool execution
+        )
+
+    def build_llm(self):
+        return OpenAILLMService(
+            api_key=OPENAI_KEY,
+            model="gpt-4o",
+            system_prompt="You are a helpful assistant.",
+        )
+
+    @tool
+    async def lookup_order(self, params, order_id: str):
+        """Look up an order by ID."""
+        result = await fetch_order(order_id)
+        await params.result_callback(f"Order {order_id}: {result}")
+
+    @tool
+    async def transfer_to_billing(self, params, reason: str):
+        """Transfer the user to billing."""
+        await self.handoff_to("billing", args=LLMAgentActivationArgs(
+            messages=[{"role": "user", "content": reason}]
+        ))
+```
+
+### Activation with Context
+
+When activating an `LLMAgent`, you can inject messages into its LLM context:
+
+```python
+await self.handoff_to("support", args=LLMAgentActivationArgs(
+    messages=[
+        {"role": "user", "content": "I need help with my order #12345"}
+    ],
+    run_llm=True,  # Immediately run the LLM after injecting (default when messages provided)
+))
+```
+
+### Tool Call Deferral
+
+When `defer_tool_frames=True` (the default), frames that arrive during tool execution are queued and delivered after all tools complete. This prevents partial responses from being sent while the agent is processing tool calls.
+
+## FlowsAgent
+
+An agent with structured conversation flows via [Pipecat Flows](/server/frameworks/flows/pipecat-flows). Use `FlowsAgent` when your agent needs node-based conversation state machines.
+
+### Key Differences from BaseAgent
+
+- Always bridged (`bridged=()` by default)
+- Manages a `FlowManager` internally
+- Abstract `build_llm()` and `build_initial_node()` methods
+- `@tool` decorated methods become global functions available at every node
+- On first activation: starts at `build_initial_node()`
+- On subsequent activations: resumes from `build_resume_node()`
+
+### Usage
+
+```python
+from pipecat_subagents.agents import FlowsAgent
+from pipecat.services.openai.llm import OpenAILLMService
+
+
+class ReservationAgent(FlowsAgent):
+    def __init__(self, name, *, bus, context_aggregator):
+        super().__init__(
+            name,
+            bus=bus,
+            context_aggregator=context_aggregator,
+        )
+
+    def build_llm(self):
+        return OpenAILLMService(api_key=OPENAI_KEY, model="gpt-4o")
+
+    def build_initial_node(self):
+        return {
+            "role_messages": [
+                {"role": "system", "content": "You are a reservation assistant."}
+            ],
+            "task_messages": [
+                {"role": "system", "content": "Ask the user for their name."}
+            ],
+            "functions": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "collect_name",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"}
+                            },
+                        },
+                    },
+                    "handler": self.handle_name,
+                    "transition_to": "collect_date",
+                }
+            ],
+        }
+
+    async def handle_name(self, args):
+        self.name_collected = args["name"]
+
+    @tool
+    async def cancel_reservation(self, params):
+        """Cancel the reservation process."""
+        await self.end()
+```
+
+## Comparison
+
+| Feature         | BaseAgent          | LLMAgent              | FlowsAgent                   |
+| --------------- | ------------------ | --------------------- | ---------------------------- |
+| Pipeline        | Optional           | LLM pipeline          | LLM + FlowManager            |
+| Default active  | `True`             | `False`               | `False`                      |
+| Default bridged | `None`             | `None`                | `()`                         |
+| Tool support    | Via `@task`        | Via `@tool`           | Via `@tool` + flow functions |
+| Best for        | Transport, workers | Conversational agents | Structured workflows         |

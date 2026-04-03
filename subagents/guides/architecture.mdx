@@ -1,0 +1,232 @@
+---
+title: "Architecture"
+description: "Deep dive into the Pipecat Subagents architecture: bus, bridges, registry, and message routing."
+---
+
+This guide covers the core components of Pipecat Subagents and how they work together.
+
+## Components Overview
+
+```
+┌───────────────────┐    ┌───────────────────┐    ┌──────────────────┐
+│   Main Agent      │    │   Voice Agent      │    │   Worker(s)      │
+│                   │    │                    │    │                  │
+│   Transport I/O   │    │   LLM + Tools      │    │   Task Handlers  │
+│   STT → Bridge    │    │                    │    │                  │
+│   Bridge → TTS    │    │                    │    │                  │
+└─────────┬─────────┘    └─────────┬──────────┘    └────────┬─────────┘
+          │                        │                        │
+    ══════╧════════════════════════╧════════════════════════╧══════════
+                              Agent Bus
+    ══════════════════════════════════════════════════════════════════
+```
+
+## Agent Bus
+
+The bus is the pub/sub messaging backbone. All agents subscribe to the same bus and exchange messages for frame routing, lifecycle events, task coordination, and agent discovery.
+
+### Implementations
+
+| Bus             | Use Case                            | Backing                                     |
+| --------------- | ----------------------------------- | ------------------------------------------- |
+| `AsyncQueueBus` | Local (single process)              | `asyncio.Queue` — no serialization overhead |
+| `RedisBus`      | Distributed (multi-process/machine) | Redis pub/sub with JSON serialization       |
+
+Both implementations expose the same API. Your agent code doesn't change when switching between local and distributed.
+
+```python
+from pipecat_subagents.runner import AgentRunner
+
+# Local (default)
+runner = AgentRunner()  # Uses AsyncQueueBus
+
+# Distributed
+from pipecat_subagents.bus.network.redis import RedisBus
+bus = RedisBus(url="redis://localhost:6379")
+runner = AgentRunner(bus=bus)
+```
+
+### Message Priority
+
+The bus delivers messages in priority order:
+
+- **System messages** (high priority) — lifecycle events, activation/deactivation
+- **Data messages** (normal priority) — frames, task payloads
+
+This ensures lifecycle commands are processed before data, preventing race conditions.
+
+## Bus Bridge Processor
+
+The `BusBridgeProcessor` is a pipeline processor placed in the main agent's pipeline where an LLM would normally go. It:
+
+- Captures incoming frames (e.g., user speech text) and publishes them to the bus
+- Receives response frames (e.g., LLM output) from the bus and injects them back into the pipeline
+
+```python
+from pipecat_subagents.bus import BusBridgeProcessor
+
+bridge = BusBridgeProcessor(
+    bus=self.bus,
+    agent_name=self.name,
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    bridge,       # ← Replaces the LLM in the pipeline
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+### Named Bridges
+
+For complex topologies with multiple independent frame streams, bridges support naming:
+
+```python
+# Voice bridge
+voice_bridge = BusBridgeProcessor(
+    bus=bus, agent_name="main", bridge="voice"
+)
+
+# Video bridge (separate stream)
+video_bridge = BusBridgeProcessor(
+    bus=bus, agent_name="main", bridge="video"
+)
+
+# Agent that only handles voice frames
+voice_agent = LLMAgent("assistant", bus=bus, bridged=("voice",))
+
+# Agent that only handles video frames
+video_agent = BaseAgent("video_proc", bus=bus, bridged=("video",))
+```
+
+### Frame Filtering
+
+The bridge automatically handles frame routing:
+
+- **Lifecycle frames** (StartFrame, EndFrame, CancelFrame) never cross the bus
+- **Urgent transport frames** pass through the bridge directly
+- Custom frames can be excluded via the `exclude_frames` parameter
+
+## Agent Registry
+
+The registry tracks which agents are ready across the system. It powers agent discovery and the `on_agent_ready()` callback.
+
+### Visibility Model
+
+- **Root agents** (added via `AgentRunner.add_agent()`) are announced globally — all agents see them
+- **Child agents** (added via `BaseAgent.add_agent()`) are private — only the parent receives `on_agent_ready()`
+
+```python
+runner = AgentRunner()
+
+# Root agent — visible to all
+main = MainAgent("main", bus=runner.bus)
+await runner.add_agent(main)
+
+# Child agents — only visible to main
+greeter = GreeterAgent("greeter", bus=runner.bus)
+await main.add_agent(greeter)  # Private to main
+```
+
+### Watching for Agents
+
+Use `watch_agent()` to get notified when a specific agent registers, which is useful for distributed setups where agents may start at different times:
+
+```python
+async def on_ready(self):
+    await super().on_ready()
+    self.watch_agent("remote_worker")
+
+async def on_agent_ready(self, data):
+    if data.agent_name == "remote_worker":
+        await self.activate_agent("remote_worker")
+```
+
+## Agent Lifecycle
+
+### Activation and Deactivation
+
+Only one agent is active at a time per bridge. The active agent receives frames from the bus.
+
+```python
+# Activate another agent
+await self.activate_agent("support", args=activation_args)
+
+# Deactivate another agent
+await self.deactivate_agent("support")
+
+# Handoff: deactivate self, activate target
+await self.handoff_to("support", args=activation_args)
+```
+
+### Lifecycle Hooks
+
+All agents receive these lifecycle callbacks:
+
+| Hook                     | When                                         |
+| ------------------------ | -------------------------------------------- |
+| `on_ready()`             | Agent is registered and ready to operate     |
+| `on_activated(args)`     | Agent was activated (receives optional args) |
+| `on_deactivated()`       | Agent was deactivated                        |
+| `on_finished()`          | Agent's pipeline has completed               |
+| `on_error(error, fatal)` | Pipeline error occurred                      |
+
+### Error Handling
+
+Errors are not propagated automatically — each agent decides how to handle its own errors:
+
+```python
+async def on_error(self, error, fatal):
+    if fatal:
+        # Escalate to parent
+        await self.send_error(str(error))
+    else:
+        # Handle locally
+        logger.warning(f"Non-fatal error: {error}")
+```
+
+Parent agents receive child errors via `on_agent_error()`.
+
+## Bus Messages
+
+Messages on the bus fall into several categories:
+
+| Category        | Examples                                                                     |
+| --------------- | ---------------------------------------------------------------------------- |
+| Frame transport | `BusFrameMessage` — wraps Pipecat frames with direction and bridge name      |
+| Lifecycle       | `BusActivateAgentMessage`, `BusDeactivateAgentMessage`, `BusEndAgentMessage` |
+| Registry        | `BusAgentRegistryMessage`, `BusAddAgentMessage`                              |
+| Tasks           | `BusTaskRequestMessage`, `BusTaskResponseMessage`, `BusTaskUpdateMessage`    |
+| Errors          | `BusAgentErrorMessage`                                                       |
+
+## Distributed Deployment
+
+For distributed setups across multiple processes or machines:
+
+1. Use `RedisBus` instead of the default `AsyncQueueBus`
+2. Run separate `AgentRunner` instances connected to the same Redis
+3. Use **WebSocket proxy agents** for point-to-point connections without shared infrastructure
+
+```python
+# Process 1: Main agent
+from pipecat_subagents.bus.network.redis import RedisBus
+
+bus = RedisBus(url="redis://localhost:6379")
+runner = AgentRunner(bus=bus)
+main = MainAgent("main", bus=runner.bus)
+await runner.add_agent(main)
+await runner.run()
+
+# Process 2: Voice agent (separate machine)
+bus = RedisBus(url="redis://localhost:6379")
+runner = AgentRunner(bus=bus)
+agent = GreeterAgent("greeter", bus=runner.bus)
+await runner.add_agent(agent)
+await runner.run()
+```
+
+The agents discover each other automatically via the bus registry.
