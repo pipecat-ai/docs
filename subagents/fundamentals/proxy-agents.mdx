@@ -1,0 +1,188 @@
+---
+title: "Proxy Agents"
+description: "Connect agents on different buses with proxy agents."
+---
+
+## Overview
+
+Proxy agents connect agents running on **different buses**. Unlike [distributed agents](/subagents/fundamentals/distributed-agents) (which all share the same bus), proxy agents bridge two isolated bus instances point-to-point. This is useful when:
+
+- You want to run an LLM agent on a separate server without shared infrastructure
+- You need fine-grained control over which messages cross the network
+- You're connecting to a third-party service that hosts agents
+
+## Architecture
+
+```
+Machine A (transport)              Machine B (LLM)
+┌─────────────────────┐            ┌─────────────────────┐
+│ AgentRunner          │            │ FastAPI server       │
+│   MainAgent          │            │   AgentRunner        │
+│   ProxyClient ──── WebSocket ────── ProxyServer        │
+│                      │            │   AssistantAgent     │
+└─────────────────────┘            └─────────────────────┘
+```
+
+Each side has its own `AgentRunner` and bus. The proxy agents relay messages between the two buses over a WebSocket connection.
+
+## Client side: WebSocketProxyClientAgent
+
+The client connects to a remote server and forwards specific message types:
+
+```python
+from pipecat_subagents.agents.proxy import WebSocketProxyClientAgent
+from pipecat_subagents.bus import BusFrameMessage
+
+proxy = WebSocketProxyClientAgent(
+    "proxy",
+    bus=runner.bus,
+    url="ws://remote-server:8765/ws",
+    local_agent_name="acme",         # Agent on this bus
+    remote_agent_name="assistant",   # Agent on remote bus
+    forward_messages=(BusFrameMessage,),
+)
+await runner.add_agent(proxy)
+```
+
+| Parameter | Description |
+| --- | --- |
+| `url` | WebSocket URL of the remote server |
+| `local_agent_name` | Name of the local agent that exchanges frames with the remote |
+| `remote_agent_name` | Name of the remote agent to communicate with |
+| `forward_messages` | Tuple of message types to forward across the connection |
+| `headers` | Optional HTTP headers (e.g. authentication tokens) |
+
+The proxy connects when activated. Activate it when the client connects:
+
+```python
+class MainAgent(BaseAgent):
+    async def build_pipeline(self) -> Pipeline:
+        @self._transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            await self.activate_agent("proxy")
+        # ...
+```
+
+## Server side: WebSocketProxyServerAgent
+
+The server accepts WebSocket connections and creates a proxy for each session:
+
+```python
+from fastapi import FastAPI, WebSocket
+from pipecat_subagents.agents.proxy import WebSocketProxyServerAgent
+from pipecat_subagents.bus import BusFrameMessage
+from pipecat_subagents.runner import AgentRunner
+
+app = FastAPI()
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    runner = AgentRunner(handle_sigint=False)
+
+    proxy = WebSocketProxyServerAgent(
+        "gateway",
+        bus=runner.bus,
+        websocket=websocket,
+        agent_name="assistant",        # Agent on this bus
+        remote_agent_name="acme",      # Agent on remote bus
+        forward_messages=(BusFrameMessage,),
+    )
+
+    assistant = AssistantAgent("assistant", bus=runner.bus)
+
+    await runner.add_agent(proxy)
+    await runner.add_agent(assistant)
+    await runner.run()
+```
+
+Each WebSocket connection gets its own `AgentRunner`, bus, and set of agents. This isolates sessions from each other.
+
+## Message filtering
+
+Proxy agents provide security through message filtering:
+
+- Only messages targeted at the configured agent names cross the connection
+- Broadcast messages (no target) are **not** forwarded
+- Local-only messages (`BusLocalMessage`) never cross
+- `forward_messages` controls which message types are allowed
+
+This means internal bus traffic stays local. Only the specific message types you opt into are relayed.
+
+## Full example
+
+### Client (main_agent.py)
+
+```python
+async def run_bot(transport, runner_args):
+    runner = AgentRunner(handle_sigint=runner_args.handle_sigint)
+
+    main_agent = MainAgent("acme", bus=runner.bus, transport=transport)
+    await runner.add_agent(main_agent)
+
+    proxy = WebSocketProxyClientAgent(
+        "proxy",
+        bus=runner.bus,
+        url="ws://localhost:8765/ws",
+        local_agent_name="acme",
+        remote_agent_name="assistant",
+        forward_messages=(BusFrameMessage,),
+    )
+    await runner.add_agent(proxy)
+
+    await runner.run()
+```
+
+### Server (assistant_agent.py)
+
+```python
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    runner = AgentRunner(handle_sigint=False)
+
+    proxy = WebSocketProxyServerAgent(
+        "gateway",
+        bus=runner.bus,
+        websocket=websocket,
+        agent_name="assistant",
+        remote_agent_name="acme",
+        forward_messages=(BusFrameMessage,),
+    )
+
+    @proxy.event_handler("on_client_connected")
+    async def on_client_connected(proxy, client):
+        logger.info("WebSocket client connected")
+
+    @proxy.event_handler("on_client_disconnected")
+    async def on_client_disconnected(proxy, client):
+        await runner.cancel()
+
+    assistant = AcmeAssistant("assistant", bus=runner.bus)
+    await runner.add_agent(proxy)
+    await runner.add_agent(assistant)
+    await runner.run()
+```
+
+### Running
+
+```bash
+# Terminal 1: Start the LLM server
+python assistant_agent.py --port 8765
+
+# Terminal 2: Start the transport client
+python main_agent.py --remote-agent-url ws://localhost:8765/ws
+```
+
+<Info>
+  Install the WebSocket extra: `pip install pipecat-ai-subagents[websocket]`
+</Info>
+
+## Proxy agents vs distributed agents
+
+| | Proxy Agents (different buses) | Distributed (same bus) |
+| --- | --- | --- |
+| **Topology** | Point-to-point | Many-to-many |
+| **Session isolation** | Each connection is isolated | All agents share a channel |
+| **Use case** | Separate networks, third-party agents | Scaling agents across machines |

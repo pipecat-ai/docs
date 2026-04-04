@@ -1,0 +1,213 @@
+---
+title: "Agents and Runner"
+description: "Learn about agent types, the AgentRunner, and how to build your first agent."
+---
+
+## Agent types
+
+Pipecat Subagents provides three built-in agent types, each building on the previous:
+
+| Type | Purpose |
+| --- | --- |
+| `BaseAgent` | Foundation for all agents. Owns a pipeline, manages lifecycle, handles tasks. |
+| `LLMAgent` | Extends `BaseAgent` with an LLM pipeline and automatic `@tool` registration. |
+| `FlowsAgent` | Extends `LLMAgent` with structured conversation flows via Pipecat Flows. |
+
+### BaseAgent
+
+Every agent extends `BaseAgent`. It provides:
+
+- A pipeline that you define by overriding `build_pipeline()`
+- Lifecycle hooks (`on_ready`, `on_finished`, `on_error`)
+- Activation control (`activate_agent`, `deactivate_agent`, `handoff_to`)
+- Task coordination (`request_task`, `task_group`, `send_task_response`)
+- Child agent management (`add_agent`)
+
+### LLMAgent
+
+`LLMAgent` adds LLM-specific functionality:
+
+- Override `build_llm()` to return an LLM service
+- Mark methods with `@tool` to register them as LLM-callable tools
+- Receives activation arguments with optional messages to inject into the LLM context
+
+### FlowsAgent
+
+`FlowsAgent` adds structured conversation flows:
+
+- Override `build_initial_node()` to define the starting flow node
+- Define node functions that return results and the next node
+- Combines the power of Pipecat Flows with the multi-agent coordination model
+
+<Info>
+  `LLMAgent` and `FlowsAgent` are covered in detail in the Fundamentals section. This guide focuses on `BaseAgent` and the overall system.
+</Info>
+
+## The AgentRunner
+
+The `AgentRunner` is the entry point for every subagent system. It:
+
+- Creates and manages the shared message bus
+- Starts agent pipelines and manages their lifecycle
+- Tracks agent readiness through a registry
+- Coordinates graceful shutdown
+
+```python
+from pipecat_subagents.runner import AgentRunner
+
+runner = AgentRunner(handle_sigint=True)
+```
+
+When you don't provide a bus, the runner creates an `AsyncQueueBus` automatically -- an in-process bus backed by asyncio queues. For distributed setups, you can pass a `RedisBus` instead.
+
+## Your first agent
+
+Here's the simplest possible subagent system -- a single `BaseAgent` running a complete voice pipeline:
+
+```python
+import os
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMMessagesAppendFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.base_llm import OpenAILLMSettings
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+
+from pipecat_subagents.agents import BaseAgent
+from pipecat_subagents.bus import AgentBus
+from pipecat_subagents.runner import AgentRunner
+
+
+class SimpleAgent(BaseAgent):
+    def __init__(self, name: str, *, bus: AgentBus, transport: BaseTransport):
+        super().__init__(name, bus=bus)
+        self._transport = transport
+
+    async def build_pipeline(self) -> Pipeline:
+        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            settings=CartesiaTTSSettings(
+                voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+            ),
+        )
+        llm = OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMSettings(
+                system_instruction="You are a helpful voice assistant. Keep responses brief.",
+            ),
+        )
+
+        context = LLMContext()
+        context_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        )
+
+        @self._transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            await self.queue_frame(
+                LLMMessagesAppendFrame(
+                    messages=[{"role": "user", "content": "Greet the user."}],
+                    run_llm=True,
+                )
+            )
+
+        @self._transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            await self.end()
+
+        return Pipeline(
+            [
+                self._transport.input(),
+                stt,
+                context_aggregator.user(),
+                llm,
+                tts,
+                self._transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
+```
+
+This looks similar to a regular Pipecat pipeline -- and that's the point. A single agent wraps a standard pipeline with lifecycle management.
+
+## Running the agent
+
+To run the agent, create a runner, add the agent, and call `run()`:
+
+```python
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    runner = AgentRunner(handle_sigint=runner_args.handle_sigint)
+    agent = SimpleAgent("assistant", bus=runner.bus, transport=transport)
+    await runner.add_agent(agent)
+    await runner.run()
+```
+
+The runner blocks until `end()` or `cancel()` is called. In this case, the agent calls `self.end()` when the client disconnects.
+
+## Lifecycle hooks
+
+`BaseAgent` provides hooks you can override to react to lifecycle events. Always call `super()` in your overrides:
+
+```python
+class MyAgent(BaseAgent):
+    async def on_ready(self) -> None:
+        """Called once when the agent's pipeline is ready."""
+        await super().on_ready()
+        logger.info(f"Agent {self.name} is ready")
+
+    async def on_finished(self) -> None:
+        """Called when the agent's pipeline finishes."""
+        await super().on_finished()
+
+    async def on_error(self, error: str, fatal: bool) -> None:
+        """Called when a pipeline error occurs."""
+        await super().on_error(error, fatal)
+```
+
+## Adding child agents
+
+Agents can have child agents. This is how you build multi-agent systems -- the main agent adds LLM agents as children:
+
+```python
+@self._transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    greeter = GreeterAgent("greeter", bus=self.bus)
+    support = SupportAgent("support", bus=self.bus)
+    await self.add_agent(greeter)
+    await self.add_agent(support)
+```
+
+Child agents are managed by their parent:
+
+- They are announced only to the parent (not visible to other runners)
+- When the parent shuts down, children are shut down too
+- The parent's `@agent_ready` handlers fire when children become ready
+
+<Note>
+  Root agents (added directly to the runner via `runner.add_agent()`) are visible across runners in distributed setups. Child agents (added via `parent.add_agent()`) are only visible to their parent.
+</Note>
+
+## What's next
+
+A single agent works, but the real power comes when agents communicate. Next, let's learn about the message bus that connects them.
+
+<Card
+  title="The Agent Bus"
+  icon="arrow-right"
+  href="/subagents/learn/agent-bus"
+>
+  How agents communicate through the message bus
+</Card>
