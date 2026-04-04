@@ -1,0 +1,171 @@
+---
+title: "LLMAgent"
+description: "Agent with LLM pipeline and automatic tool registration"
+---
+
+## Overview
+
+`LLMAgent` extends [`BaseAgent`](/api-reference/pipecat-subagents/base-agent) with an LLM pipeline and automatic tool registration. Subclasses implement `build_llm()` to provide an LLM service and define tools with the [`@tool`](/api-reference/pipecat-subagents/decorators#tool) decorator.
+
+```python
+from pipecat_subagents.agents import LLMAgent
+```
+
+```python
+class MyAgent(LLMAgent):
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key="...",
+            system_instruction="You are a helpful assistant.",
+        )
+
+    @tool
+    async def my_function(self, params, arg: str):
+        ...
+```
+
+## Configuration
+
+Inherits all parameters from [`BaseAgent`](/api-reference/pipecat-subagents/base-agent#configuration).
+
+<ParamField path="name" type="str" required>
+  Unique name for this agent.
+</ParamField>
+
+<ParamField path="bus" type="AgentBus" required>
+  The [`AgentBus`](/api-reference/pipecat-subagents/bus#agentbus) for
+  inter-agent communication.
+</ParamField>
+
+<ParamField path="active" type="bool" default="False">
+  Whether the agent starts active. Defaults to `False` (unlike `BaseAgent` which
+  defaults to `True`), since LLM agents typically wait to be activated via
+  handoff.
+</ParamField>
+
+<ParamField path="bridged" type="Optional[tuple[str, ...]]" default="None">
+  Bridge configuration. See
+  [`BaseAgent`](/api-reference/pipecat-subagents/base-agent#configuration) for
+  details.
+</ParamField>
+
+<ParamField path="defer_tool_frames" type="bool" default="True">
+  Whether to defer frames queued during tool execution until all tools complete.
+  When `True`, any frames queued via `queue_frame()` while a `@tool` method is
+  running are held in an internal queue and delivered automatically once the
+  last tool finishes.
+</ParamField>
+
+## Properties
+
+Inherits all properties from [`BaseAgent`](/api-reference/pipecat-subagents/base-agent#properties).
+
+### tool_call_active
+
+```python
+agent.tool_call_active -> bool
+```
+
+`True` when one or more `@tool` methods are executing.
+
+## Abstract Methods
+
+### build_llm
+
+```python
+@abstractmethod
+def build_llm(self) -> LLMService
+```
+
+Return the LLM service for this agent. Subclasses must implement this to provide a configured `LLMService` (e.g. `OpenAILLMService`, `AnthropicLLMService`). Tool registration is handled automatically; do not register `@tool` methods here.
+
+**Returns:** An `LLMService` instance.
+
+## Methods
+
+### build_tools
+
+```python
+def build_tools(self) -> list
+```
+
+Return the tools for this agent's LLM. By default, returns all methods decorated with [`@tool`](/api-reference/pipecat-subagents/decorators#tool). Override to provide additional or different tools.
+
+**Returns:** List of tool functions.
+
+### create_llm
+
+```python
+def create_llm(self) -> LLMService
+```
+
+Create the LLM with tools registered. Calls `build_llm()` and registers all `@tool` decorated methods. Each tool is automatically wrapped with inflight tracking for frame deferral. Override to customize the LLM setup.
+
+**Returns:** The configured `LLMService`.
+
+### on_activated
+
+```python
+async def on_activated(self, args: Optional[dict]) -> None
+```
+
+Configure the LLM with tools and activation messages. When `args` contains `messages`, they are appended to the LLM context. When `args` contains `run_llm` (defaults to `True` when messages are set), the LLM is triggered after appending.
+
+| Parameter | Type             | Description                                                                                                          |
+| --------- | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `args`    | `Optional[dict]` | Activation arguments (see [`LLMAgentActivationArgs`](/api-reference/pipecat-subagents/types#llmagentactivationargs)) |
+
+### handoff_to
+
+```python
+async def handoff_to(
+    self,
+    agent_name: str,
+    *,
+    args: Optional[AgentActivationArgs] = None,
+    result_callback: Optional[FunctionCallResultCallback] = None,
+) -> None
+```
+
+Hand off to another agent. When called from a `@tool` handler, pass `params.result_callback` to ensure any pending LLM output is fully delivered before handing off.
+
+| Parameter         | Type                                   | Default | Description                                     |
+| ----------------- | -------------------------------------- | ------- | ----------------------------------------------- |
+| `agent_name`      | `str`                                  |         | Name of the agent to hand off to                |
+| `args`            | `Optional[AgentActivationArgs]`        | `None`  | Arguments forwarded to `on_activated`           |
+| `result_callback` | `Optional[FunctionCallResultCallback]` | `None`  | The `result_callback` from `FunctionCallParams` |
+
+### end
+
+```python
+async def end(
+    self,
+    *,
+    reason: Optional[str] = None,
+    result_callback: Optional[FunctionCallResultCallback] = None,
+) -> None
+```
+
+Request a graceful end of the session. When called from a `@tool` handler, pass `params.result_callback` to ensure any pending LLM output is fully delivered before ending.
+
+| Parameter         | Type                                   | Default | Description                                     |
+| ----------------- | -------------------------------------- | ------- | ----------------------------------------------- |
+| `reason`          | `Optional[str]`                        | `None`  | Human-readable reason for ending                |
+| `result_callback` | `Optional[FunctionCallResultCallback]` | `None`  | The `result_callback` from `FunctionCallParams` |
+
+### process_deferred_tool_frames
+
+```python
+async def process_deferred_tool_frames(
+    self,
+    frames: list[tuple[Frame, FrameDirection]],
+) -> list[tuple[Frame, FrameDirection]]
+```
+
+Process deferred frames before they are flushed. Called after all in-flight tools complete, before the deferred frames are queued into the pipeline. Override to inspect, modify, reorder, or filter the frames.
+
+| Parameter | Type                                 | Description                                         |
+| --------- | ------------------------------------ | --------------------------------------------------- |
+| `frames`  | `list[tuple[Frame, FrameDirection]]` | The deferred frames collected during tool execution |
+
+**Returns:** The frames to queue. Return the list as-is for default behavior.

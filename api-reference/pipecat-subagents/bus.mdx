@@ -1,0 +1,188 @@
+---
+title: "Bus"
+description: "Bus infrastructure for inter-agent messaging"
+---
+
+## AgentBus
+
+Abstract base for inter-agent and runner-agent communication. Provides pub/sub messaging where each subscriber receives messages independently through its own priority queue. System messages (e.g. cancel) are delivered before normal data messages.
+
+```python
+from pipecat_subagents.bus import AgentBus
+```
+
+### Methods
+
+#### start
+
+```python
+async def start(self) -> None
+```
+
+Start dispatch tasks for all registered subscribers.
+
+#### stop
+
+```python
+async def stop(self) -> None
+```
+
+Stop all dispatch tasks.
+
+#### subscribe
+
+```python
+async def subscribe(self, subscriber: BusSubscriber) -> None
+```
+
+Register a subscriber to receive messages from the bus.
+
+| Parameter    | Type            | Description                |
+| ------------ | --------------- | -------------------------- |
+| `subscriber` | `BusSubscriber` | The subscriber to register |
+
+#### unsubscribe
+
+```python
+async def unsubscribe(self, subscriber: BusSubscriber) -> None
+```
+
+Remove a subscriber and cancel its dispatch task.
+
+| Parameter    | Type            | Description              |
+| ------------ | --------------- | ------------------------ |
+| `subscriber` | `BusSubscriber` | The subscriber to remove |
+
+#### send
+
+```python
+async def send(self, message: BusMessage) -> None
+```
+
+Send a message through the bus. Local-only messages are delivered directly to subscribers. All other messages are passed to `publish()` for transport.
+
+| Parameter | Type                                                      | Description             |
+| --------- | --------------------------------------------------------- | ----------------------- |
+| `message` | [`BusMessage`](/api-reference/pipecat-subagents/messages) | The bus message to send |
+
+#### publish
+
+```python
+@abstractmethod
+async def publish(self, message: BusMessage) -> None
+```
+
+Publish a message to the transport. Subclasses implement this for the specific transport (e.g. in-process queue, Redis pub/sub).
+
+| Parameter | Type                                                      | Description                |
+| --------- | --------------------------------------------------------- | -------------------------- |
+| `message` | [`BusMessage`](/api-reference/pipecat-subagents/messages) | The bus message to publish |
+
+#### on_message_received
+
+```python
+def on_message_received(self, message: BusMessage) -> None
+```
+
+Deliver a message to all local subscribers via their priority queues. Called by bus implementations when a message arrives (either from a local `send()` or from a network transport).
+
+## AsyncQueueBus
+
+In-process bus that delivers messages via priority queues. This is the default bus used by [`AgentRunner`](/api-reference/pipecat-subagents/agent-runner) when no bus is provided.
+
+```python
+from pipecat_subagents.bus import AsyncQueueBus
+
+bus = AsyncQueueBus()
+runner = AgentRunner(bus=bus)
+```
+
+Suitable for single-process setups where all agents run in the same Python process.
+
+## RedisBus
+
+Distributed agent bus backed by Redis pub/sub for cross-process communication.
+
+<Note>Requires the redis extra: `pip install pipecat-ai-subagents[redis]`</Note>
+
+```python
+from redis.asyncio import Redis
+from pipecat_subagents.bus.network.redis import RedisBus
+
+redis = Redis.from_url("redis://localhost:6379")
+bus = RedisBus(redis=redis, channel="my-session")
+runner = AgentRunner(bus=bus)
+```
+
+### Configuration
+
+<ParamField path="redis" type="Redis" required>
+  A `redis.asyncio.Redis` client instance.
+</ParamField>
+
+<ParamField path="serializer" type="Optional[MessageSerializer]" default="None">
+  The
+  [`MessageSerializer`](/api-reference/pipecat-subagents/serializers#messageserializer)
+  for encoding/decoding messages. Defaults to
+  [`JSONMessageSerializer`](/api-reference/pipecat-subagents/serializers#jsonmessageserializer).
+</ParamField>
+
+<ParamField path="channel" type="str" default="pipecat:bus">
+  The Redis pub/sub channel name.
+</ParamField>
+
+## BusBridgeProcessor
+
+Bidirectional mid-pipeline bridge between a Pipecat pipeline and the bus. Placed in a transport or session agent's pipeline to exchange frames with other agents via the `AgentBus`.
+
+```python
+from pipecat_subagents.bus import BusBridgeProcessor
+
+bridge = BusBridgeProcessor(
+    bus=runner.bus,
+    agent_name="session",
+    bridge="voice",
+)
+
+pipeline = Pipeline([transport.input(), bridge, transport.output()])
+```
+
+### Configuration
+
+<ParamField path="bus" type="AgentBus" required>
+  The `AgentBus` to exchange frames with.
+</ParamField>
+
+<ParamField path="agent_name" type="str" required>
+  Name of this agent, used as message source.
+</ParamField>
+
+<ParamField path="target_agent" type="Optional[str]" default="None">
+  When set, only exchange frames with this agent.
+</ParamField>
+
+<ParamField path="bridge" type="Optional[str]" default="None">
+  Optional bridge name for routing. When set, outgoing frames are tagged with
+  this name and only incoming frames with the same bridge name are accepted.
+</ParamField>
+
+<ParamField
+  path="exclude_frames"
+  type="Optional[tuple[type[Frame], ...]]"
+  default="None"
+>
+  Extra frame types that should never cross the bus (on top of lifecycle frames
+  which are always excluded).
+</ParamField>
+
+## BusSubscriber
+
+Mixin for objects that receive messages from an `AgentBus`. Implementors override `on_bus_message()` to handle incoming messages.
+
+```python
+from pipecat_subagents.bus.subscriber import BusSubscriber
+
+class MySubscriber(BusSubscriber):
+    async def on_bus_message(self, message: BusMessage) -> None:
+        ...
+```
