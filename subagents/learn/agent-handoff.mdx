@@ -1,0 +1,213 @@
+---
+title: "Agent Handoff"
+description: "Transfer control between agents with activation, deactivation, and handoff."
+---
+
+## The activation model
+
+In a multi-agent voice system, only one agent is **active** at a time (per bridge). The active agent receives audio frames from the bus and can respond to the user. Inactive agents exist but don't process frames.
+
+Every agent has an `active` property that defaults to `False`. You control which agent is active using three methods:
+
+| Method | What it does |
+| --- | --- |
+| `activate_agent(name, args)` | Activate another agent |
+| `deactivate_agent(name)` | Deactivate another agent |
+| `handoff_to(name, args)` | Deactivate self, then activate the target |
+
+`handoff_to()` is the most common -- it's a single call that transfers control from the current agent to another.
+
+## Building a handoff system
+
+Let's walk through how the two-agent handoff works. You need three pieces:
+
+### 1. A main agent with a bus bridge
+
+The main agent owns the transport (audio I/O) and places a `BusBridgeProcessor` in its pipeline instead of an LLM. The bridge routes frames to whichever LLM agent is active:
+
+```python
+from pipecat_subagents.agents import BaseAgent
+from pipecat_subagents.bus import BusBridgeProcessor
+
+class MainAgent(BaseAgent):
+    def __init__(self, name, *, bus, transport):
+        super().__init__(name, bus=bus)
+        self._transport = transport
+
+    async def build_pipeline(self) -> Pipeline:
+        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+        tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"))
+
+        context = LLMContext()
+        context_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        )
+
+        bridge = BusBridgeProcessor(bus=self.bus, agent_name=self.name)
+
+        return Pipeline([
+            self._transport.input(),
+            stt,
+            context_aggregator.user(),
+            bridge,                        # Where the LLM would go
+            tts,
+            self._transport.output(),
+            context_aggregator.assistant(),
+        ])
+```
+
+### 2. LLM agents with bridged=()
+
+LLM agents set `bridged=()` to receive frames from the bus. Each one runs its own LLM and defines its own system prompt:
+
+```python
+from pipecat_subagents.agents import LLMAgent
+
+class GreeterAgent(LLMAgent):
+    def __init__(self, name, *, bus):
+        super().__init__(name, bus=bus, bridged=())
+
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMSettings(
+                system_instruction="You are a friendly greeter. Route product questions to support.",
+            ),
+        )
+```
+
+<Note>
+  `bridged=()` means the agent receives frames from all bridges. You can filter by bridge name with `bridged=("voice",)` if you have multiple bridges.
+</Note>
+
+### 3. Handoff via tools
+
+The LLM decides when to transfer by calling a tool. The tool calls `handoff_to()`:
+
+```python
+from pipecat_subagents.agents import tool, LLMAgentActivationArgs
+
+class GreeterAgent(LLMAgent):
+    # ... build_llm() as above ...
+
+    @tool(cancel_on_interruption=False)
+    async def transfer_to_agent(self, params: FunctionCallParams, agent: str, reason: str):
+        """Transfer the user to another agent.
+
+        Args:
+            agent (str): The agent to transfer to (e.g. 'support').
+            reason (str): Why the user is being transferred.
+        """
+        await self.handoff_to(
+            agent,
+            args=LLMAgentActivationArgs(
+                messages=[{"role": "user", "content": reason}],
+            ),
+            result_callback=params.result_callback,
+        )
+```
+
+When the greeter calls `handoff_to("support", ...)`:
+
+1. The greeter is deactivated -- it stops receiving frames from the bus
+2. The support agent is activated with the provided arguments
+3. The support agent's `on_activated()` fires, injecting the reason message into its LLM context
+4. The support agent starts responding to the user
+
+The transition is seamless -- the user experiences it as a natural conversation flow.
+
+## Activation arguments
+
+When activating an `LLMAgent`, you can pass `LLMAgentActivationArgs` to control what happens:
+
+```python
+from pipecat_subagents.agents import LLMAgentActivationArgs
+
+await self.activate_agent(
+    "support",
+    args=LLMAgentActivationArgs(
+        messages=[{"role": "user", "content": "The user asked about Rocket Boots."}],
+        run_llm=True,  # Default: run the LLM after injecting messages
+    ),
+)
+```
+
+- `messages`: A list of messages to inject into the LLM context
+- `run_llm`: Whether to immediately run the LLM after injection (default `True`)
+
+This lets you give the target agent context about why it was activated.
+
+## Activation hooks
+
+Agents can react to activation and deactivation by overriding hooks:
+
+```python
+class SupportAgent(LLMAgent):
+    async def on_activated(self, args) -> None:
+        await super().on_activated(args)
+        # Agent was just activated -- args contains LLMAgentActivationArgs
+
+    async def on_deactivated(self) -> None:
+        await super().on_deactivated()
+        # Agent was just deactivated
+```
+
+For `LLMAgent`, the default `on_activated()` implementation handles injecting messages and running the LLM, so you typically don't need to override it unless you want additional behavior.
+
+## Waiting for agents to be ready
+
+Before you can activate an agent, it needs to be ready (its pipeline must be started). Use the `@agent_ready` decorator to declare a handler that fires when a specific agent registers:
+
+```python
+from pipecat_subagents.agents import agent_ready
+
+class MainAgent(BaseAgent):
+    @agent_ready(name="greeter")
+    async def on_greeter_ready(self, data: AgentReadyData) -> None:
+        await self.activate_agent(
+            "greeter",
+            args=LLMAgentActivationArgs(
+                messages=[{"role": "user", "content": "Welcome the user."}],
+            ),
+        )
+```
+
+The framework automatically watches for the named agent when the main agent starts. If the agent is already registered, the handler fires immediately. This is the typical pattern: the main agent waits for the first LLM agent, then activates it to start the conversation.
+
+## Putting it all together
+
+Here's the full flow:
+
+<Steps>
+  <Step title="Runner starts">
+    `AgentRunner` creates the bus and starts the main agent's pipeline.
+  </Step>
+  <Step title="Client connects">
+    The main agent creates child LLM agents and adds them via `add_agent()`.
+  </Step>
+  <Step title="Agent becomes ready">
+    The `@agent_ready` handler fires on the parent. The main agent activates the greeter.
+  </Step>
+  <Step title="User speaks">
+    Audio flows: transport -> STT -> BusBridge -> bus -> greeter's LLM -> bus -> BusBridge -> TTS -> transport.
+  </Step>
+  <Step title="LLM decides to transfer">
+    The greeter's LLM calls `transfer_to_agent`. The tool calls `handoff_to("support", ...)`.
+  </Step>
+  <Step title="Handoff completes">
+    Greeter deactivates, support activates with context. Audio now flows through the support agent.
+  </Step>
+</Steps>
+
+## What's next
+
+Handoff transfers a conversation between agents. But sometimes you need agents to do work in parallel. Next, let's look at task coordination.
+
+<Card
+  title="Task Coordination"
+  icon="arrow-right"
+  href="/subagents/learn/task-coordination"
+>
+  Dispatch work to multiple agents in parallel
+</Card>
