@@ -7,6 +7,13 @@ description: "Service to connect to MCP (Model Context Protocol) servers"
 
 MCP is an open standard for enabling AI agents to interact with external data and tools. `MCPClient` provides a way to access and call tools via MCP. For example, instead of writing bespoke function call implementations for an external API, you may use an MCP server that provides a bridge to the API. _Be aware there may be security implications._ See [MCP documenation](https://github.com/modelcontextprotocol) for more details.
 
+The client maintains a persistent connection to the MCP server and must be used as an async context manager or explicitly started and closed:
+
+```python
+async with MCPClient(server_params=...) as mcp:
+    tools = await mcp.register_tools(llm)
+```
+
 ## Installation
 
 To use `MCPClient`, install the required dependencies:
@@ -105,27 +112,26 @@ from pipecat.services.mcp_service import MCPClient
 llm = ...
 
 # Initialize and configure MCPClient with server parameters
-mcp = MCPClient(
+async with MCPClient(
     server_params=StdioServerParameters(
         command=shutil.which("npx"),
         args=["-y", "@name/mcp-server-name@latest"],
         env={"ENV_API_KEY": "<env_api_key>"},
     )
-)
+) as mcp:
+    # Create tools schema from the MCP server and register them with llm
+    tools = await mcp.register_tools(llm)
 
-# Create tools schema from the MCP server and register them with llm
-tools = await mcp.register_tools(llm)
-
-# Create context with system message and tools
-context = LLMContext(
-    messages=[
-        {
-            "role": "system",
-            "content": "You are a helpful assistant in a voice conversation. You have access to MCP tools. Keep responses concise."
-        }
-    ],
-    tools=tools
-)
+    # Create context with system message and tools
+    context = LLMContext(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant in a voice conversation. You have access to MCP tools. Keep responses concise."
+            }
+        ],
+        tools=tools
+    )
 ```
 
 ### MCP SSE Transport
@@ -138,25 +144,24 @@ from pipecat.services.mcp_service import MCPClient
 llm = ...
 
 # Initialize and configure MCPClient with SSE server parameters
-mcp = MCPClient(
+async with MCPClient(
     server_params=SseServerParameters(
         url="https://your.mcp.server/sse",
     )
-)
+) as mcp:
+    # Create tools schema from the MCP server and register them with llm
+    tools = await mcp.register_tools(llm)
 
-# Create tools schema from the MCP server and register them with llm
-tools = await mcp.register_tools(llm)
-
-# Create context with system message and tools
-context = LLMContext(
-    messages=[
-        {
-            "role": "system",
-            "content": "You are a helpful assistant in a voice conversation. You have access to MCP tools. Keep responses concise."
-        }
-    ],
-    tools=tools
-)
+    # Create context with system message and tools
+    context = LLMContext(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant in a voice conversation. You have access to MCP tools. Keep responses concise."
+            }
+        ],
+        tools=tools
+    )
 ```
 
 ### MCP Streamable HTTP Transport
@@ -171,18 +176,17 @@ from pipecat.services.mcp_service import MCPClient
 llm = ...
 
 # Initialize and configure MCPClient with Streamable HTTP parameters
-mcp = MCPClient(
+async with MCPClient(
     server_params=StreamableHttpParameters(
         url="https://api.githubcopilot.com/mcp/",
         headers={"Authorization": f"Bearer {os.getenv('GITHUB_PERSONAL_ACCESS_TOKEN')}"},
     )
-)
+) as mcp:
+    # Create tools schema from the MCP server and register them with llm
+    tools = await mcp.register_tools(llm)
 
-# Create tools schema from the MCP server and register them with llm
-tools = await mcp.register_tools(llm)
-
-# Create context with tools
-context = LLMContext(tools=tools)
+    # Create context with tools
+    context = LLMContext(tools=tools)
 ```
 
 ### Two-Step Registration
@@ -194,25 +198,24 @@ from mcp.client.session_group import StreamableHttpParameters
 from pipecat.services.mcp_service import MCPClient
 
 # Initialize MCPClient
-mcp = MCPClient(
+async with MCPClient(
     server_params=StreamableHttpParameters(
         url="https://api.githubcopilot.com/mcp/",
         headers={"Authorization": f"Bearer {os.getenv('GITHUB_PERSONAL_ACCESS_TOKEN')}"},
     )
-)
+) as mcp:
+    # Step 1: Get tools schema without registering
+    tools = await mcp.get_tools_schema()
 
-# Step 1: Get tools schema without registering
-tools = await mcp.get_tools_schema()
+    # Step 2: Create LLM with tools
+    llm = GeminiLiveLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        system_instruction="You are a helpful assistant.",
+        tools=tools,
+    )
 
-# Step 2: Create LLM with tools
-llm = GeminiLiveLLMService(
-    api_key=os.getenv("GOOGLE_API_KEY"),
-    system_instruction="You are a helpful assistant.",
-    tools=tools,
-)
-
-# Step 3: Register tool handlers with the LLM
-await mcp.register_tools_schema(tools, llm)
+    # Step 3: Register tool handlers with the LLM
+    await mcp.register_tools_schema(tools, llm)
 ```
 
 ### Multiple MCP Servers
@@ -229,40 +232,57 @@ from pipecat.services.mcp_service import MCPClient
 llm = ...
 
 # Set up multiple MCP clients
-server_a = MCPClient(
+async with MCPClient(
     server_params=StdioServerParameters(
         command=shutil.which("npx"),
         args=["-y", "mcp-server-a"],
         env={"API_KEY": os.getenv("SERVER_A_API_KEY")},
     )
-)
-
-server_b = MCPClient(
+) as server_a, MCPClient(
     server_params=StreamableHttpParameters(
         url="https://api.githubcopilot.com/mcp/",
         headers={"Authorization": f"Bearer {os.getenv('GITHUB_PERSONAL_ACCESS_TOKEN')}"},
     )
-)
+) as server_b:
+    # Register tools from each server
+    tools_a = await server_a.register_tools(llm)
+    tools_b = await server_b.register_tools(llm)
 
-# Register tools from each server
-tools_a = await server_a.register_tools(llm)
-tools_b = await server_b.register_tools(llm)
+    # Merge tools into a single schema
+    all_tools = ToolsSchema(
+        standard_tools=tools_a.standard_tools + tools_b.standard_tools
+    )
 
-# Merge tools into a single schema
-all_tools = ToolsSchema(
-    standard_tools=tools_a.standard_tools + tools_b.standard_tools
-)
-
-# Create context with combined tools
-context = LLMContext(tools=all_tools)
+    # Create context with combined tools
+    context = LLMContext(tools=all_tools)
 ```
 
 ## Methods
 
+<ResponseField name="start" type="async method">
+  Opens a persistent connection to the MCP server and initializes the session.
+  The session is reused for all subsequent tool calls until `close()` is called.
+  Can also be used via async context manager instead of calling this directly.
+</ResponseField>
+
+```python
+async def start(self) -> None
+```
+
+<ResponseField name="close" type="async method">
+  Closes the persistent MCP connection. Safe to call multiple times or without
+  having called `start()`.
+</ResponseField>
+
+```python
+async def close(self) -> None
+```
+
 <ResponseField name="register_tools" type="async method">
-  Connects to the MCP server, discovers available tools, converts their schemas
+  Discovers available tools from the active session, converts their schemas
   to Pipecat format, and registers them with the LLM service. This is equivalent
   to calling `get_tools_schema()` followed by `register_tools_schema()`.
+  Requires the client to be started via `start()` or async context manager.
 </ResponseField>
 
 ```python
@@ -270,9 +290,10 @@ async def register_tools(self, llm: LLMService | LLMSwitcher) -> ToolsSchema
 ```
 
 <ResponseField name="get_tools_schema" type="async method">
-  Connects to the MCP server, discovers available tools, and converts their
+  Discovers available tools from the active session and converts their
   schemas to Pipecat format — without registering them with an LLM. Use this
   when you need the tools schema before the LLM is created.
+  Requires the client to be started via `start()` or async context manager.
 </ResponseField>
 
 ```python
