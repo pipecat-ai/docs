@@ -1,0 +1,392 @@
+---
+title: "Migrating to 1.0"
+description: "Guide to upgrading your Pipecat application from 0.0.x to 1.0"
+---
+
+Pipecat 1.0 removes many deprecated APIs from the 0.0.x series. If you were already using the non-deprecated replacements, most of these changes won't affect you.
+
+Before upgrading, search your codebase for the deprecated imports and patterns listed below to identify what needs to change.
+
+<Warning>
+  Pipecat 1.0 requires **Python 3.11 or later**. Support for Python 3.10 has
+  been dropped. Python 3.11 through 3.14 are supported.
+</Warning>
+
+## 1. Universal LLMContext
+
+`LLMContext` is a universal context that works with all LLM providers. It allows you to dynamically switch `LLMService` at runtime, passing a compatible context between services. Pipecat maintains adapters for each LLM service, which are applied automatically at the time of inference.
+
+Use the standard messages format along with [`FunctionSchema` and `ToolsSchema`](/pipecat/learn/function-calling) to define tools in a provider-agnostic way.
+
+### Before (1.0)
+
+```python
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+
+# Service-specific context
+context = OpenAILLMContext(messages, tools)
+
+# Service-specific aggregator factory
+context_aggregator = llm.create_context_aggregator(context)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+### After (1.0)
+
+```python
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+# Universal context — works with any LLM provider
+tools = ToolsSchema(standard_tools=[
+    FunctionSchema(
+        name="get_weather",
+        description="Get current weather",
+        properties={"location": {"type": "string", "description": "City name"}},
+        required=["location"],
+    )
+])
+context = LLMContext(messages=messages, tools=tools)
+
+# Universal aggregator
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    user_aggregator,
+    llm,
+    tts,
+    transport.output(),
+    assistant_aggregator,
+])
+```
+
+### What was removed
+
+| Removed                                  | Replacement                            |
+| ---------------------------------------- | -------------------------------------- |
+| `OpenAILLMContext`                       | `LLMContext`                           |
+| `OpenAILLMContextFrame`                  | `LLMContextFrame`                      |
+| `AnthropicLLMContext`                    | `LLMContext`                           |
+| `AWSBedrockLLMContext`                   | `LLMContext`                           |
+| `GatedOpenAILLMContextAggregator`        | `GatedLLMContextAggregator`            |
+| `llm.create_context_aggregator(context)` | `LLMContextAggregatorPair(context)`    |
+| `VisionImageFrame`                       | `LLMContext.add_image_frame_message()` |
+
+## 2. Turn Management
+
+Turn management was unified into the user context aggregator configuration. Strategies for interruptions, muting, and idle detection are now configured via `LLMUserAggregatorParams`.
+
+### Before (1.0)
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.user_idle_processor import UserIdleProcessor
+
+# Interruptions configured on the pipeline task
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(allow_interruptions=True),
+)
+
+# Separate idle processor
+idle = UserIdleProcessor(timeout=5.0, callback=handle_idle)
+
+# STTMuteFilter
+stt_mute_filter = STTMuteFilter(
+    config=STTMuteConfig(strategies={STTMuteStrategy.FIRST_SPEECH})
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    stt_mute_filter,
+    idle,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+### After (1.0)
+
+```python
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+# Everything configured on the aggregator
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=[
+            UserTurnStrategies(
+                start=[
+                    # Start strategies
+                ],
+                stop=[
+                    # Stop strategies
+                ],
+            ),
+        ],
+        user_mute_strategies=[
+            # Mute strategies
+        ],
+        user_turn_stop_timeout=5.0,
+        user_idle_timeout=8.0,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+)
+```
+
+### What was removed
+
+| Removed                                  | Replacement                                                  |
+| ---------------------------------------- | ------------------------------------------------------------ |
+| `PipelineParams.allow_interruptions`     | `user_turn_strategies` on `LLMUserAggregatorParams`          |
+| `PipelineParams.interruption_strategies` | `user_turn_strategies` on `LLMUserAggregatorParams`          |
+| `UserResponseAggregator`                 | `LLMUserAggregator` (created via `LLMContextAggregatorPair`) |
+| `UserIdleProcessor`                      | `user_idle_timeout` on `LLMUserAggregatorParams`             |
+| `STTMuteFilter`                          | `user_mute_strategies` on `LLMUserAggregatorParams`          |
+| `MinWordsInterruptionStrategy`           | `MinWordsUserTurnStartStrategy`                              |
+| `TranscriptionUserTurnStopStrategy`      | `SpeechTimeoutUserTurnStopStrategy`                          |
+
+## 3. VAD & Turn Analyzer Configuration
+
+VAD and turn detection configuration moved from transport params to the user aggregator. Additionally, the `VADParams` default `stops_secs` changed from 0.8 to 0.2. This ensures that STT services create transcripts with optimal latency and sufficient silence padding.
+
+The `UserTurnStrategies` (`stop`) now control how long to wait before the user's turn has stopped:
+
+- `SpeechTimeoutUserTurnStopStrategy` has a `user_speech_timeout` parameter that you can configure to control how long to wait before the user's turn has stopped.
+- `TurnAnalyzerUserTurnStopStrategy` uses the `smart-turn` model to dynamically modify the wait time. No configuration is required.
+
+### Before (1.0)
+
+```python
+from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+
+transport = DailyTransport(
+    room_url,
+    token,
+    "Bot",
+    DailyParams(
+        vad_enabled=True,
+        vad_audio_passthrough=True,
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
+    ),
+)
+```
+
+### After (1.0)
+
+By default, the `TurnAnalyzerUserTurnStopStrategy` stop strategy is used, which includes the `LocalSmartTurnAnalyzerV3` turn analyzer.
+
+```python
+from pipecat.transports.daily.transport import DailyTransport, DailyParams
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+transport = DailyTransport(
+    room_url,
+    token,
+    "Bot",
+    DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+)
+
+# VAD is now configured on the aggregator
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+)
+```
+
+### What was removed
+
+| Removed                                 | Replacement                                                                       |
+| --------------------------------------- | --------------------------------------------------------------------------------- |
+| `TransportParams.vad_analyzer`          | `LLMUserAggregatorParams.vad_analyzer`                                            |
+| `TransportParams.vad_enabled`           | Removed (VAD is active when analyzer is set)                                      |
+| `TransportParams.vad_audio_passthrough` | Removed                                                                           |
+| `TransportParams.turn_analyzer`         | `UserTurnStrategies(stop=[TurnAnalyzerUserTurnStopStrategy()])` (now the default) |
+| `VADParams.stop_secs` default (0.8)     | Now defaults to 0.2; turn timing is controlled by stop strategies                 |
+
+## 4. Service Import Paths
+
+All flat service imports have been removed. Services now use submodule imports.
+
+### Pattern change
+
+```python
+# Before (1.0)
+from pipecat.services.openai import OpenAILLMService
+
+# After (1.0)
+from pipecat.services.openai.llm import OpenAILLMService
+```
+
+### Renamed/moved service modules
+
+| Old module                                | New module                            |
+| ----------------------------------------- | ------------------------------------- |
+| `pipecat.services.gemini_multimodal_live` | `pipecat.services.google.gemini_live` |
+| `pipecat.services.aws_nova_sonic`         | `pipecat.services.aws.nova_sonic`     |
+| `pipecat.services.openai_realtime`        | `pipecat.services.openai.realtime`    |
+| `pipecat.services.riva` (STT)             | `pipecat.services.nvidia.stt`         |
+| `pipecat.services.riva` (TTS)             | `pipecat.services.nvidia.tts`         |
+| `pipecat.services.nim`                    | `pipecat.services.nvidia.llm`         |
+
+### Removed service classes
+
+These service have been removed.
+
+| Removed class                  | Replacement class          |
+| ------------------------------ | -------------------------- |
+| `PollyTTSService`              | `AWSPollyTTSService`       |
+| `OpenAIRealtimeBetaLLMService` | `OpenAIRealtimeLLMService` |
+| `GoogleLLMOpenAIBetaService`   | `GoogleLLMService`         |
+
+## 5. Transport Import Paths
+
+Transport imports moved from `services` subdirectory to transport-specific subdirectories.
+
+| Old import                                     | New import                             |
+| ---------------------------------------------- | -------------------------------------- |
+| `pipecat.transports.services.daily`            | `pipecat.transports.daily.transport`   |
+| `pipecat.transports.services.livekit`          | `pipecat.transports.livekit.transport` |
+| `pipecat.transports.network.websocket_server`  | `pipecat.transports.websocket.server`  |
+| `pipecat.transports.network.websocket_client`  | `pipecat.transports.websocket.client`  |
+| `pipecat.transports.network.fastapi_websocket` | `pipecat.transports.websocket.fastapi` |
+| `pipecat.sync`                                 | `pipecat.utils.sync`                   |
+
+## 6. Frames
+
+Several frame classes were renamed or removed. Update any direct references in your code.
+
+| Removed                              | Replacement                                                     |
+| ------------------------------------ | --------------------------------------------------------------- |
+| `TransportMessageFrame`              | `OutputTransportMessageFrame`                                   |
+| `TransportMessageUrgentFrame`        | `OutputTransportMessageUrgentFrame`                             |
+| `InputTransportMessageUrgentFrame`   | `InputTransportMessageFrame`                                    |
+| `KeypadEntryFrame`                   | `DTMFFrame`                                                     |
+| `StartInterruptionFrame`             | `InterruptionFrame`                                             |
+| `BotInterruptionFrame`               | `InterruptionTaskFrame`                                         |
+| `TranscriptionMessage`               | Use events: `on_user_turn_stopped`, `on_assistant_turn_stopped` |
+| `TranscriptionUpdateFrame`           | Use events: `on_user_turn_stopped`, `on_assistant_turn_stopped` |
+| `DailyTransportMessageFrame`         | `DailyOutputTransportMessageFrame`                              |
+| `DailyTransportMessageUrgentFrame`   | `DailyOutputTransportMessageUrgentFrame`                        |
+| `LiveKitTransportMessageFrame`       | `LiveKitOutputTransportMessageFrame`                            |
+| `LiveKitTransportMessageUrgentFrame` | `LiveKitOutputTransportMessageUrgentFrame`                      |
+
+## 7. Service-Specific Parameter Changes
+
+Individual services renamed or removed configuration parameters. Find your service below to see what changed.
+
+| Service                    | Removed param                | Replacement                            |
+| -------------------------- | ---------------------------- | -------------------------------------- |
+| `DeepgramSTTService`       | `url`                        | `base_url`                             |
+| `DeepgramSTTService`       | `vad_events`                 | Removed                                |
+| `FishAudioTTSService`      | `model`                      | `reference_id`                         |
+| `GladiaSTTService`         | `InputParams.language`       | Removed                                |
+| `GladiaSTTService`         | `InputParams.confidence`     | Removed                                |
+| `GeminiTTSService`         | `api_key`                    | Removed                                |
+| `GeminiLiveLLMService`     | `base_url`                   | `http_options`                         |
+| `GoogleVertexLLMService`   | `InputParams`                | Removed (`project_id` now required)    |
+| `MiniMaxHttpTTSService`    | `english_normalization`      | `text_normalization`                   |
+| `SimliVideoService`        | `simli_config`               | `api_key` and `face_id` (required str) |
+| `AnthropicLLMService`      | `enable_prompt_caching_beta` | `enable_prompt_caching`                |
+| `AWSNovaSonicLLMService`   | `send_transcription_frames`  | Removed                                |
+| `OpenAIRealtimeLLMService` | `send_transcription_frames`  | Removed                                |
+
+## 8. Transport Parameters
+
+All `camera_*` transport parameters were renamed to `video_*`. VAD-related transport params were removed — VAD is now configured on the user aggregator (see [section 3](#3-vad--turn-analyzer-configuration)).
+
+| Removed                                  | Replacement                            |
+| ---------------------------------------- | -------------------------------------- |
+| `camera_in_enabled`                      | `video_in_enabled`                     |
+| `camera_in_is_live`                      | `video_in_is_live`                     |
+| `camera_in_width` / `camera_in_height`   | `video_in_width` / `video_in_height`   |
+| `camera_out_enabled`                     | `video_out_enabled`                    |
+| `camera_out_is_live`                     | `video_out_is_live`                    |
+| `camera_out_width` / `camera_out_height` | `video_out_width` / `video_out_height` |
+| `camera_out_bitrate`                     | `video_out_bitrate`                    |
+| `camera_out_framerate`                   | `video_out_framerate`                  |
+| `camera_out_codec`                       | `video_out_codec`                      |
+| `vad_enabled`                            | Removed                                |
+| `vad_audio_passthrough`                  | Removed                                |
+
+## 9. Other API Changes
+
+Smaller breaking changes across the rest of the API.
+
+### Pipeline
+
+| Removed                              | Replacement                                    |
+| ------------------------------------ | ---------------------------------------------- |
+| `PipelineParams.observers`           | Pass `observers` to `PipelineTask` constructor |
+| `PipelineTask.on_pipeline_ended`     | `on_pipeline_finished`                         |
+| `PipelineTask.on_pipeline_cancelled` | `on_pipeline_finished`                         |
+| `PipelineTask.on_pipeline_stopped`   | `on_pipeline_finished`                         |
+| `DailyRunner.configure_with_args()`  | Use `PipelineRunner` with `RunnerArguments`    |
+
+### TTS service
+
+| Removed                      | Replacement            |
+| ---------------------------- | ---------------------- |
+| `TTSService.say()`           | Push a `TTSSpeakFrame` |
+| `text_aggregator` init param | Use `LLMTextProcessor` |
+| `text_filter` init param     | `text_filters`         |
+
+### Processors
+
+| Removed                                       | Replacement                                                     |
+| --------------------------------------------- | --------------------------------------------------------------- |
+| `AudioBufferProcessor.user_continuous_stream` | `user_audio_passthrough`                                        |
+| `UserBotLatencyLogObserver`                   | `UserBotLatencyObserver` (use `on_latency_measured` event)      |
+| `TranscriptProcessor`                         | Use events: `on_user_turn_stopped`, `on_assistant_turn_stopped` |
+| `add_pattern_pair()`                          | `add_pattern()`                                                 |
+
+### RTVI
+
+- Deprecated RTVI models (`RTVIConfig`, `RTVIServiceConfig`) removed
+- `RTVIActionFrame` removed
+- `RTVIProcessor.handle_function_call` and `handle_function_call_start` removed
+
+### Other
+
+| Removed                                                     | Replacement                                  |
+| ----------------------------------------------------------- | -------------------------------------------- |
+| `expect_stripped_words` from `LLMAssistantAggregatorParams` | Removed                                      |
+| `context` field from `UserImageRequestFrame`                | Removed                                      |
+| Old multi-parameter `on_push_frame` observer signature      | Use new signature                            |
+| `pipecat.utils.tracing.class_decorators`                    | Removed                                      |
+| `NoisereduceFilter`                                         | Use `KrispVivaFilter` or other audio filters |
+| `KrispFilter`                                               | Use `KrispVivaFilter`                        |
+| `pipecat.turns.mute`                                        | `pipecat.turns.user_mute`                    |
