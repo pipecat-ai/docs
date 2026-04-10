@@ -1,0 +1,79 @@
+---
+title: "Agent Registry and Discovery"
+description: "How agents discover each other and get notified when other agents are ready."
+---
+
+## What is the agent registry?
+
+The `AgentRegistry` tracks all known agents across local and remote runners. It is owned by the runner and shared with all its agents. When an agent becomes ready, it registers itself, and other agents that are watching for it get notified.
+
+You don't interact with the registry directly in most cases. Instead, you use the `@agent_ready` decorator or `watch_agent()` to express interest in a specific agent, and the registry handles the rest.
+
+## Watching for agents
+
+### The @agent_ready decorator
+
+The most common way to watch for an agent. Decorate a method with the agent name, and it fires when that agent registers:
+
+```python
+from pipecat_subagents.agents import BaseAgent, agent_ready
+from pipecat_subagents.types import AgentReadyData
+
+class MainAgent(BaseAgent):
+    @agent_ready(name="greeter")
+    async def on_greeter_ready(self, data: AgentReadyData) -> None:
+        await self.activate_agent("greeter")
+```
+
+The framework automatically calls `watch_agent()` for each `@agent_ready` handler when the agent starts. If the watched agent is already registered, the handler fires immediately.
+
+### watch_agent()
+
+For dynamic cases where you don't know the agent name at class definition time, call `watch_agent()` directly:
+
+```python
+class MainAgent(BaseAgent):
+    async def on_ready(self) -> None:
+        await super().on_ready()
+        for name in self._dynamic_agent_names:
+            await self.watch_agent(name)
+
+    async def on_agent_ready(self, data: AgentReadyData) -> None:
+        await super().on_agent_ready(data)
+        await self.activate_agent(data.agent_name)
+```
+
+This is useful when agent names come from configuration or are created at runtime.
+
+## How discovery works
+
+### Local agents
+
+When all agents run in the same process, discovery is straightforward. An agent registers in the shared registry when its pipeline is ready, and watchers are notified immediately.
+
+### Distributed agents
+
+In distributed setups (agents across different processes connected to the same bus), runners exchange registry snapshots automatically. When a remote agent becomes ready, its runner broadcasts a registry message over the bus. Other runners update their local registry, and any matching watchers fire.
+
+<Note>
+  Only root agents (added via `runner.add_agent()`) are discoverable across runners. Child agents (added via `parent.add_agent()`) are not broadcast and remain invisible to other runners.
+</Note>
+
+### Proxy agents
+
+With proxy agents (agents on different buses), the proxy relays registry messages between the two buses. When the remote agent registers, the proxy notifies the local side. From the local agent's perspective, `@agent_ready` and `watch_agent()` work exactly the same as in local or distributed setups.
+
+## Agent readiness data
+
+When a watcher fires, it receives an `AgentReadyData` object:
+
+```python
+@agent_ready(name="greeter")
+async def on_greeter_ready(self, data: AgentReadyData) -> None:
+    print(data.agent_name)  # "greeter"
+    print(data.runner)       # Name of the runner managing the agent
+```
+
+## Uniqueness
+
+Agent names must be unique within a registry. If the same name is registered from two different runners, the registry logs a warning. In distributed setups, choose unique names across all runners to avoid conflicts.
