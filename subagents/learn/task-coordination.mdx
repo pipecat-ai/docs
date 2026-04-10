@@ -1,11 +1,11 @@
 ---
 title: "Task Coordination"
-description: "Dispatch work to multiple agents in parallel and collect results."
+description: "Dispatch work to other agents and collect results."
 ---
 
 ## What are tasks?
 
-Tasks let one agent dispatch work to other agents. While handoff transfers the conversation, tasks are for background work -- an agent asks workers to do something and collects their results, all while the voice conversation continues.
+Tasks let one agent dispatch work to other agents. While handoff transfers the conversation, tasks are for background work -- an agent asks workers to do something and collects their results.
 
 Use cases for tasks:
 
@@ -13,25 +13,103 @@ Use cases for tasks:
 - Running a code analysis while talking to the user
 - Fetching data from multiple sources simultaneously
 
-## Task group: structured parallel work
+## Single task
 
-The most common pattern is `task_group()`, which dispatches work to multiple agents and waits for all of them to respond:
+The simplest form is `self.task()`, which sends a task to one agent and waits for the response:
+
+```python
+async with self.task("worker", payload={"question": "What is Pipecat?"}, timeout=30) as t:
+    pass
+
+print(t.response)
+```
+
+`self.task()` is a context manager that handles the full lifecycle: it waits for the agent to be ready, sends the request, and collects the response. Under the hood, this is equivalent to calling `request_task()` (fire-and-forget) and then handling `on_task_response()` and `on_task_completed()` yourself.
+
+## Task group
+
+When you need to dispatch work to multiple agents in parallel, use `self.task_group()`:
 
 ```python
 async with self.task_group("worker1", "worker2", "worker3", payload={"topic": "AI safety"}, timeout=30) as tg:
-    pass  # Wait for all workers to respond
+    pass
 
-# Results are available after the context manager exits
 for agent_name, response in tg.responses.items():
     print(f"{agent_name}: {response}")
 ```
 
-`task_group()` is a context manager that:
+`self.task_group()` works the same way but for multiple agents: it waits for all of them to be ready, sends a request to each, and collects all responses. Under the hood, this is equivalent to calling `request_task_group()` and then handling `on_task_response()` for each agent and a final `on_task_completed()` yourself.
 
-1. Waits for all named agents to be ready (via the registry)
-2. Sends a `BusTaskRequestMessage` to each worker
-3. Collects responses until all workers have replied or the timeout is reached
-4. Makes results available in `tg.responses`
+The same payload is sent to every agent. If you need different arguments per agent, you can structure the payload so each worker reads its own key:
+
+```python
+async with self.task_group("researcher", "fact_checker", payload={
+    "researcher": {"topic": "AI safety", "depth": "detailed"},
+    "fact_checker": {"claims": ["AI can self-improve", "AGI is near"]},
+}, timeout=30) as tg:
+    pass
+```
+
+## Handling task requests
+
+Workers handle incoming tasks in two ways.
+
+### The @task decorator
+
+The `@task` decorator marks a method as a task handler. The framework automatically dispatches matching requests to it:
+
+```python
+from pipecat_subagents.agents import task
+
+class MyWorker(BaseAgent):
+    @task
+    async def on_task_handler(self, message: BusTaskRequestMessage):
+        result = await self._do_work(message.payload)
+        await self.send_task_response(result)
+```
+
+You can use named tasks to route different types of work to different handlers:
+
+```python
+class MyWorker(BaseAgent):
+    @task(name="research")
+    async def on_research(self, message: BusTaskRequestMessage):
+        await self.send_task_response({"answer": "..."})
+
+    @task(name="summarize")
+    async def on_summarize(self, message: BusTaskRequestMessage):
+        await self.send_task_response({"summary": "..."})
+```
+
+The requester specifies the task name when dispatching:
+
+```python
+async with self.task("worker", name="research", payload={"topic": "AI"}) as t:
+    pass
+```
+
+Set `parallel=True` to allow concurrent execution of multiple requests:
+
+```python
+@task(parallel=True)
+async def on_task_handler(self, message: BusTaskRequestMessage):
+    # Each request runs in its own asyncio task
+    await self.send_task_response({"done": True})
+```
+
+### Overriding on_task_request
+
+Alternatively, you can override `on_task_request()` directly without the `@task` decorator:
+
+```python
+class MyWorker(BaseAgent):
+    async def on_task_request(self, message: BusTaskRequestMessage) -> None:
+        await super().on_task_request(message)
+        result = await self._do_work(message.payload)
+        await self.send_task_response(result)
+```
+
+This is useful when you need custom routing logic or want to integrate with an existing pipeline, as shown in the example below.
 
 ## Building a task system
 
@@ -39,10 +117,10 @@ Let's build a debate system where a moderator dispatches a topic to three worker
 
 ### Worker agents
 
-Workers receive task requests and respond with results. Override `on_task_request` to handle incoming work:
+Workers use the `@task` decorator to handle incoming requests. Here each worker handles `"debate"` tasks:
 
 ```python
-from pipecat_subagents.agents import LLMAgent
+from pipecat_subagents.agents import LLMAgent, task
 from pipecat_subagents.bus.messages import BusTaskRequestMessage
 
 class DebateWorker(LLMAgent):
@@ -68,11 +146,11 @@ class DebateWorker(LLMAgent):
 
         return Pipeline([user_agg, llm, assistant_agg])
 
-    async def on_task_request(self, message: BusTaskRequestMessage) -> None:
-        await super().on_task_request(message)
+    @task(name="debate")
+    async def on_debate(self, message: BusTaskRequestMessage):
         await self.queue_frame(
             LLMMessagesAppendFrame(
-                messages=[{"role": "user", "content": f"Topic: {message.payload['topic']}"}],
+                messages=[{"role": "developer", "content": f"Topic: {message.payload['topic']}"}],
                 run_llm=True,
             )
         )
@@ -80,17 +158,13 @@ class DebateWorker(LLMAgent):
 
 The worker:
 
-1. Receives a task request with a payload containing the topic
+1. Receives a `"debate"` task request with a payload containing the topic
 2. Injects the topic into its LLM context and runs the LLM
 3. When the LLM finishes, calls `send_task_response()` with the result
 
-<Note>
-  Each worker keeps its own `LLMContext`, so it remembers previous topics across multiple task rounds.
-</Note>
-
 ### Coordinator agent
 
-The coordinator (moderator) creates workers, triggers tasks via a tool, and synthesizes results:
+The coordinator creates workers, triggers tasks via a tool, and synthesizes results:
 
 ```python
 class ModeratorAgent(LLMAgent):
@@ -124,7 +198,7 @@ class ModeratorAgent(LLMAgent):
             topic (str): The topic to debate.
         """
         worker_names = [str(w) for w in self._workers]
-        async with self.task_group(*worker_names, payload={"topic": topic}, timeout=30) as tg:
+        async with self.task_group(*worker_names, name="debate", payload={"topic": topic}, timeout=30) as tg:
             pass
 
         result = "\n\n".join(
@@ -141,60 +215,24 @@ When the user says "debate whether AI should be regulated," the moderator:
 4. The moderator collects all responses and returns them to the LLM
 5. The LLM synthesizes a balanced summary and speaks it to the user
 
-## Streaming events
-
-For long-running tasks, you can stream progress updates using the async iterator:
-
-```python
-async with self.task_group(*worker_names, payload=data, timeout=60) as tg:
-    async for event in tg:
-        if event.type == TaskGroupEvent.UPDATE:
-            logger.info(f"{event.agent_name}: {event.data}")
-        elif event.type == TaskGroupEvent.STREAM_DATA:
-            # Handle streaming chunks
-            pass
-```
-
-Workers send updates via `send_task_update()`:
-
-```python
-async def on_task_request(self, message):
-    await super().on_task_request(message)
-    await self.send_task_update({"progress": "starting research..."})
-    # ... do work ...
-    await self.send_task_response({"result": "done"})
-```
-
-## Fire-and-forget tasks
-
-If you don't need to wait for results, use `request_task()` instead:
-
-```python
-await self.request_task("worker", payload={"action": "log_event"}, timeout=10)
-```
-
-This sends the task request and returns immediately. The worker processes it independently.
-
 ## Task lifecycle
 
 <Steps>
   <Step title="Request">
-    Parent calls `task_group()` or `request_task()`. The framework waits for workers to be ready, then sends `BusTaskRequestMessage` to each.
+    Parent calls `task()` or `task_group()`. The framework waits for workers to be ready, then sends a task request to each.
   </Step>
   <Step title="Process">
-    Workers receive `on_task_request()`, do their work, and optionally send updates via `send_task_update()`.
+    Workers receive the request in `on_task_request()` and do their work.
   </Step>
   <Step title="Respond">
-    Workers call `send_task_response()` with their results. A `BusTaskResponseMessage` is sent back.
+    Workers call `send_task_response()` with their results.
   </Step>
   <Step title="Complete">
-    When all workers respond (or timeout/error occurs), the task group context manager exits and results are available in `tg.responses`.
+    When all workers respond (or timeout occurs), the context manager exits and results are available.
   </Step>
 </Steps>
 
-<Warning>
-  Task completion does NOT end the agent. Workers stay alive and can receive more tasks. Only `end()` or `cancel()` stops an agent.
-</Warning>
+The framework also supports fire-and-forget tasks, progress updates, streaming, and cancellation.
 
 ## What's next
 
