@@ -56,7 +56,7 @@ Workers handle incoming tasks in two ways.
 
 ### The @task decorator
 
-The `@task` decorator marks a method as a task handler. The framework automatically dispatches matching requests to it:
+The `@task` decorator marks a method as a task handler. The framework automatically dispatches matching requests to it. The worker passes `message.task_id` when sending the response:
 
 ```python
 from pipecat_subagents.agents import task
@@ -65,7 +65,7 @@ class MyWorker(BaseAgent):
     @task
     async def on_task_handler(self, message: BusTaskRequestMessage):
         result = await self._do_work(message.payload)
-        await self.send_task_response(result)
+        await self.send_task_response(message.task_id, result)
 ```
 
 You can use named tasks to route different types of work to different handlers:
@@ -74,11 +74,11 @@ You can use named tasks to route different types of work to different handlers:
 class MyWorker(BaseAgent):
     @task(name="research")
     async def on_research(self, message: BusTaskRequestMessage):
-        await self.send_task_response({"answer": "..."})
+        await self.send_task_response(message.task_id, {"answer": "..."})
 
     @task(name="summarize")
     async def on_summarize(self, message: BusTaskRequestMessage):
-        await self.send_task_response({"summary": "..."})
+        await self.send_task_response(message.task_id, {"summary": "..."})
 ```
 
 The requester specifies the task name when dispatching:
@@ -94,7 +94,7 @@ Set `parallel=True` to allow concurrent execution of multiple requests:
 @task(parallel=True)
 async def on_task_handler(self, message: BusTaskRequestMessage):
     # Each request runs in its own asyncio task
-    await self.send_task_response({"done": True})
+    await self.send_task_response(message.task_id, {"done": True})
 ```
 
 ### Overriding on_task_request
@@ -106,10 +106,14 @@ class MyWorker(BaseAgent):
     async def on_task_request(self, message: BusTaskRequestMessage) -> None:
         await super().on_task_request(message)
         result = await self._do_work(message.payload)
-        await self.send_task_response(result)
+        await self.send_task_response(message.task_id, result)
 ```
 
 This is useful when you need custom routing logic or want to integrate with an existing pipeline, as shown in the example below.
+
+<Note>
+  `send_task_response()`, `send_task_update()`, and `send_task_stream_*()` all require an explicit `task_id`. This lets a worker handle multiple concurrent tasks -- typically with `@task(parallel=True)` -- and respond to each one correctly. For simple handlers, pass `message.task_id` from the request. For asynchronous responses (see the example below), track the `task_id` yourself until you're ready to respond.
+</Note>
 
 ## Building a task system
 
@@ -117,16 +121,17 @@ Let's build a debate system where a moderator dispatches a topic to three worker
 
 ### Worker agents
 
-Workers use the `@task` decorator to handle incoming requests. Here each worker handles `"debate"` tasks:
+Each worker runs its own LLM pipeline. The LLM response arrives asynchronously through an event handler, so the worker tracks the current task ID until it has something to respond with:
 
 ```python
-from pipecat_subagents.agents import LLMAgent, task
+from pipecat_subagents.agents import LLMAgent
 from pipecat_subagents.bus.messages import BusTaskRequestMessage
 
 class DebateWorker(LLMAgent):
     def __init__(self, name, *, bus, role):
         super().__init__(name, bus=bus)
         self._role = role
+        self._current_task_id = ""
 
     def build_llm(self) -> LLMService:
         return OpenAILLMService(
@@ -142,12 +147,16 @@ class DebateWorker(LLMAgent):
         @assistant_agg.event_handler("on_assistant_turn_stopped")
         async def on_assistant_turn_stopped(aggregator, message):
             text = message.content
-            await self.send_task_response({"role": self._role, "text": text})
+            if self._current_task_id:
+                task_id = self._current_task_id
+                await self.send_task_response(task_id, {"role": self._role, "text": text})
+                self._current_task_id = ""
 
         return Pipeline([user_agg, llm, assistant_agg])
 
-    @task(name="debate")
-    async def on_debate(self, message: BusTaskRequestMessage):
+    async def on_task_request(self, message: BusTaskRequestMessage) -> None:
+        await super().on_task_request(message)
+        self._current_task_id = message.task_id
         await self.queue_frame(
             LLMMessagesAppendFrame(
                 messages=[{"role": "developer", "content": f"Topic: {message.payload['topic']}"}],
@@ -158,9 +167,9 @@ class DebateWorker(LLMAgent):
 
 The worker:
 
-1. Receives a `"debate"` task request with a payload containing the topic
+1. Receives a task request and stores the `task_id`
 2. Injects the topic into its LLM context and runs the LLM
-3. When the LLM finishes, calls `send_task_response()` with the result
+3. When the LLM finishes its turn, the event handler sends the response with the stored `task_id`
 
 ### Coordinator agent
 
@@ -198,7 +207,7 @@ class ModeratorAgent(LLMAgent):
             topic (str): The topic to debate.
         """
         worker_names = [str(w) for w in self._workers]
-        async with self.task_group(*worker_names, name="debate", payload={"topic": topic}, timeout=30) as tg:
+        async with self.task_group(*worker_names, payload={"topic": topic}, timeout=30) as tg:
             pass
 
         result = "\n\n".join(
@@ -225,7 +234,7 @@ When the user says "debate whether AI should be regulated," the moderator:
     Workers receive the request in `on_task_request()` and do their work.
   </Step>
   <Step title="Respond">
-    Workers call `send_task_response()` with their results.
+    Workers call `send_task_response(task_id, ...)` with their results.
   </Step>
   <Step title="Complete">
     When all workers respond (or timeout occurs), the context manager exits and results are available.
