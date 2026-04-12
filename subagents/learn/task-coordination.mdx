@@ -241,7 +241,66 @@ When the user says "debate whether AI should be regulated," the moderator:
   </Step>
 </Steps>
 
-The framework also supports fire-and-forget tasks, progress updates, streaming, and cancellation.
+The framework also supports fire-and-forget tasks, progress updates, and streaming.
+
+## Task cancellation
+
+Tasks can be cancelled in several ways. The framework handles cleanup automatically and notifies workers so they can stop in-progress work.
+
+### Automatic cancellation with context managers
+
+When using `task()` or `task_group()`, cancellation happens automatically if the context block raises an exception. This includes tool interruptions (`CancelledError`) when using `cancel_on_interruption=True`:
+
+```python
+# If an exception or CancelledError is raised inside the block,
+# all workers are cancelled automatically
+async with self.task_group("w1", "w2", payload=data) as tg:
+    # ... if this raises, workers get cancelled
+    pass
+```
+
+### Worker errors
+
+By default (`cancel_on_error=True`), if any worker responds with an error status, the remaining workers in the group are cancelled and `TaskGroupError` is raised:
+
+```python
+try:
+    async with self.task_group("w1", "w2", payload=data) as tg:
+        pass
+except TaskGroupError as e:
+    # A worker errored -- remaining workers were cancelled
+    pass
+```
+
+### Manual cancellation with cancel_task()
+
+For fire-and-forget tasks (using `request_task()`), you manage cancellation yourself by tracking task IDs:
+
+```python
+task_ids = []
+try:
+    task_ids.append(await self.request_task("w1", payload={"job": 1}))
+    task_ids.append(await self.request_task("w2", payload={"job": 2}))
+    # ...
+except asyncio.CancelledError:
+    for tid in task_ids:
+        await self.cancel_task(tid, reason="tool cancelled")
+```
+
+### Handling cancellation on the worker side
+
+When a task is cancelled, the worker's `on_task_cancelled` hook fires. The framework automatically sends a `CANCELLED` response back to the requester, so you only need to override this hook if you have resources to clean up:
+
+```python
+class MyWorker(BaseAgent):
+    async def on_task_cancelled(self, message: BusTaskCancelMessage) -> None:
+        # Optional: clean up resources, stop in-progress work
+        logger.info(f"Task {message.task_id} cancelled: {message.reason}")
+```
+
+### Agent shutdown
+
+When a worker agent stops with tasks still in flight, it automatically sends a `CANCELLED` response for each active task so requesters aren't left waiting on a timeout.
 
 ## What's next
 
