@@ -5,7 +5,12 @@ description: "Large Language Model services using OpenAI's Responses API"
 
 ## Overview
 
-`OpenAIResponsesLLMService` provides chat completion capabilities using OpenAI's Responses API, supporting streaming text responses, function calling, usage metrics, and out-of-band inference. This service works with the universal `LLMContext` and `LLMContextAggregatorPair`.
+Pipecat provides two variants of the OpenAI Responses API LLM service:
+
+- **`OpenAIResponsesLLMService`** (WebSocket-based, recommended): Maintains a persistent WebSocket connection for lower-latency inference and automatically uses `previous_response_id` to send only incremental context when possible.
+- **`OpenAIResponsesHttpLLMService`** (HTTP-based): Uses server-sent events (SSE) via HTTP streaming. Each request opens a new connection. Use this when WebSocket is not available or preferred.
+
+Both variants support streaming text responses, function calling, usage metrics, and out-of-band inference, and work with the universal `LLMContext` and `LLMContextAggregatorPair`.
 
 <Note>
   The Responses API is a newer OpenAI API designed for conversational AI
@@ -14,6 +19,22 @@ description: "Large Language Model services using OpenAI's Responses API"
   documentation](https://platform.openai.com/docs/api-reference/responses) for
   more details.
 </Note>
+
+### WebSocket vs HTTP
+
+**Use WebSocket (`OpenAIResponsesLLMService`)** when:
+
+- You need the lowest possible latency for real-time conversations
+- Your workflow involves frequent tool/function calls
+- You want automatic incremental context optimization without server-side storage
+
+**Use HTTP (`OpenAIResponsesHttpLLMService`)** when:
+
+- WebSocket connections are blocked by your infrastructure
+- You prefer stateless request/response patterns
+- You don't need the incremental context optimization
+
+The WebSocket variant's `previous_response_id` optimization works with `store=False` (the default) using a connection-local in-memory cache—no conversations are stored on OpenAI's servers. The HTTP variant does not offer this optimization by default, as it would require `store=True` (30-day OpenAI-side conversation storage).
 
 <CardGroup cols={2}>
   <Card
@@ -71,6 +92,10 @@ Before using OpenAI Responses LLM services, you need:
 
 ## Configuration
 
+### Common Parameters
+
+These parameters are available for both `OpenAIResponsesLLMService` and `OpenAIResponsesHttpLLMService`:
+
 <ParamField path="api_key" type="str" default="None">
   OpenAI API key. If `None`, uses the `OPENAI_API_KEY` environment variable.
 </ParamField>
@@ -96,12 +121,20 @@ Before using OpenAI Responses LLM services, you need:
   Service tier to use (e.g., "auto", "flex", "priority").
 </ParamField>
 
-<ParamField
-  path="settings"
-  type="OpenAIResponsesLLMService.Settings"
-  default="None"
->
+<ParamField path="settings" type="OpenAIResponsesLLMSettings" default="None">
   Runtime-configurable model settings. See [Settings](#settings) below.
+</ParamField>
+
+### WebSocket-Specific Parameters
+
+The following parameter is only available for `OpenAIResponsesLLMService` (WebSocket variant):
+
+<ParamField
+  path="ws_url"
+  type="str"
+  default="wss://api.openai.com/v1/responses"
+>
+  WebSocket endpoint URL. Override for custom deployments or proxies.
 </ParamField>
 
 ### Settings
@@ -129,6 +162,8 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 ### Basic Setup
 
+**WebSocket variant (recommended):**
+
 ```python
 from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
 
@@ -141,17 +176,28 @@ llm = OpenAIResponsesLLMService(
 )
 ```
 
+**HTTP variant:**
+
+```python
+from pipecat.services.openai.responses.llm import OpenAIResponsesHttpLLMService
+
+llm = OpenAIResponsesHttpLLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAIResponsesHttpLLMService.Settings(
+        model="gpt-4.1",
+        system_instruction="You are a helpful assistant.",
+    ),
+)
+```
+
 ### With Custom Settings
 
 ```python
-from pipecat.services.openai.responses.llm import (
-    OpenAIResponsesLLMService,
-    OpenAIResponsesLLMSettings,
-)
+from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
 
 llm = OpenAIResponsesLLMService(
     api_key=os.getenv("OPENAI_API_KEY"),
-    settings=OpenAIResponsesLLMSettings(
+    settings=OpenAIResponsesLLMService.Settings(
         model="gpt-4.1",
         temperature=0.7,
         max_completion_tokens=1000,
@@ -160,17 +206,23 @@ llm = OpenAIResponsesLLMService(
 )
 ```
 
+<Note>
+  Both `OpenAIResponsesLLMService.Settings` and
+  `OpenAIResponsesHttpLLMService.Settings` use the same
+  `OpenAIResponsesLLMSettings` class, so settings are identical between
+  variants.
+</Note>
+
 ### Updating Settings at Runtime
 
 Model settings can be changed mid-conversation using `LLMUpdateSettingsFrame`:
 
 ```python
 from pipecat.frames.frames import LLMUpdateSettingsFrame
-from pipecat.services.openai.responses.llm import OpenAIResponsesLLMSettings
 
 await task.queue_frame(
     LLMUpdateSettingsFrame(
-        delta=OpenAIResponsesLLMSettings(
+        delta=OpenAIResponsesLLMService.Settings(
             temperature=0.3,
             max_completion_tokens=500,
         )
@@ -198,15 +250,18 @@ print(response)  # "The capital of France is Paris."
 
 ## Notes
 
-- **Responses API vs Chat Completions API**: The Responses API has a different request/response structure compared to the Chat Completions API. Use `OpenAILLMService` for the Chat Completions API and `OpenAIResponsesLLMService` for the Responses API.
-- **Universal LLM Context**: This service works with the universal `LLMContext` and `LLMContextAggregatorPair`, making it easy to switch between different LLM providers.
+- **WebSocket is the new default**: As of Pipecat version with PR #4141, `OpenAIResponsesLLMService` uses WebSocket transport by default. If you need the HTTP streaming behavior, use `OpenAIResponsesHttpLLMService` instead. Both have identical constructor args and settings.
+- **Persistent WebSocket connection**: The WebSocket variant maintains a persistent connection to `wss://api.openai.com/v1/responses` and automatically reconnects on connection loss. Connection lifetime is limited to 60 minutes server-side, after which automatic reconnection occurs.
+- **Incremental context optimization**: The WebSocket variant uses `previous_response_id` to send only incremental context when the conversation prefix hasn't changed, reducing latency and costs. This works with `store=False` (no server-side storage) via a connection-local cache.
+- **Responses API vs Chat Completions API**: The Responses API has a different request/response structure compared to the Chat Completions API. Use `OpenAILLMService` for the Chat Completions API and `OpenAIResponsesLLMService` or `OpenAIResponsesHttpLLMService` for the Responses API.
+- **Universal LLM Context**: Both services work with the universal `LLMContext` and `LLMContextAggregatorPair`, making it easy to switch between different LLM providers.
 - **Function calling**: Supports OpenAI's tool/function calling format. Register function handlers on the pipeline task to handle tool calls automatically.
 - **Usage metrics**: Automatically tracks token usage, including cached tokens and reasoning tokens.
 - **Service tiers**: Supports OpenAI's service tier system for prioritizing requests.
 
 ## Event Handlers
 
-`OpenAIResponsesLLMService` supports the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
+Both `OpenAIResponsesLLMService` and `OpenAIResponsesHttpLLMService` support the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
 | Event                       | Description                                                             |
 | --------------------------- | ----------------------------------------------------------------------- |
