@@ -1,0 +1,144 @@
+---
+title: "LLM Agent and the @tool Decorator"
+description: "Build agents with LLM pipelines and automatic tool registration."
+---
+
+## LLMAgent overview
+
+`LLMAgent` extends `BaseAgent` with everything you need to run an LLM-powered agent:
+
+- A pipeline with your LLM service, automatically built
+- Tool registration via the `@tool` decorator
+- Activation handling that injects messages and runs the LLM
+
+To create an LLM agent, subclass `LLMAgent` and implement `build_llm()`:
+
+```python
+from pipecat.services.llm_service import LLMService
+from pipecat.services.openai.base_llm import OpenAILLMSettings
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat_subagents.agents import LLMAgent
+
+class MyAgent(LLMAgent):
+    def __init__(self, name, *, bus):
+        super().__init__(name, bus=bus, bridged=())
+
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMSettings(
+                system_instruction="You are a helpful assistant.",
+            ),
+        )
+```
+
+The default pipeline is: `LLM` (with tools from `build_tools()` automatically registered). When `bridged=()` is set, the framework wraps this pipeline with edge processors that connect it to the bus.
+
+## The @tool decorator
+
+The `@tool` decorator marks a method as an LLM-callable tool. The framework automatically collects all `@tool`-decorated methods and registers them with the LLM service.
+
+```python
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat_subagents.agents import tool
+
+class MyAgent(LLMAgent):
+    # ... build_llm() ...
+
+    @tool
+    async def get_weather(self, params: FunctionCallParams, city: str):
+        """Get the current weather for a city.
+
+        Args:
+            city (str): The city name (e.g. 'San Francisco').
+        """
+        weather = await fetch_weather(city)
+        await params.result_callback(weather)
+```
+
+The tool's name comes from the method name. The docstring becomes the tool description. Parameter types and descriptions are extracted from the type annotations and the `Args` section in the docstring.
+
+### Tool options
+
+The `@tool` decorator accepts options:
+
+```python
+@tool(cancel_on_interruption=False, timeout=60)
+async def long_running_tool(self, params: FunctionCallParams, query: str):
+    """A tool that takes a while.
+
+    Args:
+        query (str): The search query.
+    """
+    result = await expensive_search(query)
+    await params.result_callback(result)
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `cancel_on_interruption` | `True` | Cancel the tool if the user interrupts |
+| `timeout` | `None` | Maximum execution time in seconds |
+
+### Tool parameters
+
+Every tool method receives `self` and `params: FunctionCallParams` as the first two arguments. Additional arguments are the tool's parameters that the LLM fills in.
+
+The `params` object gives you access to:
+
+- `params.result_callback(result)` -- return the result to the LLM
+- `params.llm` -- the LLM service instance, useful for queuing frames
+
+### Returning results
+
+Always call `params.result_callback()` to return the tool result to the LLM:
+
+```python
+@tool
+async def lookup(self, params: FunctionCallParams, item: str):
+    """Look up an item.
+
+    Args:
+        item (str): The item to look up.
+    """
+    data = await database.get(item)
+    await params.result_callback({"found": True, "data": data})
+```
+
+## Activation with messages
+
+When an `LLMAgent` is activated, you can inject messages into its context:
+
+```python
+from pipecat_subagents.agents import LLMAgentActivationArgs
+
+await self.activate_agent(
+    "support",
+    activation_args=LLMAgentActivationArgs(
+        messages=[{"role": "user", "content": "The user asked about pricing."}],
+        run_llm=True,  # Run the LLM immediately after injection
+    ),
+)
+```
+
+The default `on_activated()` implementation:
+
+1. Sets the tools from `build_tools()`
+2. Injects the provided messages into the LLM context
+3. Runs the LLM if `run_llm` is `True` (the default)
+
+## Custom pipelines
+
+If you need more control, you can override `build_pipeline()` entirely. For example, to add TTS to the agent's own pipeline:
+
+```python
+class AgentWithTTS(LLMAgent):
+    async def build_pipeline(self) -> Pipeline:
+        pipeline = await super().build_pipeline()
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            settings=CartesiaTTSSettings(voice="..."),
+        )
+        return Pipeline([pipeline, tts])
+```
+
+This is how [custom voices per agent](/subagents/learn/custom-voices-per-agent) works -- each agent adds its own TTS after the LLM.

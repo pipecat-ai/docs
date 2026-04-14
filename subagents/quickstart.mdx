@@ -1,0 +1,338 @@
+---
+title: "Quickstart"
+description: "Build a multi-agent voice bot with agent handoff in under 10 minutes."
+---
+
+This quickstart walks you through building a multi-agent voice bot where two LLM agents transfer control between each other. A greeter agent welcomes the user, and a support agent answers product questions. The LLM decides when to hand off.
+
+## Prerequisites
+
+**Environment**
+
+- Python 3.11 or later
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager installed
+
+**AI Service API Keys**
+
+<CardGroup cols={3}>
+  <Card
+    title="Deepgram (STT)"
+    icon="microphone"
+    href="https://console.deepgram.com/signup"
+  >
+    Speech recognition API key.
+  </Card>
+
+  <Card
+    title="OpenAI (LLM)"
+    icon="brain"
+    href="https://auth.openai.com/create-account"
+  >
+    Language model API key.
+  </Card>
+
+  <Card
+    title="Cartesia (TTS)"
+    icon="volume-high"
+    href="https://play.cartesia.ai/sign-up"
+  >
+    Voice synthesis API key.
+  </Card>
+</CardGroup>
+
+## Setup
+
+1. Create a new project and install dependencies
+
+```bash
+mkdir acme-bot && cd acme-bot
+uv init
+uv add pipecat-ai-subagents "pipecat-ai[cartesia,deepgram,openai,runner,silero,webrtc]"
+```
+
+2. Configure your API keys
+
+```bash .env
+DEEPGRAM_API_KEY=your_deepgram_api_key
+OPENAI_API_KEY=your_openai_api_key
+CARTESIA_API_KEY=your_cartesia_api_key
+```
+
+3. Create `bot.py` with the following code
+
+```python bot.py
+import os
+
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMMessagesAppendFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import FunctionCallParams, LLMService
+from pipecat.services.openai.base_llm import OpenAILLMSettings
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.daily.transport import DailyParams
+
+from pipecat_subagents.agents import BaseAgent, LLMAgent, LLMAgentActivationArgs, agent_ready, tool
+from pipecat_subagents.bus import AgentBus, BusBridgeProcessor
+from pipecat_subagents.runner import AgentRunner
+from pipecat_subagents.types import AgentReadyData
+
+load_dotenv(override=True)
+
+transport_params = {
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+}
+
+
+# --- LLM Agents ---
+
+
+class AcmeLLMAgent(LLMAgent):
+    """Base class with shared tools for transfer and ending conversations."""
+
+    def __init__(self, name: str, *, bus: AgentBus):
+        super().__init__(name, bus=bus, bridged=())
+
+    @tool(cancel_on_interruption=False)
+    async def transfer_to_agent(self, params: FunctionCallParams, agent: str, reason: str):
+        """Transfer the user to another agent.
+
+        Args:
+            agent (str): The agent to transfer to (e.g. 'greeter', 'support').
+            reason (str): Why the user is being transferred.
+        """
+        logger.info(f"Agent '{self.name}': transferring to '{agent}' ({reason})")
+        await self.handoff_to(
+            agent,
+            activation_args=LLMAgentActivationArgs(
+                messages=[{"role": "user", "content": reason}],
+            ),
+            result_callback=params.result_callback,
+        )
+
+    @tool
+    async def end_conversation(self, params: FunctionCallParams, reason: str):
+        """End the conversation when the user says goodbye.
+
+        Args:
+            reason (str): Why the conversation is ending.
+        """
+        logger.info(f"Agent '{self.name}': ending conversation ({reason})")
+        await params.llm.queue_frame(
+            LLMMessagesAppendFrame(messages=[{"role": "user", "content": reason}], run_llm=True)
+        )
+        await self.end(reason=reason, result_callback=params.result_callback)
+
+
+class GreeterAgent(AcmeLLMAgent):
+    """Greets the user and routes to support when needed."""
+
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMSettings(
+                system_instruction=(
+                    "You are a friendly greeter for Acme Corp. The available products "
+                    "are: the Acme Rocket Boots, the Acme Invisible Paint, and the Acme "
+                    "Tornado Kit. Ask which one they'd like to learn more about. "
+                    "When the user picks a product or asks a question about one, "
+                    "immediately call the transfer_to_agent tool with agent 'support'. "
+                    "Do not answer product questions yourself. If the user says goodbye, "
+                    "call the end_conversation tool. Keep responses brief."
+                ),
+            ),
+        )
+
+
+class SupportAgent(AcmeLLMAgent):
+    """Handles product questions and can transfer back to the greeter."""
+
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMSettings(
+                system_instruction=(
+                    "You are a support agent for Acme Corp. You know about three "
+                    "products: Acme Rocket Boots ($299, run up to 60 mph), "
+                    "Acme Invisible Paint ($49 per can, lasts 24 hours), and "
+                    "Acme Tornado Kit ($199, batteries included). Answer product "
+                    "questions. If the user wants to browse other products, call "
+                    "the transfer_to_agent tool with agent 'greeter'. If the user "
+                    "says goodbye, call the end_conversation tool. Keep responses brief."
+                ),
+            ),
+        )
+
+
+# --- Main Transport Agent ---
+
+
+class AcmeAgent(BaseAgent):
+    """Owns the transport and bridges audio to/from the LLM agents."""
+
+    def __init__(self, name: str, *, bus: AgentBus, transport: BaseTransport):
+        super().__init__(name, bus=bus)
+        self._transport = transport
+
+    @agent_ready(name="greeter")
+    async def on_greeter_ready(self, data: AgentReadyData) -> None:
+        await self.activate_agent(
+            "greeter",
+            args=LLMAgentActivationArgs(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Welcome the user to Acme Corp and ask how you can help.",
+                    },
+                ],
+            ),
+        )
+
+    def build_pipeline_task(self, pipeline: Pipeline) -> PipelineTask:
+        return PipelineTask(
+            pipeline,
+            enable_rtvi=True,
+            params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+        )
+
+    async def build_pipeline(self) -> Pipeline:
+        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            settings=CartesiaTTSSettings(
+                voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+            ),
+        )
+
+        context = LLMContext()
+        context_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        )
+
+        bridge = BusBridgeProcessor(
+            bus=self.bus,
+            agent_name=self.name,
+        )
+
+        @self._transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info("Client connected")
+            greeter = GreeterAgent("greeter", bus=self.bus)
+            support = SupportAgent("support", bus=self.bus)
+            for agent in [greeter, support]:
+                await self.add_agent(agent)
+
+        @self._transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info("Client disconnected")
+            await self.cancel()
+
+        return Pipeline(
+            [
+                self._transport.input(),
+                stt,
+                context_aggregator.user(),
+                bridge,
+                tts,
+                self._transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
+
+
+# --- Entry Point ---
+
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    runner = AgentRunner(handle_sigint=runner_args.handle_sigint)
+    main = AcmeAgent("acme", bus=runner.bus, transport=transport)
+    await runner.add_agent(main)
+    await runner.run()
+
+
+async def bot(runner_args: RunnerArguments):
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
+
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+
+    main()
+```
+
+## Run your bot
+
+```bash
+uv run bot.py
+```
+
+Open `http://localhost:7860/client` in your browser and click **Connect**.
+
+Try saying "I'd like to know about the Rocket Boots." The greeter agent will transfer you to support, which knows the product details. Say "I want to browse other products" and you'll be transferred back to the greeter.
+
+## How it works
+
+This bot has three agents coordinating through a shared message bus:
+
+```
+AcmeAgent (transport owner)
+  transport.input → STT → context_agg → BusBridge → TTS → transport.output
+    |
+    ├── GreeterAgent (LLM)
+    └── SupportAgent (LLM)
+```
+
+1. **AcmeAgent** owns the transport (audio I/O) and places a `BusBridgeProcessor` in its pipeline where an LLM would normally go. The bridge routes audio frames to whichever LLM agent is currently active.
+
+2. **GreeterAgent** and **SupportAgent** are `LLMAgent` subclasses with `bridged=()`, meaning they receive frames from the bus. Each runs its own LLM and defines tools via the `@tool` decorator.
+
+3. When an LLM agent calls `transfer_to_agent`, it uses `handoff_to()` which deactivates itself and activates the target agent. The transition is seamless to the user.
+
+## Key concepts
+
+| Concept              | What it does                                                           |
+|----------------------|------------------------------------------------------------------------|
+| `AgentRunner`        | Orchestrates the system lifecycle                                      |
+| `BaseAgent`          | Base class for agents with pipeline lifecycle management               |
+| `LLMAgent`           | Agent with an LLM pipeline and automatic `@tool` registration          |
+| `BusBridgeProcessor` | Routes frames between the transport pipeline and other agent pipelines |
+| `@agent_ready`       | Declares a handler that fires when a specific agent becomes ready      |
+| `handoff_to()`       | Deactivates the current agent and activates another                    |
+| `bridged=()`         | Makes an agent receive frames from the bus                             |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Learn the Fundamentals"
+    icon="book-open"
+    href="/subagents/learn/overview"
+  >
+    Walk through each concept step by step
+  </Card>
+
+  <Card
+    title="Browse Examples"
+    icon="code"
+    href="/subagents/examples/overview"
+  >
+    Task coordination, Flows agents, distributed setups, and more
+  </Card>
+</CardGroup>

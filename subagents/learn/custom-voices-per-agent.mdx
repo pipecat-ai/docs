@@ -1,0 +1,142 @@
+---
+title: "Custom Voices per Agent"
+description: "Give each agent its own TTS voice for distinct personalities."
+---
+
+## Overview
+
+In a typical voice setup, the main agent owns the TTS service and all agents share the same voice. But you can move TTS into each agent's pipeline so that each agent speaks with a distinct voice. This makes handoffs more natural -- the user hears a different voice when they're transferred to a different agent.
+
+## Architecture
+
+The key change is in where TTS lives:
+
+**Default (shared TTS):**
+```
+Main agent:  transport.in → STT → context_agg → BusBridge → TTS → transport.out
+LLM agent:   BusInput → LLM → BusOutput     (text frames flow through bus)
+```
+
+**Per-agent TTS:**
+```
+Main agent:  transport.in → STT → context_agg → BusBridge → transport.out  (no TTS!)
+LLM agent:   BusInput → LLM → TTS → BusOutput    (audio frames flow through bus)
+```
+
+With per-agent TTS, text-to-speech happens inside each agent's pipeline. The bus carries audio frames instead of text frames.
+
+<Note>
+  Per-agent TTS requires all agents to run in the same process (local bus). Streaming audio frames across a network bus adds too much latency for real-time conversations. For distributed setups, remote agents can achieve distinct voices by joining the same audio session directly through their own transport instead.
+</Note>
+
+## Implementation
+
+### LLM agent with TTS
+
+Override `build_pipeline()` on your LLM agent to add TTS after the LLM:
+
+```python
+from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
+from pipecat_subagents.agents import LLMAgent
+
+class AgentWithVoice(LLMAgent):
+    def __init__(self, name, *, bus, voice_id):
+        super().__init__(name, bus=bus, bridged=())
+        self._voice_id = voice_id
+
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMSettings(system_instruction="..."),
+        )
+
+    async def build_pipeline(self) -> Pipeline:
+        pipeline = await super().build_pipeline()
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            settings=CartesiaTTSSettings(voice=self._voice_id),
+        )
+        return Pipeline([pipeline, tts])
+```
+
+Call `super().build_pipeline()` to get the default LLM pipeline, then append your TTS service.
+
+### Agents with different voices
+
+Create agents with different voice IDs:
+
+```python
+class GreeterAgent(AgentWithVoice):
+    def __init__(self, name, *, bus):
+        super().__init__(
+            name,
+            bus=bus,
+            voice_id="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # Jacqueline
+        )
+
+    def build_llm(self) -> LLMService:
+        # ...
+
+
+class SupportAgent(AgentWithVoice):
+    def __init__(self, name, *, bus):
+        super().__init__(
+            name,
+            bus=bus,
+            voice_id="a167e0f3-df7e-4d52-a9c3-f949145efdab",  # Blake
+        )
+
+    def build_llm(self) -> LLMService:
+        # ...
+```
+
+### Main agent without TTS
+
+Remove TTS from the main agent's pipeline since each LLM agent handles its own:
+
+```python
+class MainAgent(BaseAgent):
+    async def build_pipeline(self) -> Pipeline:
+        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+
+        context = LLMContext()
+        context_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        )
+
+        bridge = BusBridgeProcessor(bus=self.bus, agent_name=self.name)
+
+        return Pipeline([
+            self._transport.input(),
+            stt,
+            context_aggregator.user(),
+            bridge,
+            # No TTS here -- agents handle their own
+            self._transport.output(),
+            context_aggregator.assistant(),
+        ])
+```
+
+## Announcing transfers
+
+With per-agent TTS, agents can announce a transfer in their own voice before handing off:
+
+```python
+@tool(cancel_on_interruption=False)
+async def transfer_to_agent(self, params: FunctionCallParams, agent: str, reason: str):
+    """Transfer the user to another agent.
+
+    Args:
+        agent (str): The agent to transfer to.
+        reason (str): Why the user is being transferred.
+    """
+    await self.handoff_to(
+        agent,
+        messages=[{"role": "developer", "content": f"Tell the user about the transfer ({reason})."}],
+        activation_args=LLMAgentActivationArgs(messages=[{"role": "developer", "content": reason}]),
+        result_callback=params.result_callback,
+    )
+```
+
+The user hears "Let me connect you with our support team" in the greeter's voice, then the support agent starts speaking in a different voice.
