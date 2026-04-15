@@ -1,0 +1,298 @@
+---
+title: "Migrating to 1.0"
+description: "Guide to upgrading your Pipecat Flows application from 0.0.x to 1.0"
+---
+
+Pipecat Flows 1.0 removes deprecated APIs from the 0.0.x series. If you were already using the non-deprecated replacements, most of these changes won't affect you.
+
+Before upgrading, search your codebase for the deprecated imports and patterns listed below to identify what needs to change.
+
+<Warning>
+  Pipecat Flows 1.0 requires **Python 3.11 or later** and **pipecat-ai >= 1.0.0**.
+  If you're also upgrading Pipecat, see the [Pipecat 1.0 migration guide](/pipecat/migration/migration-1.0) first.
+</Warning>
+
+## 1. FlowManager Initialization
+
+The `tts` parameter was removed from `FlowManager.__init__()`. The built-in `tts_say` action now uses Pipecat's `TTSSpeakFrame` directly and no longer needs a reference to your TTS service.
+
+### Before (1.0)
+
+```python
+flow_manager = FlowManager(
+    task=task,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    tts=tts,  # No longer accepted
+)
+```
+
+### After (1.0)
+
+```python
+flow_manager = FlowManager(
+    task=task,
+    llm=llm,
+    context_aggregator=context_aggregator,
+)
+```
+
+### What was removed
+
+| Removed                | Replacement                                      |
+| ---------------------- | ------------------------------------------------ |
+| `FlowManager(tts=...)` | Remove the parameter; `tts_say` works without it |
+
+## 2. Node Transitions
+
+Three deprecated APIs for controlling node transitions were removed. All three are replaced by **consolidated handlers** that return a `(result, next_node)` tuple, or by `set_node_from_config()` for imperative transitions.
+
+### Before (1.0)
+
+**`transition_to` on FlowsFunctionSchema:**
+
+```python
+FlowsFunctionSchema(
+    name="collect_name",
+    description="Collect the user's name",
+    properties={"name": {"type": "string"}},
+    required=["name"],
+    handler=handle_name,
+    transition_to="next_node",  # No longer accepted
+)
+```
+
+**`transition_callback` on FlowsFunctionSchema:**
+
+```python
+FlowsFunctionSchema(
+    name="collect_name",
+    description="Collect the user's name",
+    properties={"name": {"type": "string"}},
+    required=["name"],
+    handler=handle_name,
+    transition_callback=decide_next_node,  # No longer accepted
+)
+```
+
+**`set_node()` on FlowManager:**
+
+```python
+# In a transition callback or handler
+await flow_manager.set_node("next_node", next_node_config)  # No longer available
+```
+
+### After (1.0)
+
+**Consolidated handler** (preferred) -- return a tuple of `(result, next_node)`:
+
+```python
+async def handle_name(args: FlowArgs, flow_manager: FlowManager):
+    name = args["name"]
+    flow_manager.state["name"] = name
+    return {"name": name}, create_next_node()
+
+FlowsFunctionSchema(
+    name="collect_name",
+    description="Collect the user's name",
+    properties={"name": {"type": "string"}},
+    required=["name"],
+    handler=handle_name,
+)
+```
+
+**Direct function** alternative:
+
+```python
+async def collect_name(flow_manager: FlowManager, name: str):
+    """Collect the user's name.
+
+    Args:
+        name: The user's name.
+    """
+    flow_manager.state["name"] = name
+    return {"name": name}, create_next_node()
+```
+
+**Imperative transition** with `set_node_from_config()`:
+
+```python
+await flow_manager.set_node_from_config(next_node_config)
+```
+
+### What was removed
+
+| Removed                                        | Replacement                                 |
+| ---------------------------------------------- | ------------------------------------------- |
+| `FlowsFunctionSchema(transition_to=...)`       | Return `(result, next_node)` from handler   |
+| `FlowsFunctionSchema(transition_callback=...)` | Return `(result, next_node)` from handler   |
+| `flow_manager.set_node(id, config)`            | `flow_manager.set_node_from_config(config)` |
+
+## 3. Static Flows
+
+The `FlowConfig` type and `flow_config` parameter were removed. Static flows defined all nodes upfront in a dictionary and transitioned by node name. Dynamic flows replaced them. You create `NodeConfig` objects at runtime and return them from handlers.
+
+### Before (1.0)
+
+```python
+from pipecat_flows import FlowManager, FlowConfig
+
+flow_config: FlowConfig = {
+    "initial_node": "greeting",
+    "nodes": {
+        "greeting": {
+            "role_messages": [...],
+            "task_messages": [...],
+            "functions": [...]
+        },
+        "collect_info": {
+            "task_messages": [...],
+            "functions": [...]
+        }
+    }
+}
+
+flow_manager = FlowManager(
+    task=task,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    flow_config=flow_config,  # No longer accepted
+)
+await flow_manager.initialize()
+```
+
+### After (1.0)
+
+```python
+from pipecat_flows import FlowManager, NodeConfig
+
+def create_greeting_node() -> NodeConfig:
+    return {
+        "role_message": "You are a helpful assistant.",
+        "task_messages": [{"role": "user", "content": "Greet the user."}],
+        "functions": [collect_info_func],
+    }
+
+flow_manager = FlowManager(
+    task=task,
+    llm=llm,
+    context_aggregator=context_aggregator,
+)
+await flow_manager.initialize(create_greeting_node())
+```
+
+### What was removed
+
+| Removed                        | Replacement                             |
+| ------------------------------ | --------------------------------------- |
+| `FlowConfig` type              | `NodeConfig` returned from functions    |
+| `FlowManager(flow_config=...)` | `flow_manager.initialize(initial_node)` |
+| Transition by node name string | Return `NodeConfig` from handler        |
+
+## 4. Function Definition Format
+
+Provider-specific function definition dicts (OpenAI, Anthropic, Gemini formats) are no longer accepted in node configs. Use `FlowsFunctionSchema` or direct functions instead.
+
+### Before (1.0)
+
+```python
+# OpenAI-style dict format
+node_config = {
+    "task_messages": [...],
+    "functions": [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                }
+            },
+            "handler": get_weather_handler,
+        }
+    ]
+}
+```
+
+### After (1.0)
+
+**Using `FlowsFunctionSchema`:**
+
+```python
+from pipecat_flows import FlowsFunctionSchema
+
+node_config = {
+    "task_messages": [...],
+    "functions": [
+        FlowsFunctionSchema(
+            name="get_weather",
+            description="Get the weather",
+            properties={"location": {"type": "string"}},
+            required=["location"],
+            handler=get_weather_handler,
+        )
+    ]
+}
+```
+
+**Using a direct function:**
+
+```python
+async def get_weather(flow_manager: FlowManager, location: str):
+    """Get the weather for a location.
+
+    Args:
+        location: The city to check weather for.
+    """
+    result = await fetch_weather(location)
+    return {"weather": result}, None
+
+node_config = {
+    "task_messages": [...],
+    "functions": [get_weather]
+}
+```
+
+### What was removed
+
+| Removed                              | Replacement                               |
+| ------------------------------------ | ----------------------------------------- |
+| OpenAI-style function dicts          | `FlowsFunctionSchema`                     |
+| Anthropic-style function dicts       | `FlowsFunctionSchema`                     |
+| Gemini `function_declarations` dicts | `FlowsFunctionSchema`                     |
+| Any provider-specific dict format    | `FlowsFunctionSchema` or direct functions |
+
+## Still-Active Deprecations
+
+<Tip>
+  The following APIs still work in 1.0 but emit deprecation warnings. They will
+  be removed in 2.0.
+</Tip>
+
+| Deprecated                                      | Since   | Replacement                                                                                |
+| ----------------------------------------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `role_messages` (list of dicts in `NodeConfig`) | v0.0.24 | `role_message` (plain string)                                                              |
+| `RESET_WITH_SUMMARY` context strategy           | v0.0.25 | Pipecat's native [`LLMSummarizeContextFrame`](/pipecat/fundamentals/context-summarization) |
+
+**`role_messages`**: Replace the list-of-dicts `role_messages` field with the `role_message` string field. The string is sent as the LLM's system instruction and persists across node transitions until a new node explicitly sets it again.
+
+```python
+# Before
+node = {
+    "role_messages": [{"role": "system", "content": "You are a helpful assistant."}],
+    "task_messages": [...]
+}
+
+# After
+node = {
+    "role_message": "You are a helpful assistant.",
+    "task_messages": [...]
+}
+```
+
+**`RESET_WITH_SUMMARY`**: Instead of using the `RESET_WITH_SUMMARY` context strategy, push an `LLMSummarizeContextFrame` in a pre-action to trigger on-demand summarization during a node transition. See the [context summarization guide](/pipecat/fundamentals/context-summarization) for details.
