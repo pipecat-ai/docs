@@ -175,21 +175,20 @@ async def main(room_url: str, token: str):
         )
 
         tts = ElevenLabsTTSService(
-            aiohttp_session=session,
             api_key=os.getenv("ELEVENLABS_API_KEY", ""),
-            voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
+            settings=ElevenLabsTTSService.Settings(
+                voice=os.getenv("ELEVENLABS_VOICE_ID", ""),
+            ),
         )
 
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+        llm = OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMService.Settings(
+                system_instruction="You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Respond to what the user said in a creative, helpful, and brief way.",
+            ),
+        )
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are Chatbot, a friendly, helpful robot. Your output will be converted to audio so don't include special characters other than '!' or '?' in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by saying hello.",
-            },
-        ]
-
-        context = LLMContext(messages)
+        context = LLMContext()
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
@@ -210,19 +209,19 @@ async def main(room_url: str, token: str):
 
         task = PipelineTask(pipeline)
 
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
-            transport.capture_participant_transcription(participant["id"])
-            await task.queue_frames([LLMContextFrame(LLMContext(messages))])
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info(f"Client connected")
+            # Kick off the conversation.
+            context.add_message(
+                {"role": "developer", "content": "Please introduce yourself to the user."}
+            )
+            await task.queue_frames([LLMRunFrame()])
 
-        @transport.event_handler("on_participant_left")
-        async def on_participant_left(transport, participant, reason):
-            await task.queue_frame(EndFrame())
-
-        @transport.event_handler("on_call_state_updated")
-        async def on_call_state_updated(transport, state):
-            if state == "left":
-                await task.queue_frame(EndFrame())
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected")
+            await task.cancel()
 
         runner = PipelineRunner()
 
