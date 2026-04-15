@@ -1,0 +1,162 @@
+---
+title: "Choosing a Transport"
+description: "How to pick the right transport for your Pipecat client application."
+---
+
+A transport is the connection layer between your client and your Pipecat bot. It handles device management, the underlying connection, media streaming, and session state. You choose one transport when creating your `PipecatClient` and it stays for the lifetime of that client instance.
+
+The choice of transport has one important constraint: **the client transport and server transport must be a matching pair**. If your client uses `DailyTransport`, your Pipecat pipeline must use the server-side `DailyTransport`. See the [server transport docs](/pipecat/learn/transports) for the server side of this picture.
+
+## Available transports
+
+<CardGroup cols={2}>
+  <Card title="SmallWebRTC" icon="link" href="/api-reference/client/js/transports/small-webrtc">
+    Serverless peer-to-peer WebRTC. No third-party account needed.
+  </Card>
+  <Card title="Daily" icon="tower-broadcast" href="/api-reference/client/js/transports/daily">
+    WebRTC via Daily's global infrastructure. Recommended for production.
+  </Card>
+  <Card title="WebSocket" icon="plug" href="/api-reference/client/js/transports/websocket">
+    Direct WebSocket connection. For server-to-server setups only.
+  </Card>
+  <Card title="Gemini Live" icon="google" href="/api-reference/client/js/transports/gemini">
+    Direct connection to Google's Gemini Live API. No Pipecat server needed.
+  </Card>
+  <Card title="OpenAI WebRTC" icon="robot" href="/api-reference/client/js/transports/openai-webrtc">
+    Direct connection to OpenAI's Realtime API. No Pipecat server needed.
+  </Card>
+</CardGroup>
+
+## WebRTC vs WebSocket
+
+For any client-to-server voice application, **WebRTC is the right choice**. WebSocket may look simpler, but it's built on TCP, which makes it a poor fit for real-time audio:
+
+- **Head-of-line blocking**: TCP retransmits lost packets and holds up everything behind them. For audio, a dropped packet is better discarded than waited for — a brief gap sounds far better than a stutter.
+- **Opus codec coupling**: Opus's forward error correction and packet loss concealment are designed to work with UDP's delivery model. On TCP, that machinery either doesn't help or actively hurts.
+- **No automatic timestamping**: WebRTC handles RTP timestamping and jitter buffering automatically. WebSocket leaves that to you.
+- **No built-in echo cancellation or noise suppression**: Browser echo cancellation (AEC) is wired into the WebRTC stack. It's not available to arbitrary WebSocket streams.
+- **Reconnection complexity**: WebRTC handles ICE restarts and network changes. WebSocket reconnection on mobile, sleep/wake cycles, or network switches requires you to rebuild that logic yourself.
+
+WebSocket is appropriate for **server-to-server** communication (where both sides are on stable, controlled networks) or for **text-only** bots with no audio.
+
+## Serverless WebRTC vs WebRTC cloud
+
+Once you've settled on WebRTC, the next question is how you route it. There are two approaches:
+
+**Serverless WebRTC (SmallWebRTC)** establishes a direct peer-to-peer connection between the browser and your Pipecat server. There's no relay infrastructure — the media takes the most direct path. This works well when latency is already low (local dev, same-region deployments) and keeps your stack simple. If you're self-hosting Pipecat, this is the recommended approach.
+
+**WebRTC cloud (Daily)** routes media through a global network of Points of Presence (PoPs). Instead of a single direct hop, your client connects to the nearest PoP, and Daily's mesh routing finds the best path from there to your bot. Daily's network spans ~75 PoPs with a P50 first-hop latency of ~13ms. For users on degraded networks, distant from your server, or on mobile, the reliability and audio quality advantages are significant.
+
+A useful way to think about it: if you're self-hosting, use SmallWebRTC — it's simpler than running your own WebRTC infrastructure and avoids a third-party dependency. If you want managed infrastructure that handles global routing, audio processing, and scaling for you, use Daily.
+
+<Note>
+  For a deeper look at this tradeoff, see the Daily blog post [You don't need a WebRTC server for your voice agents](https://www.daily.co/blog/you-dont-need-a-webrtc-server-for-your-voice-agents/).
+</Note>
+
+---
+
+## How to choose
+
+### SmallWebRTC — self-hosted and local development
+
+SmallWebRTC is the default in all Pipecat quickstart templates. No account needed, no third-party services — just a direct peer-to-peer WebRTC connection between your client and your bot.
+
+**Use it when:**
+- Developing or testing locally
+- Running a self-hosted deployment
+- Building embedded or edge deployments where simplicity matters
+
+**Avoid it when:**
+- Your users are geographically distributed
+- You need built-in echo cancellation, noise reduction, or network resilience at scale
+- You're scaling beyond a handful of concurrent sessions
+
+```tsx
+import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
+
+const client = new PipecatClient({
+  transport: new SmallWebRTCTransport(),
+  enableMic: true,
+});
+
+await client.connect({ webrtcUrl: "http://localhost:7860/api/offer" });
+```
+
+---
+
+### Daily — production web and mobile apps
+
+Daily provides a global WebRTC network with mesh routing, built-in audio processing (echo cancellation, noise suppression, automatic gain control), and resilience to network changes. It's the recommended choice for anything user-facing in production.
+
+**Use it when:**
+- Shipping a production app to real users
+- Your users are on a variety of networks, devices, or locations
+- You want managed infrastructure without operating it yourself
+- You're deploying to Pipecat Cloud (Daily is included)
+
+```tsx
+import { DailyTransport } from "@pipecat-ai/daily-transport";
+
+const client = new PipecatClient({
+  transport: new DailyTransport(),
+  enableMic: true,
+});
+
+// startBotAndConnect calls your server endpoint, which creates a Daily room
+// and returns the connection credentials
+await client.startBotAndConnect({ endpoint: "/api/start" });
+```
+
+---
+
+### WebSocket — server-to-server and text-only
+
+The WebSocket transport connects to a WebSocket server rather than using WebRTC. It's appropriate for controlled, server-to-server scenarios where both sides are on stable networks, or for text-only bots with no audio requirements.
+
+**Use it when:**
+- Building text-only interactions (no audio)
+- Connecting two servers (not a browser client)
+- Network constraints make WebRTC impractical in a specific environment
+
+**Do not use it for browser-to-server voice interactions.** See [WebRTC vs WebSocket](#webrtc-vs-websocket) above.
+
+---
+
+### Gemini Live and OpenAI WebRTC — direct API connections
+
+These transports connect your client directly to Google's Gemini Live API or OpenAI's Realtime API, bypassing a Pipecat server entirely. They're useful for prototyping or demos when you want speech-to-speech interactions without running a backend.
+
+<Warning>
+  Direct API transports expose your API key in the client. They are appropriate for development and demos, but **not for production** — use a server-side Pipecat pipeline with `DailyTransport` or `SmallWebRTCTransport` to keep API keys secure.
+</Warning>
+
+---
+
+## Swapping transports
+
+Transports are interchangeable — the rest of your application code stays the same. The only thing that changes is the import and constructor:
+
+```tsx
+// Development / self-hosted
+import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
+const transport = new SmallWebRTCTransport();
+
+// Production / managed
+import { DailyTransport } from "@pipecat-ai/daily-transport";
+const transport = new DailyTransport();
+
+// Everything else is identical
+const client = new PipecatClient({ transport, enableMic: true });
+```
+
+The Pipecat CLI scaffolds a `config.ts` that selects the transport based on an environment variable, so you can run SmallWebRTC locally and Daily in production without changing your app code.
+
+## Summary
+
+| Transport | Best for | Requires |
+|---|---|---|
+| SmallWebRTC | Local dev, self-hosted | Nothing |
+| Daily | Production apps, global users | Daily account |
+| WebSocket | Text-only, server-to-server | Custom server |
+| Gemini Live | Gemini prototypes | Gemini API key |
+| OpenAI WebRTC | OpenAI prototypes | OpenAI API key |

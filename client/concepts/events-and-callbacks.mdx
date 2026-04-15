@@ -1,0 +1,193 @@
+---
+title: "Events & Callbacks"
+description: "How to respond to bot and session events in Pipecat client applications."
+---
+
+The Pipecat client emits events throughout the session lifecycle — when the bot connects, when the user speaks, when a transcript arrives, and more. You can respond to these in two equivalent ways: **callbacks** defined at construction time, or **event listeners** added at any point.
+
+## Two patterns, same events
+
+### Callbacks
+
+Pass handlers in the `PipecatClient` constructor. Good for events you always want to handle, defined once at setup:
+
+```tsx
+const client = new PipecatClient({
+  transport: new DailyTransport(),
+  callbacks: {
+    onBotReady: () => console.log("Bot is ready"),
+    onUserTranscript: (data) => console.log("User said:", data.text),
+  },
+});
+```
+
+### Event listeners
+
+Add handlers with `.on()` at any point — useful for component-level subscriptions or when you want to add/remove handlers dynamically:
+
+```tsx
+client.on(RTVIEvent.BotReady, () => console.log("Bot is ready"));
+client.on(RTVIEvent.UserTranscript, (data) => console.log("User said:", data.text));
+```
+
+Both patterns are equivalent. Mix them freely — there's no functional difference between a callback and its corresponding event listener.
+
+### React: `useRTVIClientEvent`
+
+In React, use the `useRTVIClientEvent` hook to subscribe within a component. It handles registration and cleanup automatically:
+
+```tsx
+import { RTVIEvent } from "@pipecat-ai/client-js";
+import { useRTVIClientEvent } from "@pipecat-ai/client-react";
+
+function TranscriptDisplay() {
+  useRTVIClientEvent(
+    RTVIEvent.UserTranscript,
+    useCallback((data) => {
+      if (data.final) setTranscript(data.text);
+    }, [])
+  );
+}
+```
+
+---
+
+## Event reference
+
+### Session and connectivity
+
+These events track the connection state of the client and bot. See [Session Lifecycle](/client/concepts/session-lifecycle) for the full state progression.
+
+| Event | Callback | When it fires |
+|---|---|---|
+| `Connected` | `onConnected` | Client transport connection established |
+| `Disconnected` | `onDisconnected` | Client disconnected (intentional or error) |
+| `TransportStateChanged` | `onTransportStateChanged` | Any transport state change; receives the new `TransportState` string |
+| `BotConnected` | `onBotConnected` | Bot joined the transport; pipeline may still be initializing |
+| `BotReady` | `onBotReady` | Bot pipeline is ready; safe to send messages and expect audio |
+| `BotDisconnected` | `onBotDisconnected` | Bot left the session; client will also disconnect unless `disconnectOnBotDisconnect: false` |
+| `ParticipantConnected` | `onParticipantJoined` | Any participant joined (bot, local, or other) |
+| `ParticipantLeft` | `onParticipantLeft` | Any participant left (bot, local, or other) |
+
+<Tip>
+`BotReady` receives a `BotReadyData` object with a `version` field — the RTVI version the bot is running. You can use this to check compatibility if your client and server may be on different versions.
+</Tip>
+
+### Voice activity
+
+These events are driven by the bot's VAD (voice activity detection) model. VAD is smarter than tracking raw audio levels — it understands turn-taking, so it can distinguish between a user who has finished speaking and one who has simply paused or is speaking slowly.
+
+| Event | Callback | When it fires |
+|---|---|---|
+| `UserStartedSpeaking` | `onUserStartedSpeaking` | VAD detected the user started speaking |
+| `UserStoppedSpeaking` | `onUserStoppedSpeaking` | VAD detected the user stopped speaking |
+| `BotStartedSpeaking` | `onBotStartedSpeaking` | Bot started sending audio |
+| `BotStoppedSpeaking` | `onBotStoppedSpeaking` | Bot stopped sending audio |
+| `LocalAudioLevel` | `onLocalAudioLevel` | Local audio gain level (0–1); fires continuously |
+| `RemoteAudioLevel` | `onRemoteAudioLevel` | Remote audio gain level (0–1); fires continuously |
+| `UserMuteStarted` | `onUserMuteStarted` | Server started ignoring client audio (server-side mute) |
+| `UserMuteStopped` | `onUserMuteStopped` | Server resumed processing client audio |
+
+<Tip>
+`UserMuteStarted`/`UserMuteStopped` reflect server-side muting — the client continues sending audio, but the bot is ignoring it. Use these to update your UI (e.g., show a muted indicator) without actually stopping the local mic.
+</Tip>
+
+### Transcription and bot output
+
+| Event | Callback | Data | When it fires |
+|---|---|---|---|
+| `UserTranscript` | `onUserTranscript` | `TranscriptData` | User speech transcribed; fires for both partial (`final: false`) and final results |
+| `BotOutput` | `onBotOutput` | `BotOutputData` | Bot text output, typically aggregated by sentence or word during TTS synthesis |
+| `BotLlmText` | `onBotLlmText` | `BotLLMTextData` | Raw LLM token stream |
+| `BotLlmStarted` | `onBotLlmStarted` | — | LLM inference started |
+| `BotLlmStopped` | `onBotLlmStopped` | — | LLM inference finished |
+| `BotTtsText` | `onBotTtsText` | `BotTTSTextData` | Words from TTS as they are synthesized (streaming TTS only) |
+| `BotTtsStarted` | `onBotTtsStarted` | — | TTS synthesis started |
+| `BotTtsStopped` | `onBotTtsStopped` | — | TTS synthesis finished |
+
+`UserTranscript` fires continuously as speech is recognized. Check `data.final` to distinguish committed transcripts from work-in-progress partials:
+
+```tsx
+client.on(RTVIEvent.UserTranscript, (data) => {
+  if (data.final) {
+    addMessage(data.text); // committed
+  } else {
+    updatePartial(data.text); // still in progress
+  }
+});
+```
+
+`BotOutput` is the recommended way to display the bot's response text. It provides the best possible representation of what the bot is saying — supporting interruptions and unspoken responses. By default, Pipecat aggregates output by sentences and words (assuming your TTS supports streaming), but custom aggregation strategies are supported too - like breaking out code snippets or other structured content:
+
+```tsx
+client.on(RTVIEvent.BotOutput, (data) => {
+  if (data.aggregated_by === "sentence") {
+    appendSentence(data.text);
+  }
+});
+```
+
+### Errors
+
+| Event | Callback | When it fires |
+|---|---|---|
+| `Error` | `onError` | Bot signalled an error; `data.fatal` is `true` if the session is unrecoverable |
+| `MessageError` | `onMessageError` | A client message failed or got an error response |
+
+Always handle `Error`. If `data.fatal` is `true`, the bot has already disconnected — update your UI accordingly:
+
+```tsx
+client.on(RTVIEvent.Error, ({ data }) => {
+  if (data.fatal) {
+    showReconnectPrompt(data.message);
+  } else {
+    showToast(data.message);
+  }
+});
+```
+
+### Devices and tracks
+
+| Event | Callback | When it fires |
+|---|---|---|
+| `AvailableMicsUpdated` | `onAvailableMicsUpdated` | Mic list changed or `initDevices()` called |
+| `AvailableCamsUpdated` | `onAvailableCamsUpdated` | Camera list changed or `initDevices()` called |
+| `AvailableSpeakersUpdated` | `onAvailableSpeakersUpdated` | Speaker list changed or `initDevices()` called |
+| `MicUpdated` | `onMicUpdated` | Active microphone changed |
+| `CamUpdated` | `onCamUpdated` | Active camera changed |
+| `SpeakerUpdated` | `onSpeakerUpdated` | Active speaker changed |
+| `DeviceError` | `onDeviceError` | Mic, camera, or permission error |
+| `TrackStarted` | `onTrackStarted` | A media track (audio or video) became playable |
+| `TrackStopped` | `onTrackStopped` | A media track stopped |
+
+### Function calling
+
+These events fire when the bot's LLM makes a function call. If your bot uses function calling, you can use these to track the status of calls and display relevant UI (e.g., a loading spinner while the call is in progress).
+
+| Event | Callback | When it fires |
+|---|---|---|
+| `LLMFunctionCallStarted` | `onLLMFunctionCallStarted` | LLM initiated a function call |
+| `LLMFunctionCallInProgress` | `onLLMFunctionCallInProgress` | Function call is executing; triggers registered `FunctionCallHandler`s |
+| `LLMFunctionCallStopped` | `onLLMFunctionCallStopped` | Function call completed or was cancelled |
+
+### Other
+
+| Event | Callback | When it fires |
+|---|---|---|
+| `ServerMessage` | `onServerMessage` | Custom message sent from the bot to the client |
+| `Metrics` | `onMetrics` | Pipeline performance metrics from Pipecat |
+
+For custom server\<-\>client messaging, see [Custom Messaging](/client/guides/custom-messaging).
+
+---
+
+## API reference
+
+<CardGroup cols={2}>
+  <Card title="JavaScript SDK Callbacks" icon="js" href="/api-reference/client/js/callbacks">
+    Complete callback signatures, data types, and transport compatibility
+  </Card>
+  <Card title="React Hooks" icon="react" href="/api-reference/client/react/hooks">
+    `useRTVIClientEvent` and other React-specific event utilities
+  </Card>
+</CardGroup>
