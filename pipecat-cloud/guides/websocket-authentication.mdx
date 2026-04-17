@@ -1,0 +1,153 @@
+---
+title: WebSocket Authentication
+description: "Secure your WebSocket connections with HMAC token authentication"
+---
+
+Pipecat Cloud supports optional HMAC token authentication for WebSocket connections. When enabled, clients must obtain a short-lived session token via the `/start` endpoint before connecting, preventing unauthorized session starts.
+
+## How It Works
+
+<Steps>
+  <Step title="Client calls /start">
+    Your client calls the `/start` endpoint with `transport: "websocket"` and
+    your public API key. Pipecat Cloud generates a signed HMAC token and returns
+    it along with the WebSocket URL.
+  </Step>
+  <Step title="Client connects with token">
+    The client connects to the WebSocket URL with the token included as a
+    header, query parameter, or URL path segment. No bot is started until the
+    client connects.
+  </Step>
+  <Step title="Bot-starter validates">
+    The token is validated before the WebSocket connection is accepted. Invalid,
+    expired, or replayed tokens are rejected with an HTTP 403 — no bot resources
+    are allocated.
+  </Step>
+</Steps>
+
+## Configuration
+
+WebSocket authentication is controlled by the `websocket_auth` setting in your deployment config. Valid values are:
+
+| Value   | Behavior                                                                 |
+| ------- | ------------------------------------------------------------------------ |
+| `token` | Requires an HMAC session token (default for new agents)                  |
+| `none`  | No authentication required — any client can connect with the service URL |
+
+Set it in your `pcc-deploy.toml`:
+
+```toml pcc-deploy.toml
+agent_name = "my-agent"
+websocket_auth = "token"
+
+[scaling]
+min_agents = 1
+```
+
+<Note>
+  Existing agents deployed before this feature default to `none` for backward
+  compatibility. New agents default to `token`.
+</Note>
+
+## Getting a Token
+
+Call the `/start` endpoint with `transport` set to `"websocket"`:
+
+```bash
+curl -X POST "https://api.pipecat.daily.co/v1/public/my-agent/start" \
+  -H "Authorization: Bearer pk_your_public_key" \
+  -H "Content-Type: application/json" \
+  -d '{"transport": "websocket"}'
+```
+
+Response:
+
+```json
+{
+  "token": "eyJzaCI6Im15LWFnZW50Lm15LW9yZy...",
+  "wsUrl": "wss://us-west.api.pipecat.daily.co/ws/generic/my-agent.my-org",
+  "sessionId": "639f91d8-d511-4677-a83b-bd7564d5d92f"
+}
+```
+
+<Info>
+  Unlike other transport types, `transport: "websocket"` does not start a bot
+  immediately. The bot starts when the client connects to the WebSocket URL.
+</Info>
+
+## Connecting with a Token
+
+The token can be provided in three ways, checked in this order:
+
+### Authorization Header
+
+```
+Authorization: Bearer <token>
+```
+
+<Warning>
+  Browser WebSocket connections cannot set custom headers. Use a query parameter
+  or URL path instead for browser-based clients.
+</Warning>
+
+### Query Parameter
+
+```
+wss://api.pipecat.daily.co/ws/generic/my-agent.my-org?token=<token>
+```
+
+### URL Path
+
+```
+wss://api.pipecat.daily.co/ws/generic/my-agent.my-org/<token>
+```
+
+This is the recommended method for telephony providers that don't support query
+parameters (such as Twilio).
+
+## Token Details
+
+- **Lifetime**: 5 minutes from generation. Connect promptly after calling `/start`.
+- **One-time use**: Each token can only be used once. Replayed tokens are rejected.
+- **Scoped**: Tokens are bound to a specific agent and organization. They cannot be used with a different agent.
+
+## Using with Telephony Providers
+
+Telephony providers like Twilio, Plivo, and Telnyx initiate WebSocket connections
+directly — they can't call `/start` themselves. To use token authentication with
+these providers, use an intermediary server:
+
+<Steps>
+  <Step title="Provider calls your server">
+    Configure the provider's Answer URL to point to your intermediary server.
+  </Step>
+  <Step title="Your server calls /start">
+    Your server calls Pipecat Cloud's `/start` endpoint with `transport:
+    "websocket"` to get a token.
+  </Step>
+  <Step title="Your server returns XML with token">
+    Your server returns the provider-specific XML (TwiML, Plivo XML, or TeXML)
+    with the token embedded in the WebSocket URL path.
+  </Step>
+  <Step title="Provider connects">
+    The provider connects to the authenticated WebSocket URL. The token is
+    validated and the bot session starts.
+  </Step>
+</Steps>
+
+For example, a Twilio intermediary would return:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://api.pipecat.daily.co/ws/generic/my-agent.my-org/<token>" />
+  </Connect>
+</Response>
+```
+
+<Tip>
+  If you don't need token authentication for telephony (e.g., in a trusted
+  network), set `websocket_auth = "none"` and connect directly without the
+  intermediary step.
+</Tip>
