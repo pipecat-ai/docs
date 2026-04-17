@@ -13,6 +13,11 @@ You are currently viewing the React version of this page. Use the dropdown to th
 You are currently viewing the JavaScript version of this page. Use the dropdown to the right to customize this page for your client framework.
 </Callout>
 </View>
+<View title="React Native" icon="mobile">
+<Callout icon="mobile" color="#FFC107">
+You are currently viewing the React Native version of this page. Use the dropdown to the right to customize this page for your client framework.
+</Callout>
+</View>
 
 <View title="React" icon="react">
 This guide walks through building a React voice app without any UI abstractions — just the Pipecat React SDK directly. You'll see exactly how the client, provider, hooks, and audio output fit together, which is useful whether you're building a fully custom UI or want to understand what the [CLI-generated app](/client/get-started/quickstart) is doing under the hood.
@@ -20,6 +25,10 @@ This guide walks through building a React voice app without any UI abstractions 
 
 <View title="JavaScript" icon="js">
 This guide walks through building a voice app in vanilla TypeScript — just the Pipecat JavaScript SDK directly, with no framework. You'll see how to set up the client, handle events, and wire up audio output manually.
+</View>
+
+<View title="React Native" icon="mobile">
+This guide walks through building a React Native voice app using the Pipecat JavaScript SDK. You'll see how to set up the client, subscribe to events with `useEffect`, and connect to your bot from a mobile app — with audio handled automatically by the platform.
 </View>
 
 ## Prerequisites
@@ -53,6 +62,36 @@ Create a new TypeScript project and install the SDK and SmallWebRTC transport:
 npm create vite@latest my-voice-app -- --template vanilla-ts
 cd my-voice-app
 npm install @pipecat-ai/client-js @pipecat-ai/small-webrtc-transport
+```
+
+</View>
+
+<View title="React Native" icon="mobile">
+
+Create a new Expo project and install the SDK, SmallWebRTC transport, and media manager:
+
+```bash
+npx create-expo-app MyVoiceApp
+cd MyVoiceApp
+npx expo install @pipecat-ai/client-js @pipecat-ai/react-native-small-webrtc-transport @pipecat-ai/react-native-daily-media-manager expo-dev-client
+```
+
+<Note>
+  These packages use native modules, so they won't run in Expo Go. You'll need a
+  [development build](https://docs.expo.dev/develop/development-builds/introduction/).
+</Note>
+
+Because this is a voice app, both platforms need explicit microphone permissions declared in `app.json`:
+
+```json
+"ios": {
+  "infoPlist": {
+    "NSMicrophoneUsageDescription": "This app uses the microphone to talk to your voice AI assistant."
+  }
+},
+"android": {
+  "permissions": ["android.permission.RECORD_AUDIO"]
+}
 ```
 
 </View>
@@ -123,6 +162,25 @@ client.on(RTVIEvent.TrackStarted, (track, participant) => {
   }
 });
 ```
+
+</View>
+
+<View title="React Native" icon="mobile">
+
+Create the `PipecatClient` with the React Native SmallWebRTC transport and `DailyMediaManager`. Create `lib/client.ts` at the project root:
+
+```ts
+import { PipecatClient } from "@pipecat-ai/client-js";
+import { RNSmallWebRTCTransport } from "@pipecat-ai/react-native-small-webrtc-transport";
+import { DailyMediaManager } from "@pipecat-ai/react-native-daily-media-manager";
+
+export const client = new PipecatClient({
+  transport: new RNSmallWebRTCTransport({ mediaManager: new DailyMediaManager() }),
+  enableMic: true,
+});
+```
+
+Audio output is handled automatically — no `<audio>` element or `PipecatClientAudio` needed.
 
 </View>
 
@@ -261,15 +319,154 @@ And update `index.html` to include the elements the script expects:
 
 </View>
 
+<View title="React Native" icon="mobile">
+
+Replace `app/(tabs)/index.tsx` with:
+
+```tsx
+import React, { useState, useEffect } from "react";
+import { View, Text, Button, ScrollView, StyleSheet, Platform } from "react-native";
+import { RTVIEvent } from "@pipecat-ai/client-js";
+import { client } from "@/lib/client";
+
+// Android emulators can't reach the host via `localhost` — use 10.0.2.2 instead.
+// On a physical device, replace this with your machine's local network IP.
+const BOT_URL =
+  Platform.OS === "android"
+    ? "http://10.0.2.2:7860/api/offer"
+    : "http://localhost:7860/api/offer";
+
+interface Message {
+  role: "user" | "bot";
+  text: string;
+}
+
+export default function App() {
+  const [transportState, setTransportState] = useState(client.state);
+  const [messages, setMessages] = useState<Message[]>([]);
+
+  useEffect(() => {
+    const onStateChange = (state: string) => setTransportState(state);
+    const onBotOutput = (data: any) => {
+      if (data.aggregated_by === "sentence") {
+        setMessages((prev) => [...prev, { role: "bot", text: data.text }]);
+      }
+    };
+    const onUserTranscript = (data: any) => {
+      if (data.final) {
+        setMessages((prev) => [...prev, { role: "user", text: data.text }]);
+      }
+    };
+    const onError = (error: any) => console.error("Bot error:", error);
+
+    client.on(RTVIEvent.TransportStateChanged, onStateChange);
+    client.on(RTVIEvent.BotOutput, onBotOutput);
+    client.on(RTVIEvent.UserTranscript, onUserTranscript);
+    client.on(RTVIEvent.Error, onError);
+
+    return () => {
+      client.off(RTVIEvent.TransportStateChanged, onStateChange);
+      client.off(RTVIEvent.BotOutput, onBotOutput);
+      client.off(RTVIEvent.UserTranscript, onUserTranscript);
+      client.off(RTVIEvent.Error, onError);
+    };
+  }, []);
+
+  const isConnected = transportState === "ready";
+  const isConnecting = ["authenticating", "connecting", "connected"].includes(transportState);
+
+  const handlePress = async () => {
+    if (isConnected) {
+      await client.disconnect();
+    } else {
+      await client.connect({ webrtcUrl: BOT_URL });
+    }
+  };
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Pipecat Voice App</Text>
+      <View style={styles.controls}>
+        <Button
+          title={isConnected ? "Disconnect" : isConnecting ? "Connecting…" : "Connect"}
+          onPress={handlePress}
+          disabled={isConnecting}
+        />
+        <Text style={styles.status}>{transportState}</Text>
+      </View>
+      <ScrollView style={styles.messages}>
+        {messages.map((msg, i) => (
+          <Text key={i} style={styles.message}>
+            <Text style={styles.role}>{msg.role === "user" ? "You" : "Bot"}: </Text>
+            {msg.text}
+          </Text>
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, padding: 40, paddingTop: 60 },
+  title: { fontSize: 24, marginBottom: 16 },
+  controls: { flexDirection: "row", alignItems: "center", marginBottom: 16, gap: 12 },
+  status: { color: "#666" },
+  messages: { flex: 1 },
+  message: { marginBottom: 8 },
+  role: { fontWeight: "bold" },
+});
+```
+
+</View>
+
 ## Step 3: Run it
 
 Start your Pipecat bot (if it isn't already running), then start the app:
+
+<View title="React" icon="react">
 
 ```bash
 npm run dev
 ```
 
 Open `http://localhost:5173`, click **Connect**, allow microphone access, and start talking.
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:5173`, click **Connect**, allow microphone access, and start talking.
+
+</View>
+
+<View title="React Native" icon="mobile">
+
+```bash
+npx expo prebuild --clean
+npm run ios -- --device
+# or
+npm run android -- --device
+```
+
+The `--device` flag prompts you to choose between connected physical devices and simulators, and starts Metro automatically. Running from Xcode directly won't work — it builds the app but doesn't start Metro, so the app will show "No development servers found."
+
+**Networking note:** The bot URL differs by target:
+
+| Target | URL |
+|---|---|
+| iOS simulator | `http://localhost:7860/api/offer` |
+| Android emulator | `http://10.0.2.2:7860/api/offer` |
+| Physical device (either) | `http://<your-mac-ip>:7860/api/offer` — find it with `ipconfig getifaddr en0` |
+
+The `BOT_URL` constant in the code above handles the simulator cases automatically.
+
+Tap **Connect**, allow microphone access, and start talking.
+
+</View>
 
 ## What each piece does
 
@@ -294,6 +491,20 @@ Open `http://localhost:5173`, click **Connect**, allow microphone access, and st
 | `PipecatClient` | Manages the connection and session lifecycle |
 | `SmallWebRTCTransport` | Handles the WebRTC peer connection to your bot |
 | `TrackStarted` event | Notifies when the bot's audio track is ready to play |
+| `TransportStateChanged` event | Drives button state and status display |
+| `BotOutput` event | Streams the bot's response text sentence by sentence |
+| `UserTranscript` event | Receives finalized speech-to-text from the user |
+
+</View>
+
+<View title="React Native" icon="mobile">
+
+| Piece | Role |
+|---|---|
+| `PipecatClient` | Manages the connection and session lifecycle |
+| `RNSmallWebRTCTransport` | Handles the WebRTC peer connection to your bot |
+| `DailyMediaManager` | Manages audio routing and media permissions on the device |
+| `useEffect` + `.on()` / `.off()` | Subscribes to events and cleans up when the component unmounts |
 | `TransportStateChanged` event | Drives button state and status display |
 | `BotOutput` event | Streams the bot's response text sentence by sentence |
 | `UserTranscript` event | Receives finalized speech-to-text from the user |
