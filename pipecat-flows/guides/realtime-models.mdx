@@ -1,0 +1,116 @@
+---
+title: "Using Flows with Realtime Models"
+description: "Compatibility notes for Gemini Live, OpenAI Realtime, and other speech-to-speech services."
+---
+
+Pipecat Flows doesn't currently work with realtime speech-to-speech (S2S) services like Gemini Live or OpenAI Realtime. This page covers what works, what doesn't, and the recommended path forward.
+
+## Compatibility at a Glance
+
+| Service                                                                         | Works with Flows |
+| ------------------------------------------------------------------------------- | :--------------: |
+| Cascade LLMs (OpenAI, Anthropic, Gemini, AWS Bedrock, and OpenAI-compatible)    |        Yes       |
+| Gemini Live (`GeminiLiveLLMService`, `GeminiLiveVertexLLMService`)              |        No        |
+| OpenAI Realtime (`OpenAIRealtimeLLMService`)                                    |        No        |
+| AWS Nova Sonic (`AWSNovaSonicLLMService`)                                       |        No        |
+| Grok S2S, Inworld S2S, Ultravox                                                 |        No        |
+
+## Why
+
+Flows currently requires a cascade LLM service (STT → LLM → TTS). Native S2S support is currently being developed.
+
+## Recommended Path: Use a Cascade Pipeline
+
+If you want structured conversation flows today, build a cascade pipeline with a separate STT, LLM, and TTS service. Any cascade LLM that supports function calling works.
+
+Install Pipecat Flows along with Pipecat and the services you want to use. This example uses Deepgram (STT), Google Gemini (LLM), and Cartesia (TTS):
+
+```bash
+uv add pipecat-ai-flows
+uv add "pipecat-ai[daily,google,deepgram,cartesia,silero]"
+```
+
+Set the API keys:
+
+```bash
+export DEEPGRAM_API_KEY=...
+export GOOGLE_API_KEY=...
+export CARTESIA_API_KEY=...
+```
+
+Build the pipeline with the cascade services and attach a `FlowManager`:
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context_aggregator import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat_flows import FlowManager
+
+stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"), model="gemini-2.0-flash")
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    voice_id="32b3f3c5-7171-46aa-abe7-b598964aa793",
+)
+
+context = LLMContext()
+context_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        context_aggregator.user(),
+        llm,
+        tts,
+        transport.output(),
+        context_aggregator.assistant(),
+    ]
+)
+
+task = PipelineTask(pipeline)
+
+flow_manager = FlowManager(
+    task=task,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    transport=transport,
+)
+```
+
+<Tip>
+  For a complete runnable walkthrough (nodes, functions, and a working end-to-end
+  example), see the [Flows Quickstart](/pipecat-flows/guides/quickstart).
+</Tip>
+
+## If You Specifically Need Realtime S2S
+
+If low-latency speech-to-speech is a hard requirement, build with plain Pipecat (without Flows) and manage conversation state in your own code. The S2S service pages have everything you need to get started:
+
+<CardGroup cols={2}>
+  <Card
+    title="Gemini Live"
+    icon="google"
+    href="/api-reference/server/services/s2s/gemini-live"
+  >
+    Realtime speech-to-speech with Google Gemini Live
+  </Card>
+  <Card
+    title="OpenAI Realtime"
+    icon="microphone"
+    href="/api-reference/server/services/s2s/openai"
+  >
+    Realtime speech-to-speech with OpenAI's Realtime API
+  </Card>
+</CardGroup>
