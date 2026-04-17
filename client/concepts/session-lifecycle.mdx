@@ -1,0 +1,305 @@
+---
+title: "Session Lifecycle"
+description: "How a Pipecat session starts, runs, and ends — and how to handle each phase."
+---
+
+<View title="React" icon="react">
+<Callout icon="react" color="#FFC107">
+You are currently viewing the React version of this page. Use the Dropdown to the right to customize this page for your client framework.
+</Callout>
+</View>
+<View title="JavaScript" icon="js">
+<Callout icon="js" color="#FFC107">
+You are currently viewing the JavaScript version of this page. Use the Dropdown to the right to customize this page for your client framework.
+</Callout>
+</View>
+
+A session is the span of time from when your client connects to a bot until it disconnects. Understanding the lifecycle helps you build correct connection flows, handle errors gracefully, and clean up reliably.
+
+## Transport states
+
+The client exposes a `state` string that tracks where you are in the lifecycle. States progress in order:
+
+```
+idle → authenticating → authenticated → connecting → connected → ready → disconnecting → disconnected
+```
+
+| State | What it means |
+|---|---|
+| `idle` | No connection attempt has started |
+| `authenticating` | `startBot()` called; waiting for your server to start the bot |
+| `authenticated` | Server responded; bot is starting |
+| `connecting` | Transport is establishing the WebRTC/WebSocket connection |
+| `connected` | Transport is connected; bot pipeline is initializing |
+| `ready` | Bot pipeline is running and ready to receive audio/messages |
+| `disconnecting` | Disconnect in progress |
+| `disconnected` | Session has ended |
+
+The `ready` state is the one that matters most — it's the gate before which you should not send messages or expect audio. The `connected` state means the transport is up but the bot's pipeline may still be warming up.
+
+## Starting a session
+
+There are three ways to start a session, depending on your architecture.
+
+### Option 1: `startBotAndConnect()` (recommended)
+
+The most common pattern. Calls your server endpoint to start the bot, then connects the transport with the credentials returned by your server:
+
+```tsx
+await client.startBotAndConnect({
+  endpoint: "/api/start",
+  requestData: {
+    // Optional data forwarded to your server
+    initialPrompt: "You are a helpful assistant.",
+  },
+});
+// Resolves when the bot reaches 'ready' state
+```
+
+Use this when you control the server and need to create a session (e.g., a Daily room) before connecting.
+
+### Option 2: `connect()` with direct params
+
+Pass connection parameters directly — useful when you've already obtained them out of band, or with SmallWebRTC where the transport URL is known at build time:
+
+```tsx
+await client.connect({ webrtcUrl: "http://localhost:7860/api/offer" });
+```
+
+### Option 3: `startBot()` + `connect()` separately
+
+Gives you explicit control over each phase — useful if you need to inspect the server response before connecting:
+
+```tsx
+const connectionParams = await client.startBot({ endpoint: "/api/start" });
+// inspect or modify connectionParams here
+await client.connect(connectionParams);
+```
+
+All three methods resolve when the bot signals it is `ready`. Wrap them in `try/catch` to handle startup errors.
+
+## Waiting for ready
+
+`await client.connect(...)` (and `startBotAndConnect`) resolves only once the bot sends its `BotReady` signal, meaning the pipeline is fully initialized. You don't need to poll or listen for a separate event — the promise resolves at the right time.
+
+If you prefer event-driven code, or you call `connect()` without `await`:
+
+<View title="React" icon="react">
+
+Use `useRTVIClientEvent` so the handler is properly managed by React's lifecycle:
+
+```tsx
+import { RTVIEvent } from "@pipecat-ai/client-js";
+import { useRTVIClientEvent } from "@pipecat-ai/client-react";
+
+function MyComponent() {
+  useRTVIClientEvent(
+    RTVIEvent.BotReady,
+    useCallback((data) => {
+      console.log("Bot ready, RTVI version:", data.version);
+    }, [])
+  );
+}
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+Listen for the `BotReady` event on the client:
+
+```tsx
+import { RTVIEvent } from "@pipecat-ai/client-js";
+
+client.on(RTVIEvent.BotReady, (data) => {
+  console.log("Bot ready, RTVI version:", data.version);
+});
+```
+
+</View>
+
+## Ending a session
+
+### Client-initiated disconnect
+
+Call `disconnect()` to end the session from the client side. The bot will typically shut down when the client disconnects:
+
+```tsx
+await client.disconnect();
+// Transport state: disconnecting → disconnected
+```
+
+### Bot-initiated disconnect
+
+The bot can end the session on its own — due to a pipeline error, session timeout, or intentional shutdown. By default, the client disconnects automatically when the bot disconnects.
+
+To keep the client connected after the bot disconnects, set `disconnectOnBotDisconnect: false` in the constructor:
+
+```tsx
+const client = new PipecatClient({
+  transport: new DailyTransport(),
+  disconnectOnBotDisconnect: false,
+});
+```
+
+Listen for `BotDisconnected` to update your UI when this happens:
+
+<View title="React" icon="react">
+
+```tsx
+import { RTVIEvent } from "@pipecat-ai/client-js";
+import { useRTVIClientEvent } from "@pipecat-ai/client-react";
+
+function MyComponent() {
+  useRTVIClientEvent(
+    RTVIEvent.BotDisconnected,
+    useCallback(() => {
+      // Update UI to show the session has ended
+    }, [])
+  );
+}
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+```tsx
+client.on(RTVIEvent.BotDisconnected, () => {
+  // Update UI to show the session has ended
+});
+```
+
+</View>
+
+After a bot disconnect, you can call `connect()` again to start a new session.
+
+## Error handling
+
+Two distinct error signals:
+
+**Startup errors** — thrown by `connect()` / `startBotAndConnect()` if the server can't be reached, credentials are invalid, or the transport can't establish a connection:
+
+```tsx
+try {
+  await client.startBotAndConnect({ endpoint: "/api/start" });
+} catch (error) {
+  // Connection failed — update UI accordingly
+  console.error("Failed to start session:", error);
+}
+```
+
+**Runtime errors** — sent by the bot during an active session. The error includes a `fatal` boolean: if `true`, the bot has already disconnected and the client will clean up automatically:
+
+<View title="React" icon="react">
+
+```tsx
+import { RTVIEvent } from "@pipecat-ai/client-js";
+import { useRTVIClientEvent } from "@pipecat-ai/client-react";
+
+function MyComponent() {
+  useRTVIClientEvent(
+    RTVIEvent.Error,
+    useCallback((message) => {
+      const { message: text, fatal } = message.data;
+      console.error("Bot error:", text);
+      if (fatal) {
+        // Session is over — show reconnect UI
+      }
+    }, [])
+  );
+}
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+```tsx
+client.on(RTVIEvent.Error, (message) => {
+  const { message: text, fatal } = message.data;
+  console.error("Bot error:", text);
+  if (fatal) {
+    // Session is over — show reconnect UI
+  }
+});
+```
+
+</View>
+
+## Reconnecting
+
+The client does not automatically reconnect. After a disconnect (whether client-initiated, bot-initiated, or due to a fatal error), you need to call `startBotAndConnect()` or `connect()` again to start a new session. The same `PipecatClient` instance can be reused.
+
+```tsx
+async function reconnect() {
+  await client.startBotAndConnect({ endpoint: "/api/start" });
+}
+```
+
+## Tracking state
+
+<View title="React" icon="react">
+
+The `usePipecatClientTransportState` hook gives you the current state as a reactive value:
+
+```tsx
+import { usePipecatClientTransportState } from "@pipecat-ai/client-react";
+
+function StatusBar() {
+  const transportState = usePipecatClientTransportState();
+
+  const isReady = transportState === "ready";
+  const isConnecting = ["authenticating", "connecting", "connected"].includes(transportState);
+
+  return (
+    <span>
+      {isReady ? "Connected" : isConnecting ? "Connecting…" : "Disconnected"}
+    </span>
+  );
+}
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+Listen for `TransportStateChanged` to react to state changes:
+
+```tsx
+import { RTVIEvent } from "@pipecat-ai/client-js";
+
+client.on(RTVIEvent.TransportStateChanged, (state) => {
+  console.log("State:", state);
+  if (state === "ready") {
+    // Session is active
+  }
+});
+```
+
+You can also read the current state synchronously at any time:
+
+```tsx
+const state = client.state;
+```
+
+</View>
+
+## Lifecycle summary
+
+```
+client.startBotAndConnect()
+  │
+  ├─ authenticating  ← hitting your /api/start endpoint
+  ├─ authenticated   ← server responded, bot is starting
+  ├─ connecting      ← transport handshake
+  ├─ connected       ← transport up, pipeline initializing
+  └─ ready           ← bot pipeline running ✓
+       │
+       │  (session active — audio flows, messages work)
+       │
+  client.disconnect() or bot disconnect
+       │
+  ├─ disconnecting
+  └─ disconnected
+```

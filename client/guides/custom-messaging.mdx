@@ -1,0 +1,313 @@
+---
+title: "Custom Messaging"
+description: "Send and receive arbitrary messages between your client and Pipecat bot."
+---
+
+<View title="React" icon="react">
+<Callout icon="react" color="#FFC107">
+You are currently viewing the React version of this page. Use the dropdown to the right to customize this page for your client framework.
+</Callout>
+</View>
+<View title="JavaScript" icon="js">
+<Callout icon="js" color="#FFC107">
+You are currently viewing the JavaScript version of this page. Use the dropdown to the right to customize this page for your client framework.
+</Callout>
+</View>
+
+The Pipecat client can send and receive arbitrary messages to and from the server running the bot. This is useful for passing configuration at startup, triggering actions mid-session, querying server state, and receiving notifications from the bot.
+
+## Connection-time configuration
+
+Often you need to pass configuration to the server when starting the bot — a system prompt, preferred language, user preferences, or any other data the server needs before the pipeline runs. Pass it via `requestData` in `startBotAndConnect()`.
+
+<View title="React" icon="react">
+
+```tsx
+import { usePipecatClient } from "@pipecat-ai/client-react";
+
+function MyComponent() {
+  const client = usePipecatClient();
+
+  const handleStart = async () => {
+    try {
+      await client.startBotAndConnect({
+        endpoint: "/api/start",
+        requestData: {
+          initial_prompt: "You are a pirate captain",
+          preferred_language: "en-US",
+        },
+      });
+    } catch (error) {
+      console.error("Error starting the bot:", error);
+    }
+  };
+}
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+```ts
+try {
+  await client.startBotAndConnect({
+    endpoint: "/api/start",
+    requestData: {
+      initial_prompt: "You are a pirate captain",
+      preferred_language: "en-US",
+    },
+  });
+} catch (error) {
+  console.error("Error starting the bot:", error);
+}
+```
+
+</View>
+
+On the server, your endpoint receives this data as the request body and can forward relevant values to the bot process or use them to configure the pipeline:
+
+<CodeGroup>
+```python FastAPI endpoint
+@app.post("/api/start")
+async def start(request: Request) -> Dict[Any, Any]:
+    body = await request.json()
+    prompt = body.get("initial_prompt", "You are a pirate captain")
+    lang = body.get("preferred_language", "en-US")
+
+    room_url, token = await create_room_and_token()
+
+    proc = subprocess.Popen(
+        [f"python3 -m bot -u {room_url} -t {token} -p {prompt} -l {lang}"],
+        shell=True,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    bot_procs[proc.pid] = (proc, room_url)
+
+    return {"url": room_url, "token": token}
+```
+
+```python bot
+def extract_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-u", "--room-url", type=str)
+    parser.add_argument("-t", "--token", type=str)
+    parser.add_argument("-p", "--prompt", type=str, default="You are a pirate captain")
+    parser.add_argument("-l", "--language", type=str, default="en-US")
+    return parser.parse_args()
+
+async def main():
+    args = extract_arguments()
+
+    llm = GeminiLiveLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        settings=GeminiLiveLLMService.Settings(
+            system_instruction=args.prompt,
+            language=args.language,
+        ),
+    )
+```
+</CodeGroup>
+
+---
+
+## Sending messages to the server
+
+Use `sendClientMessage()` to send a fire-and-forget message to the bot. The server handles it and is not expected to send a direct response.
+
+<View title="React" icon="react">
+
+```tsx
+const client = usePipecatClient();
+
+client.sendClientMessage("set-language", { language: "en-US" });
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+```ts
+client.sendClientMessage("set-language", { language: "en-US" });
+```
+
+</View>
+
+On the server, handle it via the `on_client_message` event handler or from inside a `FrameProcessor`:
+
+<CodeGroup>
+```python event handler
+@rtvi.event_handler("on_client_message")
+async def on_client_message(rtvi, msg):
+    if msg.type == "set-language":
+        language = msg.data.get("language", "en-US")
+        await task.queue_frames([STTUpdateSettingsFrame(language=language)])
+```
+
+```python FrameProcessor
+class CustomFrameProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, RTVIClientMessageFrame):
+            if frame.type == "set-language":
+                language = frame.data.get("language", "en-US")
+                await self.push_frame(STTUpdateSettingsFrame(language=language))
+                return
+        await self.push_frame(frame, direction)
+```
+</CodeGroup>
+
+---
+
+## Requesting data from the server
+
+Use `sendClientRequest()` to send a message and wait for a response. Useful for querying server state or triggering an action that needs to confirm success or failure.
+
+<View title="React" icon="react">
+
+```tsx
+const client = usePipecatClient();
+
+try {
+  const response = await client.sendClientRequest("get-language");
+  console.log("Current language:", response.language);
+} catch (error) {
+  console.error("Request failed:", error);
+}
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+```ts
+try {
+  const response = await client.sendClientRequest("get-language");
+  console.log("Current language:", response.language);
+} catch (error) {
+  console.error("Request failed:", error);
+}
+```
+
+</View>
+
+On the server, respond with `send_server_response()` or push a `RTVIServerResponseFrame`:
+
+<CodeGroup>
+```python event handler
+@rtvi.event_handler("on_client_message")
+async def on_client_message(rtvi, msg):
+    if msg.type == "get-language":
+        await rtvi.send_server_response(msg, {"language": get_current_language()})
+    else:
+        await rtvi.send_error_response(msg, "Unknown request type")
+```
+
+```python FrameProcessor
+class CustomFrameProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, RTVIClientMessageFrame):
+            if frame.type == "get-language":
+                await self.push_frame(
+                    RTVIServerResponseFrame(
+                        client_msg=frame,
+                        data={"language": get_current_language()},
+                    )
+                )
+                return
+            else:
+                await self.push_frame(
+                    RTVIServerResponseFrame(
+                        client_msg=frame,
+                        error="Unknown request type",
+                    )
+                )
+        await self.push_frame(frame, direction)
+```
+</CodeGroup>
+
+---
+
+## Receiving messages from the server
+
+The server can push unsolicited messages to the client at any time — for example, to notify the client that a setting has changed.
+
+<View title="React" icon="react">
+
+Use `useRTVIClientEvent` to subscribe to `ServerMessage` within a component:
+
+```tsx
+import { RTVIEvent } from "@pipecat-ai/client-js";
+import { useRTVIClientEvent } from "@pipecat-ai/client-react";
+
+function LanguageListener() {
+  useRTVIClientEvent(
+    RTVIEvent.ServerMessage,
+    useCallback((message) => {
+      if (message.data.msg === "language-updated") {
+        console.log("Language updated to:", message.data.language);
+      }
+    }, [])
+  );
+}
+```
+
+</View>
+
+<View title="JavaScript" icon="js">
+
+Listen for the `ServerMessage` event on the client, or pass `onServerMessage` as a constructor callback:
+
+```ts
+client.on(RTVIEvent.ServerMessage, (message) => {
+  if (message.data.msg === "language-updated") {
+    console.log("Language updated to:", message.data.language);
+  }
+});
+```
+
+</View>
+
+On the server, send messages via `send_server_message()` or by pushing a `RTVIServerMessageFrame`:
+
+<CodeGroup>
+```python Observer
+class CustomObserver(BaseObserver):
+    async def on_push_frame(self, data: FramePushed):
+        if isinstance(data.frame, STTUpdateSettingsFrame):
+            for key, value in data.frame.settings.items():
+                if key == "language":
+                    await rtvi.send_server_message({
+                        "msg": "language-updated",
+                        "language": value,
+                    })
+```
+
+```python FrameProcessor
+class CustomFrameProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, STTUpdateSettingsFrame):
+            for key, value in frame.settings.items():
+                if key == "language":
+                    await self.push_frame(
+                        RTVIServerMessageFrame(
+                            data={"msg": "language-updated", "language": value}
+                        )
+                    )
+        await self.push_frame(frame, direction)
+```
+</CodeGroup>
+
+---
+
+## API reference
+
+<CardGroup cols={2}>
+  <Card title="Client Methods" icon="js" href="/api-reference/client/js/client-methods#messages">
+    `sendClientMessage`, `sendClientRequest`, `registerFunctionCallHandler`
+  </Card>
+  <Card title="Callbacks & Events" icon="bell" href="/api-reference/client/js/callbacks#messages-and-errors">
+    `onServerMessage`, `onMessageError`, and related events
+  </Card>
+</CardGroup>
