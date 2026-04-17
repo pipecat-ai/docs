@@ -196,12 +196,11 @@ Subclass `BaseUserMuteStrategy` when none of the built-in strategies fit. A stra
 
 ### The base class
 
+`BaseUserMuteStrategy` (in `pipecat.turns.user_mute`) exposes the following interface. The signatures below are a simplified view of what your subclass can override:
+
 ```python
-from pipecat.frames.frames import Frame
-from pipecat.turns.user_mute import BaseUserMuteStrategy
-
-
-class BaseUserMuteStrategy(BaseObject):
+# Simplified interface; see the source for the full definition.
+class BaseUserMuteStrategy:
     async def setup(self, task_manager): ...
     async def cleanup(self): ...
     async def reset(self): ...
@@ -277,7 +276,7 @@ class AfterNTurnsUserMuteStrategy(BaseUserMuteStrategy):
 
 Strategies are plain Python objects. Anything that holds a reference to one can flip its state between frames, which means a companion processor placed elsewhere in the pipeline can drive the mute decision based on signals the strategy can't observe directly (LLM text, tool results, external events).
 
-The strategy exposes enable/disable methods and returns its current state:
+This example strategy adds its own `enable`/`disable` methods (not part of the base contract) and returns their state from `process_frame`:
 
 ```python
 from pipecat.frames.frames import Frame
@@ -306,7 +305,12 @@ class ToggleableUserMuteStrategy(BaseUserMuteStrategy):
 A companion processor watches for the trigger and toggles the strategy:
 
 ```python
-from pipecat.frames.frames import BotStoppedSpeakingFrame, Frame, LLMTextFrame
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    LLMTextFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
@@ -315,14 +319,20 @@ class DisclaimerGuardProcessor(FrameProcessor):
         super().__init__(**kwargs)
         self._strategy = strategy
         self._trigger = trigger_phrase
+        # Keep a small sliding window so cross-frame matches work without
+        # the buffer growing unbounded if the trigger never appears.
+        self._max_buffer = max(len(trigger_phrase) * 4, 512)
         self._buffer = ""
         self._active = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMTextFrame) and direction == FrameDirection.DOWNSTREAM:
-            self._buffer += frame.text
+        if isinstance(frame, BotStartedSpeakingFrame):
+            # Start each bot turn with a fresh buffer.
+            self._buffer = ""
+        elif isinstance(frame, LLMTextFrame) and direction == FrameDirection.DOWNSTREAM:
+            self._buffer = (self._buffer + frame.text)[-self._max_buffer :]
             if not self._active and self._trigger in self._buffer:
                 self._active = True
                 self._strategy.enable()
