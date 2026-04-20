@@ -14,8 +14,8 @@ Pipecat Cloud supports optional HMAC token authentication for WebSocket connecti
     it along with the WebSocket URL.
   </Step>
   <Step title="Client connects with token">
-    The client connects to the WebSocket URL with the token included as a
-    header, query parameter, or URL path segment. No bot is started until the
+    The client connects to the returned WebSocket URL with the token included as
+    a header, query parameter, or URL path segment. No bot is started until the
     client connects.
   </Step>
   <Step title="Pipecat Cloud validates">
@@ -29,10 +29,10 @@ Pipecat Cloud supports optional HMAC token authentication for WebSocket connecti
 
 WebSocket authentication is controlled by the `websocket_auth` setting in your deployment config. Valid values are:
 
-| Value   | Behavior                                                                 |
-| ------- | ------------------------------------------------------------------------ |
-| `token` | Requires an HMAC session token (default for new agents)                  |
-| `none`  | No authentication required — any client can connect with the service URL |
+| Value   | Behavior                                             |
+| ------- | ---------------------------------------------------- |
+| `none`  | No authentication required (default)                 |
+| `token` | Requires an HMAC session token obtained via `/start` |
 
 Set it in your `pcc-deploy.toml`:
 
@@ -43,11 +43,6 @@ websocket_auth = "token"
 [scaling]
 min_agents = 1
 ```
-
-<Note>
-  Existing agents deployed before this feature default to `none` for backward
-  compatibility. New agents default to `token`.
-</Note>
 
 ## Getting a Token
 
@@ -77,7 +72,7 @@ Response:
 
 ## Connecting with a Token
 
-The token can be provided in three ways, checked in this order:
+The `wsUrl` from the `/start` response points to the [generic WebSocket endpoint](/pipecat-cloud/guides/telephony/generic-websocket). The token can be provided in three ways, checked in this order:
 
 ### Authorization Header
 
@@ -115,39 +110,43 @@ parameters (such as Twilio).
 
 Telephony providers like Twilio, Plivo, and Telnyx initiate WebSocket connections
 directly — they can't call `/start` themselves. To use token authentication with
-these providers, use an intermediary server:
+these providers, call `/start` from your existing webhook handler and embed the
+token in the WebSocket URL that you return to the provider.
 
-<Steps>
-  <Step title="Provider calls your server">
-    Configure the provider's Answer URL to point to your intermediary server.
-  </Step>
-  <Step title="Your server calls /start">
-    Your server calls Pipecat Cloud's `/start` endpoint with `transport:
-    "websocket"` to get a token.
-  </Step>
-  <Step title="Your server returns XML with token">
-    Your server returns the provider-specific XML (TwiML, Plivo XML, or TeXML)
-    with the token embedded in the WebSocket URL path.
-  </Step>
-  <Step title="Provider connects">
-    The provider connects to the authenticated WebSocket URL. The token is
-    validated and the bot session starts.
-  </Step>
-</Steps>
+### Example: Twilio Function
 
-For example, a Twilio intermediary would return:
+This Twilio Function calls `/start` to get a token, then returns TwiML with the
+authenticated WebSocket URL:
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://api.pipecat.daily.co/ws/generic/my-agent.my-org/<token>" />
-  </Connect>
-</Response>
+```javascript
+exports.handler = async function (context, event, callback) {
+  // Call PCC /start to get a websocket auth token
+  const startResponse = await fetch(
+    "https://api.pipecat.daily.co/v1/public/my-agent/start",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${context.PCC_PUBLIC_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ transport: "websocket" }),
+    },
+  );
+  const { token, wsUrl } = await startResponse.json();
+
+  // Return TwiML with the authenticated WebSocket URL
+  const twiml = new Twilio.twiml.VoiceResponse();
+  const connect = twiml.connect();
+  connect.stream({ url: `${wsUrl}/${token}` });
+  callback(null, twiml);
+};
 ```
 
 <Tip>
-  If you don't need token authentication for telephony (e.g., in a trusted
-  network), set `websocket_auth = "none"` and connect directly without the
-  intermediary step.
+  Store your Pipecat Cloud public API key as an environment variable in your
+  Twilio Function settings (e.g., `PCC_PUBLIC_KEY`) rather than hardcoding it.
 </Tip>
+
+The same pattern works for any provider — call `/start` from your webhook handler,
+get the token, and include it in the provider-specific XML response. The token
+goes in the URL path, which is supported by all providers.
