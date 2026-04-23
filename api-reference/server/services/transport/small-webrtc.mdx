@@ -60,7 +60,7 @@ Before using SmallWebRTCTransport, you need:
 
 1. **Signaling Server**: Implement WebRTC offer/answer exchange (required)
 2. **Client Implementation**: Set up WebRTC client for browser or application use
-3. **ICE Configuration**: Configure STUN/TURN servers for NAT traversal (optional for local networks)
+3. **ICE Configuration**: Configure STUN/TURN servers for NAT traversal (optional for local networks) — see [ICE Servers Configuration](#ice-servers-configuration)
 4. **Development Runner**: Use Pipecat's development runner for quick setup (recommended)
 
 <Tip>
@@ -183,6 +183,78 @@ async def on_app_message(transport, message, sender):
 | `transport` | `SmallWebRTCTransport` | The transport instance          |
 | `message`   | `Any`                  | The message content             |
 | `sender`    | `str`                  | The sender's peer connection ID |
+
+## ICE Servers Configuration
+
+WebRTC uses ICE (Interactive Connectivity Establishment) to find the best network path between two peers. ICE relies on two types of helper servers:
+
+- **STUN** (Session Traversal Utilities for NAT) — Helps a client discover its public IP address and port when it's behind a NAT device. WebRTC uses this information to attempt a direct peer-to-peer connection.
+- **TURN** (Traversal Using Relays around NAT) — A relay fallback used when a direct connection isn't possible due to strict NATs or firewalls. All media traffic is routed through the TURN server in this case.
+
+ICE servers are **optional for local network development** but become important as soon as peers are on different networks.
+
+### When do you need ICE servers?
+
+| Scenario | STUN needed | TURN needed |
+| --- | --- | --- |
+| Both peers on the same local network | No | No |
+| Peers on different networks (Linux) | Yes | Usually not |
+| Peers on different networks (macOS / strict NAT) | Yes | Yes |
+| Docker on macOS (no `--network=host`) | Yes | Yes |
+| Production deployment | Yes | Recommended |
+
+### Server-side configuration
+
+Pass ICE servers when creating `SmallWebRTCConnection`. You can provide simple URL strings or full `IceServer` objects (an alias for aiortc's `RTCIceServer`):
+
+```python
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection, IceServer
+
+webrtc_connection = SmallWebRTCConnection(
+    ice_servers=[
+        IceServer(urls=["stun:stun.l.google.com:19302"]),
+        IceServer(
+            urls=["turn:your-turn-server.example.com:3478"],
+            username="your-username",
+            credential="your-password",
+        ),
+    ]
+)
+```
+
+<Note>
+  In production, WebRTC applications must run over HTTPS. Browsers block WebRTC
+  access to microphone and camera on insecure origins.
+</Note>
+
+## Advanced Configuration
+
+### PIPECAT_SCTP_MAX_CHUNK_SIZE
+
+Controls the maximum SCTP DATA-chunk payload size (in bytes) used by aiortc's data channel. The default is `1100`.
+
+```bash
+PIPECAT_SCTP_MAX_CHUNK_SIZE=1100
+```
+
+<Note>
+  This is a process-global setting due to an aiortc limitation — all
+  SmallWebRTC connections in the same process share the same value.
+</Note>
+
+**When to lower it**
+
+Lower this value if the data channel silently stalls on your network. This happens when aiortc's internal default produces UDP datagrams larger than your path's MTU. Each chunk carries roughly 105 bytes of SCTP + DTLS + UDP + IP overhead, so a 1200-byte chunk results in a ~1305-byte datagram. This exceeds the 1280-byte MTU common on:
+
+- IPv6 paths
+- Tailscale overlays
+- Many consumer VPNs
+
+When the datagram is too large the kernel drops it with `EMSGSIZE`. aiortc retransmits at the same size and the channel stalls indefinitely. Setting `PIPECAT_SCTP_MAX_CHUNK_SIZE=1100` produces ~1205-byte datagrams, which fits any path with MTU ≥ 1210.
+
+**When to raise it**
+
+Only raise it if you are on a controlled LAN with MTU 1500 and are sending large data-channel messages where extra fragmentation matters. Values above 1200 are unsafe on most internet paths.
 
 ## Additional Resources
 
