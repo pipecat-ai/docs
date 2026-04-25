@@ -254,3 +254,302 @@ Programmatically inject a message into the conversation.
 <ParamField path="botOutputSupported" type="boolean | null">
 Whether the connected bot supports BotOutput events (RTVI 1.1.0+). `null` means detection hasn't completed yet.
 </ParamField>
+
+## UI Agent hooks
+
+These hooks require an ambient
+[`UIAgentProvider`](/api-reference/client/react/components#uiagentprovider).
+
+### useUIAgentClient
+
+Returns the [`UIAgentClient`](/api-reference/client/js/ui-agent-client) from
+the ambient `UIAgentProvider`, or `undefined` if the provider is not mounted
+or the Pipecat client has not been initialized yet.
+
+```tsx
+import { useUIAgentClient } from "@pipecat-ai/client-react";
+
+function Diagnostics() {
+  const ui = useUIAgentClient();
+  // Escape hatch: call low-level methods directly.
+  return <button onClick={() => ui?.sendEvent("ping")}>Ping</button>;
+}
+```
+
+**Returns**
+
+<ParamField path="client" type="UIAgentClient | undefined">
+  The active `UIAgentClient`, or `undefined` while the underlying client is
+  not yet initialized.
+</ParamField>
+
+### useUIEventSender
+
+Returns a callable that sends a named UI event to the server. The returned
+function is a no-op until a `UIAgentClient` is available.
+
+```tsx
+import { useUIEventSender } from "@pipecat-ai/client-react";
+
+function NavLink({ view, label }: { view: string; label: string }) {
+  const sendEvent = useUIEventSender();
+  return <a onClick={() => sendEvent("nav_click", { view })}>{label}</a>;
+}
+```
+
+**Returns**
+
+<ParamField path="sendEvent" type="<T>(name: string, payload?: T) => void">
+  Function that emits a UI event with the given name and optional payload.
+</ParamField>
+
+### useUICommandHandler
+
+Register a handler for a named UI command. The handler is registered on
+mount and unregistered on unmount; if the handler reference changes between
+renders, the registration is refreshed. Pass a stable reference (via
+`useCallback`) to avoid per-render churn.
+
+```tsx
+import { useCallback } from "react";
+import { useUICommandHandler } from "@pipecat-ai/client-react";
+
+function Toaster() {
+  const onToast = useCallback((payload: { title: string }) => {
+    showToast(payload.title);
+  }, []);
+  useUICommandHandler("toast", onToast);
+  return null;
+}
+```
+
+**Arguments**
+
+<ParamField path="name" type="string" required>
+  App-defined command name, matching what the server emits via
+  `UIAgent.send_command`.
+</ParamField>
+
+<ParamField path="handler" type="UICommandHandler<T>" required>
+  Callback invoked with the command payload.
+</ParamField>
+
+### useA11ySnapshot
+
+Capture a structured accessibility snapshot of the document and stream it
+to the server as a reserved UI event (`__ui_snapshot`). The server-side
+[`UIAgent`](/api-reference/pipecat-subagents/ui-agent) stores the latest
+snapshot and renders it into LLM context as `<ui_state>` so the agent can
+reason about what's on screen.
+
+Call once near the root of your app, inside a `UIAgentProvider`. This hook
+is a thin lifecycle wrapper around the framework-agnostic
+[`A11ySnapshotStreamer`](/api-reference/client/js/a11y-snapshot#a11ysnapshotstreamer);
+non-React apps can instantiate the streamer directly.
+
+```tsx
+import { useA11ySnapshot } from "@pipecat-ai/client-react";
+
+function App() {
+  useA11ySnapshot();
+  return <Routes>...</Routes>;
+}
+```
+
+**Behaviour**
+
+- Emits an initial snapshot shortly after mount.
+- Re-emits on DOM mutations, ARIA attribute changes, focus changes,
+  scroll-end, window resize, and tab visibility change, coalesced by
+  `debounceMs`.
+- No-op until a `UIAgentClient` is available from the ambient
+  `UIAgentProvider`.
+
+**Options**
+
+<ParamField path="enabled" type="boolean" default="true">
+  Whether the hook is active. Set to `false` to stop emitting snapshots
+  without unmounting the component.
+</ParamField>
+
+<ParamField path="debounceMs" type="number" default="300">
+  Minimum interval between snapshot emissions, in milliseconds.
+</ParamField>
+
+<ParamField path="trackViewport" type="boolean" default="true">
+  When `true`, annotate every emitted node with `"offscreen"` in its `state`
+  list if its bounding rect sits entirely outside the viewport.
+</ParamField>
+
+<ParamField path="logSnapshots" type="boolean" default="false">
+  When `true`, log each emitted snapshot to the browser console (node count,
+  rough token estimate, raw tree).
+</ParamField>
+
+### useStandardScrollToHandler
+
+Install the default `scroll_to` handler: `scrollIntoView` on the resolved
+target. Resolves by snapshot `ref` first, then falls back to
+`document.getElementById(target_id)`.
+
+```tsx
+import { useStandardScrollToHandler } from "@pipecat-ai/client-react";
+
+function App() {
+  useStandardScrollToHandler({
+    block: "center",
+    container: () => document.querySelector(".main"),
+  });
+  return <...>;
+}
+```
+
+**Options**
+
+<ParamField path="block" type='"start" | "center" | "end" | "nearest"' default='"start"'>
+  `scrollIntoView` block position.
+</ParamField>
+
+<ParamField path="inline" type='"start" | "center" | "end" | "nearest"' default='"nearest"'>
+  `scrollIntoView` inline position.
+</ParamField>
+
+<ParamField path="defaultBehavior" type='"auto" | "instant" | "smooth"' default='"smooth"'>
+  Fallback scroll behavior when `payload.behavior` is unset.
+</ParamField>
+
+<ParamField path="container" type="Element | null | (() => Element | null | undefined)">
+  When set, scroll *inside* this element instead of relying on
+  `scrollIntoView` walking to the nearest scrollable ancestor. Function form
+  is evaluated on each scroll so it can account for containers mounted
+  after the hook.
+</ParamField>
+
+<ParamField path="offset" type="{ top?: number; left?: number }">
+  Pixel offsets applied after scrolling, typically to clear a sticky header.
+  Only applied when `container` is set.
+</ParamField>
+
+### useStandardFocusHandler
+
+Install the default `focus` handler: `.focus()` on the resolved target.
+
+```tsx
+import { useStandardFocusHandler } from "@pipecat-ai/client-react";
+useStandardFocusHandler({ preventScroll: true });
+```
+
+**Options**
+
+<ParamField path="preventScroll" type="boolean" default="false">
+  Pass `{ preventScroll: true }` to `element.focus()` so the focus change
+  doesn't also pan the viewport. Useful when focus happens alongside an
+  explicit `scroll_to`.
+</ParamField>
+
+### useStandardHighlightHandler
+
+Install the default `highlight` handler: toggle a CSS class on the resolved
+target for `duration_ms`. Apps style the class themselves, e.g.
+
+```css
+.ui-highlight {
+  outline: 2px solid gold;
+  transition: outline 0.25s;
+}
+```
+
+```tsx
+import { useStandardHighlightHandler } from "@pipecat-ai/client-react";
+
+useStandardHighlightHandler({
+  className: "ui-highlight",
+  defaultDurationMs: 2000,
+  scrollIntoViewFirst: true,
+});
+```
+
+**Options**
+
+<ParamField path="className" type="string" default='"ui-highlight"'>
+  CSS class toggled on the target for `duration_ms`.
+</ParamField>
+
+<ParamField path="defaultDurationMs" type="number" default="1500">
+  Fallback duration when `payload.duration_ms` is missing.
+</ParamField>
+
+<ParamField path="scrollIntoViewFirst" type="boolean" default="false">
+  When `true`, the target is scrolled into view before the class is applied,
+  so the flash is visible to the user even if the target is currently
+  offscreen.
+</ParamField>
+
+### useStandardCommandHandlers
+
+Install all DOM-based default handlers (`scroll_to`, `focus`, `highlight`)
+at once. Pass per-handler option objects to customize.
+
+```tsx
+import { useStandardCommandHandlers } from "@pipecat-ai/client-react";
+
+useStandardCommandHandlers({
+  scrollTo: { block: "center" },
+  highlight: { defaultDurationMs: 2000 },
+});
+```
+
+**Options**
+
+<ParamField path="scrollTo" type="StandardScrollToOptions">
+  Forwarded to `useStandardScrollToHandler`.
+</ParamField>
+
+<ParamField path="focus" type="StandardFocusOptions">
+  Forwarded to `useStandardFocusHandler`.
+</ParamField>
+
+<ParamField path="highlight" type="StandardHighlightOptions">
+  Forwarded to `useStandardHighlightHandler`.
+</ParamField>
+
+### useToastHandler
+
+Typed sugar for `useUICommandHandler<ToastPayload>("toast", handler)`. Wire
+a toast renderer of your choice; the SDK doesn't ship one.
+
+```tsx
+import { useToastHandler } from "@pipecat-ai/client-react";
+import { useCallback } from "react";
+
+useToastHandler(useCallback((payload) => {
+  myToastLib.show(payload.title, payload.subtitle);
+}, []));
+```
+
+**Arguments**
+
+<ParamField path="handler" type="UICommandHandler<ToastPayload>" required />
+
+### useNavigateHandler
+
+Typed sugar for `useUICommandHandler<NavigatePayload>("navigate", handler)`.
+Wire into your router of choice; the SDK doesn't ship one.
+
+```tsx
+import { useNavigateHandler } from "@pipecat-ai/client-react";
+import { useCallback } from "react";
+import { useNavigate } from "react-router-dom";
+
+function NavWiring() {
+  const navigate = useNavigate();
+  useNavigateHandler(useCallback((payload) => {
+    navigate(`/${payload.view}`, { state: payload.params });
+  }, [navigate]));
+  return null;
+}
+```
+
+**Arguments**
+
+<ParamField path="handler" type="UICommandHandler<NavigatePayload>" required />
