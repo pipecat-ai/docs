@@ -193,3 +193,92 @@ All messages inherit these fields from `BusDataMessage` or `BusSystemMessage`:
 | `target`  | `str | None` | `None`  | Requester agent name                                                   |
 | `task_id` | `str`        |         | The task identifier                                                    |
 | `data`    | `dict | None` | `None`  | Stream metadata (start), chunk payload (data), or final metadata (end) |
+
+## UI Messages
+
+| Type                   | Priority | Description                                               |
+| ---------------------- | -------- | --------------------------------------------------------- |
+| `BusUIEventMessage`    | Data     | UI event sent from the client to a server-side `UIAgent`  |
+| `BusUICommandMessage`  | Data     | UI command sent from a `UIAgent` to the client            |
+
+### BusUIEventMessage
+
+Emitted by [`attach_ui_bridge`](#attach-ui-bridge) when the client dispatches
+an event via `UIAgentClient.sendEvent(name, payload)`.
+[`UIAgent`](/api-reference/pipecat-subagents/ui-agent) subclasses dispatch
+these to [`@on_ui_event(name)`](/api-reference/pipecat-subagents/decorators#on_ui_event)
+handlers.
+
+| Field        | Type         | Default | Description                            |
+| ------------ | ------------ | ------- | -------------------------------------- |
+| `source`     | `str`        |         | Sending component (the bridge)         |
+| `target`     | `str | None` | `None`  | Recipient agent name (None broadcasts) |
+| `event_name` | `str`        | `""`    | App-defined event name                 |
+| `payload`    | `Any`        | `None`  | App-defined payload. Schemaless.       |
+
+### BusUICommandMessage
+
+Published by
+[`UIAgent.send_command`](/api-reference/pipecat-subagents/ui-agent#send-command).
+The bridge installed by `attach_ui_bridge` translates this to an
+`RTVIServerMessageFrame` with `data == {"type": "ui.command", "name":
+command_name, "payload": payload}` and pushes it through the root agent's
+pipeline for RTVI to deliver to the client.
+
+| Field          | Type         | Default | Description                                                |
+| -------------- | ------------ | ------- | ---------------------------------------------------------- |
+| `source`       | `str`        |         | Sending agent name                                         |
+| `target`       | `str | None` | `None`  | Recipient agent name (None broadcasts)                     |
+| `command_name` | `str`        | `""`    | App-defined command name                                   |
+| `payload`      | `Any`        | `None`  | Plain dict by the time it lands on the bus (see `send_command`) |
+
+### Constants
+
+```python
+from pipecat_subagents.bus import (
+    UI_EVENT_MESSAGE_TYPE,
+    UI_COMMAND_MESSAGE_TYPE,
+    UI_SNAPSHOT_EVENT_NAME,
+)
+```
+
+| Constant                  | Value             | Description                                                                                          |
+| ------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------- |
+| `UI_EVENT_MESSAGE_TYPE`   | `"ui.event"`      | RTVI client-message type carrying UI events. The bridge filters on this before republishing on the bus. |
+| `UI_COMMAND_MESSAGE_TYPE` | `"ui.command"`    | Discriminator written into the `RTVIServerMessageFrame` `data` field for UI commands. Client dispatchers filter on this. |
+| `UI_SNAPSHOT_EVENT_NAME`  | `"__ui_snapshot"` | Reserved `event_name` carrying an accessibility snapshot. `UIAgent` stores the payload without dispatch or `<ui_event>` injection. |
+
+## attach_ui_bridge
+
+```python
+def attach_ui_bridge(agent: BaseAgent, *, target: str | None = None) -> None
+```
+
+Wire the root agent's pipeline to the UI Agent SDK wire protocol. Call this
+from the root agent's `on_ready` hook. The root agent's pipeline task must be
+built with `enable_rtvi=True`.
+
+```python
+from pipecat_subagents.agents.ui_bridge import attach_ui_bridge
+
+class RootAgent(BaseAgent):
+    async def on_ready(self) -> None:
+        await super().on_ready()
+        attach_ui_bridge(self)
+```
+
+Side effects:
+
+- Registers an `on_client_message` handler on RTVI. Messages whose `type`
+  matches `UI_EVENT_MESSAGE_TYPE` are republished as `BusUIEventMessage`;
+  all other client messages pass through untouched.
+- Registers an `on_bus_message` handler on `agent`. When a
+  `BusUICommandMessage` arrives, the bridge pushes an `RTVIServerMessageFrame`
+  downstream so RTVI delivers it to the client.
+
+| Parameter | Type         | Default | Description                                                                                                                                |
+| --------- | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `agent`   | `BaseAgent`  |         | The root agent owning the pipeline task and RTVI processor.                                                                                |
+| `target`  | `str | None` | `None`  | Optional target agent name for the republished `BusUIEventMessage`. When `None`, the message is broadcast to every `UIAgent` on the bus. |
+
+**Raises:** `RuntimeError` if the agent's pipeline task has no RTVI processor.

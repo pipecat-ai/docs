@@ -1,0 +1,235 @@
+---
+title: "Accessibility Snapshots"
+description: "Stream the document's accessibility tree to the server as <ui_state>"
+---
+
+## Overview
+
+The accessibility-snapshot module produces a structured tree of the document
+that the server-side
+[`UIAgent`](/api-reference/pipecat-subagents/ui-agent) renders into LLM
+context as `<ui_state>`. Shape and filtering are inspired by Playwright's
+accessibility snapshot and the Playwright MCP server's LLM-facing format:
+the goal is a compact, semantically meaningful tree, not a raw DOM dump.
+
+```javascript
+import {
+  A11ySnapshotStreamer,
+  snapshotDocument,
+  findElementByRef,
+} from "@pipecat-ai/client-js";
+```
+
+The streaming side is handled by `A11ySnapshotStreamer` (or
+[`useA11ySnapshot`](/api-reference/client/react/hooks#usea11ysnapshot) in
+React). The walker (`snapshotDocument`) is exposed for apps that need a
+one-off snapshot, and `findElementByRef` resolves a server-supplied ref
+back to a live DOM element for command handlers.
+
+<Note>
+  Apps can mark a subtree as PII / sensitive by adding `data-a11y-exclude` to
+  the element. The walker skips it and its descendants entirely, without also
+  hiding it from screen readers (unlike `aria-hidden`). Password inputs are
+  stripped automatically.
+</Note>
+
+## A11ySnapshotStreamer
+
+```typescript
+class A11ySnapshotStreamer {
+  constructor(client: UIAgentClient, options?: A11ySnapshotStreamerOptions);
+  start(): void;
+  stop(): void;
+}
+```
+
+Framework-agnostic helper that drives accessibility-snapshot streaming.
+Wraps the walker, a `MutationObserver`, and the other triggers
+(`scrollend`, `resize`, focus, `visibilitychange`) into a single object
+with a `start` / `stop` lifecycle.
+
+```javascript
+import { A11ySnapshotStreamer, UIAgentClient } from "@pipecat-ai/client-js";
+
+const ui = new UIAgentClient(pcClient);
+ui.attach();
+
+const streamer = new A11ySnapshotStreamer(ui);
+streamer.start();
+
+// Later
+streamer.stop();
+```
+
+<Note>
+  React apps should prefer
+  [`useA11ySnapshot`](/api-reference/client/react/hooks#usea11ysnapshot), which
+  is a thin lifecycle wrapper around this class.
+</Note>
+
+### Triggers
+
+A snapshot is scheduled (debounced via `debounceMs`) on:
+
+- **DOM mutations** observed by `MutationObserver` on `document.body`
+  (`childList`, `subtree`, and a curated list of attribute changes including
+  `role`, `aria-*`, `data-a11y-exclude`, `disabled`, `hidden`, `tabindex`,
+  `href`).
+- **Focus changes** (`focusin`, `focusout`).
+- **Scroll-end** (`scrollend`, captured at window level so any scrollable
+  ancestor triggers it).
+- **Window resize** (debounced because the viewport rect shifts which nodes
+  are `[offscreen]`).
+- **Tab visibility** transition to `visible`.
+
+An initial snapshot is scheduled immediately on `start()`.
+
+### Options
+
+<ParamField path="debounceMs" type="number" default="300">
+  Minimum interval between snapshot emissions, in milliseconds. Multiple
+  triggers within the window coalesce into one snapshot.
+</ParamField>
+
+<ParamField path="trackViewport" type="boolean" default="true">
+  When `true`, annotate every emitted node with `"offscreen"` in its `state`
+  list if its bounding rect sits entirely outside the viewport. Set to `false`
+  to skip the per-node layout measurement (e.g. on very large pages where layout
+  cost outweighs the viewport signal).
+</ParamField>
+
+<ParamField path="logSnapshots" type="boolean" default="false">
+  When `true`, log each emitted snapshot to the browser console (node count,
+  rough token estimate, raw tree). Mirrors the server's `log_snapshots` flag on
+  `UIAgent`.
+</ParamField>
+
+### Methods
+
+#### start
+
+```typescript
+start(): void
+```
+
+Begin streaming. Idempotent: subsequent calls before `stop()` are no-ops.
+
+#### stop
+
+```typescript
+stop(): void
+```
+
+Stop streaming. Detaches all observers/listeners and cancels pending timers.
+Safe to call before `start()` or multiple times.
+
+## snapshotDocument
+
+```typescript
+function snapshotDocument(
+  root?: Element,
+  options?: SnapshotOptions,
+): A11ySnapshot;
+```
+
+Produce a one-off accessibility snapshot of a DOM subtree. Useful for tests
+or for apps that want to drive snapshot timing manually (e.g. snapshot only
+on a specific app event).
+
+<ParamField path="root" type="Element">
+  Element to walk. Defaults to `document.body`.
+</ParamField>
+
+<ParamField path="options" type="SnapshotOptions">
+  Snapshot options.
+  <Expandable title="SnapshotOptions">
+    <ParamField path="trackViewport" type="boolean" default="true">
+      When `true`, each emitted node gets `"offscreen"` in its state list if its
+      bounding rect sits entirely outside the viewport.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+**Returns:** An `A11ySnapshot` with a `generic` root containing the walked
+children, plus a client-side capture timestamp.
+
+## findElementByRef
+
+```typescript
+function findElementByRef(ref: string): Element | null;
+```
+
+Resolve a ref string like `"e42"` back to a live DOM element. Returns `null`
+if the ref was never assigned or the element has since been
+garbage-collected.
+
+The walker assigns stable refs to every emitted DOM element via a `WeakMap`
+(forward) plus a `Map<string, WeakRef<Element>>` (reverse). Refs persist as
+long as the element stays mounted and survive across snapshots. Command
+handlers use this to act on nodes the server referenced from `<ui_state>`.
+
+The
+[`useStandard*Handler`](/api-reference/client/react/hooks#usestandardscrolltohandler)
+hooks call this internally.
+
+## Types
+
+### A11yNode
+
+One node in the accessibility snapshot tree.
+
+```typescript
+interface A11yNode {
+  ref: string;
+  role: string;
+  name?: string;
+  value?: string;
+  state?: string[];
+  level?: number;
+  colcount?: number;
+  rowcount?: number;
+  children?: A11yNode[];
+}
+```
+
+| Field      | Type         | Description                                                                                                        |
+| ---------- | ------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `ref`      | `string`     | Stable reference id of the form `e{N}`. Persists across snapshots while the DOM node is mounted.                   |
+| `role`     | `string`     | ARIA role (explicit or tag-derived).                                                                               |
+| `name`     | `string`     | Accessible name, truncated to 100 chars.                                                                           |
+| `value`    | `string`     | Current value for inputs (omitted for passwords), progress, etc.                                                   |
+| `state`    | `string[]`   | Short state tags. Known values: `"focused"`, `"selected"`, `"expanded"`, `"checked"`, `"disabled"`, `"offscreen"`. |
+| `level`    | `number`     | Heading level, 1-6.                                                                                                |
+| `colcount` | `number`     | Column count for grid-like containers, populated from `aria-colcount`.                                             |
+| `rowcount` | `number`     | Row count for grid-like containers, populated from `aria-rowcount`.                                                |
+| `children` | `A11yNode[]` | Child nodes.                                                                                                       |
+
+### A11ySnapshot
+
+```typescript
+interface A11ySnapshot {
+  root: A11yNode;
+  captured_at: number;
+}
+```
+
+Shape of the payload inside a `__ui_snapshot` UI event. A full tree is sent
+on each update; the server keeps the latest and renders it into
+`<ui_state>...</ui_state>` when an agent injects it.
+
+| Field         | Type       | Description                                                      |
+| ------------- | ---------- | ---------------------------------------------------------------- |
+| `root`        | `A11yNode` | Root of the accessibility tree (usually `document.body`'s node). |
+| `captured_at` | `number`   | Client-side timestamp (ms since epoch) when captured.            |
+
+### UI_SNAPSHOT_EVENT_NAME
+
+```typescript
+const UI_SNAPSHOT_EVENT_NAME = "__ui_snapshot";
+```
+
+Reserved UI event name carrying an accessibility snapshot. The server-side
+`UIAgent` recognizes this name and stores the payload as the latest
+snapshot without dispatching to `@on_ui_event` handlers or injecting a
+`<ui_event>` developer message. Underscore-prefixed to signal SDK-internal
+and avoid colliding with app-defined event names.
