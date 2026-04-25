@@ -1,11 +1,16 @@
 ---
 title: "xAI"
-description: "Text-to-speech service using xAI's HTTP API with support for 20 languages"
+description: "Text-to-speech services using xAI's HTTP and WebSocket streaming APIs with support for 20 languages"
 ---
 
 ## Overview
 
-xAI provides text-to-speech synthesis via an HTTP API with support for multiple languages and audio encoding formats.
+xAI provides two text-to-speech services:
+
+- **XAIHttpTTSService**: Batch synthesis via HTTP API. Sends complete text and receives the full audio response.
+- **XAITTSService**: Streaming synthesis via WebSocket. Streams text incrementally and receives audio chunks as they're synthesized, reducing latency.
+
+Both support multiple languages and audio encoding formats.
 
 <CardGroup cols={2}>
   <Card
@@ -16,18 +21,25 @@ xAI provides text-to-speech synthesis via an HTTP API with support for multiple 
     Complete API reference for all parameters and methods
   </Card>
   <Card
-    title="Example Implementation"
+    title="WebSocket Example"
     icon="play"
     href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-xai.py"
   >
-    Complete example with interruption handling
+    Streaming WebSocket example with interruption handling
+  </Card>
+  <Card
+    title="HTTP Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-xai-http.py"
+  >
+    Batch HTTP example
   </Card>
   <Card
     title="xAI Documentation"
     icon="book"
-    href="https://docs.x.ai/developers/model-capabilities/audio/text-to-speech"
+    href="https://docs.x.ai/developers/rest-api-reference/inference/voice"
   >
-    Official xAI TTS API documentation
+    Official xAI voice API documentation
   </Card>
 </CardGroup>
 
@@ -89,6 +101,33 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `voice`    | `str`             | `"eve"`       | Voice identifier. _(Inherited from base settings.)_ |
 | `language` | `Language \| str` | `Language.EN` | Language code. _(Inherited from base settings.)_    |
 
+### XAITTSService
+
+<ParamField path="api_key" type="str" required>
+  xAI API key for authentication.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="wss://api.x.ai/v1/tts">
+  xAI TTS WebSocket endpoint URL. Override for custom or proxied deployments.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Output audio sample rate in Hz. When `None`, uses the pipeline's configured
+  sample rate.
+</ParamField>
+
+<ParamField path="codec" type="str" default="pcm">
+  Output audio codec. Supported codecs: `"pcm"`, `"wav"`, `"mulaw"`, `"alaw"`.
+  Defaults to `"pcm"` so emitted `TTSAudioRawFrame` objects need no decoding
+  downstream.
+</ParamField>
+
+<ParamField path="settings" type="XAITTSService.Settings" default="None">
+  Runtime-configurable settings. Uses the same settings structure as
+  `XAIHttpTTSService`. Changing voice or language settings at runtime reconnects
+  the WebSocket with new query parameters.
+</ParamField>
+
 ## Supported Languages
 
 xAI TTS supports 20 languages. Use the `Language` enum from `pipecat.transcriptions.language`:
@@ -112,35 +151,66 @@ xAI TTS supports 20 languages. Use the `Language` enum from `pipecat.transcripti
 
 ## Usage
 
-### Basic Setup
+### WebSocket Streaming (XAITTSService)
+
+#### Basic Setup
 
 ```python
 import os
-from pipecat.services.xai import XAIHttpTTSService
+from pipecat.services.xai.tts import XAITTSService
 
-tts = XAIHttpTTSService(
+tts = XAITTSService(
     api_key=os.getenv("GROK_API_KEY"),
-    settings=XAIHttpTTSService.Settings(
+    settings=XAITTSService.Settings(
         voice="eve",
     ),
 )
 ```
 
-### With Custom Language
+#### With Custom Language
 
 ```python
 from pipecat.transcriptions.language import Language
 
-tts = XAIHttpTTSService(
+tts = XAITTSService(
     api_key=os.getenv("GROK_API_KEY"),
-    settings=XAIHttpTTSService.Settings(
+    settings=XAITTSService.Settings(
         voice="eve",
         language=Language.ES,
     ),
 )
 ```
 
-### With Custom Encoding
+#### With Custom Sample Rate and Codec
+
+```python
+tts = XAITTSService(
+    api_key=os.getenv("GROK_API_KEY"),
+    sample_rate=24000,
+    codec="wav",
+    settings=XAITTSService.Settings(
+        voice="eve",
+    ),
+)
+```
+
+### HTTP Batch (XAIHttpTTSService)
+
+#### Basic Setup
+
+```python
+import os
+from pipecat.services.xai.tts import XAIHttpTTSService
+
+tts = XAIHttpTTSService(
+    api_key=os.getenv("GROK_API_KEY"),
+    settings=XAIHttpTTSService.Settings(
+        voice="eve",
+    ),
+)
+```
+
+#### With Custom Encoding
 
 ```python
 tts = XAIHttpTTSService(
@@ -152,7 +222,7 @@ tts = XAIHttpTTSService(
 )
 ```
 
-### With Shared HTTP Session
+#### With Shared HTTP Session
 
 ```python
 import aiohttp
@@ -169,7 +239,7 @@ async with aiohttp.ClientSession() as session:
 
 ### Updating Settings at Runtime
 
-Voice settings can be changed mid-conversation using `TTSUpdateSettingsFrame`:
+Voice settings can be changed mid-conversation using `TTSUpdateSettingsFrame`. This works for both services:
 
 ```python
 from pipecat.frames.frames import TTSUpdateSettingsFrame
@@ -185,8 +255,15 @@ await task.queue_frame(
 )
 ```
 
+Note: For `XAITTSService`, changing voice or language settings reconnects the WebSocket with updated query parameters.
+
 ## Notes
 
-- **HTTP-only**: This service uses xAI's HTTP API. The service requests raw PCM audio by default, which matches Pipecat's downstream expectations without extra decoding.
-- **Encoding options**: When using non-PCM encodings (`mp3`, `wav`, `mulaw`, `alaw`), ensure your audio pipeline can handle the selected format.
-- **Automatic session management**: If you don't provide an `aiohttp_session`, the service creates and manages its own session lifecycle automatically.
+- **Service choice**:
+  - Use `XAITTSService` (WebSocket) for lower latency streaming synthesis where audio begins playing before the full utterance finishes.
+  - Use `XAIHttpTTSService` (HTTP) for simpler batch synthesis or when WebSocket connections are not available.
+- **Default audio format**: Both services default to raw PCM output, which matches Pipecat's downstream expectations without extra decoding.
+- **Encoding/codec options**: When using non-PCM formats (`mp3`, `wav`, `mulaw`, `alaw`), ensure your audio pipeline can handle the selected format.
+- **Session management**:
+  - `XAIHttpTTSService`: If you don't provide an `aiohttp_session`, the service creates and manages its own session lifecycle automatically.
+  - `XAITTSService`: WebSocket connection is managed automatically; settings changes that affect URL parameters (voice, language) trigger a reconnection.
