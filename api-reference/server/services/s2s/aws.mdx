@@ -144,6 +144,13 @@ _Deprecated in v0.0.105. Use `settings=AWSNovaSonicLLMService.Settings(system_in
   Available tools/functions for the model to use.
 </ParamField>
 
+<ParamField path="session_continuation" type="SessionContinuationParams" default="None">
+  Configuration for automatic session continuation. When enabled (the default),
+  sessions are seamlessly rotated before the AWS time limit (~8 minutes) with no
+  user-perceptible interruption. See
+  [SessionContinuationParams](#sessioncontinuationparams) below.
+</ParamField>
+
 ### Settings
 
 Runtime-configurable settings passed via the `settings` constructor argument using `AWSNovaSonicLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
@@ -177,6 +184,17 @@ Audio configuration passed via the `audio_config` constructor argument.
 | `output_sample_rate`   | `int` | `24000` | Audio output sample rate in Hz.   |
 | `output_sample_size`   | `int` | `16`    | Audio output sample size in bits. |
 | `output_channel_count` | `int` | `1`     | Number of output audio channels.  |
+
+### SessionContinuationParams
+
+Configuration for automatic session continuation, passed via the `session_continuation` constructor argument. Nova Sonic sessions have an AWS-imposed time limit (~8 minutes). When enabled, session continuation proactively creates a new session in the background before the limit is reached, buffers user audio during the transition, and seamlessly hands off — preserving conversation context with no user-perceptible gap.
+
+| Parameter                         | Type    | Default | Description                                                                                                                                                                                                                                               |
+| --------------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                         | `bool`  | `True`  | Whether automatic session continuation is enabled.                                                                                                                                                                                                        |
+| `transition_threshold_seconds`    | `float` | `360.0` | How many seconds into a session to begin monitoring for a transition opportunity. The transition will occur when the assistant next starts speaking after this threshold.                                                                                 |
+| `audio_buffer_duration_seconds`   | `float` | `3.0`   | Duration of the rolling audio buffer (in seconds) that captures user audio during the transition window. This audio is replayed into the new session so no user input is lost.                                                                            |
+| `audio_start_timeout_seconds`     | `float` | `80.0`  | Maximum time to wait for the assistant to start speaking after the threshold is reached. If no assistant audio arrives within this window, the transition is forced. Set to `0` to disable the timeout (wait indefinitely).                                |
 
 ## Usage
 
@@ -243,6 +261,33 @@ async def get_weather(function_name, tool_call_id, args, llm, context, result_ca
     await result_callback({"temperature": 72, "condition": "sunny", "location": location})
 ```
 
+### With Session Continuation
+
+```python
+from pipecat.services.aws.nova_sonic import AWSNovaSonicLLMService
+from pipecat.services.aws.nova_sonic.session_continuation import SessionContinuationParams
+
+llm = AWSNovaSonicLLMService(
+    secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    region="us-east-1",
+    settings=AWSNovaSonicLLMService.Settings(
+        voice="tiffany",
+        system_instruction="You are a helpful assistant.",
+    ),
+    # Session continuation is enabled by default. You can customize the behavior:
+    session_continuation=SessionContinuationParams(
+        enabled=True,
+        transition_threshold_seconds=360,  # Start transition after 6 minutes
+        audio_buffer_duration_seconds=3.0,  # Buffer 3 seconds of audio during transition
+        audio_start_timeout_seconds=80.0,  # Force transition if no response within 80s
+    ),
+)
+
+# To disable session continuation:
+# session_continuation=SessionContinuationParams(enabled=False)
+```
+
 <Tip>
   The `Params` / `params=` pattern is deprecated as of v0.0.105. Use `Settings`
   / `settings=` for inference settings and `AudioConfig` / `audio_config=` for
@@ -253,6 +298,7 @@ async def get_weather(function_name, tool_call_id, args, llm, context, result_ca
 ## Notes
 
 - **Model versions**: Nova 2 Sonic (`amazon.nova-2-sonic-v1:0`) is the default and recommended model. The older Nova Sonic (`amazon.nova-sonic-v1:0`) has fewer features and requires an assistant response trigger mechanism.
+- **Session continuation**: Enabled by default to handle AWS's ~8-minute session limit. The service automatically rotates sessions in the background with no user-perceptible interruption, preserving conversation context and buffering user audio during the transition. You can tune the threshold or disable it via `session_continuation` parameter.
 - **Endpointing sensitivity**: Only supported with Nova 2 Sonic. Controls how quickly the model decides the user has stopped speaking -- `"HIGH"` causes the model to respond most quickly.
 - **Transcription frames**: User speech transcription frames are always emitted upstream. Assistant text transcripts are delivered in real-time using speculative text events, providing text synchronized with audio output for responsive client UIs.
 - **Connection resilience**: If a connection error occurs while the service wants to stay connected, it automatically resets the conversation and reconnects.
