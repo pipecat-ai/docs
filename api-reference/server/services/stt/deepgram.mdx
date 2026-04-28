@@ -8,7 +8,7 @@ description: "Speech-to-text service implementations using Deepgram's real-time 
 Deepgram provides four STT service implementations:
 
 - `DeepgramSTTService` for real-time speech recognition using Deepgram's standard WebSocket API with support for interim results, language detection, and voice activity detection (VAD)
-- `DeepgramFluxSTTService` for advanced conversational AI with Flux capabilities including intelligent turn detection, eager end-of-turn events, and enhanced speech processing for improved response timing
+- `DeepgramFluxSTTService` for advanced conversational AI with Flux capabilities including intelligent turn detection, eager end-of-turn events, multilingual support (with `flux-general-multi` model), and enhanced speech processing for improved response timing
 - `DeepgramSageMakerSTTService` for real-time speech recognition using Deepgram Nova models deployed on AWS SageMaker endpoints via HTTP/2 bidirectional streaming
 - `DeepgramFluxSageMakerSTTService` for advanced conversational AI using Deepgram Flux models deployed on AWS SageMaker endpoints with native turn detection and low-latency streaming
 
@@ -303,6 +303,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `eot_timeout_ms`      | `int`             | `None`              | Time in ms after speech to finish a turn regardless of confidence (default 5000).                                                                         | ✓          |
 | `keyterm`             | `list`            | `[]`                | Key terms to boost recognition accuracy for specialized terminology.                                                                                      | ✓          |
 | `min_confidence`      | `float`           | `None`              | Minimum average confidence required to produce a `TranscriptionFrame`.                                                                                    |            |
+| `language_hints`      | `list[Language]`  | `None`              | Languages to bias transcription toward. Only honored by `flux-general-multi`. Empty list clears hints; `None` means auto-detect.                          | ✓          |
 
 <Note>
   Parameters marked with ✓ in the "On-the-fly" column can be updated mid-stream
@@ -334,33 +335,60 @@ stt = DeepgramFluxSTTService(
 )
 ```
 
+#### Multilingual Support
+
+```python
+from pipecat.services.deepgram.flux import DeepgramFluxSTTService
+from pipecat.transcriptions.language import Language
+
+# Use flux-general-multi with language hints
+stt = DeepgramFluxSTTService(
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    settings=DeepgramFluxSTTService.Settings(
+        model="flux-general-multi",
+        language_hints=[Language.EN, Language.ES, Language.FR],
+    ),
+)
+```
+
 #### Updating Settings Mid-Stream
 
-The `keyterm`, `eot_threshold`, `eager_eot_threshold`, and `eot_timeout_ms` settings can be updated on-the-fly using `STTUpdateSettingsFrame`:
+The `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, and `language_hints` settings can be updated on-the-fly using `STTUpdateSettingsFrame`:
 
 ```python
 from pipecat.frames.frames import STTUpdateSettingsFrame
-from pipecat.services.deepgram.flux import DeepgramFluxSTTSettings
+from pipecat.services.deepgram.flux import DeepgramFluxSTTService
+from pipecat.transcriptions.language import Language
 
 # During pipeline execution, update settings without reconnecting
 await task.queue_frame(
     STTUpdateSettingsFrame(
-        delta=DeepgramFluxSTTSettings(
+        delta=DeepgramFluxSTTService.Settings(
             eot_threshold=0.8,
             keyterm=["Pipecat", "Deepgram"],
         )
     )
 )
+
+# Detect-then-lock: narrow language hints mid-stream
+await task.queue_frame(
+    STTUpdateSettingsFrame(
+        delta=DeepgramFluxSTTService.Settings(
+            language_hints=[Language.ES],
+        )
+    )
+)
 ```
 
-This sends a `Configure` message to Deepgram over the existing WebSocket connection, allowing you to adjust turn detection behavior and key terms without interrupting the conversation.
+This sends a `Configure` message to Deepgram over the existing WebSocket connection, allowing you to adjust turn detection behavior, key terms, and language hints without interrupting the conversation.
 
 ### Notes
 
 - **Turn management**: Flux provides its own turn detection via `StartOfTurn`/`EndOfTurn` events and broadcasts `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame` directly. Use `ExternalUserTurnStrategies` to avoid conflicting VAD-based turn management.
 - **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`) in your transport is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
-- **On-the-fly configuration**: Supports updating `keyterm`, `eot_threshold`, `eager_eot_threshold`, and `eot_timeout_ms` mid-stream via `STTUpdateSettingsFrame`. These updates are sent as `Configure` messages over the existing WebSocket connection without requiring a reconnect.
+- **On-the-fly configuration**: Supports updating `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, and `language_hints` mid-stream via `STTUpdateSettingsFrame`. These updates are sent as `Configure` messages over the existing WebSocket connection without requiring a reconnect.
 - **EagerEndOfTurn**: Enabling `eager_eot_threshold` provides faster response times by predicting end-of-turn before it is confirmed. EagerEndOfTurn transcripts are pushed as `InterimTranscriptionFrame`s. If the user resumes speaking, a `TurnResumed` event is fired.
+- **Multilingual support**: Use the `flux-general-multi` model with `language_hints` to bias transcription toward specific languages (EN, ES, FR, DE, HI, RU, PT, JA, IT, NL). `TranscriptionFrame.language` reflects the detected language for each turn. Omit hints for auto-detection or pass a subset to bias toward expected languages.
 
 ### Event Handlers
 
@@ -534,12 +562,13 @@ The Flux SageMaker service inherits all settings from `DeepgramFluxSTTService.Se
 | Parameter             | Type              | Default             | Description                                                                                                                                               | On-the-fly |
 | --------------------- | ----------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | `model`               | `str`             | `"flux-general-en"` | Deepgram Flux model to use. _(Inherited from base STT settings.)_                                                                                         |            |
-| `language`            | `Language \| str` | `Language.EN`       | Recognition language. _(Inherited from base STT settings.)_                                                                                               |            |
+| `language`            | `Language \| str` | `None`              | Recognition language. _(Inherited from base STT settings.)_                                                                                               |            |
 | `eager_eot_threshold` | `float`           | `None`              | EagerEndOfTurn threshold. Lower values trigger faster responses with more LLM calls; higher values are more conservative. `None` disables EagerEndOfTurn. | ✓          |
 | `eot_threshold`       | `float`           | `None`              | End-of-turn confidence threshold (default 0.7). Lower = faster turn endings.                                                                              | ✓          |
 | `eot_timeout_ms`      | `int`             | `None`              | Time in ms after speech to finish a turn regardless of confidence (default 5000).                                                                         | ✓          |
 | `keyterm`             | `list`            | `[]`                | Key terms to boost recognition accuracy for specialized terminology.                                                                                      | ✓          |
 | `min_confidence`      | `float`           | `None`              | Minimum average confidence required to produce a `TranscriptionFrame`.                                                                                    |            |
+| `language_hints`      | `list[Language]`  | `None`              | Languages to bias transcription toward. Only honored by `flux-general-multi`. Empty list clears hints; `None` means auto-detect.                          | ✓          |
 
 <Note>
   Parameters marked with ✓ in the "On-the-fly" column can be updated mid-stream
@@ -578,18 +607,20 @@ stt = DeepgramFluxSageMakerSTTService(
 
 #### Updating Settings Mid-Stream
 
-The `keyterm`, `eot_threshold`, `eager_eot_threshold`, and `eot_timeout_ms` settings can be updated on-the-fly:
+The `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, and `language_hints` settings can be updated on-the-fly:
 
 ```python
 from pipecat.frames.frames import STTUpdateSettingsFrame
-from pipecat.services.deepgram.flux.sagemaker.stt import DeepgramFluxSageMakerSTTSettings
+from pipecat.services.deepgram.flux.sagemaker.stt import DeepgramFluxSageMakerSTTService
+from pipecat.transcriptions.language import Language
 
 # Update settings without reconnecting
 await task.queue_frame(
     STTUpdateSettingsFrame(
-        delta=DeepgramFluxSageMakerSTTSettings(
+        delta=DeepgramFluxSageMakerSTTService.Settings(
             eot_threshold=0.8,
             keyterm=["Pipecat", "Deepgram", "SageMaker"],
+            language_hints=[Language.EN],
         )
     )
 )
@@ -599,8 +630,9 @@ await task.queue_frame(
 
 - **Turn management**: Flux provides native turn detection via `StartOfTurn`/`EndOfTurn` events and broadcasts `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame` directly. Use `ExternalUserTurnStrategies` to avoid conflicting VAD-based turn management.
 - **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`) in your transport is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
-- **On-the-fly configuration**: Supports updating `keyterm`, `eot_threshold`, `eager_eot_threshold`, and `eot_timeout_ms` mid-stream via `STTUpdateSettingsFrame`. These updates are sent as `Configure` messages over the existing HTTP/2 connection without requiring a reconnect.
+- **On-the-fly configuration**: Supports updating `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, and `language_hints` mid-stream via `STTUpdateSettingsFrame`. These updates are sent as `Configure` messages over the existing HTTP/2 connection without requiring a reconnect.
 - **EagerEndOfTurn**: Enabling `eager_eot_threshold` provides faster response times by predicting end-of-turn before it is confirmed. EagerEndOfTurn transcripts are pushed as `InterimTranscriptionFrame`s. If the user resumes speaking, a `TurnResumed` event is fired.
+- **Multilingual support**: Use the `flux-general-multi` model with `language_hints` to bias transcription toward specific languages (EN, ES, FR, DE, HI, RU, PT, JA, IT, NL). `TranscriptionFrame.language` reflects the detected language for each turn. Omit hints for auto-detection or pass a subset to bias toward expected languages.
 - **SageMaker deployment**: Requires a Deepgram Flux model deployed to an AWS SageMaker endpoint. Unlike Nova models, Flux provides native turn detection and does not require external VAD.
 - **No KeepAlive needed**: The Flux protocol uses a watchdog mechanism that sends silence when needed to maintain the connection, so manual KeepAlive messages are not required.
 
