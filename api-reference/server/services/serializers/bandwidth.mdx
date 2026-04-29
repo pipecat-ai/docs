@@ -1,0 +1,207 @@
+---
+title: "BandwidthFrameSerializer"
+description: "Serializer for Bandwidth Programmable Voice WebSocket media streaming protocol"
+---
+
+## Overview
+
+`BandwidthFrameSerializer` enables integration with Bandwidth's bidirectional WebSocket media streaming protocol, established via the BXML `<StartStream>` verb. It converts between Pipecat frames and Bandwidth's wire format with bidirectional audio conversion and optional automatic call termination via the Bandwidth Voice API.
+
+<CardGroup cols={2}>
+  <Card
+    title="Bandwidth Serializer API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.serializers.bandwidth.html"
+  >
+    Pipecat's API methods for Bandwidth WebSocket integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/bandwidth-chatbot"
+  >
+    Complete telephony example with Bandwidth
+  </Card>
+  <Card
+    title="Bandwidth StartStream Docs"
+    icon="book"
+    href="https://dev.bandwidth.com/docs/voice/programmable-voice/bxml/startStream/"
+  >
+    Official Bandwidth bidirectional media streaming documentation
+  </Card>
+  <Card
+    title="Bandwidth Dashboard"
+    icon="microphone"
+    href="https://dashboard.bandwidth.com/"
+  >
+    Manage phone numbers, applications, and VCPs
+  </Card>
+</CardGroup>
+
+## Installation
+
+The `BandwidthFrameSerializer` does not require any additional dependencies beyond the core Pipecat library:
+
+```bash
+uv add "pipecat-ai"
+```
+
+## Prerequisites
+
+### Bandwidth Account Setup
+
+Before using BandwidthFrameSerializer, you need:
+
+1. **Bandwidth Account**: A Universal Platform account at [Bandwidth Dashboard](https://dashboard.bandwidth.com/)
+2. **Media Streaming Enabled**: An account-level entitlement; verify with your account rep if unsure
+3. **Phone Number**: A voice-capable Bandwidth number assigned to a Voice Configuration Package (VCP)
+4. **Voice Application**: Pointed at your callback URL that returns `<StartStream>` BXML
+
+### Required Environment Variables
+
+- `BANDWIDTH_CLIENT_ID`: OAuth 2.0 Client ID for Bandwidth API authentication
+- `BANDWIDTH_CLIENT_SECRET`: OAuth 2.0 Client Secret
+
+<Note>
+  Bandwidth deprecated legacy API username/password Basic Auth; use OAuth 2.0
+  client credentials. Tokens are minted via the
+  `client_credentials` grant against
+  `https://api.bandwidth.com/api/v1/oauth2/token` and used as
+  `Authorization: Bearer <token>` on subsequent API requests.
+</Note>
+
+### Required Configuration
+
+- **Stream ID**: Provided by Bandwidth in the WebSocket `start` event metadata
+- **Call ID** and **Account ID**: Required for automatic call termination (also in the `start` event metadata)
+
+### Key Features
+
+- **Bidirectional Audio**: Convert between Pipecat and Bandwidth audio formats
+- **High-Fidelity Outbound**: Optional PCM at 8/16/24 kHz beyond standard PCMU
+- **Auto Hang-up**: Terminate calls via the Bandwidth Voice API
+- **Interruption Handling**: Emits `clear` events to flush buffered outbound audio
+
+## Configuration
+
+<ParamField path="stream_id" type="str" required>
+  The Bandwidth Stream ID, available in the `start` event metadata.
+</ParamField>
+
+<ParamField path="call_id" type="str" default="None">
+  The Bandwidth Call ID. Required when `auto_hang_up` is enabled.
+</ParamField>
+
+<ParamField path="account_id" type="str" default="None">
+  The Bandwidth Account ID. Required when `auto_hang_up` is enabled.
+</ParamField>
+
+<ParamField path="client_id" type="str" default="None">
+  Bandwidth OAuth 2.0 Client ID. Required when `auto_hang_up` is enabled.
+</ParamField>
+
+<ParamField path="client_secret" type="str" default="None">
+  Bandwidth OAuth 2.0 Client Secret. Required when `auto_hang_up` is enabled.
+</ParamField>
+
+<ParamField path="params" type="InputParams" default="None">
+  Configuration parameters for audio and hang-up behavior. See
+  [InputParams](#inputparams) below.
+</ParamField>
+
+### InputParams
+
+| Parameter                   | Type   | Default  | Description                                                                                                              |
+| --------------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `bandwidth_sample_rate`     | `int`  | `8000`   | Sample rate Bandwidth uses on the wire for PCMU (Hz). Always 8000.                                                       |
+| `sample_rate`               | `int`  | `None`   | Optional override for pipeline input sample rate. When `None`, uses the pipeline's configured rate.                      |
+| `outbound_encoding`         | `str`  | `"PCMU"` | Outbound audio encoding: `"PCMU"` (μ-law 8kHz) or `"PCM"` (16-bit signed little-endian linear PCM at higher rates).      |
+| `outbound_pcm_sample_rate`  | `int`  | `24000`  | Sample rate when `outbound_encoding == "PCM"`. One of 8000, 16000, or 24000. Higher values yield better TTS audio quality. |
+| `auto_hang_up`              | `bool` | `True`   | Whether to automatically terminate the call on `EndFrame` or `CancelFrame`.                                              |
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+from pipecat.serializers.bandwidth import BandwidthFrameSerializer
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
+
+# Read metadata from the first WebSocket message (Bandwidth's "start" event).
+metadata = start_event["metadata"]
+
+serializer = BandwidthFrameSerializer(
+    stream_id=metadata["streamId"],
+    call_id=metadata["callId"],
+    account_id=str(metadata["accountId"]),
+    client_id=os.getenv("BANDWIDTH_CLIENT_ID"),
+    client_secret=os.getenv("BANDWIDTH_CLIENT_SECRET"),
+)
+
+transport = FastAPIWebsocketTransport(
+    websocket=websocket,
+    params=FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        add_wav_header=False,
+        serializer=serializer,
+    ),
+)
+```
+
+### High-Fidelity Outbound (24 kHz PCM)
+
+Bandwidth supports linear PCM outbound at higher rates than μ-law's 8 kHz, which can noticeably improve TTS quality:
+
+```python
+serializer = BandwidthFrameSerializer(
+    stream_id=metadata["streamId"],
+    call_id=metadata["callId"],
+    account_id=str(metadata["accountId"]),
+    client_id=os.getenv("BANDWIDTH_CLIENT_ID"),
+    client_secret=os.getenv("BANDWIDTH_CLIENT_SECRET"),
+    params=BandwidthFrameSerializer.InputParams(
+        outbound_encoding="PCM",
+        outbound_pcm_sample_rate=24000,
+    ),
+)
+```
+
+### Without Auto Hang-up
+
+```python
+serializer = BandwidthFrameSerializer(
+    stream_id=metadata["streamId"],
+    params=BandwidthFrameSerializer.InputParams(
+        auto_hang_up=False,
+    ),
+)
+```
+
+## BXML Setup
+
+Your voice application's inbound webhook should respond with BXML that opens a bidirectional stream pointing at your WebSocket endpoint:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <StartStream
+    destination="wss://your-server.example.com/ws"
+    mode="bidirectional"
+    tracks="inbound"/>
+  <Pause duration="86400"/>
+</Response>
+```
+
+The `<Pause>` keeps the call alive while the WebSocket runs. `tracks="inbound"` means only the caller's audio is forwarded — the bot's outbound audio is sent back via `playAudio` events on the same WebSocket.
+
+## Notes
+
+- **Auto hang-up requires credentials**: When `auto_hang_up` is enabled (the default), you must provide `call_id`, `account_id`, `client_id`, and `client_secret`. A `ValueError` is raised at initialization if any are missing.
+- **DTMF**: Bandwidth does not deliver DTMF events over the media-stream WebSocket. Touch-tone digits are captured via the BXML `<Gather>` verb and posted to a separate webhook. Handle DTMF in your application's webhook handler.
+- **OAuth tokens are minted per call**: The serializer is per-call and only mints a Bearer token when an `EndFrame` or `CancelFrame` triggers the hang-up REST call. There is no token caching across calls.
+- **Higher-fidelity outbound is opt-in**: The default PCMU 8 kHz matches the parity baseline with Twilio and Telnyx. Switch to `outbound_encoding="PCM"` to take advantage of Bandwidth's higher-rate options.
