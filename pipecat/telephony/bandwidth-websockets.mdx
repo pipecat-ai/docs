@@ -1,0 +1,265 @@
+---
+title: "Bandwidth WebSocket Integration"
+sidebarTitle: "Bandwidth WebSocket"
+description: "Complete guide to using Bandwidth Programmable Voice Media Streaming with Pipecat for inbound calls"
+---
+
+## Things you'll need
+
+- A Bandwidth account (see [Account Setup](#account-setup) — Build for indie devs, Enterprise for production scale)
+- A voice-capable Bandwidth phone number
+- Media Streaming enabled on the account (account-level entitlement)
+- A public-facing server or tunneling service like [ngrok](https://ngrok.com/)
+- API keys for speech-to-text, text-to-speech, and LLM services
+
+<CardGroup cols={2}>
+  <Card
+    title="Bandwidth Dial-in Example"
+    icon="phone-arrow-down-left"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/bandwidth-chatbot/inbound"
+  >
+    Complete dial-in implementation using Bandwidth Programmable Voice over WebSocket
+  </Card>
+  <Card
+    title="BandwidthFrameSerializer API"
+    icon="code"
+    href="/api-reference/server/services/serializers/bandwidth"
+  >
+    Serializer reference, parameters, and configuration options
+  </Card>
+</CardGroup>
+
+## Account Setup
+
+Bandwidth offers two paths to an account, and both work with this integration:
+
+### Bandwidth Build — for individual developers
+
+The fastest way to get started. Self-service signup with no credit card and no sales call.
+
+- Sign up at [bandwidth.com/build-sign-up](https://www.bandwidth.com/build-sign-up/)
+- $3,000 in pre-loaded trial credits
+- One US local phone number included with signup
+- Instant flow: sign up → provision a number → place your first call
+- Pay-as-you-go (add a card) once trial credits are used
+
+Bandwidth Build is scoped to the Voice API, which is exactly what this integration needs. If you only want to dial into a Pipecat bot from a US number, Build covers it end-to-end.
+
+### Bandwidth Enterprise — for production scale
+
+For higher-volume production deployments, multiple regions, or when you need products beyond Voice (messaging, emergency services, etc.).
+
+- Contact sales at [bandwidth.com](https://www.bandwidth.com/)
+- Full Bandwidth product portfolio: voice, messaging, emergency services
+- Global phone-number inventory across 65+ countries
+- Dedicated onboarding and support
+- Custom pricing under a master service agreement
+
+The runtime integration is identical in both tiers — same Universal Platform, same Voice API, same Media Streaming protocol. Only the account-management surface differs.
+
+<Note>
+  **Media Streaming** is the feature that powers the bidirectional WebSocket
+  used here. On Build accounts it's available as part of Voice API; on
+  Enterprise accounts it may need to be explicitly enabled by your account
+  rep. If your call connects but the WebSocket never opens, that's the first
+  thing to check.
+</Note>
+
+## Phone Number Setup
+
+You'll need a Bandwidth voice-capable phone number routed to a Voice Configuration Package (VCP) that points at a voice application — your callback URL.
+
+The fastest way to wire this up is the [`band` CLI](https://github.com/Bandwidth/bandwidth-cli):
+
+```bash
+band auth login --client-id $BANDWIDTH_CLIENT_ID --client-secret $BANDWIDTH_CLIENT_SECRET
+
+# Create a voice application that points at your public URL
+band app create --name pipecat-bot --type voice \
+  --callback-url https://your-server.example.com/incoming-call
+
+# Update an existing VCP to use your new app, or create one via the dashboard
+band vcp update <vcp-id> --app-id <app-id-from-previous-step>
+```
+
+You can also do this entirely in the Bandwidth dashboard: create a Voice application, point it at your public callback URL, then assign your phone number to a VCP that references the application.
+
+## Environment Setup
+
+Configure your environment variables for Bandwidth and AI services:
+
+```shell .env
+BANDWIDTH_CLIENT_ID=...
+BANDWIDTH_CLIENT_SECRET=...
+BANDWIDTH_ACCOUNT_ID=...
+
+OPENAI_API_KEY=...
+DEEPGRAM_API_KEY=...
+CARTESIA_API_KEY=...
+
+NGROK_PUBLIC_URL=https://your-subdomain.ngrok-free.dev
+```
+
+<Note>
+  Bandwidth deprecated legacy API username/password Basic Auth (sunset
+  2026-12-02). Use OAuth 2.0 client credentials instead — generate a Client
+  ID and Client Secret pair under **API Credentials** in the Bandwidth
+  dashboard.
+</Note>
+
+## Dial-in
+
+Dial-in lets users call your Bandwidth number and connect to your Pipecat bot via bidirectional WebSocket Media Streaming.
+
+### How It Works
+
+Here's the sequence of events when someone calls your Bandwidth number:
+
+1. **Bandwidth receives an incoming call** to your number.
+2. **Bandwidth POSTs to your voice application's callback URL** with call metadata (caller, callee, callId).
+3. **Your server responds with BXML** containing a `<StartStream>` verb pointing at your WebSocket endpoint.
+4. **Bandwidth opens a bidirectional WebSocket** to your server. The first message is a `start` event with the stream metadata (`streamId`, `callId`, `accountId`, tracks).
+5. **Bandwidth streams the caller's audio** as base64-encoded PCMU `media` events.
+6. **Your bot processes audio** through the Pipecat pipeline.
+7. **Your bot sends audio back** as `playAudio` events on the same WebSocket.
+8. **Bandwidth plays the audio** to the caller in real time, and terminates the WebSocket on hangup.
+
+### Set up your BXML response
+
+Your callback URL responds with BXML that opens a bidirectional stream and parks the call:
+
+```xml BXML for dial-in
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <StartStream
+    destination="wss://your-server.example.com/ws"
+    mode="bidirectional"
+    tracks="inbound"/>
+  <Pause duration="86400"/>
+</Response>
+```
+
+`mode="bidirectional"` enables the bot to send audio back over the same WebSocket via `playAudio` events. `tracks="inbound"` means only the caller's audio is forwarded (not the bot's own outbound, which would cause feedback). The `<Pause>` keeps the call alive while the WebSocket runs.
+
+### Configure your Pipecat bot for dial-in
+
+Bandwidth's first WebSocket message is the `start` event, which carries the call metadata you'll need. Read it before instantiating the serializer:
+
+```python bot.py
+import json
+import os
+from fastapi import WebSocket
+from pipecat.serializers.bandwidth import BandwidthFrameSerializer
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
+
+async def run_bot(websocket: WebSocket):
+    # Read Bandwidth's first message — the "start" event.
+    start_event = json.loads(await websocket.receive_text())
+    metadata = start_event["metadata"]
+
+    serializer = BandwidthFrameSerializer(
+        stream_id=metadata["streamId"],
+        call_id=metadata["callId"],
+        account_id=str(metadata["accountId"]),
+        client_id=os.getenv("BANDWIDTH_CLIENT_ID"),
+        client_secret=os.getenv("BANDWIDTH_CLIENT_SECRET"),
+    )
+
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            serializer=serializer,
+        ),
+    )
+
+    # Build your pipeline (STT → LLM → TTS) using `transport` and run it.
+```
+
+<Card
+  title="Complete Bot Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/blob/main/bandwidth-chatbot/inbound/bot.py"
+>
+  See the full bot.py with WebSocket parsing, transport setup, and pipeline configuration
+</Card>
+
+## Key Features
+
+### OAuth 2.0 Authentication
+
+The serializer uses OAuth 2.0 client credentials, not legacy Basic Auth. When `auto_hang_up` is enabled (the default), it mints a short-lived Bearer token from `https://api.bandwidth.com/api/v1/oauth2/token` and uses it to terminate the call when your pipeline ends.
+
+### Audio Format and Sample Rate
+
+Bandwidth Media Streaming uses PCMU at 8 kHz on the wire by default. Set your input rate to match:
+
+```python
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(
+        audio_in_sample_rate=8000,
+        audio_out_sample_rate=8000,
+    ),
+)
+```
+
+If your TTS provider produces audio at a higher rate (e.g. OpenAI TTS at 24 kHz), set `audio_out_sample_rate` to match the TTS rate — the serializer will resample down to 8 kHz μ-law on the wire.
+
+### Higher-Fidelity Outbound (24 kHz PCM)
+
+Bandwidth supports linear PCM outbound at higher rates than μ-law's 8 kHz. To skip the downsample and send Bandwidth higher-fidelity audio:
+
+```python
+serializer = BandwidthFrameSerializer(
+    stream_id=metadata["streamId"],
+    call_id=metadata["callId"],
+    account_id=str(metadata["accountId"]),
+    client_id=os.getenv("BANDWIDTH_CLIENT_ID"),
+    client_secret=os.getenv("BANDWIDTH_CLIENT_SECRET"),
+    params=BandwidthFrameSerializer.InputParams(
+        outbound_encoding="PCM",
+        outbound_pcm_sample_rate=24000,
+    ),
+)
+```
+
+This is unique to Bandwidth among the WebSocket telephony providers — Twilio and Telnyx are 8 kHz μ-law only.
+
+### Automatic Call Termination
+
+When you pass OAuth credentials to `BandwidthFrameSerializer`, it automatically terminates the call when your pipeline ends:
+
+```python
+serializer = BandwidthFrameSerializer(
+    stream_id=metadata["streamId"],
+    call_id=metadata["callId"],
+    account_id=str(metadata["accountId"]),
+    client_id=os.getenv("BANDWIDTH_CLIENT_ID"),
+    client_secret=os.getenv("BANDWIDTH_CLIENT_SECRET"),
+)
+```
+
+### DTMF
+
+Bandwidth does not deliver DTMF events over the media-stream WebSocket. Touch-tone digits are captured via the BXML `<Gather>` verb and posted to a separate webhook. Handle DTMF in your application's webhook handler, not in the serializer.
+
+## Deployment
+
+For self-hosted production, ensure your servers are:
+
+- Publicly accessible over HTTPS (Bandwidth requires `wss://`)
+- Able to handle concurrent WebSocket connections
+- Configured with valid OAuth credentials in environment variables
+- Implementing proper error handling and structured logging
+
+## Next Steps
+
+- Explore the [complete example](https://github.com/pipecat-ai/pipecat-examples/tree/main/bandwidth-chatbot) for a full implementation
+- Read the [`BandwidthFrameSerializer` API reference](/api-reference/server/services/serializers/bandwidth) for all configuration options
+- Review [Bandwidth's StartStream BXML reference](https://dev.bandwidth.com/docs/voice/programmable-voice/bxml/startStream/) for advanced stream configuration
