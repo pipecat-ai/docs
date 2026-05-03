@@ -5,25 +5,21 @@ description: "Client-side surface for the UI Agent pattern"
 
 ## Overview
 
-`UIAgentClient` wraps an existing `PipecatClient` with the v1 UI Agent
-protocol:
+`UIAgentClient` wraps an existing `PipecatClient` with the [UI Agent Protocol](/client/rtvi-standard#ui-agent-protocol) (RTVI v1.3):
 
-- **`sendEvent(name, payload)`** for client → server events.
-- **`registerCommandHandler(name, handler)`** for server → client commands.
-  Handlers dispatch on the command name extracted from `RTVIEvent.ServerMessage`
-  payloads of type `"ui.command"`.
+- **`sendEvent(name, payload)`** for client → server events. Sends as a first-class `ui-event` RTVI message.
+- **`registerCommandHandler(name, handler)`** for server → client commands. Handlers dispatch on the command name extracted from `RTVIEvent.UICommand` payloads (the `ui-command` envelope).
+- **`addTaskListener(listener)`** for server → client task lifecycle envelopes (`ui-task`). Listeners receive every `group_started` / `task_update` / `task_completed` / `group_completed` envelope in arrival order.
+- **`cancelTask(task_id, reason?)`** to ask the server to cancel an in-flight user task group.
 
-Construction does not subscribe to anything. Call `attach()` to start
-listening for `RTVIEvent.ServerMessage` and store the returned detach
-function to stop. The React provider
-([`UIAgentProvider`](/api-reference/client/react/components#uiagentprovider))
-does this automatically inside a `useEffect` so subscription lifecycle
-follows mount/unmount.
+Construction does not subscribe to anything. Call `attach()` to start listening for `RTVIEvent.UICommand` and `RTVIEvent.UITask`, and store the returned detach function to stop. The React provider ([`UIAgentProvider`](/api-reference/client/react/components#uiagentprovider)) does this automatically inside a `useEffect` so subscription lifecycle follows mount/unmount (including `StrictMode`'s double-invoke).
 
 ```javascript
 import { PipecatClient, UIAgentClient } from "@pipecat-ai/client-js";
 
-const pcClient = new PipecatClient({ /* ... */ });
+const pcClient = new PipecatClient({
+  /* ... */
+});
 const uiClient = new UIAgentClient(pcClient);
 const detach = uiClient.attach();
 
@@ -45,8 +41,8 @@ new UIAgentClient(client: PipecatClient)
 
 <ParamField path="client" type="PipecatClient" required>
   An existing Pipecat client. The UI agent client wraps this without taking
-  ownership; the host is still responsible for connecting and disconnecting
-  the underlying client.
+  ownership; the host is still responsible for connecting and disconnecting the
+  underlying client.
 </ParamField>
 
 ## Properties
@@ -57,8 +53,7 @@ new UIAgentClient(client: PipecatClient)
 get pipecatClient: PipecatClient
 ```
 
-The underlying Pipecat client, exposed as an escape hatch when an app needs
-to call `PipecatClient` methods directly.
+The underlying Pipecat client, exposed as an escape hatch when an app needs to call `PipecatClient` methods directly.
 
 ## Methods
 
@@ -68,9 +63,7 @@ to call `PipecatClient` methods directly.
 sendEvent<T = unknown>(name: string, payload?: T): void
 ```
 
-Send a named UI event to the server. The event is delivered as an RTVI
-client message with type `"ui.event"`; the bridge installed by
-`attach_ui_bridge` republishes it as `BusUIEventMessage` on the bus.
+Send a named UI event to the server as a first-class `ui-event` RTVI message. Internally calls `PipecatClient.sendRTVIMessage(RTVIMessageType.UI_EVENT, ...)`. The server-side bridge installed by `attach_ui_bridge` republishes the event as `BusUIEventMessage` on the agent bus, where matching `@on_ui_event(name)` handlers run.
 
 <ParamField path="name" type="string" required>
   App-defined event name. Must match the `name` argument on a server-side
@@ -90,18 +83,16 @@ registerCommandHandler<T = unknown>(
 ): void
 ```
 
-Register a handler for a named UI command. Overwrites any existing handler
-for the same name.
+Register a handler for a named UI command. Overwrites any existing handler for the same name.
 
 <ParamField path="name" type="string" required>
-  App-defined command name. Must match the `name` argument the server passes
-  to `UIAgent.send_command(name, payload)`.
+  App-defined command name. Must match the `name` argument the server passes to
+  `UIAgent.send_command(name, payload)`.
 </ParamField>
 
 <ParamField path="handler" type="UICommandHandler<T>" required>
   Callback invoked with the command payload. Sync or async; rejected promises
-  surface to the host's unhandled-rejection channel rather than being
-  swallowed.
+  surface to the host's unhandled-rejection channel rather than being swallowed.
 </ParamField>
 
 ### unregisterCommandHandler
@@ -110,8 +101,7 @@ for the same name.
 unregisterCommandHandler(name: string): void
 ```
 
-Remove the handler previously registered for `name`, if any. No-op when no
-handler is registered.
+Remove the handler previously registered for `name`, if any. No-op when no handler is registered.
 
 ### unregisterAllCommandHandlers
 
@@ -121,19 +111,73 @@ unregisterAllCommandHandlers(): void
 
 Remove all registered command handlers.
 
+### addTaskListener
+
+```typescript
+addTaskListener(listener: UITaskListener): void
+```
+
+Subscribe a listener to every `ui-task` envelope. The listener fires for each lifecycle phase: `group_started`, `task_update`, `task_completed`, `group_completed`. Switch on `envelope.kind` to react to specific phases.
+
+The React `useUITasks` hook is the recommended consumer for app code; this lower-level listener is for hosts that want to drive their own state.
+
+<ParamField path="listener" type="UITaskListener" required>
+  Callback invoked once per envelope:
+  `(envelope: UITaskEnvelope) => void`. The discriminated `kind` field
+  (`"group_started"` / `"task_update"` / `"task_completed"` /
+  `"group_completed"`) selects which envelope shape arrived.
+</ParamField>
+
+### removeTaskListener
+
+```typescript
+removeTaskListener(listener: UITaskListener): void
+```
+
+Remove a previously added task listener. No-op when the listener is not registered.
+
+### removeAllTaskListeners
+
+```typescript
+removeAllTaskListeners(): void
+```
+
+Remove every task listener.
+
+### cancelTask
+
+```typescript
+cancelTask(task_id: string, reason?: string): void
+```
+
+Ask the server to cancel an in-flight user task group. Sends a first-class `ui-cancel-task` RTVI message; the server-side `UIAgent` routes this to `cancel_task` on the matching group. The server honors the request only when the group was registered with `cancellable=True`; otherwise the request is silently ignored.
+
+<ParamField path="task_id" type="string" required>
+  The shared task identifier of the group to cancel. Read this from a task
+  group's `taskId` (`useUITasks` surfaces it) or from the `task_id` on any
+  envelope you saw for the group.
+</ParamField>
+
+<ParamField path="reason" type="string">
+  Optional human-readable reason. Logged on the server alongside the cancel
+  request.
+</ParamField>
+
 ### attach
 
 ```typescript
 attach(): () => void
 ```
 
-Subscribe to `RTVIEvent.ServerMessage` on the underlying `PipecatClient`.
-Returns a detach function that unsubscribes.
+Subscribe to `RTVIEvent.UICommand` and `RTVIEvent.UITask` on the underlying `PipecatClient`. Returns a detach function that unsubscribes.
 
-Safe to call more than once: each call installs an independent listener.
-Invoke the returned function to remove that listener. The React provider
-calls this inside `useEffect` and uses the returned function as the cleanup,
-so subscription lifecycle follows React's mount/unmount cycle (including
-`StrictMode`'s double-invoke in development).
+Safe to call more than once: each call installs an independent pair of listeners. Invoke the returned function to remove them. The React provider calls this inside `useEffect` and uses the returned function as the cleanup, so subscription lifecycle follows React's mount/unmount cycle (including `StrictMode`'s double-invoke in development).
 
 **Returns:** A `() => void` detach function.
+
+## See also
+
+- [`PipecatClient.sendRTVIMessage`](/api-reference/client/js/client-methods#sendrtvimessage) — the underlying primitive `sendEvent` and `cancelTask` use to send first-class typed RTVI messages.
+- [`A11ySnapshotStreamer`](/api-reference/client/js/a11y-snapshot) — streams the accessibility tree as `ui-snapshot` messages.
+- [`UIAgentProvider`](/api-reference/client/react/components#uiagentprovider) — React idiom for the same surface.
+- [UI Agent Protocol on the wire](/client/rtvi-standard#ui-agent-protocol) — the underlying RTVI message types.

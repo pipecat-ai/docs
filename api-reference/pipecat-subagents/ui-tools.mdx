@@ -1,100 +1,144 @@
 ---
 title: "UI Tools"
-description: "Opt-in tool mixins for UIAgent"
+description: "Bundled LLM tool mixin for UIAgent"
 ---
 
 ## Overview
 
-Tool mixins expose focused LLM tools that work with the v1 UI protocol. Apps
-compose them by inheriting alongside their `UIAgent` subclass:
+`ReplyToolMixin` is the canonical bundled-tool shape for `UIAgent`. It
+exposes a single LLM tool — `reply(answer, ...)` — that combines a
+required spoken answer with the optional standard UI actions in one
+turn-terminating call. Apps compose it by inheriting alongside their
+`UIAgent` subclass:
 
 ```python
-from pipecat_subagents.agents import UIAgent
-from pipecat_subagents.agents.ui_tools import (
-    HighlightToolMixin,
-    ScrollToToolMixin,
-)
+from pipecat_subagents.agents import ReplyToolMixin, UIAgent
 
-class MyUIAgent(ScrollToToolMixin, HighlightToolMixin, UIAgent):
+class MyUIAgent(ReplyToolMixin, UIAgent):
     ...
 ```
 
-Keeping these as separate mixins (instead of methods on `UIAgent`) means apps
-opt in to what the LLM sees: a single-screen app with no scrolling shouldn't
-have a `scroll_to` tool cluttering its tool list.
+The bundled-tool design solves a real failure mode: smaller models often
+omit the spoken terminator when scroll-and-highlight tools are exposed
+separately and chainable. Making `answer` a required argument enforced by
+the API schema closes that loop — the model can't call `reply(...)`
+without committing to what it will say.
+
+The mixin covers the canonical app shapes (pointing, reading, form-fill)
+and any blend of them. Apps don't pick a mode up front; the LLM uses
+whichever fields fit the user's request per turn, leaving the rest as
+`null`.
 
 The host class must provide
-[`send_command`](/api-reference/pipecat-subagents/ui-agent#send-command) and
-[`respond_to_task`](/api-reference/pipecat-subagents/ui-agent#respond-to-task)
-(`UIAgent` does both) and must be the target of `@tool` discovery on the LLM
+[`scroll_to`](/api-reference/pipecat-subagents/ui-agent#scroll-to),
+[`highlight`](/api-reference/pipecat-subagents/ui-agent#highlight),
+[`select_text`](/api-reference/pipecat-subagents/ui-agent#select-text),
+[`click`](/api-reference/pipecat-subagents/ui-agent#click),
+[`set_input_value`](/api-reference/pipecat-subagents/ui-agent#set-input-value),
+and [`respond_to_task`](/api-reference/pipecat-subagents/ui-agent#respond-to-task)
+(`UIAgent` does) and must be the target of `@tool` discovery on the LLM
 pipeline.
 
 <Note>
-  The shipped mixin tools are **silent fire-and-forget side effects**. They
-  dispatch a UI command, complete the in-flight task with no `speak` field,
-  and exit. The visual change on the client (the scroll, the highlight) is
-  the user-facing feedback; the voice agent stays quiet for that turn. If
-  you want spoken narration, override the mixin tool and pass a `speak`
-  argument:
-
-  ```python
-  class MyAgent(ScrollToToolMixin, UIAgent):
-      @tool
-      async def scroll_to(self, params, ref: str):
-          await self.send_command("scroll_to", ScrollTo(ref=ref))
-          await self.respond_to_task(speak="Scrolling.")
-          await params.result_callback(None)
-  ```
+  Apps with a different shape — multiple per-domain tools (`play`,
+  `navigate_to_artist`, etc.) where each tool is the whole turn — should skip
+  the mixin and write their own `@tool` methods. Use the action helpers
+  (`scroll_to`, `highlight`, `select_text`, `click`, `set_input_value`) on
+  `UIAgent` directly inside those tool bodies. See [Choosing a tool
+  shape](/subagents/learn/ui-agent#choosing-a-tool-shape) for the decision.
 </Note>
 
-## ScrollToToolMixin
+## ReplyToolMixin
 
-Exposes a `scroll_to(ref)` tool to the LLM. The LLM is meant to call it
-before acting on elements tagged `[offscreen]` in the current `<ui_state>`.
+Exposes a single bundled `reply(...)` LLM tool. One call per turn, no
+chaining; the required `answer` argument keeps the model from omitting the
+spoken terminator.
 
-The tool issues a standard
-[`ScrollTo`](/api-reference/pipecat-subagents/ui-commands#scrollto) command;
-the client's
-[`useStandardScrollToHandler`](/api-reference/client/react/hooks#usestandardscrolltohandler)
-(or any app-defined handler) does the actual scrolling.
-
-### scroll_to
+### reply
 
 ```python
 @tool
-async def scroll_to(self, params: FunctionCallParams, ref: str) -> None
+async def reply(
+    self,
+    params: FunctionCallParams,
+    answer: str,
+    scroll_to: str | None = None,
+    highlight: list[str] | None = None,
+    select_text: str | None = None,
+    fills: list[dict] | None = None,
+    click: list[str] | None = None,
+) -> None
 ```
 
-Scroll an element into view by its snapshot ref.
+Reply to the user. Optionally point at content and act on inputs.
 
-| Parameter | Type                 | Description                                                       |
-| --------- | -------------------- | ----------------------------------------------------------------- |
-| `params`  | `FunctionCallParams` | Framework-provided tool invocation context.                       |
-| `ref`     | `str`                | Ref string from the most recent `<ui_state>` (e.g. `"e42"`). |
+Action fields are dispatched in a fixed order before the answer is spoken:
+`scroll_to`, then `highlight`, then `select_text`, then `fills`, then
+`click`, then the spoken `answer`.
 
-## HighlightToolMixin
+#### Visual / pointing actions
 
-Exposes a `highlight(ref)` tool to the LLM. Gives the LLM a way to visually
-point at a specific element on screen, e.g. answering "which one is
-Radiohead?" by flashing the tile.
+Draw the user's attention without changing app state.
 
-The tool issues a standard
-[`Highlight`](/api-reference/pipecat-subagents/ui-commands#highlight) command;
-the client's
-[`useStandardHighlightHandler`](/api-reference/client/react/hooks#usestandardhighlighthandler)
-(or a custom one) does the actual visual effect.
+- **`scroll_to`** brings an element into view (single ref).
+- **`highlight`** flashes elements briefly (list of refs). Best for short
+  emphasis like a button or a fact.
+- **`select_text`** puts the page's text selection on an element (single
+  ref). Best for "this paragraph" / "the section about X" so the user
+  sees exactly what was meant. Persists until the user clicks elsewhere.
 
-### highlight
+#### State-changing actions
 
-```python
-@tool
-async def highlight(self, params: FunctionCallParams, ref: str) -> None
+Modify form / app state.
+
+- **`fills`** writes values into inputs (list of `{"ref", "value"}`
+  objects, multi-fill in one turn).
+- **`click`** clicks elements (list of refs in order). Use for
+  checkboxes, radios, submit buttons.
+
+#### Parameters
+
+| Parameter     | Type                 | Default | Description                                                                                          |
+| ------------- | -------------------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| `params`      | `FunctionCallParams` |         | Framework-provided tool invocation context.                                                          |
+| `answer`      | `str`                |         | The spoken reply in plain language. One short sentence. No markdown, no symbols.                     |
+| `scroll_to`   | `str \| None`        | `None`  | Optional snapshot ref. Scrolls the element into view before speaking.                                |
+| `highlight`   | `list[str] \| None`  | `None`  | Optional list of snapshot refs. Visually pulses each element.                                        |
+| `select_text` | `str \| None`        | `None`  | Optional snapshot ref. Places the page's text selection on that element.                             |
+| `fills`       | `list[dict] \| None` | `None`  | Optional list of `{"ref": "eN", "value": "..."}` objects. Writes each value into the input at `ref`. |
+| `click`       | `list[str] \| None`  | `None`  | Optional list of snapshot refs to click in order. Use for checkboxes, radios, submit buttons.        |
+
+#### Examples
+
+A pointing turn:
+
+```text
+reply(answer="Here's the iPhone 17.", scroll_to="e5", highlight=["e5"])
 ```
 
-Briefly flash an element on screen by its snapshot ref. After the flash,
-the element returns to its normal appearance.
+A read-side deixis turn:
 
-| Parameter | Type                 | Description                                                       |
-| --------- | -------------------- | ----------------------------------------------------------------- |
-| `params`  | `FunctionCallParams` | Framework-provided tool invocation context.                       |
-| `ref`     | `str`                | Ref string from the most recent `<ui_state>` (e.g. `"e42"`). |
+```text
+reply(
+    answer="That paragraph explains the rationale.",
+    select_text="e42",
+)
+```
+
+A form-fill turn:
+
+```text
+reply(
+    answer="Filled in your details.",
+    fills=[
+        {"ref": "e3", "value": "Marie Curie"},
+        {"ref": "e4", "value": "marie@example.com"},
+    ],
+    click=["e7"],
+)
+```
+
+Defensive guards on the list arguments skip non-conforming entries (a
+malformed `fills` element such as `None` or a bare string is dropped
+rather than raising) so a transient model hiccup doesn't leave the
+single-flight task lock held until the voice-task timeout fires.
