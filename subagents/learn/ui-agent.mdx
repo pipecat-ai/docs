@@ -18,7 +18,7 @@ Every voice-enabled GUI app reinvents the same four pieces:
 
 Hand-written prose helpers gave the agent _some_ sense of the screen, enough that "describe this page" worked on a good day. The picture broke easily: server-only state injection missed client-side changes, prose shapes were tightly coupled to the system prompt, and there was no way for the agent to issue a command targeting an element it had just described.
 
-The protocol turns those four patterns into one wire format and adds the missing piece: a **live accessibility snapshot** the agent can actually reason about. The snapshot streams from the client on DOM mutations, focus changes, scroll-end, resize, and tab visibility. The server overwrites a single `_latest_snapshot` slot; the UI agent auto-injects it as `<ui_state>` at the start of every task. Refs (`"e42"`, `"e7"`) are stable across snapshots while a DOM node is mounted, so the LLM can cross-reference between turns ("the button I mentioned earlier") and the agent can point at elements ("flash this one") using the same identifiers it just observed.
+The protocol turns those four patterns into one wire format and adds the missing piece: a **live accessibility snapshot** the agent can actually reason about. The snapshot streams from the client as the UI changes. The server overwrites a single `_latest_snapshot` slot; the UI agent auto-injects it as `<ui_state>` at the start of every task. Refs (`"e42"`, `"e7"`) are stable across snapshots while the underlying UI node exists, so the LLM can cross-reference between turns ("the button I mentioned earlier") and the agent can point at UI nodes ("flash this one") using the same identifiers it just observed.
 
 ### The bigger picture
 
@@ -68,16 +68,16 @@ The split keeps each agent's prompt focused: the voice agent's system prompt is 
 
 Four loops run concurrently. Knowing what each one writes is the key to the whole pattern.
 
-| Loop     | Direction       | What it writes                                                              | Triggers an LLM call?           |
-| -------- | --------------- | --------------------------------------------------------------------------- | ------------------------------- |
-| Snapshot | client → server | Latest a11y tree in `_latest_snapshot`                                      | No                              |
-| Event    | client → server | `<ui_event>` developer message in LLM context, plus `@on_ui_event` dispatch | No                              |
-| Command  | server → client | DOM change (scroll, navigate, highlight, click, fill, select, toast, …)     | Yes (response to a task)        |
-| Task     | server → client | `ui-task` lifecycle envelope; client renders an in-flight panel             | Triggered by long-running tools |
+| Loop     | Direction       | What it writes                                                                | Triggers an LLM call?           |
+| -------- | --------------- | ----------------------------------------------------------------------------- | ------------------------------- |
+| Snapshot | client → server | Latest a11y tree in `_latest_snapshot`                                        | No                              |
+| Event    | client → server | `<ui_event>` developer message in LLM context, plus `@on_ui_event` dispatch   | No                              |
+| Command  | server → client | Client UI change (scroll, navigate, highlight, click, fill, select, toast, …) | Yes (response to a task)        |
+| Task     | server → client | `ui-task` lifecycle envelope; client renders an in-flight panel               | Triggered by long-running tools |
 
-**The snapshot loop is observation.** A client-side walker emits an accessibility tree on DOM mutations and other settle-points. The server overwrites a single slot — `_latest_snapshot` internally — and does nothing else. No inference. No LLM context change.
+**The snapshot loop is observation.** A client-side snapshotter emits an accessibility tree when the UI changes or settles. The server overwrites a single slot — `_latest_snapshot` internally — and does nothing else. No inference. No LLM context change.
 
-**The event loop is intent.** Curated by the app, not fired automatically. Most user input (scrolls, hovers, focus changes) already shows up in the snapshot loop, so the SDK doesn't try to mirror every DOM event onto the bus. The app picks which interactions count as _intent_ worth telling the agent about and calls `UIAgentClient.sendEvent(name, payload)` for those. When an event arrives, the server appends a `<ui_event>` to the LLM's context and dispatches to any matching `@on_ui_event` handler. Still no LLM call: the click sits in history, ready for the next time the user speaks.
+**The event loop is intent.** Curated by the app, not fired automatically. Most user input (scrolls, hovers, focus changes) already shows up in the snapshot loop, so the SDK doesn't try to mirror every DOM event onto the bus. The app picks which interactions count as _intent_ worth telling the agent about and calls `PipecatClient.sendUIEvent(event, payload)` for those. When an event arrives, the server appends a `<ui_event>` to the LLM's context and dispatches to any matching `@on_ui_event` handler. Still no LLM call: the click sits in history, ready for the next time the user speaks.
 
 **The command loop is action.** When the UI agent's LLM calls an action tool, the tool publishes a `BusUICommandMessage` on the bus. The bridge translates it into an `RTVIUICommandFrame` that the client routes to the matching command handler.
 
@@ -306,7 +306,7 @@ function DiscoveryPanel() {
 }
 ```
 
-`useUITasks` requires a [`UITasksProvider`](/api-reference/client/react/components#uitasksprovider) mounted inside the [`UIAgentProvider`](/api-reference/client/react/components#uiagentprovider).
+`useUITasks` requires a [`UITasksProvider`](/api-reference/client/react/components#uitasksprovider) mounted inside the [`PipecatClientProvider`](/api-reference/client/react/components#pipecatclientprovider).
 
 When the user clicks Cancel, `cancelTask` sends a `ui-cancel-task` message; the SDK on the server side cancels the matching group (subject to `cancellable=True` having been set when the group was dispatched).
 
@@ -338,7 +338,7 @@ Once it fits, three shapes. From least to most infrastructure:
 
 #### Single LLM, snapshot-aware (no subagents)
 
-Drop [`A11ySnapshotStreamer`](/api-reference/client/js/a11y-snapshot) into your client, render the snapshot into a developer message in your Pipecat pipeline, give your LLM tools that emit the typed RTVI frames ([`RTVIUICommandFrame`](/api-reference/server/frames/system-frames#rtviuicommandframe), [`RTVIUITaskFrame`](/api-reference/server/frames/system-frames#rtviuitaskframe)). Less code than wiring up a bus + bridge.
+Start the managed client snapshot stream with [`PipecatClient.startA11ySnapshotStream`](/api-reference/client/js/client-methods#starta11ysnapshotstream) or [`useA11ySnapshot`](/api-reference/client/react/hooks#usea11ysnapshot), render the snapshot into a developer message in your Pipecat pipeline, give your LLM tools that emit the typed RTVI frames ([`RTVIUICommandFrame`](/api-reference/server/frames/system-frames#rtviuicommandframe), [`RTVIUITaskFrame`](/api-reference/server/frames/system-frames#rtviuitaskframe)). Less code than wiring up a bus + bridge.
 
 Use this when you have a single LLM doing both conversation and UI work, no multi-agent fan-out. The wire format itself ([RTVI v1.3](/client/rtvi-standard#ui-agent-protocol)) is canonical in Pipecat; subagents builds the agent abstraction on top.
 
@@ -386,5 +386,5 @@ Read it when "show me code" beats "tell me about it."
 - [`@on_ui_event`](/api-reference/pipecat-subagents/decorators#on_ui_event) — decorator for client-event handlers (no LLM call).
 - [RTVI standard — UI Agent Protocol](/client/rtvi-standard#ui-agent-protocol) — on-the-wire message types.
 - [RTVI UI frames](/api-reference/server/frames/system-frames#rtvi-ui-frames) — pipeline frames for direct integration.
-- [`UIAgentClient`](/api-reference/client/js/ui-agent-client) — client-side wrapper.
+- [`PipecatClient` UI methods](/api-reference/client/js/client-methods#ui-agent-protocol) — client-side API for UI events, commands, and tasks.
 - [React hooks](/api-reference/client/react/hooks) — `useA11ySnapshot`, `useUICommandHandler`, `useUITasks`, the standard handlers.

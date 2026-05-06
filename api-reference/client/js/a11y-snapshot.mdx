@@ -1,30 +1,33 @@
 ---
 title: "Accessibility Snapshots"
-description: "Stream the document's accessibility tree to the server as <ui_state>"
+description: "Stream a web document's accessibility tree to the server as <ui_state>"
 ---
 
 ## Overview
 
-The accessibility-snapshot module produces a structured tree of the document
+The accessibility-snapshot module produces a structured tree of a web document
 that the server-side
 [`UIAgent`](/api-reference/pipecat-subagents/ui-agent) renders into LLM
 context as `<ui_state>`. Shape and filtering are inspired by Playwright's
 accessibility snapshot and the Playwright MCP server's LLM-facing format:
 the goal is a compact, semantically meaningful tree, not a raw DOM dump.
 
+This page documents the web SDK implementation. The RTVI `ui-snapshot` wire
+shape is intentionally platform-neutral: native clients can produce the same
+`A11ySnapshot` shape from iOS, Android, or other platform accessibility APIs.
+
 ```javascript
 import {
-  A11ySnapshotStreamer,
   snapshotDocument,
   findElementByRef,
 } from "@pipecat-ai/client-js";
 ```
 
-The streaming side is handled by `A11ySnapshotStreamer` (or
-[`useA11ySnapshot`](/api-reference/client/react/hooks#usea11ysnapshot) in
-React). The walker (`snapshotDocument`) is exposed for apps that need a
-one-off snapshot, and `findElementByRef` resolves a server-supplied ref
-back to a live DOM element for command handlers.
+Most apps should start streaming through the managed `PipecatClient` API
+or [`useA11ySnapshot`](/api-reference/client/react/hooks#usea11ysnapshot)
+in React. The walker (`snapshotDocument`) is exposed for apps that need a
+one-off snapshot, and `findElementByRef` resolves a server-supplied ref back
+to a live DOM element for command handlers.
 
 <Note>
   Apps can mark a subtree as PII / sensitive by adding `data-a11y-exclude` to
@@ -37,34 +40,52 @@ back to a live DOM element for command handlers.
 
 ```typescript
 class A11ySnapshotStreamer {
-  constructor(client: UIAgentClient, options?: A11ySnapshotStreamerOptions);
+  constructor(
+    emitSnapshot: A11ySnapshotEmitter,
+    options?: A11ySnapshotStreamerOptions,
+  );
   start(): void;
   stop(): void;
 }
 ```
 
-Framework-agnostic helper that drives accessibility-snapshot streaming.
-Wraps the walker, a `MutationObserver`, and the other triggers
-(`scrollend`, `resize`, focus, `visibilitychange`) into a single object
-with a `start` / `stop` lifecycle.
+Low-level, framework-agnostic helper that drives accessibility-snapshot
+streaming. It wraps the walker, a `MutationObserver`, and the other triggers
+(`scrollend`, `resize`, focus, `visibilitychange`) into a single object with a
+`start` / `stop` lifecycle.
+
+Vanilla web apps should usually use the managed client methods:
 
 ```javascript
-import { A11ySnapshotStreamer, UIAgentClient } from "@pipecat-ai/client-js";
+import { PipecatClient } from "@pipecat-ai/client-js";
 
-const ui = new UIAgentClient(pcClient);
-ui.attach();
+const pcClient = new PipecatClient({
+  /* ... */
+});
 
-const streamer = new A11ySnapshotStreamer(ui);
-streamer.start();
+pcClient.startA11ySnapshotStream({ debounceMs: 200 });
 
 // Later
-streamer.stop();
+pcClient.stopA11ySnapshotStream();
+```
+
+If you need to provide your own transport or batching layer, instantiate the
+low-level streamer directly and provide an emitter callback:
+
+```javascript
+import { A11ySnapshotStreamer } from "@pipecat-ai/client-js";
+
+const streamer = new A11ySnapshotStreamer((snapshot) => {
+  emitUISnapshot({ tree: snapshot });
+});
+
+streamer.start();
 ```
 
 <Note>
   React apps should prefer
   [`useA11ySnapshot`](/api-reference/client/react/hooks#usea11ysnapshot), which
-  is a thin lifecycle wrapper around this class.
+  starts and stops the managed `PipecatClient` stream.
 </Note>
 
 ### Triggers
@@ -174,6 +195,16 @@ hooks call this internally.
 
 ## Types
 
+### A11ySnapshotEmitter
+
+```typescript
+type A11ySnapshotEmitter = (snapshot: A11ySnapshot) => void;
+```
+
+Callback passed to the low-level `A11ySnapshotStreamer`. The managed
+`PipecatClient` stream provides this callback internally and sends each
+snapshot as a `ui-snapshot` RTVI message with `{ tree: snapshot }`.
+
 ### A11yNode
 
 One node in the accessibility snapshot tree.
@@ -194,7 +225,7 @@ interface A11yNode {
 
 | Field      | Type         | Description                                                                                                        |
 | ---------- | ------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `ref`      | `string`     | Stable reference id of the form `e{N}`. Persists across snapshots while the DOM node is mounted.                   |
+| `ref`      | `string`     | Stable web reference id of the form `e{N}`. Persists across snapshots while the DOM node is mounted.               |
 | `role`     | `string`     | ARIA role (explicit or tag-derived).                                                                               |
 | `name`     | `string`     | Accessible name, truncated to 100 chars.                                                                           |
 | `value`    | `string`     | Current value for inputs (omitted for passwords), progress, etc.                                                   |
@@ -216,7 +247,9 @@ interface A11ySnapshot {
 
 Shape of the payload inside a `ui-snapshot` RTVI message. A full tree is sent
 on each update; the server keeps the latest and renders it into
-`<ui_state>...</ui_state>` when an agent injects it.
+`<ui_state>...</ui_state>` when an agent injects it. The fields are shared
+across client platforms; details in this page describe how the web SDK fills
+them from the DOM.
 
 | Field         | Type            | Description                                                                                     |
 | ------------- | --------------- | ----------------------------------------------------------------------------------------------- |
@@ -246,8 +279,6 @@ The user's current text selection. Lets the agent ground deictic references like
 
 ## See also
 
-- [`UIAgentClient`](/api-reference/client/js/ui-agent-client) — the wrapper the streamer dispatches through.
+- [`PipecatClient` UI methods](/api-reference/client/js/client-methods#ui-agent-protocol) — the client-side UI Agent Protocol API.
 - [`useA11ySnapshot`](/api-reference/client/react/hooks#usea11ysnapshot) — React hook idiom.
 - [UI Agent Protocol on the wire](/client/rtvi-standard#ui-snapshot-) — the `ui-snapshot` RTVI message that carries the tree.
-
-The streamer dispatches via `PipecatClient.sendRTVIMessage(RTVIMessageType.UI_SNAPSHOT, { tree })` (RTVI v1.3); apps that build their own snapshot pipeline can target the same wire shape directly without using `UIAgentClient`.
