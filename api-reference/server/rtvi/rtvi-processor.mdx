@@ -252,3 +252,123 @@ pcClient.onServerMessage((message) => {
 ```
 
 See [Handling Custom Messages from the Server](/client/guides/custom-messaging#handling-custom-messages-from-the-server) for more details and examples.
+
+## UI Agent Protocol
+
+RTVI 1.3.0+ includes first-class support for the UI Agent Protocol, which lets server-side AI agents observe and drive GUI applications on the client. The protocol covers five message types:
+
+- **`ui-event`** — client → server event message
+- **`ui-command`** — server → client command message
+- **`ui-snapshot`** — client → server accessibility snapshot
+- **`ui-cancel-task`** — client → server task cancellation request
+- **`ui-task`** — server → client task lifecycle envelope
+
+### Handling UI Messages
+
+The processor automatically handles inbound UI messages from the client and fires the `on_ui_message` event handler:
+
+```python
+@rtvi.event_handler("on_ui_message")
+async def on_ui_message(rtvi, message):
+    # message is a UIEventMessage, UISnapshotMessage, or UICancelTaskMessage
+    if message.type == "ui-event":
+        logger.info(f"UI event: {message.data.event}")
+    elif message.type == "ui-snapshot":
+        # Process accessibility tree
+        tree = message.data.tree
+        logger.info(f"Snapshot captured at: {tree.captured_at}")
+    elif message.type == "ui-cancel-task":
+        task_id = message.data.task_id
+        logger.info(f"Cancel requested for task: {task_id}")
+```
+
+The processor also pushes corresponding frames downstream for pipeline-level handling:
+
+- `RTVIUIEventFrame` — for `ui-event` messages
+- `RTVIUISnapshotFrame` — for `ui-snapshot` messages
+- `RTVIUICancelTaskFrame` — for `ui-cancel-task` messages
+
+### Sending UI Commands
+
+Push `RTVIUICommandFrame` to send commands to the client. The observer wraps these in `ui-command` messages:
+
+```python
+from pipecat.processors.frameworks.rtvi import RTVIUICommandFrame
+from pipecat.processors.frameworks.rtvi.models import Toast, Navigate
+
+# Send a toast notification
+toast = Toast(title="Order confirmed", subtitle="Your order #1234 is on the way")
+await self.push_frame(
+    RTVIUICommandFrame(command="toast", payload=toast.model_dump())
+)
+
+# Navigate to a different view
+nav = Navigate(view="order_detail", params={"order_id": "1234"})
+await self.push_frame(
+    RTVIUICommandFrame(command="navigate", payload=nav.model_dump())
+)
+```
+
+Built-in command payload models include: `Toast`, `Navigate`, `ScrollTo`, `Highlight`, `Focus`, `Click`, `SetInputValue`, and `SelectText`. These have matching default handlers in `@pipecat-ai/client-react`.
+
+### Sending UI Tasks
+
+Push `RTVIUITaskFrame` to send task lifecycle updates to the client:
+
+```python
+from pipecat.processors.frameworks.rtvi import RTVIUITaskFrame
+from pipecat.processors.frameworks.rtvi.models import (
+    UITaskGroupStartedData,
+    UITaskUpdateData,
+    UITaskCompletedData,
+    UITaskGroupCompletedData,
+)
+import time
+
+task_id = "search-123"
+timestamp = int(time.time() * 1000)
+
+# Start a task group
+await self.push_frame(
+    RTVIUITaskFrame(
+        data=UITaskGroupStartedData(
+            task_id=task_id,
+            agents=["search", "summarize"],
+            label="Searching knowledge base",
+            at=timestamp,
+        )
+    )
+)
+
+# Send progress update
+await self.push_frame(
+    RTVIUITaskFrame(
+        data=UITaskUpdateData(
+            task_id=task_id,
+            agent_name="search",
+            data={"progress": 0.5},
+            at=timestamp,
+        )
+    )
+)
+
+# Complete individual task
+await self.push_frame(
+    RTVIUITaskFrame(
+        data=UITaskCompletedData(
+            task_id=task_id,
+            agent_name="search",
+            status="completed",
+            response={"results": [...]},
+            at=timestamp,
+        )
+    )
+)
+
+# Complete the group
+await self.push_frame(
+    RTVIUITaskFrame(
+        data=UITaskGroupCompletedData(task_id=task_id, at=timestamp)
+    )
+)
+```
