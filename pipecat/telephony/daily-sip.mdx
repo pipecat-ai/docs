@@ -1,0 +1,254 @@
+---
+title: "Daily SIP"
+description: "Use Daily as the SIP provider for dial-in and dial-out with any SIP-capable telephony carrier (Twilio, Telnyx, Plivo, etc.)."
+---
+
+This guide covers the **`provider="daily"`** SIP mode, where Daily directly connects its SIP leg to your telephony carrier (Twilio, Telnyx, Five9, Genseys, Cisco, …). This SIP mode with `provider="daily"` gives you:
+
+- **Static egress IPs** you can allow-list on the carrier side for tighter ACLs.
+- **One SIP configuration** that works across carriers — the bot code doesn't change when you swap providers.
+
+<Info>
+  The reference implementation lives in the Twilio SIP examples because Twilio
+  is the most common carrier, but the same bot code works with any SIP-capable
+  provider — only the carrier-side webhook / SIP URI changes.
+</Info>
+
+<CardGroup cols={2}>
+  <Card
+    title="SIP Dial-in Example"
+    icon="phone-arrow-down-left"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-in"
+  >
+    Inbound calls routed from a carrier into a Daily room via `provider="daily"` SIP
+  </Card>
+
+  <Card
+    title="SIP Dial-out Example"
+    icon="phone-arrow-up-right"
+    href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-out"
+  >
+    Outbound calls initiated from Daily and routed out through the carrier
+  </Card>
+</CardGroup>
+
+## Things you'll need
+
+- A Daily API key.
+- An account with a SIP-capable carrier (Twilio, Telnyx, Plivo, Exotel, …) with at least one provisioned number.
+
+## Environment Setup
+
+```shell .env
+DAILY_API_KEY=...
+DAILY_API_URL=https://api.daily.co/v1
+OPENAI_API_KEY=...
+CARTESIA_API_KEY=...
+```
+
+## Creating a Daily room with `provider="daily"`
+
+The key difference from the carrier-default SIP flow is a single field on the room SIP config:
+
+```python server_utils.py
+sip_config = await configure(
+    session,
+    sip_caller_phone=call_data.from_phone,
+    sip_provider="daily",   # <-- routes SIP through Daily's own infrastructure
+    enable_dialout=True,
+    room_geo="us-east-1",   # <-- optional, this anchors the Daily Room to a location
+)
+```
+
+This returns a `sip_endpoint` you hand to your carrier for call forwarding, and (for dial-out) a room configured to accept `start_dialout` with `{"provider": "daily", ...}`. Daily's SIP address are of the format: `sip:$roomName.$index@$domainName.sip-us.daily.co`.
+
+## Dial-in
+
+Dial-in lets a caller reach your bot by calling a carrier-owned phone number. The carrier forwards the audio into Daily over SIP.
+
+### Flow
+
+1. Carrier receives the incoming call and hits your webhook server.
+2. Your server creates a Daily room with `sip_provider="daily"` and spawns the bot.
+3. Your server responds to the carrier with hold music. So the caller isn't in silence while the bot boots.
+4. The bot fires `on_dialin_ready` with a Daily SIP endpoint URI.
+5. The bot calls the carrier's API to update the in-progress call, forwarding its audio to that SIP endpoint.
+6. Caller and bot are connected; Daily carries the media over WebRTC.
+
+### Bot configuration
+
+```python bot.py
+from pipecat.transports.daily import DailyTransport, DailyParams
+
+async def run_bot(room_url: str, token: str, call_sid: str, sip_endpoint: str):
+    transport = DailyTransport(
+        room_url,
+        token,
+        "Voice Bot",
+        DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            video_out_enabled=False,
+            transcription_enabled=True,
+        ),
+    )
+
+    call_already_forwarded = False
+
+    @transport.event_handler("on_dialin_ready")
+    async def on_dialin_ready(transport, cdata):
+        nonlocal call_already_forwarded
+        if call_already_forwarded:
+            return
+        # Forward the carrier's in-progress call to Daily's SIP endpoint.
+        # This example uses Twilio; swap for your carrier's call-update API.
+        twilio_client.calls(call_sid).update(
+            twiml=f"<Response><Dial><Sip>{sip_endpoint}</Sip></Dial></Response>"
+        )
+        call_already_forwarded = True
+```
+
+<Card
+  title="Complete dial-in server + bot"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-in"
+>
+  Full FastAPI server, bot, and README with setup instructions
+</Card>
+
+## Dial-out
+
+Dial-out initiates an outbound call from Daily, routed out through the carrier.
+
+### Flow
+
+1. Your app triggers a dial-out (API call, agent decision, scheduled task).
+2. Server creates a Daily room with `sip_provider="daily"` and `enable_dialout=True`.
+3. Bot joins the Daily room and sets up the WebRTC transport.
+4. Bot calls `transport.start_dialout(...)` with `provider="daily"` and a SIP URI pointing at the carrier.
+5. Carrier places the PSTN call to the destination number.
+6. Recipient answers; media flows through Daily's WebRTC transport to the bot.
+
+### Bot configuration
+
+```python bot.py
+from pipecat.transports.daily import DailyTransport, DailyParams
+
+async def run_bot(room_url: str, token: str, target_number: str, sip_uri: str):
+    transport = DailyTransport(
+        room_url,
+        token,
+        "Voice Bot",
+        DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            video_out_enabled=False,
+            transcription_enabled=True,
+        ),
+    )
+
+    @transport.event_handler("on_joined")
+    async def on_joined(transport, data):
+        await transport.start_dialout(
+            {
+                "sipUri": sip_uri,
+                "displayName": "Pipecat Bot",
+                "provider": "daily",
+            }
+        )
+
+    @transport.event_handler("on_dialout_connected")
+    async def on_dialout_connected(transport, data):
+        logger.info(f"Dial-out connected: {data}")
+
+    @transport.event_handler("on_dialout_stopped")
+    async def on_dialout_stopped(transport, data):
+        logger.info(f"Dial-out stopped: {data}")
+        await task.cancel()
+
+    @transport.event_handler("on_dialout_warning")
+    async def on_dialout_warning(transport, data):
+        logger.warning(f"Dial-out warning: {data}")
+```
+
+<Card
+  title="Complete dial-out server + bot"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-out"
+>
+  Full FastAPI server, bot, and README with setup instructions
+</Card>
+
+## DTMF
+
+When `provider="daily"` is in use, Daily surfaces DTMF tones from the connected carrier leg and lets you send tones back out over the same session.
+
+### Receiving DTMF
+
+Register `on_dtmf_event` on the transport. The event fires once per keypress and the payload contains the `sessionId` of the calling leg and the pressed `tone`:
+
+```python bot.py
+@transport.event_handler("on_dtmf_event")
+async def on_dtmf_event(transport, data):
+    logger.info(f"DTMF event: {data}")
+    # data = {"sessionId": "...", "tone": "1", ...}
+```
+
+Internally, Pipecat also pushes each inbound digit as an `InputDTMFFrame` into the pipeline, so processors like `DTMFAggregator` can collect a sequence and feed it to an LLM as context; use that path if you want the bot to "hear" DTMF alongside speech.
+
+### Sending DTMF
+
+To send DTMF tones back to the caller, send them through Daily's native DTMF channel. Use the session id from the inbound event (or the dial-out session id captured in `on_dialout_connected`) as the target. The default `method`to send the DTMF tones is `auto`, determined in the SIP offer/answer negotiation. However, if you already know what the remote party supports, then pick the appropriate option: `telephone-events` which are in-band RTP packets (RFC2833/4733) or as a `sip-info` message. 
+
+```python bot.py
+@transport.event_handler(“on_dialout_answered”)
+async def on_dialout_answered(transport, data):
+    logger.info(f”Dial-out answered: {data}”)
+    # Wait briefly for the IVR prompt before sending the PIN
+    await asyncio.sleep(1)
+
+    err = await transport.send_dtmf({
+        “sessionId”: data[“sessionId”],  # the dialed-out participant
+        “tones”: “1234#”,                # full sequence in one call
+        “digitDurationMs”: 100,
+        # “method”: “sip-info” | “telephone-event” | “auto”
+    })
+    if err:
+        logger.error(f”send_dtmf failed: {err}”)
+```
+
+You can also push `OutputDTMFFrame` / `OutputDTMFUrgentFrame` through the pipeline for cases where the tones are part of your bot's conversational logic (IVR navigation, confirming a menu choice) rather than a direct invocation:
+
+```python
+# Single key (backward compatible)
+await transport.queue_frame(OutputDTMFUrgentFrame(button=KeypadEntry.ONE))
+
+# Multi-key dial string
+await transport.queue_frame(OutputDTMFFrame.from_string("1234#"))
+
+# Daily with explicit session + method
+await transport.queue_frame(
+    DailyOutputDTMFFrame.from_string(
+        "1234#",
+        session_id="abc",
+        digit_duration_ms=80,
+        method="sip-info",
+    )
+)
+```
+
+## Best Practices
+
+### Guard against duplicate forwarding
+
+`on_dialin_ready` can fire more than once when you have multiple sip endpoints defined on a room, for example for supervisory actions (silent monitoring, barge-in). In this case, you will need to keep track of which sip endpoint is assigned to which incoming call. Daily's SIP address are of the format: `sip:$roomName.$index@$domainName.sip-us.daily.co`.
+
+### Allow-list Daily's static IPs
+
+One of the main reasons to pick `provider="daily"` is that Daily publishes static IPs that you can allow-list on the carrier side, tightening SIP ACLs. Fetch the [current list](https://ip-info.daily.co/ips/ip-info.json) from Daily's [Networking Guide](https://docs.daily.co/guides/privacy-and-security/corporate-firewalls-nats-allowed-ip-list) and configure your SIP trunk / IP access control list accordingly. There are different Static IP addresses for SIP signaling and media traffic.
+
+## Next Steps
+
+- See [Daily + Twilio SIP](./twilio-daily-sip) for the carrier-specific walkthrough (Twilio webhooks, TwiML, call forwarding).
+- See [Daily PSTN](./daily-pstn) to skip the carrier entirely and have Daily provision the number.
+- For simpler carrier-hosted telephony (no SIP), see [Twilio WebSockets](./twilio-websockets), [Telnyx WebSockets](./telnyx-websockets), [Plivo WebSockets](./plivo-websockets), or [Exotel WebSockets](./exotel-websockets).
