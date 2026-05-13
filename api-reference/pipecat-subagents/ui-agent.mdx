@@ -1,0 +1,580 @@
+---
+title: "UIAgent"
+description: "LLM agent that dispatches UI events from the client and reasons about what's on screen"
+---
+
+## Overview
+
+`UIAgent` extends `LLMContextAgent` (an internal `LLMAgent` subclass that bundles an `LLMContext` plus the user/assistant aggregator pair) with a UI-aware loop:
+
+- **UI events** sent from the client via `PipecatClient.sendUIEvent(event, payload)` are dispatched to methods marked with [`@on_ui_event(name)`](/api-reference/pipecat-subagents/decorators#on_ui_event), and (by default) appended to the LLM context as `<ui_event name="...">payload</ui_event>` developer messages.
+- **Accessibility snapshots** captured by the client arrive as first-class `ui-snapshot` RTVI messages, then the bridge republishes them internally under a reserved event name and stores the latest `<ui_state>`. By default, the snapshot is auto-injected into the LLM context at the start of every task request, so the agent always reasons over the current screen.
+- **UI commands** flow back the other way via `send_command(name, payload)`. The bridge installed by [`attach_ui_bridge`](/api-reference/pipecat-subagents/messages#attach-ui-bridge) translates each command into an `RTVIUICommandFrame` (or `RTVIUITaskFrame` for task-lifecycle traffic) on the root agent's pipeline; the [`RTVIObserver`](/api-reference/server/rtvi/rtvi-observer) wraps it into a `ui-command` / `ui-task` envelope on the wire and the client receives it through `RTVIEvent.UICommand`, `onUICommand`, or React's `useUICommandHandler`.
+
+```python
+from pipecat_subagents.agents import UIAgent, on_ui_event
+```
+
+```python
+class MyUIAgent(UIAgent):
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key="...",
+            system_instruction=f"You are a UI agent.\n\n{UI_STATE_PROMPT_GUIDE}",
+        )
+
+    @on_ui_event("nav_click")
+    async def on_nav(self, message):
+        view = message.payload.get("view")
+        ...
+```
+
+<Note>
+  Apps that want a single bundled LLM tool covering the full action vocabulary
+  can inherit
+  [`ReplyToolMixin`](/api-reference/pipecat-subagents/ui-tools#replytoolmixin)
+  alongside `UIAgent`. Apps with their own tool surface call the action helpers
+  (`scroll_to`, `highlight`, `select_text`, `click`, `set_input_value`) directly
+  inside custom `@tool` methods. See [Choosing a tool
+  shape](/subagents/learn/ui-agent#choosing-a-tool-shape).
+</Note>
+
+## Configuration
+
+Inherits all parameters from [`LLMAgent`](/api-reference/pipecat-subagents/llm-agent#configuration).
+
+<ParamField path="name" type="str" required>
+  Unique name for this agent.
+</ParamField>
+
+<ParamField path="bus" type="AgentBus" required>
+  The [`AgentBus`](/api-reference/pipecat-subagents/bus#agentbus) for
+  inter-agent communication.
+</ParamField>
+
+<ParamField path="active" type="bool" default="True">
+  Whether the agent starts active. Defaults to `True` for `UIAgent` (vs. `False`
+  on `LLMAgent` / `LLMContextAgent`) because the canonical UIAgent role is an
+  always-on delegate that should self-activate as soon as its pipeline starts.
+  Pass `active=False` only if you have a handoff use case.
+</ParamField>
+
+<ParamField path="bridged" type="tuple[str, ...] | None" default="None">
+  Bridge configuration. See
+  [`BaseAgent`](/api-reference/pipecat-subagents/base-agent#configuration) for
+  details. Setting this together with the default `auto_inject_ui_state=True`
+  raises `ValueError` — see `auto_inject_ui_state` below.
+</ParamField>
+
+<ParamField path="defer_tool_frames" type="bool" default="True">
+  Forwarded to `LLMContextAgent`. See
+  [`LLMAgent`](/api-reference/pipecat-subagents/llm-agent) for details.
+</ParamField>
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  Optional pre-built `LLMContext`. Forwarded to `LLMContextAgent`. Note that any
+  messages seeded here are part of the mutable task history and are cleared
+  before each task when `keep_history=False` (the default), since the reset
+  replaces the entire message list. For durable UI / app instructions, pass them
+  via the LLM service's `system_instruction` instead.
+</ParamField>
+
+<ParamField
+  path="user_params"
+  type="LLMUserAggregatorParams | None"
+  default="None"
+>
+  Optional user-aggregator parameters. Forwarded to `LLMContextAgent`.
+</ParamField>
+
+<ParamField
+  path="assistant_params"
+  type="LLMAssistantAggregatorParams | None"
+  default="None"
+>
+  Optional assistant-aggregator parameters. Forwarded to `LLMContextAgent`. Set
+  `enable_auto_context_summarization=True` here to keep the running context
+  bounded over long sessions when `keep_history=True`.
+</ParamField>
+
+<ParamField path="inject_events" type="bool" default="True">
+  When `True`, every UI event received is appended to the LLM context as a `
+  <ui_event name="...">payload</ui_event>` developer message before the matching
+  `@on_ui_event` handler (if any) runs. Override
+  [`render_ui_event`](#render-ui-event) to customize the rendered string, or set
+  this to `False` to disable injection entirely.
+</ParamField>
+
+<ParamField path="auto_inject_ui_state" type="bool" default="True">
+  When `True`, the latest `<ui_state>` snapshot is appended to the LLM context
+  at the start of every task request, so the agent always reasons over the
+  current screen. Set to `False` to call [`inject_ui_state`](#inject-ui-state)
+  yourself.
+
+Setting this together with a non-`None` `bridged` value raises `ValueError`:
+auto-injection fires on `on_task_request`, but a bridged `UIAgent` receives
+user voice frames through the bridge instead of task messages, so the
+snapshot would never reach the LLM context. The canonical pattern is a
+non-bridged `UIAgent` receiving delegated tasks from a separate voice
+`LLMAgent`. To use a bridged `UIAgent` (advanced cases), pass
+`auto_inject_ui_state=False` explicitly and call `inject_ui_state()`
+yourself.
+
+</ParamField>
+
+<ParamField path="keep_history" type="bool" default="False">
+  When `False` (the default), the LLM context is cleared at the start of every
+  task: each task starts from an empty messages list, the current `<ui_state>`
+  is injected, and the user's query follows. Best for the canonical
+  stateless-delegate role where the voice agent owns dialog state and the UI
+  agent's job is "given the current screen, do something."
+
+When `True`, conversation history accumulates across tasks (queries, prior
+`<ui_state>` blocks, tool calls, responses) so the LLM can reason over
+multi-turn references like "show me the next one" or "tell me about the Pro
+version of that." History accumulation grows token usage and can confuse
+smaller models when multiple `<ui_state>` snapshots are present at once;
+opt in only when the dialog continuity is worth the cost. Pair with
+`enable_auto_context_summarization=True` on the assistant aggregator (via
+`assistant_params`) to keep the running context bounded over long sessions.
+Apps in `keep_history=True` mode can call `await self.reset_context()` to
+clear manually.
+
+In `keep_history=False` mode, messages pre-seeded via `context=` are
+also cleared on the first task. Durable instructions belong in the LLM
+service's `system_instruction` setting (e.g. concatenate with the
+[`UI_STATE_PROMPT_GUIDE`](/api-reference/pipecat-subagents/ui-prompts)
+constant); use `keep_history=True` if seeded messages genuinely need to
+live in the conversation history.
+
+</ParamField>
+
+## Properties
+
+Inherits all properties from
+[`LLMAgent`](/api-reference/pipecat-subagents/llm-agent#properties).
+
+### current_task
+
+```python
+agent.current_task -> BusTaskRequestMessage | None
+```
+
+The task this agent is currently processing, or `None` when idle. Set when
+[`on_task_request`](#on-task-request) runs and cleared by
+[`respond_to_task`](#respond-to-task). Lets `@tool` methods inspect the
+in-flight task without threading the message through every call.
+
+## Abstract Methods
+
+### build_llm
+
+```python
+@abstractmethod
+def build_llm(self) -> LLMService
+```
+
+Return the LLM service for this agent. Same contract as
+[`LLMAgent.build_llm`](/api-reference/pipecat-subagents/llm-agent#build-llm).
+
+**Returns:** An `LLMService` instance.
+
+## Lifecycle Hooks
+
+### on_bus_message
+
+```python
+async def on_bus_message(self, message: BusMessage) -> None
+```
+
+Override of `BaseAgent.on_bus_message` that dispatches UI events alongside
+base lifecycle handling.
+
+When a [`BusUIEventMessage`](/api-reference/pipecat-subagents/messages#busuieventmessage)
+arrives:
+
+1. The reserved [`UI_SNAPSHOT_EVENT_NAME`](/api-reference/pipecat-subagents/messages#ui-snapshot-event-name)
+   updates the stored snapshot and returns. No `<ui_event>` injection, no
+   handler dispatch.
+2. Other events trigger context injection followed by handler dispatch: a
+   `<ui_event>` developer message is appended to the LLM context (when
+   `inject_events=True`), then the matching
+   [`@on_ui_event(name)`](/api-reference/pipecat-subagents/decorators#on_ui_event)
+   handler (if any) runs in its own asyncio task.
+
+Always call `super()` when overriding so base lifecycle handling continues
+to run.
+
+### on_task_request
+
+```python
+async def on_task_request(self, message: BusTaskRequestMessage) -> None
+```
+
+Override of `BaseAgent.on_task_request` that:
+
+1. Acquires the per-agent single-flight task lock (held until
+   [`respond_to_task`](#respond-to-task) or
+   [`on_task_cancelled`](#on-task-cancelled) fires).
+2. Records the in-flight task on [`current_task`](#current-task) for
+   `respond_to_task` to close out.
+3. In `keep_history=False` mode (the default), clears the LLM context so
+   each task starts fresh.
+4. Auto-injects the latest `<ui_state>` so the agent reasons over the
+   current screen.
+
+Disable the snapshot injection via `auto_inject_ui_state=False` if your app
+wants to drive injection manually (e.g. inject only on specific task names).
+Task tracking and lock acquisition happen regardless.
+
+The single-flight lock keeps overlapping requests queued rather than
+interleaving their context mutations: a second request arrives while the
+first is in-flight, sits in `acquire()`, and proceeds only after the first
+calls `respond_to_task` (or is cancelled).
+
+| Parameter | Type                                                                                       | Description                             |
+| --------- | ------------------------------------------------------------------------------------------ | --------------------------------------- |
+| `message` | [`BusTaskRequestMessage`](/api-reference/pipecat-subagents/messages#bustaskrequestmessage) | The incoming task request from the bus. |
+
+### on_task_cancelled
+
+```python
+async def on_task_cancelled(self, message: BusTaskCancelMessage) -> None
+```
+
+Override of `BaseAgent.on_task_cancelled` that releases the single-flight
+task lock when the in-flight task is cancelled. Without this hook, a
+cancellation would strand the lock (because the framework's cancel path
+sends a `CANCELLED` response directly via `send_task_response`, bypassing
+`respond_to_task` and its lock-release) and every subsequent task request
+would block forever.
+
+Idempotent: if a tool calls `respond_to_task` concurrently and clears the
+slot first, this hook short-circuits.
+
+| Parameter | Type                                                                                     | Description                            |
+| --------- | ---------------------------------------------------------------------------------------- | -------------------------------------- |
+| `message` | [`BusTaskCancelMessage`](/api-reference/pipecat-subagents/messages#bustaskcancelmessage) | The cancellation message from the bus. |
+
+## Methods
+
+### respond_to_task
+
+```python
+async def respond_to_task(
+    self,
+    response: dict | None = None,
+    *,
+    speak: str | None = None,
+    status: TaskStatus = TaskStatus.COMPLETED,
+) -> None
+```
+
+Complete the in-flight task this agent is processing.
+
+Convenience wrapper around `send_task_response` that looks up the current
+task from [`current_task`](#current-task) so `@tool` methods don't have to
+thread the `task_id` through every call. Clears `current_task` and
+**releases the single-flight task lock** (acquired in
+[`on_task_request`](#on-task-request)) so the next queued task can proceed.
+Calling a second time is a no-op.
+
+`speak` is the convention the SDK demos use for "text the voice agent
+should hand verbatim to TTS." When provided, it's merged into the
+response dict as `{"speak": speak}`. Apps that don't follow the convention
+can pass a fully formed `response` dict and leave `speak` unset.
+
+No-op when there is no task in flight (e.g. the tool was invoked outside a
+task dispatch).
+
+| Parameter  | Type                                                              | Default     | Description        |
+| ---------- | ----------------------------------------------------------------- | ----------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `response` | `dict                                                             | None`       | `None`             | Result data dict. Merged with the `speak` key when `speak` is provided.                                                                              |
+| `speak`    | `str                                                              | None`       | `None`             | Optional short text for verbatim TTS. Omit (or pass `None`) to leave the response without a `speak` key — the voice agent stays silent for the turn. |
+| `status`   | [`TaskStatus`](/api-reference/pipecat-subagents/types#taskstatus) | `COMPLETED` | Completion status. |
+
+```python
+@tool
+async def navigate_to_artist(self, params, name: str):
+    await self.send_command("navigate", Navigate(view=f"/artist/{name}"))
+    await self.respond_to_task(speak=f"Showing {name}.")
+    await params.result_callback(None)
+```
+
+### send_command
+
+```python
+async def send_command(self, name: str, payload: Any = None) -> None
+```
+
+Send a named UI command to the client. Publishes a
+[`BusUICommandMessage`](/api-reference/pipecat-subagents/messages#busuicommandmessage),
+which the bridge installed by `attach_ui_bridge` turns into an
+`RTVIUICommandFrame` on the root agent's pipeline; the [`RTVIObserver`](/api-reference/server/rtvi/rtvi-observer)
+wraps that into a `ui-command` envelope on the wire. Client-side handlers
+subscribed through `RTVIEvent.UICommand`, `onUICommand`, or one of the React
+`useDefault*Handler` hooks dispatch on the command name.
+
+| Parameter | Type  | Default | Description                                                                        |
+| --------- | ----- | ------- | ---------------------------------------------------------------------------------- |
+| `name`    | `str` |         | App-defined command name (e.g. `"toast"`, `"navigate"`, or any app-specific name). |
+| `payload` | `Any` | `None`  | Pydantic model, dataclass, dict, or `None`. See below.                             |
+
+`payload` is normalized before sending:
+
+- **Pydantic `BaseModel` instance** (including the built-in command models
+  in [`pipecat.processors.frameworks.rtvi.models`](/api-reference/pipecat-subagents/ui-commands)):
+  converted to a plain dict via `model_dump()`.
+- **Dataclass instance**: converted to a plain dict via `dataclasses.asdict`.
+- **`dict`**: forwarded as-is.
+- **`None`**: forwarded as an empty dict.
+
+```python
+from pipecat.processors.frameworks.rtvi.models import Toast, Navigate
+
+await self.send_command("toast", Toast(title="Saved"))
+await self.send_command("navigate", Navigate(view="settings"))
+await self.send_command("custom", {"foo": "bar"})
+```
+
+### Action helpers
+
+Plain instance methods that wrap `send_command` with the standard payload
+models. They are NOT LLM tools — subclasses that want them exposed to the
+LLM either inherit
+[`ReplyToolMixin`](/api-reference/pipecat-subagents/ui-tools#replytoolmixin)
+(which calls these helpers under the hood from a single bundled
+`reply(...)` tool), or write their own `@tool` methods that delegate to
+these helpers.
+
+#### scroll_to
+
+```python
+async def scroll_to(self, ref: str) -> None
+```
+
+Dispatch a `scroll_to` UI command for the given snapshot ref. Convenience
+wrapper around `send_command("scroll_to", ScrollTo(ref=ref))`.
+
+#### highlight
+
+```python
+async def highlight(self, ref: str) -> None
+```
+
+Dispatch a `highlight` UI command for the given snapshot ref. Convenience
+wrapper around `send_command("highlight", Highlight(ref=ref))`.
+
+#### select_text
+
+```python
+async def select_text(
+    self,
+    ref: str,
+    *,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
+) -> None
+```
+
+Dispatch a `select_text` UI command for the given snapshot ref. With
+`start_offset` / `end_offset` set, the client's standard handler selects a
+sub-range of the target's text; with both `None` (the default), the entire
+target text is selected. Offsets are character offsets over the target's
+text content.
+
+#### click
+
+```python
+async def click(self, ref: str) -> None
+```
+
+Dispatch a `click` UI command for the given snapshot ref. Use inside custom
+`@tool` bodies for state-changing form actions like checkboxes, radio
+buttons, and submit buttons. The standard client handler silently no-ops on
+`disabled` targets so the agent can't bypass UI affordances.
+
+#### set_input_value
+
+```python
+async def set_input_value(
+    self,
+    ref: str,
+    value: str,
+    *,
+    replace: bool = True,
+) -> None
+```
+
+Dispatch a `set_input_value` UI command for the given input/textarea ref.
+With `replace=True` (the default) the field's existing value is overwritten;
+with `replace=False` the value is appended.
+
+### user_task_group
+
+```python
+def user_task_group(
+    self,
+    *agent_names: str,
+    name: str | None = None,
+    payload: dict | None = None,
+    timeout: float | None = None,
+    cancel_on_error: bool = True,
+    label: str | None = None,
+    cancellable: bool = True,
+) -> UserTaskGroupContext
+```
+
+Dispatch a task group whose lifecycle is forwarded to the client as `ui-task`
+envelopes. Behaves exactly like
+[`task_group(...)`](/api-reference/pipecat-subagents/base-agent), but the
+client's task reducer (`useUITasks` on React) consumes the envelopes
+automatically — `group_started` on entry, `task_update` for each worker
+update, `task_completed` for each worker response, and `group_completed` on
+exit.
+
+Workers don't need to change. Any `send_task_update` they emit against the
+group's `task_id` is forwarded automatically.
+
+Returns a `UserTaskGroupContext` for use with `async with`. See the
+[Async tasks and lifecycle](/subagents/learn/ui-agent#async-tasks-and-lifecycle)
+guide section for a worked example.
+
+| Parameter         | Type            | Default | Description                                                                            |
+| ----------------- | --------------- | ------- | -------------------------------------------------------------------------------------- |
+| `*agent_names`    | `str`           |         | Names of the worker agents to dispatch to.                                             |
+| `name`            | `str \| None`   | `None`  | Optional task name for routing to named `@task` handlers on the workers.               |
+| `payload`         | `dict \| None`  | `None`  | Optional structured data describing the work.                                          |
+| `timeout`         | `float \| None` | `None`  | Optional timeout in seconds covering both the ready-wait and task execution.           |
+| `cancel_on_error` | `bool`          | `True`  | Whether to cancel the group if a worker errors.                                        |
+| `label`           | `str \| None`   | `None`  | Optional human-readable label surfaced to the client (titles the in-flight task card). |
+| `cancellable`     | `bool`          | `True`  | Whether the client may request cancellation of this group via `ui-cancel-task`.        |
+
+### start_user_task_group
+
+```python
+async def start_user_task_group(
+    self,
+    *agent_names: str,
+    name: str | None = None,
+    payload: dict | None = None,
+    timeout: float | None = None,
+    cancel_on_error: bool = True,
+    label: str | None = None,
+    cancellable: bool = True,
+) -> str
+```
+
+Fire-and-forget version of [`user_task_group`](#user-task-group). Dispatches
+the group in the background and returns the `task_id`. The SDK manages the
+asyncio task that holds the context open while workers run, so callers don't
+need to spawn one themselves.
+
+Use this when an LLM `@tool` body wants to kick off a task group and return
+immediately so the voice agent unblocks. Use the `user_task_group` context
+manager when the caller wants to consume worker events inline (`async for
+event in tg`) or react to results before returning.
+
+Worker exceptions inside the dispatched context are logged but do not
+propagate; cancellation works the same way it does for the context-manager
+form (the user clicks Cancel, the SDK turns it into a `ui-cancel-task`
+envelope and the framework cancels the group).
+
+### reset_context
+
+```python
+async def reset_context(self) -> None
+```
+
+Clear the LLM conversation history. Replaces all messages in the running
+context with an empty list. The system prompt (set via
+`system_instruction`) is unaffected.
+
+Apps in `keep_history=True` mode call this when they want to deliberately
+start over (e.g. the user said "start fresh"). Apps in the default
+`keep_history=False` mode don't need to call this; the per-task reset runs
+automatically.
+
+### render_ui_state
+
+```python
+def render_ui_state(self) -> str
+```
+
+Render the latest accessibility snapshot as a `<ui_state>` block.
+
+Produces Playwright-MCP-style indented text with stable UI node refs. Each
+line is `- role "name" [level=N] [cols=N] [rows=N] [state] [ref=eN]`, with
+children nested one indent deeper. Returns an empty string if no snapshot has
+been received yet.
+
+Override to customize the rendered form (different formatting, additional
+metadata, alternate truncation).
+
+```
+<ui_state>
+- generic [ref=e1]:
+  - main [ref=e2]:
+    - heading "Trending artists" [level=2] [ref=e5]
+    - region "New releases" [cols=4] [ref=e12]:
+      - button "Veils" [ref=e18]
+      - button "Vanessa Carlton" [offscreen] [ref=e19]
+</ui_state>
+```
+
+**Returns:** The rendered `<ui_state>` string, or empty string when no
+snapshot is available.
+
+### inject_ui_state
+
+```python
+async def inject_ui_state(self) -> None
+```
+
+Append the latest `<ui_state>` block to the LLM context as a developer
+message. No-op when no snapshot has been received. The frame is queued with
+`run_llm=False` so the snapshot is treated as context, not a user turn.
+
+Apps with `auto_inject_ui_state=True` (the default) get this for free at the
+start of every task. Call this manually only when you want extra injections
+between tasks (e.g. inside an `@on_ui_event` handler that performs a chain of
+work).
+
+### visible_nodes
+
+```python
+def visible_nodes(self) -> list[dict[str, Any]]
+```
+
+Return the snapshot nodes the user is currently looking at: a flat list of
+every node whose `state` does not contain `"offscreen"`, in depth-first order
+matching `<ui_state>`.
+
+Useful for code paths that want to reason about visible interactables without
+parsing the rendered text. Returns an empty list when no snapshot has been
+received yet.
+
+**Returns:** Flat list of visible `A11yNode`-shaped dicts.
+
+### render_ui_event
+
+```python
+def render_ui_event(self, message: BusUIEventMessage) -> str
+```
+
+Render a UI event as a string for LLM context injection. Override to
+customize the injected content.
+
+The default wraps the event in a single `<ui_event>` XML tag with a `name`
+attribute and a JSON-encoded payload as inner text:
+
+```
+<ui_event name="nav_click">{"view": "settings"}</ui_event>
+```
+
+| Parameter | Type                                                                               | Description             |
+| --------- | ---------------------------------------------------------------------------------- | ----------------------- |
+| `message` | [`BusUIEventMessage`](/api-reference/pipecat-subagents/messages#busuieventmessage) | The UI event to render. |
+
+**Returns:** A string to append to the LLM context as a developer message.
+Return an empty string to skip injection for this event.

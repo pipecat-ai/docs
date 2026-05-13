@@ -6,7 +6,11 @@ description: "An overview of the RTVI standard and its key features"
 The RTVI (Real-Time Voice and Video Inference) standard defines a set of message types and structures sent between clients and servers. It is designed to facilitate real-time interactions between clients and AI applications that require voice, video, and text communication. It provides a consistent framework for building applications that can communicate with AI models and the backends running those models in real-time.
 
 <Note>
-  This page documents version 1.0 of the RTVI standard, released in June 2025.
+  This page documents version 1.3 of the RTVI standard. The UI Agent Protocol
+  message types (`ui-event`, `ui-snapshot`, `ui-cancel-task`, `ui-command`,
+  `ui-task`) were added in v1.3 as an additive extension to v1.2. Older clients
+  that pre-date v1.3 ignore the new types; the major-version compatibility check
+  the server runs on `client-ready` still passes for any 1.x peer.
 </Note>
 
 ## Key Features
@@ -298,6 +302,126 @@ Error response to a specific client message. **IMPORTANT**: The `id` should matc
 - **type**: `'error-response'`
 - **data**:
   - **error**: `string`
+
+### UI Agent Protocol
+
+The UI Agent Protocol lets server-side AI agents observe and drive a client GUI app through structured RTVI messages. Five top-level message types form the protocol:
+
+| Type             | Direction          | Purpose                                                                                                |
+| ---------------- | ------------------ | ------------------------------------------------------------------------------------------------------ |
+| `ui-event`       | 🏄 client → server | Named event with payload (e.g. button click, navigation intent)                                        |
+| `ui-snapshot`    | 🏄 client → server | Platform accessibility tree; grounds agent reasoning in current UI state                               |
+| `ui-cancel-task` | 🏄 client → server | Cancel an in-flight user-facing task group                                                             |
+| `ui-command`     | 🤖 server → client | Named command with payload (toast, scroll, highlight, click, set input value, ...)                     |
+| `ui-task`        | 🤖 server → client | Task lifecycle envelope; one of `group_started` / `task_update` / `task_completed` / `group_completed` |
+
+Server-side, each type is a paired `*Data` / `*Message` pydantic model in `pipecat.processors.frameworks.rtvi.models`. Client-side, each type is a member of `RTVIMessageType` (e.g. `RTVIMessageType.UI_EVENT`). The full agent-side abstraction lives in [`pipecat-subagents`](/subagents/learn/ui-agent); single-LLM Pipecat apps can target this wire format directly via the new pipeline frames (`RTVIUICommandFrame`, `RTVIUITaskFrame`).
+
+For a higher-level walkthrough of using this protocol from the web client SDK with a server-side UI agent, see the [UI Agent guide](/subagents/learn/ui-agent).
+
+#### ui-event 🏄
+
+A named event from the client carrying an app-defined payload. Unlike `client-message`, no server response is expected; the server side fans out the event to handlers and (optionally) injects it into the LLM context as a `<ui_event>` developer message.
+
+- **type**: `'ui-event'`
+- **data**:
+  - **event**: `string`
+
+    App-defined event name (e.g. `"nav_click"`, `"play_track"`, `"set_tab"`). Apps may pick any name.
+
+  - **payload**: `unknown` (optional)
+
+    App-defined payload. Schemaless by design.
+
+#### ui-snapshot 🏄
+
+The current accessibility tree for the client UI, captured from the platform's accessibility or semantic UI model. Web clients can produce this from the DOM; native mobile clients can produce the same shape from iOS or Android accessibility metadata. The server stores the latest snapshot and renders it as `<ui_state>` into the LLM context so the agent reasons over the current UI state.
+
+- **type**: `'ui-snapshot'`
+- **data**:
+  - **tree**: [`A11ySnapshot`](/api-reference/client/js/a11y-snapshot#a11ysnapshot)
+
+    The serialized platform accessibility tree. The server-side model mirrors the shared snapshot shape and allows extra fields for platform-specific metadata and forward compatibility. The web SDK's managed stream (`PipecatClient.startUISnapshotStream` or React's `useUISnapshot`) produces this shape; `A11ySnapshotStreamer` is available as a low-level helper.
+
+#### ui-cancel-task 🏄
+
+A request to cancel an in-flight user-facing task group. The server-side framework looks up the matching task group and cancels it (subject to whatever cancellable policy the group was registered with).
+
+- **type**: `'ui-cancel-task'`
+- **data**:
+  - **task_id**: `string`
+
+    The task group id the client wants cancelled.
+
+  - **reason**: `string` (optional)
+
+    Optional human-readable reason logged on the server.
+
+#### ui-command 🤖
+
+A named UI command directing the client to take an action. Client apps can subscribe to `RTVIEvent.UICommand`, use the `onUICommand` constructor callback, or use the `useUICommandHandler` React hook to filter by `data.command`.
+
+- **type**: `'ui-command'`
+- **data**:
+  - **command**: `string`
+
+    App-defined command name. Standard names with default React handlers: `toast`, `navigate`, `scroll_to`, `highlight`, `focus`, `click`, `set_input_value`, `select_text`. Apps may publish their own command names freely.
+
+  - **payload**: `unknown`
+
+    App-defined payload. Standard payload shapes for the standard commands are documented under [Standard command payloads](#standard-command-payloads) below.
+
+#### ui-task 🤖
+
+A task lifecycle envelope for a user-facing task group dispatched by the server. The `data` field carries one of four lifecycle phases discriminated by `kind`. Client-side, `useUITasks()` from `@pipecat-ai/client-react` reduces these into a live in-flight panel with cancel support.
+
+- **type**: `'ui-task'`
+- **data** (one of):
+
+  **`group_started`** — group dispatched, worker list known.
+  - **kind**: `'group_started'`
+  - **task_id**: `string`
+  - **agents**: `string[]`
+  - **label**: `string` (optional)
+  - **cancellable**: `boolean`
+  - **at**: `number` (epoch ms)
+
+  **`task_update`** — per-worker progress.
+  - **kind**: `'task_update'`
+  - **task_id**: `string`
+  - **agent_name**: `string`
+  - **data**: `unknown` (worker-defined)
+  - **at**: `number` (epoch ms)
+
+  **`task_completed`** — per-worker terminal.
+  - **kind**: `'task_completed'`
+  - **task_id**: `string`
+  - **agent_name**: `string`
+  - **status**: `string` (`"completed"`, `"cancelled"`, `"failed"`, `"error"`)
+  - **response**: `unknown` (optional)
+  - **at**: `number` (epoch ms)
+
+  **`group_completed`** — group terminal; every worker has responded or the group was cancelled.
+  - **kind**: `'group_completed'`
+  - **task_id**: `string`
+  - **at**: `number` (epoch ms)
+
+#### Standard command payloads
+
+The `ui-command` message carries a free-form `payload`, but eight standard payload shapes ship with the protocol. Apps can use them as-is, override the client handler to customize behavior, or ignore them and define their own command names.
+
+| Command           | Payload shape                                                |
+| ----------------- | ------------------------------------------------------------ |
+| `toast`           | `{title, subtitle?, description?, image_url?, duration_ms?}` |
+| `navigate`        | `{view, params?}`                                            |
+| `scroll_to`       | `{ref?, target_id?, behavior?}`                              |
+| `highlight`       | `{ref?, target_id?, duration_ms?}`                           |
+| `focus`           | `{ref?, target_id?}`                                         |
+| `click`           | `{ref?, target_id?}`                                         |
+| `set_input_value` | `{value, ref?, target_id?, replace?}`                        |
+| `select_text`     | `{ref?, target_id?, start_offset?, end_offset?}`             |
+
+`ref` is an opaque snapshot reference like `"e42"` assigned by the client and emitted in the latest `ui-snapshot`. Client handlers should resolve `ref` first, then fall back to `target_id`, an optional app-defined stable target identifier outside the snapshot system. Web clients commonly map `target_id` to a DOM id; native clients might map it to an accessibility identifier, view id, or app-specific component id. Pydantic models for these shapes ship in `pipecat.processors.frameworks.rtvi.models` (`Toast`, `Navigate`, `ScrollTo`, `Highlight`, `Focus`, `Click`, `SetInputValue`, `SelectText`); server-side helpers like `UIAgent.send_command` accept them directly and `model_dump` to the wire shape.
 
 ### Advanced LLM Interactions
 

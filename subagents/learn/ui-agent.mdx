@@ -1,0 +1,393 @@
+---
+title: "UI Agent"
+description: "Build voice-driven assistants for GUI apps with structural awareness and a typed action vocabulary."
+---
+
+`UIAgent` is the subagents abstraction for AI agents that observe and drive a client GUI app. It pairs a snapshot-aware LLM (the agent always reasons over the current screen) with a typed action vocabulary (scroll, highlight, fill, click, etc.) and a task-lifecycle protocol for fan-out work the user can see and cancel.
+
+This guide covers the why, the architecture, the action vocabulary, and the deployment shapes. It assumes familiarity with the [agents and runner basics](/subagents/learn/agents-and-runner) and the [task coordination model](/subagents/learn/task-coordination).
+
+## Why we built this
+
+Every voice-enabled GUI app reinvents the same four pieces:
+
+1. **Per-screen prose helpers** that serialize "what's on screen" into a developer message on every navigation. They worked, but they had to be hand-written per screen, drifted from the rendered UI as layouts changed, and ran on the server only when the server itself triggered the navigation. Anything client-only — the user scrolling, focusing a different element, toggling a tab — was invisible to the agent.
+2. **Ad-hoc click-event encoding** — each demo defined its own shapes for "the user clicked something" plus the deserialization back into the agent.
+3. **Ad-hoc server-to-client commands** — each demo rolled its own message dispatch and its own client-side registry of handlers for toast / scroll / navigate.
+4. **Position references with no grounding** — "top right" / "the first one" / "the last song" had no reliable anchor in the prose helpers, so apps had to plan their grid layouts around what the prompt could resolve.
+
+Hand-written prose helpers gave the agent _some_ sense of the screen, enough that "describe this page" worked on a good day. The picture broke easily: server-only state injection missed client-side changes, prose shapes were tightly coupled to the system prompt, and there was no way for the agent to issue a command targeting an element it had just described.
+
+The protocol turns those four patterns into one wire format and adds the missing piece: a **live accessibility snapshot** the agent can actually reason about. The snapshot streams from the client as the UI changes. The server overwrites a single `_latest_snapshot` slot; the UI agent auto-injects it as `<ui_state>` at the start of every task. Refs (`"e42"`, `"e7"`) are stable across snapshots while the underlying UI node exists, so the LLM can cross-reference between turns ("the button I mentioned earlier") and the agent can point at UI nodes ("flash this one") using the same identifiers it just observed.
+
+### The bigger picture
+
+Most existing apps are mouse / keyboard / touch driven, and that's the right default. People know how to navigate. What they don't have is an assistant that:
+
+- **Searches by voice.** "Show me Radiohead's last album" is one sentence; finding it by clicking is several taps.
+- **Answers questions about what they're looking at.** "Did this album win a Grammy?" doesn't fit any menu.
+- **Resolves deictic references.** "Play that one." "Show me the next one." "Go back."
+- **Fills forms by voice.** "Set the address to 123 Main Street, city San Francisco, zip 94105." Three inputs, one sentence.
+- **Kicks off long-running work without blocking.** "Find me music like Radiohead." A worker fan-out runs in the background, results stream into a panel, the user keeps interacting.
+
+Layer those onto a normal app and any app becomes agent-enabled: the agent takes actions for the user when voice is faster, and answers open-world questions about whatever's on screen. The user keeps clicking when clicking is natural. The agent fills the gap when speech is.
+
+## Architecture: voice agent + UI agent
+
+The canonical shape splits responsibilities across two subagents.
+
+**The voice agent owns the conversation.** It runs the STT/TTS pipeline, the small talk, and the tool-call loop that decides what the user wants. It does not know what's on screen; it does not issue UI commands.
+
+**The UI agent owns the screen.** It receives the live accessibility snapshot from the client, dispatches user click/tap events, and issues commands back to the client when the LLM picks an action tool.
+
+The two communicate through the bus. Voice delegates to UI when an answer needs the screen or an action targets the UI:
+
+```
+                           ┌─────────────────┐
+   user speaks ──► STT ──► │   voice agent   │ ──► TTS ──► user hears
+                           └────────┬────────┘
+                                    │ task: handle_request("…")
+                                    ▼
+                           ┌─────────────────┐
+                           │    UI agent     │
+                           └────────┬────────┘
+                                    │ command: navigate / scroll / …
+                                    ▼
+                                  client
+```
+
+Three concrete scenarios make the split tangible:
+
+- **Voice-only.** "Hello." "Tell me a joke." The voice agent's LLM decides the UI agent isn't needed and replies directly.
+- **Voice + UI for information.** "What's on screen?" "Did this album win a Grammy?" The voice agent delegates to the UI agent; the UI agent's LLM looks at the latest `<ui_state>` and writes a spoken reply.
+- **Voice + UI for action.** "Show me Radiohead." "Play the last song." "Scroll to my favorites." The voice agent delegates; the UI agent's LLM picks an action tool that calls `send_command(...)`. The client re-renders, a fresh snapshot lands on the server, and the next turn starts from current state.
+
+The split keeps each agent's prompt focused: the voice agent's system prompt is about conversation; the UI agent's is about the app's tool vocabulary plus the canonical wire-format guide ([`UI_STATE_PROMPT_GUIDE`](/api-reference/pipecat-subagents/ui-prompts)) the SDK ships.
+
+## How information flows
+
+Four loops run concurrently. Knowing what each one writes is the key to the whole pattern.
+
+| Loop     | Direction       | What it writes                                                                | Triggers an LLM call?           |
+| -------- | --------------- | ----------------------------------------------------------------------------- | ------------------------------- |
+| Snapshot | client → server | Latest a11y tree in `_latest_snapshot`                                        | No                              |
+| Event    | client → server | `<ui_event>` developer message in LLM context, plus `@on_ui_event` dispatch   | No                              |
+| Command  | server → client | Client UI change (scroll, navigate, highlight, click, fill, select, toast, …) | Yes (response to a task)        |
+| Task     | server → client | `ui-task` lifecycle envelope; client renders an in-flight panel               | Triggered by long-running tools |
+
+**The snapshot loop is observation.** A client-side snapshotter emits an accessibility tree when the UI changes or settles. The server overwrites a single slot — `_latest_snapshot` internally — and does nothing else. No inference. No LLM context change.
+
+**The event loop is intent.** Curated by the app, not fired automatically. Most user input (scrolls, hovers, focus changes) already shows up in the snapshot loop, so the SDK doesn't try to mirror every DOM event onto the bus. The app picks which interactions count as _intent_ worth telling the agent about and calls `PipecatClient.sendUIEvent(event, payload)` for those. When an event arrives, the server appends a `<ui_event>` to the LLM's context and dispatches to any matching `@on_ui_event` handler. Still no LLM call: the click sits in history, ready for the next time the user speaks.
+
+**The command loop is action.** When the UI agent's LLM calls an action tool, the tool publishes a `BusUICommandMessage` on the bus. The bridge translates it into an `RTVIUICommandFrame` that the client routes to the matching command handler.
+
+**The task loop is async work.** When a tool calls `start_user_task_group(...)`, the SDK forwards lifecycle envelopes (`group_started`, `task_update`, `task_completed`, `group_completed`) to the client as `ui-task` messages. The React `useUITasks()` hook reduces these into a live in-flight panel with cancel support — see [Async tasks and lifecycle](#async-tasks-and-lifecycle).
+
+The actual LLM calls happen in the **task loop**: when the user speaks, the voice agent's LLM runs, and if it delegates to the UI agent, that agent's LLM runs too. The just-in-time injection of the latest snapshot happens at the start of the UI agent's task, so the agent always reasons over the current screen rather than a stale tree.
+
+## Sequence: voice + UI for action
+
+The most common turn shape:
+
+```
+ User       Voice agent       UI agent       Client          TTS
+  │              │                │             │             │
+  │              │   snapshot loop running                    │
+  │              │   ─ ─ ─ ─ ─ ─ ─ ─ ─>│ (continuous,         │
+  │              │                │     no LLM call)          │
+  │              │                │             │             │
+  │ "Show me Radiohead"           │             │             │
+  │─────────────>│                │             │             │
+  │              │ LLM picks      │             │             │
+  │              │ handle_request │             │             │
+  │              │ task           │             │             │
+  │              │───────────────>│             │             │
+  │              │                │ inject      │             │
+  │              │                │ <ui_state>  │             │
+  │              │                │ LLM picks   │             │
+  │              │                │ navigate_to │             │
+  │              │                │  _artist    │             │
+  │              │                │ ui-command  │             │
+  │              │                │────────────>│             │
+  │              │                │             │ render      │
+  │              │                │ fresh snapshot            │
+  │              │                │<────────────│             │
+  │              │ response       │             │             │
+  │              │ {speak:"…"}    │             │             │
+  │              │<───────────────│             │             │
+  │              │ speak verbatim │             │             │
+  │              │───────────────────────────────────────────>│
+  │                                                           │
+  │                        audio                              │
+  │<──────────────────────────────────────────────────────────│
+```
+
+Two LLM calls. The command flows back to the client during the same turn; the client re-renders and a fresh snapshot arrives on the server before the next user utterance, so deictic follow-ups ("play the first one") resolve against current state.
+
+## Action vocabulary
+
+The protocol ships with eight standard commands, grouped by what they do:
+
+**Pointing** — draw the user's attention without changing app state.
+
+- `scroll_to(ref)` — scroll an element into view.
+- `highlight(ref)` — briefly flash an element.
+- `focus(ref)` — move input focus.
+
+**Reading** — surface specific content for deictic reference.
+
+- `select_text(ref, [start_offset, end_offset])` — put the page's text selection on a paragraph or sub-range so the user sees exactly what the agent meant. Pairs with the `<selection>` block in `<ui_state>` for the read direction.
+
+**Writing** — modify form / app state.
+
+- `set_input_value(ref, value, [replace])` — write into a text input or textarea. The standard handler refuses `disabled`, `readonly`, and `<input type="hidden">` targets.
+- `click(ref)` — click an element. Use for checkboxes, radios, submit buttons, links. The standard handler silently no-ops on `disabled` targets.
+
+**Presentation** — surface notifications and navigate the app.
+
+- `toast({title, ...})` — transient notification. Apps wire their own toast renderer via [`useToastHandler`](/api-reference/client/react/hooks#usetoasthandler).
+- `navigate({view, params?})` — client-side navigation. Apps wire their own router via [`useNavigateHandler`](/api-reference/client/react/hooks#usenavigatehandler).
+
+Each command has a matching pydantic payload model in [`pipecat.processors.frameworks.rtvi.models`](/api-reference/pipecat-subagents/ui-commands) and a default React handler in `@pipecat-ai/client-react`'s standard handlers. Apps can use the standard handlers, override them, or define their own command names freely.
+
+`UIAgent` exposes plain-method helpers (`scroll_to`, `highlight`, `select_text`, `click`, `set_input_value`) that wrap `send_command(...)` with the standard payloads — see [Action helpers](/api-reference/pipecat-subagents/ui-agent#action-helpers).
+
+## Choosing a tool shape
+
+Three options for exposing the action vocabulary to the LLM. Pick based on your app shape.
+
+### Bundled `ReplyToolMixin`
+
+The canonical shape for general-purpose UI assistants. Inherit
+[`ReplyToolMixin`](/api-reference/pipecat-subagents/ui-tools) alongside your `UIAgent` subclass:
+
+```python
+from pipecat_subagents.agents import ReplyToolMixin, UIAgent
+
+class MyUIAgent(ReplyToolMixin, UIAgent):
+    def build_llm(self) -> LLMService:
+        return OpenAILLMService(
+            api_key=...,
+            settings=OpenAILLMSettings(
+                system_instruction=f"{APP_PROMPT}\n\n{UI_STATE_PROMPT_GUIDE}",
+            ),
+        )
+```
+
+The LLM gets one tool: `reply(answer, scroll_to=None, highlight=None, select_text=None, fills=None, click=None)`. A pointing turn ("where's the iPhone 17?") becomes one call: `reply(answer="Here's the iPhone 17.", scroll_to="e5", highlight=["e5"])`. A form-fill turn ("set the address fields") becomes `reply(answer="Filled in.", fills=[{"ref": "e3", ...}, ...], click=["e7"])`.
+
+The required `answer` argument is enforced by the API schema, so smaller models can't omit the spoken terminator (a real failure mode of the chainable shape we tried first). One tool call per turn, no chaining.
+
+Use this when your tool surface IS the action vocabulary — pointing, reading, form-fill, and any blend.
+
+### Custom `@tool reply` with helpers
+
+For apps that want a tighter schema or app-specific actions on the same turn, write your own `@tool reply` and call the action helpers in the body:
+
+```python
+from pipecat_subagents.agents import UIAgent, tool
+
+class MyUIAgent(UIAgent):
+    @tool
+    async def reply(
+        self,
+        params,
+        answer: str,
+        scroll_to: str | None = None,
+        highlight: list[str] | None = None,
+        # ... only the fields YOUR app actually uses
+    ):
+        if scroll_to:
+            await self.scroll_to(scroll_to)
+        if highlight:
+            for ref in highlight:
+                await self.highlight(ref)
+        await self.respond_to_task(speak=answer)
+        await params.result_callback(None)
+```
+
+Use this when `ReplyToolMixin`'s schema is too broad and you want the model to see only the fields you actually support.
+
+### Per-domain tools where each is the whole turn
+
+For domain-rich apps (a music player, a CRM, a dashboard) where the LLM picks among `play`, `navigate_to_artist`, `add_to_favorites`, `show_info`, etc., write each as its own `@tool`:
+
+```python
+class MyUIAgent(UIAgent):
+    @tool
+    async def navigate_to_artist(self, params, name: str):
+        artist = await self._catalog_find_artist(name)
+        await self._do_navigate_to_artist(artist)
+        await self.respond_to_task(speak=f"Showing {name}.")
+        await params.result_callback(None)
+
+    @tool
+    async def play(self, params, item_title: str):
+        ...
+```
+
+Each tool is the whole turn: it sends commands, completes the in-flight task with `respond_to_task(speak=...)`, and exits. Use the action helpers (`self.scroll_to`, `self.highlight`, etc.) inside tool bodies for visual side effects.
+
+This is the shape the [reference music player](#reference-app) uses. Skip `ReplyToolMixin` here.
+
+## Async tasks and lifecycle
+
+Long-running work — research, recommendation, exploration — shouldn't block the voice agent. The SDK ships a task-lifecycle protocol so the user can see workers in flight and cancel them.
+
+### Server side
+
+`UIAgent.start_user_task_group(...)` is the fire-and-forget primitive:
+
+```python
+@tool
+async def start_discovery(self, params, seed_artist: str):
+    """Find new music similar to a seed artist."""
+    artist = await self._catalog_find_artist(seed_artist)
+    await self.start_user_task_group(
+        "similar_artist",
+        "genre",
+        "two_hop",
+        payload={"seed": artist["name"]},
+        label=f"Discoveries: {artist['name']}",
+        cancellable=True,
+    )
+    await self.respond_to_task(speak=f"Looking for music like {seed_artist}.")
+    await params.result_callback(None)
+```
+
+The SDK manages the asyncio task that holds the group context open while workers run; the tool returns immediately so the voice agent unblocks. Lifecycle envelopes (`group_started` on dispatch, `task_update` for each worker stream emission, `task_completed` for each worker response, `group_completed` when all workers are done) flow to the client as `ui-task` messages.
+
+Workers stream results via `send_task_update`:
+
+```python
+class SimilarArtistRecommender(BaseAgent):
+    async def on_task_request(self, message):
+        for track in self._find_tracks(message.payload["seed"]):
+            await self.send_task_update(
+                message.task_id,
+                update={"kind": "track", "track": track},
+            )
+        await self.send_task_response(message.task_id, response={...})
+```
+
+To turn worker streams into UI commands (e.g. drop tracks into a Discovery grid as they arrive), override `on_task_update` on the UI agent:
+
+```python
+class MyUIAgent(UIAgent):
+    async def on_task_update(self, message):
+        await super().on_task_update(message)
+        update = message.update or {}
+        if update.get("kind") == "track":
+            await self.send_command("add_track", {"track": update["track"]})
+```
+
+### Client side
+
+The React `useUITasks()` hook reduces the lifecycle envelopes into live state:
+
+```tsx
+import { useUITasks } from "@pipecat-ai/client-react";
+
+function DiscoveryPanel() {
+  const { groups, cancelTask } = useUITasks();
+  const inflight = groups.find((g) => g.status === "running");
+  if (!inflight) return null;
+  return (
+    <div>
+      <h3>{inflight.label}</h3>
+      {inflight.cancellable && (
+        <button onClick={() => cancelTask(inflight.taskId, "user requested")}>
+          Cancel
+        </button>
+      )}
+      <progress
+        value={inflight.tasks.filter((t) => t.status !== "running").length}
+        max={inflight.tasks.length}
+      />
+    </div>
+  );
+}
+```
+
+For live task state, mount a [`UITasksProvider`](/api-reference/client/react/components#uitasksprovider) inside the [`PipecatClientProvider`](/api-reference/client/react/components#pipecatclientprovider). Without the provider, `useUITasks` returns an empty list and no-op methods.
+
+When the user clicks Cancel, `cancelTask` sends a `ui-cancel-task` message; the SDK on the server side cancels the matching group (subject to `cancellable=True` having been set when the group was dispatched).
+
+Use `start_user_task_group` for fire-and-forget. Use the [`user_task_group(...)`](/api-reference/pipecat-subagents/ui-agent#user-task-group) context manager when the caller wants to consume worker events inline (`async for event in tg`) or react to results before returning.
+
+## When (not) to use this
+
+Two questions, in order. First **does this fit your app**, then **which deployment shape**.
+
+### App-shape fit
+
+Good fit when at least one is true:
+
+- **Rich screens where voice search beats click-paths**: catalogs, browsers, dashboards, file explorers, e-commerce.
+- **Screen-grounded Q&A**: "tell me about what I'm looking at" matters.
+- **Form-fill by voice**: applications, surveys, data entry.
+- **Multi-turn deictic dialog**: "play that one", "the next one", "more like them".
+- **Parallel / long-running work the user shouldn't block on**: research, recommendation, exploration.
+
+Poor fit when:
+
+- **Pure voice-only apps with no UI to ground in**. Just use a regular Pipecat LLM agent — the snapshot machinery is dead weight.
+- **Apps that are already agent-friendly through clicking**. One-action apps, single-screen forms with three fields. The protocol's overhead outweighs the benefit.
+- **Pixel-level UI control or headless automation** (drawing, gestures, browser automation). The accessibility-tree abstraction doesn't capture spatial / pixel intent.
+
+### Deployment shape
+
+Once it fits, three shapes. From least to most infrastructure:
+
+#### Single LLM, snapshot-aware (no subagents)
+
+Start the managed client snapshot stream with [`PipecatClient.startUISnapshotStream`](/api-reference/client/js/client-methods#startuisnapshotstream) or [`useUISnapshot`](/api-reference/client/react/hooks#useuisnapshot), render the snapshot into a developer message in your Pipecat pipeline, give your LLM tools that emit the typed RTVI frames ([`RTVIUICommandFrame`](/api-reference/server/frames/system-frames#rtviuicommandframe), [`RTVIUITaskFrame`](/api-reference/server/frames/system-frames#rtviuitaskframe)). Less code than wiring up a bus + bridge.
+
+Use this when you have a single LLM doing both conversation and UI work, no multi-agent fan-out. The wire format itself ([RTVI v1.3](/client/rtvi-standard#ui-agent-protocol)) is canonical in Pipecat; subagents builds the agent abstraction on top.
+
+#### Voice + UI separation (subagents `UIAgent`)
+
+`VoiceAgent` (LLM, bridged to STT/TTS) + `UIAgent` (LLM, owns screen state) on a bus, joined by [`attach_ui_bridge`](/api-reference/pipecat-subagents/messages#attach-ui-bridge). Voice delegates every UI-touching utterance via `self.task("ui", ...)`. The UI agent's LLM runs against `<ui_state>` and emits commands; the voice agent speaks the result verbatim.
+
+Use this when the conversation layer should stay focused on TTS/STT and dialog management, and a separate agent should own screen state and the action vocabulary. **The canonical pattern**, and what most production apps will reach for.
+
+#### Multi-agent peer subagents
+
+Full subagents framework: `UIAgent` plus worker peer agents on the bus, task fan-out via `start_user_task_group`, peers that share state (catalog, search index, user profile).
+
+Use this when long-running work fans out to multiple workers, agents share state across the bus, or the agent topology is large enough that multi-agent orchestration earns its complexity.
+
+### Subagents-specific knob
+
+`UIAgent` accepts a `keep_history` flag that picks between two task-context modes:
+
+- **`keep_history=False`** (default): clear the LLM context at the start of every task. Each task starts with just the current `<ui_state>` and the user's query. Matches the canonical stateless-delegate pattern.
+- **`keep_history=True`**: accumulate history across tasks. Pair with `enable_auto_context_summarization=True` on the assistant aggregator to keep the context bounded over long sessions. Use when deixis spans multiple turns ("show me the next one", "more like them") and the agent needs to remember what was discussed.
+
+The auto-injection of `<ui_state>` is hard-wired to `on_task_request`, so a single bridged `UIAgent` would silently never inject the snapshot. The `UIAgent` constructor raises `ValueError` if you try (`bridged != None` with default `auto_inject_ui_state=True`). The canonical pattern is a non-bridged `UIAgent` receiving delegated tasks from a separate voice `LLMAgent`.
+
+## Reference app
+
+The [`pipecat-music-player`](https://github.com/pipecat-ai/pipecat-music-player) demo exercises every pattern in this guide end-to-end against a live Deezer catalog:
+
+- Voice/UI separation with `attach_ui_bridge`
+- `<ui_state>`-grounded Q&A with `keep_history=True` and auto context summarization
+- Multi-turn deixis ("play that one", "more like them")
+- Per-domain `@tool` shape (skipping `ReplyToolMixin`)
+- Parallel fan-out via `start_user_task_group` with three worker recommenders, streaming results into a Discovery grid, with cancel
+- Long-lived singleton `CatalogAgent` peer of the `MusicAgent` root
+
+Read it when "show me code" beats "tell me about it."
+
+## API reference
+
+- [`UIAgent`](/api-reference/pipecat-subagents/ui-agent) — class reference, constructor, methods, action helpers.
+- [`ReplyToolMixin`](/api-reference/pipecat-subagents/ui-tools) — bundled-tool mixin reference.
+- [Standard command payloads](/api-reference/pipecat-subagents/ui-commands) — `Toast`, `Navigate`, `ScrollTo`, `Highlight`, `Focus`, `Click`, `SetInputValue`, `SelectText`.
+- [`UI_STATE_PROMPT_GUIDE`](/api-reference/pipecat-subagents/ui-prompts) — canonical prompt fragment for the system prompt.
+- [Bus messages](/api-reference/pipecat-subagents/messages) — `BusUIEventMessage`, `BusUICommandMessage`, the four `BusUITask*` lifecycle messages, and `attach_ui_bridge`.
+- [`@on_ui_event`](/api-reference/pipecat-subagents/decorators#on_ui_event) — decorator for client-event handlers (no LLM call).
+- [RTVI standard — UI Agent Protocol](/client/rtvi-standard#ui-agent-protocol) — on-the-wire message types.
+- [RTVI UI frames](/api-reference/server/frames/system-frames#rtvi-ui-frames) — pipeline frames for direct integration.
+- [`PipecatClient` UI methods](/api-reference/client/js/client-methods#ui-agent-protocol) — client-side API for UI events, commands, and tasks.
+- [React hooks](/api-reference/client/react/hooks) — `useUISnapshot`, `useUICommandHandler`, `useUITasks`, the default handlers.

@@ -206,14 +206,28 @@ function Messages() {
 
 **Options**
 
-<ParamField path="onMessageCreated" type="(message: ConversationMessage) => void">
-Called once when a new message first enters the conversation. The message may or may not be complete at this point — check `message.final`.
+<ParamField
+  path="onMessageCreated"
+  type="(message: ConversationMessage) => void"
+>
+  Called once when a new message first enters the conversation. The message may
+  or may not be complete at this point — check `message.final`.
 </ParamField>
-<ParamField path="onMessageUpdated" type="(message: ConversationMessage) => void">
-Called whenever an existing message's content changes (e.g. streaming text appended, function call status changed, message finalized). Check `message.final` to detect finalization.
+<ParamField
+  path="onMessageUpdated"
+  type="(message: ConversationMessage) => void"
+>
+  Called whenever an existing message's content changes (e.g. streaming text
+  appended, function call status changed, message finalized). Check
+  `message.final` to detect finalization.
 </ParamField>
-<ParamField path="aggregationMetadata" type="Record<string, AggregationMetadata>">
-Metadata for aggregation types to control rendering and speech progress behavior. Used to determine which aggregations should be excluded from position-based speech splitting.
+<ParamField
+  path="aggregationMetadata"
+  type="Record<string, AggregationMetadata>"
+>
+  Metadata for aggregation types to control rendering and speech progress
+  behavior. Used to determine which aggregations should be excluded from
+  position-based speech splitting.
 </ParamField>
 
 **Returns**
@@ -242,15 +256,438 @@ function TextInput() {
     });
   };
 
-  return <input onKeyDown={(e) => e.key === "Enter" && send(e.currentTarget.value)} />;
+  return (
+    <input
+      onKeyDown={(e) => e.key === "Enter" && send(e.currentTarget.value)}
+    />
+  );
 }
 ```
 
 **Returns**
 
-<ParamField path="injectMessage" type="(message: { role: string; parts: ConversationMessagePart[] }) => void">
-Programmatically inject a message into the conversation.
+<ParamField
+  path="injectMessage"
+  type="(message: { role: string; parts: ConversationMessagePart[] }) => void"
+>
+  Programmatically inject a message into the conversation.
 </ParamField>
 <ParamField path="botOutputSupported" type="boolean | null">
-Whether the connected bot supports BotOutput events (RTVI 1.1.0+). `null` means detection hasn't completed yet.
+  Whether the connected bot supports BotOutput events (RTVI 1.1.0+). `null`
+  means detection hasn't completed yet.
 </ParamField>
+
+## UI Agent hooks
+
+These hooks use the `PipecatClient` from the ambient
+[`PipecatClientProvider`](/api-reference/client/react/components#pipecatclientprovider).
+For the full client/server pattern, including snapshots, commands, and task
+lifecycle, see the [UI Agent guide](/subagents/learn/ui-agent).
+
+### useUIEventSender
+
+Returns a callable that sends a named UI event to the server. The returned
+function is a no-op until a `PipecatClient` is available.
+
+```tsx
+import { useUIEventSender } from "@pipecat-ai/client-react";
+
+function NavLink({ view, label }: { view: string; label: string }) {
+  const sendEvent = useUIEventSender();
+  return <a onClick={() => sendEvent("nav_click", { view })}>{label}</a>;
+}
+```
+
+**Returns**
+
+<ParamField path="sendEvent" type="<T>(event: string, payload?: T) => void">
+  Function that emits a UI event with the given event name and optional payload.
+</ParamField>
+
+### useUICommandHandler
+
+Register a handler for a named UI command. The handler is registered on
+mount and unregistered on unmount; if the handler reference changes between
+renders, the registration is refreshed. Pass a stable reference (via
+`useCallback`) to avoid per-render churn.
+
+```tsx
+import { useCallback } from "react";
+import { useUICommandHandler } from "@pipecat-ai/client-react";
+
+function Toaster() {
+  const onToast = useCallback((payload: { title: string }) => {
+    showToast(payload.title);
+  }, []);
+  useUICommandHandler("toast", onToast);
+  return null;
+}
+```
+
+**Arguments**
+
+<ParamField path="name" type="string" required>
+  App-defined command name, matching what the server emits via
+  `UIAgent.send_command`.
+</ParamField>
+
+<ParamField path="handler" type="UICommandHandler<T>" required>
+  Callback invoked with the command payload.
+</ParamField>
+
+### useUISnapshot
+
+Capture a structured accessibility snapshot of the document and stream it
+to the server as a first-class `ui-snapshot` RTVI message. The server-side
+[`UIAgent`](/api-reference/pipecat-subagents/ui-agent) stores the latest
+snapshot and renders it into LLM context as `<ui_state>` so the agent can
+reason about what's on screen.
+
+Call once near the root of your app, inside a `PipecatClientProvider`. This hook
+is a thin lifecycle wrapper around
+[`PipecatClient.startUISnapshotStream`](/api-reference/client/js/client-methods#startuisnapshotstream);
+non-React apps should use the managed client method directly.
+
+```tsx
+import { useUISnapshot } from "@pipecat-ai/client-react";
+
+function App() {
+  useUISnapshot();
+  return <Routes>...</Routes>;
+}
+```
+
+**Behaviour**
+
+- Emits an initial snapshot shortly after mount.
+- Re-emits on DOM mutations, ARIA attribute changes, focus changes,
+  scroll-end, window resize, tab visibility change, and text selection changes,
+  coalesced by `debounceMs`.
+- No-op until a `PipecatClient` is available from the ambient
+  `PipecatClientProvider`.
+
+**Options**
+
+<ParamField path="enabled" type="boolean" default="true">
+  Whether the hook is active. Set to `false` to stop emitting snapshots without
+  unmounting the component.
+</ParamField>
+
+<ParamField path="debounceMs" type="number" default="300">
+  Minimum interval between snapshot emissions, in milliseconds.
+</ParamField>
+
+<ParamField path="trackViewport" type="boolean" default="true">
+  When `true`, annotate every emitted node with `"offscreen"` in its `state`
+  list if its bounding rect sits entirely outside the viewport.
+</ParamField>
+
+<ParamField path="logSnapshots" type="boolean" default="false">
+  When `true`, log each emitted snapshot to the browser console (node count,
+  rough token estimate, raw tree).
+</ParamField>
+
+### useDefaultScrollToHandler
+
+Install the default `scroll_to` handler: `scrollIntoView` on the resolved
+target. Resolves by snapshot `ref` first, then falls back to
+`document.getElementById(target_id)`.
+
+```tsx
+import { useDefaultScrollToHandler } from "@pipecat-ai/client-react";
+
+function App() {
+  useDefaultScrollToHandler({
+    block: "center",
+    container: () => document.querySelector(".main"),
+  });
+  return <...>;
+}
+```
+
+**Options**
+
+<ParamField
+  path="block"
+  type='"start" | "center" | "end" | "nearest"'
+  default='"start"'
+>
+  `scrollIntoView` block position.
+</ParamField>
+
+<ParamField
+  path="inline"
+  type='"start" | "center" | "end" | "nearest"'
+  default='"nearest"'
+>
+  `scrollIntoView` inline position.
+</ParamField>
+
+<ParamField
+  path="defaultBehavior"
+  type='"auto" | "instant" | "smooth"'
+  default='"smooth"'
+>
+  Fallback scroll behavior when `payload.behavior` is unset.
+</ParamField>
+
+<ParamField
+  path="container"
+  type="Element | null | (() => Element | null | undefined)"
+>
+  When set, scroll *inside* this element instead of relying on `scrollIntoView`
+  walking to the nearest scrollable ancestor. Function form is evaluated on each
+  scroll so it can account for containers mounted after the hook.
+</ParamField>
+
+<ParamField path="offset" type="{ top?: number; left?: number }">
+  Pixel offsets applied after scrolling, typically to clear a sticky header.
+  Only applied when `container` is set.
+</ParamField>
+
+### useDefaultFocusHandler
+
+Install the default `focus` handler: `.focus()` on the resolved target.
+
+```tsx
+import { useDefaultFocusHandler } from "@pipecat-ai/client-react";
+useDefaultFocusHandler({ preventScroll: true });
+```
+
+**Options**
+
+<ParamField path="preventScroll" type="boolean" default="false">
+  Pass `{ preventScroll: true }` to `element.focus()` so the focus change
+  doesn't also pan the viewport. Useful when focus happens alongside an
+  explicit `scroll_to`.
+</ParamField>
+
+### useDefaultHighlightHandler
+
+Install the default `highlight` handler: toggle a CSS class on the resolved
+target for `duration_ms`. Apps style the class themselves, e.g.
+
+```css
+.ui-highlight {
+  outline: 2px solid gold;
+  transition: outline 0.25s;
+}
+```
+
+```tsx
+import { useDefaultHighlightHandler } from "@pipecat-ai/client-react";
+
+useDefaultHighlightHandler({
+  className: "ui-highlight",
+  defaultDurationMs: 2000,
+  scrollIntoViewFirst: true,
+});
+```
+
+**Options**
+
+<ParamField path="className" type="string" default='"ui-highlight"'>
+  CSS class toggled on the target for `duration_ms`.
+</ParamField>
+
+<ParamField path="defaultDurationMs" type="number" default="1500">
+  Fallback duration when `payload.duration_ms` is missing.
+</ParamField>
+
+<ParamField path="scrollIntoViewFirst" type="boolean" default="false">
+  When `true`, the target is scrolled into view before the class is applied, so
+  the flash is visible to the user even if the target is currently offscreen.
+</ParamField>
+
+### useDefaultSelectTextHandler
+
+Enable the default `select_text` handler. Resolves the target by ref / target_id and applies the page text selection (`Range.selectNodeContents` for document elements, `el.select()` for `<input>` / `<textarea>`). With `start_offset` / `end_offset` set, walks descendant text nodes to apply a sub-range selection.
+
+```tsx
+import { useDefaultSelectTextHandler } from "@pipecat-ai/client-react";
+
+useDefaultSelectTextHandler({ scrollIntoViewFirst: true });
+```
+
+**Options**
+
+<ParamField path="scrollIntoViewFirst" type="boolean" default="true">
+  When true, scroll the target into view before applying the selection so the
+  user actually sees what was selected.
+</ParamField>
+
+<ParamField path="block" type="ScrollLogicalPosition" default='"center"'>
+  `scrollIntoView` block position when scrolling first.
+</ParamField>
+
+### useDefaultSetInputValueHandler
+
+Enable the default `set_input_value` handler. Resolves the target by ref / target_id; refuses on `disabled`, `readonly`, and `<input type="hidden">` (silent no-op so the agent can't bypass UI affordances the user is meant to control), then assigns `el.value` and dispatches single-shot `input` and `change` events so React-controlled inputs and vanilla `onChange` listeners pick up the new value naturally.
+
+With `replace: false` on the payload, the new text is appended to the current value; the default replaces. The flag is ignored for native `<select>` since a select either has the value or doesn't. Native `<select>` is supported alongside text inputs and textareas (the handler sets `el.value` and dispatches `change`).
+
+```tsx
+import { useDefaultSetInputValueHandler } from "@pipecat-ai/client-react";
+
+useDefaultSetInputValueHandler({ focusFirst: true });
+```
+
+**Options**
+
+<ParamField path="focusFirst" type="boolean" default="false">
+  When true, fire `focus()` on the target before writing so the user sees the
+  cursor land in the field. The element is blurred after the change events fire
+  to avoid stealing keyboard focus mid-conversation.
+</ParamField>
+
+### useDefaultClickHandler
+
+Enable the default `click` handler. Resolves the target by ref / target_id and calls `el.click()`. Silently no-ops on `disabled` and `aria-disabled="true"` targets so the agent can't bypass UI affordances meant to be user-controlled.
+
+```tsx
+import { useDefaultClickHandler } from "@pipecat-ai/client-react";
+
+useDefaultClickHandler();
+```
+
+Takes no options.
+
+### useDefaultUICommandHandlers
+
+Install all DOM-based default handlers (`scroll_to`, `focus`, `highlight`,
+`select_text`, `set_input_value`, `click`) at once. Pass per-handler option
+objects to customize.
+
+```tsx
+import { useDefaultUICommandHandlers } from "@pipecat-ai/client-react";
+
+useDefaultUICommandHandlers({
+  scrollTo: { block: "center" },
+  highlight: { defaultDurationMs: 2000 },
+  setInputValue: { focusFirst: true },
+});
+```
+
+**Options**
+
+<ParamField path="scrollTo" type="DefaultScrollToOptions">
+  Forwarded to `useDefaultScrollToHandler`.
+</ParamField>
+
+<ParamField path="focus" type="DefaultFocusOptions">
+  Forwarded to `useDefaultFocusHandler`.
+</ParamField>
+
+<ParamField path="highlight" type="DefaultHighlightOptions">
+  Forwarded to `useDefaultHighlightHandler`.
+</ParamField>
+
+<ParamField path="selectText" type="DefaultSelectTextOptions">
+  Forwarded to `useDefaultSelectTextHandler`.
+</ParamField>
+
+<ParamField path="setInputValue" type="DefaultSetInputValueOptions">
+  Forwarded to `useDefaultSetInputValueHandler`.
+</ParamField>
+
+`useDefaultClickHandler` takes no options and is always installed.
+
+### useToastHandler
+
+Typed sugar for `useUICommandHandler<ToastPayload>("toast", handler)`. Wire
+a toast renderer of your choice; the SDK doesn't ship one.
+
+```tsx
+import { useToastHandler } from "@pipecat-ai/client-react";
+import { useCallback } from "react";
+
+useToastHandler(
+  useCallback((payload) => {
+    myToastLib.show(payload.title, payload.subtitle);
+  }, []),
+);
+```
+
+**Arguments**
+
+<ParamField path="handler" type="UICommandHandler<ToastPayload>" required />
+
+### useNavigateHandler
+
+Typed sugar for `useUICommandHandler<NavigatePayload>("navigate", handler)`.
+Wire into your router of choice; the SDK doesn't ship one.
+
+```tsx
+import { useNavigateHandler } from "@pipecat-ai/client-react";
+import { useCallback } from "react";
+import { useNavigate } from "react-router-dom";
+
+function NavWiring() {
+  const navigate = useNavigate();
+  useNavigateHandler(
+    useCallback(
+      (payload) => {
+        navigate(`/${payload.view}`, { state: payload.params });
+      },
+      [navigate],
+    ),
+  );
+  return null;
+}
+```
+
+**Arguments**
+
+<ParamField path="handler" type="UICommandHandler<NavigatePayload>" required />
+
+### useUITasks
+
+Subscribe to the in-flight task-group state surfaced by the server's [`ui-task`](/client/rtvi-standard#ui-task-) lifecycle envelopes. Returns the live list of task groups plus methods to cancel and prune task groups.
+
+For live task state, mount a [`UITasksProvider`](/api-reference/client/react/components#uitasksprovider) inside [`PipecatClientProvider`](/api-reference/client/react/components#pipecatclientprovider). The provider listens to `RTVIEvent.UITask` envelopes from the underlying `PipecatClient` and reduces them into `groups` state.
+
+```tsx
+import { useUITasks } from "@pipecat-ai/client-react";
+
+function DiscoveryPanel() {
+  const { groups, cancelTask } = useUITasks();
+  const inflight = groups.find((g) => g.status === "running");
+  if (!inflight) return null;
+  return (
+    <div>
+      <h3>{inflight.label}</h3>
+      {inflight.cancellable && (
+        <button onClick={() => cancelTask(inflight.taskId, "user requested")}>
+          Cancel
+        </button>
+      )}
+    </div>
+  );
+}
+```
+
+**Returns**
+
+<ParamField path="groups" type="TaskGroup[]">
+  Live array of in-flight and recently completed task groups, in arrival order.
+  Each group has `taskId`, `label`, `status` (`"running"` / `"completed"` /
+  `"cancelled"` / `"error"`), `cancellable`, timestamps, and per-worker
+  entries with status, progress updates, and response.
+</ParamField>
+
+<ParamField path="cancelTask" type="(taskId: string, reason?: string) => void">
+  Ask the server to cancel the named task group. Forwards to
+  [`PipecatClient.cancelUITask`](/api-reference/client/js/client-methods#canceluitask).
+  Honored only when the group was registered with `cancellable=True` on the
+  server.
+</ParamField>
+
+<ParamField path="dismissTask" type="(taskId: string) => void">
+  Remove a non-running group from local UI state. Running groups are kept.
+</ParamField>
+
+<ParamField path="clearCompleted" type="() => void">
+  Remove every non-running group from local UI state.
+</ParamField>
+
+When no `UITasksProvider` is mounted, `useUITasks` returns an empty `groups` list and no-op methods rather than throwing.
