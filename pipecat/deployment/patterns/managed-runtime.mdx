@@ -1,0 +1,45 @@
+---
+title: "Managed agent runtime"
+description: "Hand the bot lifecycle off to a runtime that owns scaling, dispatch, and execution."
+---
+
+You write the bot file and a thin proxy server. The proxy receives session-start requests from clients and forwards them to an external agent runtime; the runtime owns the bot's execution environment, scaling, lifecycle, and (typically) the WebRTC offer/answer plumbing. You don't run a pool, you don't spawn subprocesses, you don't manage VM-level resources — the runtime does.
+
+This is the shape used in the [`aws-agentcore-webrtc`](https://github.com/pipecat-ai/pipecat-examples/tree/main/deployment/aws-agentcore-webrtc) example: the proxy is a small FastAPI app that calls `bedrock-agentcore` to invoke the agent, and the agent is a containerized bot file deployed to AgentCore Runtime.
+
+[Pipecat Cloud](/pipecat-cloud/introduction) is architecturally a managed runtime in this family. The difference from running PCC and rolling your own is mostly about how much of the runtime you want to operate vs. consume.
+
+## When it fits
+
+- You'd rather not operate dispatch, fleet, or pool infrastructure at all.
+- You're already heavily invested in a cloud platform that has an agent-runtime offering (AWS Bedrock AgentCore, GCP Vertex AI agents, etc.).
+- Your bots fit comfortably within the runtime's constraints (container size, network egress, GPU availability if you need one).
+- You're willing to trade some flexibility for a lower-ops footprint.
+
+## When it doesn't
+
+- The runtime's feature ceiling or pricing model doesn't match your bot. Agent runtimes tend to be opinionated about how the bot communicates with the outside world; if your bot needs unusual networking, custom transport, or specific compute shapes, you can hit walls.
+- You need portability across cloud providers and don't want a runtime-shaped lock-in.
+- Cold-start behavior of the runtime is unacceptable for your latency requirements. Most runtimes have warm-instance options but they cost extra.
+
+## How it usually looks
+
+There are two pieces:
+
+1. **A proxy server** that exposes whatever session-start API your clients expect (commonly `POST /start` and a per-session proxy under `/sessions/{id}/...`). It authenticates the request and forwards it to the runtime's invocation API.
+2. **The bot file**, deployed to the runtime as a container. It receives session inputs (e.g. a WebRTC offer) through whatever channel the runtime supplies and runs the pipeline.
+
+In the AgentCore example the proxy forwards WebRTC offers and ICE candidates as JSON payloads via `bedrock.invoke_agent_runtime()`, and the agent container responds with a WebRTC answer over a streaming response. The bot file inside the container is a standard Pipecat bot.
+
+## Tradeoffs worth being explicit about
+
+- **Low ops vs. lock-in.** You'll have less infrastructure to operate but you're betting on the runtime's roadmap and pricing.
+- **Feature ceiling.** Anything the runtime doesn't natively support — custom transports, unusual networking, specific GPU types, persistent volumes — is friction. Worth confirming the runtime supports your bot's actual shape, not just the example shape.
+- **Cold starts.** Runtimes typically scale from zero and pay cold-start cost on first invocation. Many offer "min-instance" settings that keep capacity warm at a flat cost.
+- **Observability.** Logs and metrics live in the runtime's surface, not yours. If you have an existing logging stack, plan for getting the bot's output into it (or accept living in the runtime's UI).
+
+## See also
+
+- [`aws-agentcore-webrtc` example](https://github.com/pipecat-ai/pipecat-examples/tree/main/deployment/aws-agentcore-webrtc) — worked example of the pattern on Bedrock AgentCore with WebRTC.
+- [`aws-agentcore-websocket`](https://github.com/pipecat-ai/pipecat-examples/tree/main/deployment/aws-agentcore-websocket) and [`aws-agentcore-webrtc-kvs`](https://github.com/pipecat-ai/pipecat-examples/tree/main/deployment/aws-agentcore-webrtc-kvs) — same pattern, other AgentCore transport modes.
+- [Pipecat Cloud](/pipecat-cloud/introduction) — Daily's managed runtime, purpose-built for Pipecat.

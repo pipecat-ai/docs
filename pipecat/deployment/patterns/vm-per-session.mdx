@@ -1,0 +1,47 @@
+---
+title: "VM per session"
+description: "A dispatcher spawns a fresh cloud VM for each session via the provider's machines API."
+---
+
+A small HTTP service ("the dispatcher") receives session-start requests from clients. For each request it calls a cloud provider's machines API to spawn a fresh VM running your bot image, with the room URL and token passed in via the entrypoint command. The VM exits when the session ends, the provider tears it down, and you pay for exactly the time the bot was running.
+
+This is the shape used in the [Fly.io example](https://github.com/pipecat-ai/pipecat-examples/tree/main/deployment/flyio-example). The pattern generalizes to any cloud with a machines API: AWS Fargate, Google Cloud Run jobs, Azure Container Instances, Fly Machines, and so on.
+
+## When it fits
+
+- You want strong per-session isolation — each bot runs in its own VM, so misbehavior in one session can't affect another.
+- Your traffic is bursty enough that maintaining a warm pool would mostly burn money on idle capacity.
+- You're comfortable with cold-start latency in the seconds range on each new session (mitigated by image size discipline and the provider's start-up speed).
+- You don't want to operate a long-running fleet — the provider's machines API is the only thing you talk to.
+
+## When it doesn't
+
+- Cold-start latency dominates your UX. If users expect a bot to answer within a second of pressing "call", per-session VMs are usually too slow without significant work (small images, warm reserves, optimistic client connect + poll).
+- Your concurrency exceeds the provider's per-account API rate limits or instance-count quotas. These are routinely raised on request but worth checking before committing.
+- Your bots are extremely lightweight — at some point the VM-per-session overhead dominates the actual work.
+
+## How it usually looks
+
+The dispatcher:
+
+1. Receives `POST /start` (or whatever your equivalent is).
+2. Authenticates the request.
+3. Creates whatever transport-side resources the bot will need (e.g. a Daily room and tokens).
+4. Calls the cloud provider's machines API with the bot image and a command that passes `--room-url` / `--token` / etc. into the bot.
+5. Waits for the machine to enter a "started" state (most providers expose a synchronous wait endpoint).
+6. Returns the join URL to the client.
+
+The bot is a normal Pipecat bot file — its entrypoint parses the room URL and token, builds the transport, and runs the pipeline. The dispatcher does not need to know anything about Pipecat internals.
+
+## Tradeoffs worth being explicit about
+
+- **Cold-start vs. cost.** No warm capacity means low idle cost and slow first-byte. Mitigations: keep images small, pre-cache pipeline models at build time, optimistically return the join URL once dispatch has been requested (and let the client poll for "bot ready").
+- **Isolation vs. operations.** Fresh VM per session is the cleanest possible isolation model, but it also means every session goes through your cloud provider's full instance-startup path on every call. That's a lot of work per session.
+- **Rate limits and quotas.** Your machines-API quota becomes your real concurrency ceiling. Worth knowing in advance.
+- **Image discipline.** Image size directly affects cold-start time. Multi-stage builds, baking only what the bot needs at runtime, and keeping VAD/STT models cached are all material here.
+
+## See also
+
+- [Fly.io worked example](../platforms/fly) — end-to-end walkthrough of the pattern on Fly Machines.
+- [Modal](../platforms/modal) — similar pattern on Modal's function infrastructure.
+- [Cerebrium](../platforms/cerebrium) — similar with GPU support if your pipeline needs it.
