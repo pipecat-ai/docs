@@ -131,6 +131,98 @@ runner = AgentRunner(bus=bus)
   The Redis pub/sub channel name.
 </ParamField>
 
+## PgmqBus
+
+Distributed agent bus backed by PGMQ (PostgreSQL Message Queue). Implements pub/sub fan-out on top of PGMQ's point-to-point queue semantics by giving each bus instance its own queue and broadcasting on publish.
+
+<Note>Requires the pgmq extra: `uv add "pipecat-ai-subagents[pgmq]"`</Note>
+
+PgmqBus supports two backend modes:
+
+- **DirectPgmqBackend**: Calls `pgmq.*` directly with prefix-based peer discovery. Suitable when bus peers trust each other (single-tenant deployments, internal services).
+- **IsolatedPgmqBackend**: Uses SECURITY DEFINER Postgres wrappers for isolation. Suitable when bus peers should be isolated and the channel name is the bus capability.
+
+### DirectPgmqBackend example
+
+```python
+from pgmq.async_queue import PGMQueue
+from pipecat_subagents.bus.network.pgmq import PgmqBus
+
+pgmq = PGMQueue(
+    host="localhost",
+    port="5432",
+    database="postgres",
+    username="postgres",
+    password="...",
+    pool_size=4,
+)
+await pgmq.init()
+bus = PgmqBus(pgmq=pgmq, channel="pipecat_acme")
+```
+
+### IsolatedPgmqBackend example
+
+```python
+import asyncpg
+from pipecat_subagents.bus.network.pgmq import PgmqBus
+from pipecat_subagents.bus.network.pgmq_backends import IsolatedPgmqBackend
+
+pool = await asyncpg.create_pool(
+    host="localhost",
+    port=5432,
+    database="postgres",
+    user="postgres",
+    password="...",
+    min_size=2,
+    max_size=4,
+)
+backend = IsolatedPgmqBackend(pool=pool)
+bus = PgmqBus(backend=backend, channel="pipecat_acme")
+```
+
+### Configuration
+
+<ParamField path="pgmq" type="PGMQueue | None" default="None">
+  An initialized `PGMQueue` client (call `await pgmq.init()` before passing). Selects DirectPgmqBackend. Mutually exclusive with `backend`.
+</ParamField>
+
+<ParamField path="backend" type="PgmqBackend | None" default="None">
+  A backend instance (e.g. `IsolatedPgmqBackend` or custom). Mutually exclusive with `pgmq`.
+</ParamField>
+
+<ParamField path="serializer" type="MessageSerializer | None" default="None">
+  The
+  [`MessageSerializer`](/api-reference/pipecat-subagents/serializers#messageserializer)
+  for encoding/decoding messages. Defaults to
+  [`JSONMessageSerializer`](/api-reference/pipecat-subagents/serializers#jsonmessageserializer).
+</ParamField>
+
+<ParamField path="channel" type="str" default="pipecat_bus">
+  Channel name. With DirectPgmqBackend this is sanitized into a queue-name prefix. With IsolatedPgmqBackend it is the bus capability passed to every wrapper call.
+</ParamField>
+
+<ParamField path="visibility_timeout" type="int" default="30">
+  Seconds a read message stays invisible before redelivery.
+</ParamField>
+
+<ParamField path="batch_size" type="int" default="10">
+  Maximum messages to fetch per read.
+</ParamField>
+
+<ParamField path="poll_interval_ms" type="int" default="100">
+  Long-poll check interval in milliseconds. Backend may ignore if it doesn't expose this knob.
+</ParamField>
+
+<ParamField path="max_poll_seconds" type="int" default="5">
+  Maximum seconds the reader blocks per poll cycle.
+</ParamField>
+
+<Note>
+Prefer a session-mode pooler when available. Transaction-mode pooling works for direct `pgmq.*` calls but is fragile around the long-poll inside the SECURITY DEFINER `bus_subscribe` wrapper used by IsolatedPgmqBackend.
+
+The underlying connection pool must allow at least two concurrent connections (one for the reader's long-poll, one for publishes).
+</Note>
+
 ## BusBridgeProcessor
 
 Bidirectional mid-pipeline bridge between a Pipecat pipeline and the bus. Placed in a transport or session agent's pipeline to exchange frames with other agents via the `AgentBus`.
