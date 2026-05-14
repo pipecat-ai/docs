@@ -1,0 +1,70 @@
+---
+title: "Telephony in production"
+description: "Webhook-driven dispatch, carrier-specific gotchas, and how telephony differs from WebRTC."
+---
+
+Telephony bots have a different shape than WebRTC bots. The session doesn't start because a client sent your dispatcher an HTTP request — it starts because the carrier (Twilio, Telnyx, Plivo, Exotel, or your SIP provider) is calling your webhook to tell you there's an inbound call. The dispatch path is _inverted_, and a handful of carrier-specific concerns show up that don't exist in WebRTC.
+
+This page is about the operational shape, not the bot code itself. The dispatch _patterns_ described elsewhere — [VM per session](./patterns/vm-per-session), [warm pool with subprocess workers](./patterns/warm-pool-subprocess), [managed agent runtime](./patterns/managed-runtime) — all apply to telephony. What changes is what triggers them.
+
+## What's different from WebRTC
+
+In WebRTC, your client app initiates the session. Your dispatcher gets a request from a client it knows, can authenticate, and can return a session ID to. In telephony, the carrier is the client. The dispatcher gets a webhook from a third party with a phone number on it and has to:
+
+1. Respond synchronously with carrier-specific XML (TwiML for Twilio, the equivalent for Telnyx/Plivo) that tells the carrier where to send the bidirectional media stream.
+2. Accept a long-lived WebSocket from the carrier carrying audio in both directions.
+3. Spawn a bot wired to that WebSocket as its transport.
+
+The development runner's telephony mode handles this for you locally:
+
+```bash
+python bot.py -t twilio -x your-name.ngrok.io
+python bot.py -t telnyx -x your-name.ngrok.io
+python bot.py -t plivo -x your-name.ngrok.io
+python bot.py -t exotel
+```
+
+In production, whatever serves the carrier's webhook needs to do the same things: return the right XML, accept the WebSocket, hand it to a bot.
+
+For worked examples of telephony bots:
+
+- [`twilio-chatbot`](https://github.com/pipecat-ai/pipecat-examples/tree/main/twilio-chatbot) — inbound and outbound Twilio integration.
+- [`telnyx-chatbot`](https://github.com/pipecat-ai/pipecat-examples/tree/main/telnyx-chatbot), [`plivo-chatbot`](https://github.com/pipecat-ai/pipecat-examples/tree/main/plivo-chatbot), [`exotel-chatbot`](https://github.com/pipecat-ai/pipecat-examples/tree/main/exotel-chatbot) — equivalents for other carriers.
+- [`phone-chatbot/`](https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot) — Daily PSTN and SIP-based dial-in and dial-out, including transfer scenarios.
+- [`pipecat-cloud-daily-pstn-server`](https://github.com/pipecat-ai/pipecat-examples/tree/main/deployment/pipecat-cloud-daily-pstn-server) — webhook server for Daily's pinless dial-in flow against Pipecat Cloud.
+
+## Carrier-specific gotchas
+
+These are the things teams running telephony in production routinely run into:
+
+### Stable egress IPs
+
+Many SIP/PSTN providers want your media and/or signaling to come from a known set of IPs, either for billing or to traverse their security policies. If your bots run on ephemeral cloud infrastructure that gets fresh IPs on every spawn, you'll need a NAT gateway, fixed-IP egress, or a media gateway in front. Worth checking with your carrier _before_ you've built the rest of the stack.
+
+### Codecs and audio encoding
+
+Telephony providers transmit audio in carrier-specific formats — typically μ-law (Twilio, Telnyx) or a-law, at 8 kHz. Pipecat's [telephony serializers](https://github.com/pipecat-ai/pipecat/tree/main/src/pipecat/serializers) handle these on the wire, but you should be aware that:
+
+- The pipeline operates in PCM internally; the serializer converts at the transport boundary.
+- 8 kHz is _narrow_. Local STT/TTS models with broader bandwidth assumptions can sound worse than they do on WebRTC.
+- Twilio, Telnyx, Plivo, Exotel, Vonage, and Genesys all have slightly different framing and timing on the wire. Use the matching serializer.
+
+### Session timeouts and reconnects
+
+Carriers enforce maximum call durations and may drop calls that go silent for too long. Decide how the bot handles graceful end-of-call (which you probably want to drive from the carrier's call-state events, not just from disconnect) vs. unexpected hang-ups.
+
+### Webhook verification
+
+Carriers sign webhooks (Twilio's `X-Twilio-Signature`, Daily's pinless HMAC, etc.). In development you can skip verification; in production you should not, because the webhook URL is necessarily public and unsigned requests are trivial to forge. The [PSTN server example](https://github.com/pipecat-ai/pipecat-examples/tree/main/deployment/pipecat-cloud-daily-pstn-server) shows HMAC verification for Daily's pinless flow.
+
+### Dial-out and call transfers
+
+If your product needs to _make_ calls, not just receive them, the dispatch shape changes again — now you're making an authenticated call to the carrier's API to initiate a call, and the bot needs to be running before the carrier connects the human party. Most carriers can do "create call → connect media when answered", but the orchestration is more involved than inbound. The [`phone-chatbot/daily-pstn-dial-out`](https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-pstn-dial-out) and [`daily-twilio-sip-dial-out`](https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-twilio-sip-dial-out) examples cover this.
+
+Warm and cold transfers (handing a call from the bot to a human agent without dropping the caller) add another layer; see [`daily-pstn-cold-transfer`](https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-pstn-cold-transfer) and [`daily-pstn-warm-transfer`](https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-pstn-warm-transfer).
+
+## Pairing telephony with a dispatch pattern
+
+Telephony adds carrier-specific concerns on top of the same dispatch question you'd answer for WebRTC. You still need to decide who actually runs the bot process — the development runner directly, a VM per session, a warm-pool dispatcher, a managed runtime — and the answer is independent of the carrier choice.
+
+A common production shape is: carrier webhook → your dispatcher (validates the webhook signature, decides which bot to run) → your dispatch pattern of choice spawns a bot wired to the carrier's media WebSocket.
