@@ -119,10 +119,12 @@ Dataclass for defining function call schemas with Flows-specific properties. Pro
 </ParamField>
 
 <ParamField path="handler" type="FunctionHandler" default="None">
-  Function handler to process the function call. Can be a legacy handler
-  `(args)` or modern handler `(args, flow_manager)`. The handler should return a
-  [`FlowResult`](#flowresult) or a
-  [`ConsolidatedFunctionResult`](#consolidatedfunctionresult) tuple.
+  Function handler to process the function call. Can be a modern handler
+  `(args, flow_manager)`, legacy handler `(args)`, or zero-arg handler `()`.
+  Legacy and zero-arg handlers are deprecated. The handler returns any
+  JSON-serializable value, or a
+  [`ConsolidatedFunctionResult`](#consolidatedfunctionresult) tuple to also
+  specify the next node.
 </ParamField>
 
 <ParamField path="cancel_on_interruption" type="bool" default="False">
@@ -317,18 +319,23 @@ node_config: NodeConfig = {
 
 ## FlowsDirectFunction
 
-Protocol defining the interface for direct functions. Any async callable matching this signature can be used as a direct function in node configurations.
+Type alias for direct functions with automatic metadata extraction. Any async callable matching this signature can be used as a direct function in node configurations.
 
 ```python
-class FlowsDirectFunction(Protocol):
-    def __call__(
-        self, flow_manager: FlowManager, **kwargs: Any
-    ) -> Awaitable[ConsolidatedFunctionResult]: ...
+FlowsDirectFunction = Callable[..., Awaitable[ConsolidatedFunctionResult]]
 ```
+
+Direct functions must accept `flow_manager: FlowManager` as the first parameter, followed by any named parameters described in the function's docstring. Python's `Protocol` system cannot express "any concrete named-parameter list", so this is defined as a generic `Callable`. Runtime validation is handled by `FlowsDirectFunctionWrapper.validate_function`.
 
 ## Type Aliases
 
 ### FlowResult
+
+<Warning>
+  **Deprecated.** `FlowResult` is no longer required by any handler type and
+  will be removed in 2.0.0. Function handlers can return any JSON-serializable
+  value. Define your own `TypedDict` if you want a structured result.
+</Warning>
 
 ```python
 class FlowResult(TypedDict, total=False):
@@ -336,7 +343,7 @@ class FlowResult(TypedDict, total=False):
     error: str
 ```
 
-Base return type for function results. The `status` field indicates the outcome. The optional `error` field contains an error message if execution failed. Additional fields are allowed and passed through to the LLM.
+Optional convention TypedDict for `status`/`error` results. The `status` field indicates the outcome. The optional `error` field contains an error message if execution failed. Additional fields are allowed and passed through to the LLM.
 
 ### FlowArgs
 
@@ -344,35 +351,69 @@ Base return type for function results. The `status` field indicates the outcome.
 FlowArgs = dict[str, Any]
 ```
 
-Type alias for function handler arguments. Contains the parameters extracted from the LLM's function call.
+Type alias for function handler arguments. Contains the parameters extracted from the LLM's function call. Each invocation gets its own dict, so handlers may mutate it freely.
+
+<Note>
+  In 2.0.0, this alias is planned to widen to `Mapping[str, Any]` to align with
+  Pipecat's typing. Handlers that only read args will be unaffected; handlers
+  that mutate args will need to keep the annotation as `dict[str, Any]`
+  explicitly.
+</Note>
 
 ### ConsolidatedFunctionResult
 
 ```python
-ConsolidatedFunctionResult = tuple[FlowResult | None, NodeConfig | None]
+ConsolidatedFunctionResult = tuple[Any, NodeConfig | None]
 ```
 
 Return type for consolidated function handlers that both do work and specify the next node:
 
-- First element: The function result (or `None` for transition-only functions)
+- First element: Any JSON-serializable value (or `None` for transition-only functions)
 - Second element: The next node as a `NodeConfig`, or `None` for node functions
 
 ### FlowFunctionHandler
 
 ```python
-FlowFunctionHandler = Callable[
-    [FlowArgs, FlowManager], Awaitable[FlowResult | ConsolidatedFunctionResult]
-]
+FlowFunctionHandler = Callable[[FlowArgs, FlowManager], Awaitable[Any]]
 ```
 
 Type for modern function handlers that receive both arguments and the `FlowManager` instance.
 
-### LegacyFunctionHandler
+**Args:**
+- `args` (`FlowArgs`): Dictionary of arguments from the function call.
+- `flow_manager` (`FlowManager`): Reference to the FlowManager instance.
+
+**Returns:** Any JSON-serializable value, or a `ConsolidatedFunctionResult` tuple to also specify the next node.
+
+### ZeroArgFunctionHandler
+
+<Warning>
+  **Deprecated.** Zero-argument function handlers are deprecated and will be
+  removed in 2.0.0. Update handlers to accept `(args, flow_manager)` instead.
+</Warning>
 
 ```python
-LegacyFunctionHandler = Callable[
-    [FlowArgs], Awaitable[FlowResult | ConsolidatedFunctionResult]
-]
+ZeroArgFunctionHandler = Callable[[], Awaitable[Any]]
 ```
 
-Type for legacy function handlers that only receive arguments. Both legacy and modern handlers are supported; the flow manager detects the signature automatically.
+Type for function handlers that take no arguments. The flow manager detects the signature automatically and emits a `DeprecationWarning`.
+
+**Returns:** Any JSON-serializable value, or a `ConsolidatedFunctionResult` tuple to also specify the next node.
+
+### LegacyFunctionHandler
+
+<Warning>
+  **Deprecated.** Single-argument function handlers are deprecated and will be
+  removed in 2.0.0. Update handlers to accept `(args, flow_manager)` instead.
+</Warning>
+
+```python
+LegacyFunctionHandler = Callable[[FlowArgs], Awaitable[Any]]
+```
+
+Type for legacy function handlers that only receive arguments. Both legacy and modern handlers are supported; the flow manager detects the signature automatically and emits a `DeprecationWarning`.
+
+**Args:**
+- `args` (`FlowArgs`): Dictionary of arguments from the function call.
+
+**Returns:** Any JSON-serializable value, or a `ConsolidatedFunctionResult` tuple to also specify the next node.
