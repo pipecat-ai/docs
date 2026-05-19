@@ -47,3 +47,57 @@ wscat -c "wss://us-west.api.pipecat.daily.co/ws/generic/my-agent.my-org"
 The generic endpoint supports both text and binary WebSocket frames. Your bot receives messages exactly as sent by the client — no protocol-specific parsing or transformation is applied.
 
 Your bot code is responsible for handling the client's message format. Use the appropriate [serializer](/api-reference/server/services/serializers/introduction) for your client's protocol, or implement custom message handling for non-standard clients.
+
+## Passing parameters to the bot
+
+You can pass arbitrary JSON to your bot at session start via a `?body=` query parameter on the WebSocket URL. The value must be base64-encoded JSON. Your bot receives the decoded original through `args.body` — the same way it works for `daily` and `webrtc` transports. See [Passing data](/pipecat-cloud/fundamentals/active-sessions#passing-data) for examples in your bot code.
+
+How you assemble the URL depends on your service's `websocket_auth` setting.
+
+### With `websocket_auth = "token"`
+
+The `/start` call returns your body pre-encoded as a convenience, alongside the token and `wsUrl`. Append the encoded body to the URL when you connect:
+
+```python
+import requests
+import websockets
+
+resp = requests.post(
+    "https://api.pipecat.daily.co/v1/public/my-agent/start",
+    headers={"Authorization": "Bearer pk_your_public_key"},
+    json={"transport": "websocket", "body": {"caller_id": "abc123"}},
+).json()
+
+ws_url = resp["wsUrl"]
+if resp.get("body"):
+    ws_url = f"{ws_url}?body={resp['body']}"
+
+async with websockets.connect(
+    ws_url,
+    additional_headers={"Authorization": f"Bearer {resp['token']}"},
+) as ws:
+    ...
+```
+
+### With `websocket_auth = "none"`
+
+There's no `/start` call in this mode — base64-encode the JSON yourself and connect directly to the WebSocket endpoint:
+
+```python
+import base64
+import json
+import websockets
+
+body = {"caller_id": "abc123"}
+encoded = base64.b64encode(json.dumps(body).encode()).decode()
+url = f"wss://us-west.api.pipecat.daily.co/ws/generic/my-agent.my-org?body={encoded}"
+
+async with websockets.connect(url) as ws:
+    ...
+```
+
+<Note>
+  Maximum body size is **4 KB of JSON** — smaller than the 1 MB cap for `daily` and `webrtc` transports because the body travels as a URL query parameter on the WebSocket upgrade, which is bounded by the receiving server's URL-length limit. The same cap applies whether the body is encoded by `/start` or by your own client code.
+
+  Including a `body` on a `/start` call against a service that has `websocket_auth = "none"` is rejected with `400 Bad Request` — the `/start` body-encoding convenience is only available for token-authed services. Encode the body yourself instead.
+</Note>
