@@ -362,6 +362,70 @@ from pipecat.turns.user_stop import ExternalUserTurnStopStrategy
 strategy = ExternalUserTurnStopStrategy()
 ```
 
+### ExternalUserTurnCompletionStopStrategy
+
+Finalizes the user turn whenever a `UserTurnInferenceCompletedFrame` arrives, regardless of which component produced it. Use this when an external component — an LLM with completion markers, an STT service with built-in turn detection, a dedicated end-of-turn classifier, or custom code — decides when a turn is semantically complete and emits that frame.
+
+Pair it with one or more detector strategies wrapped in [`deferred(...)`](#deferring-finalization), which drive inference but leave finalization to this strategy:
+
+```python
+from pipecat.turns.user_stop import (
+    ExternalUserTurnCompletionStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+    deferred,
+)
+
+stop = [
+    deferred(TurnAnalyzerUserTurnStopStrategy(turn_analyzer=...)),
+    ExternalUserTurnCompletionStopStrategy(),
+]
+```
+
+<Note>
+  If the producer never emits `UserTurnInferenceCompletedFrame`, the
+  `user_turn_stop_timeout` watchdog finalizes the turn after no activity. Tune
+  that timeout if your producer can take longer than the default to respond.
+</Note>
+
+### LLMTurnCompletionUserTurnStopStrategy
+
+A subclass of `ExternalUserTurnCompletionStopStrategy` that adds the LLM-specific setup for the marker-based completion protocol. On `StartFrame` it enables turn-completion filtering on the LLM; finalization then happens when the LLM emits a `✓` marker. This is the finalizer used by [`FilterIncompleteUserTurnStrategies`](#filterincompleteuserturnstrategies).
+
+<ParamField path="config" type="UserTurnCompletionConfig" default="None">
+  Configuration applied to the LLM (turn-completion instructions,
+  incomplete-turn timeouts, and re-prompts). Defaults to
+  `UserTurnCompletionConfig()`.
+</ParamField>
+
+```python
+from pipecat.turns.user_stop import LLMTurnCompletionUserTurnStopStrategy
+
+strategy = LLMTurnCompletionUserTurnStopStrategy()
+```
+
+<Tip>
+  See [Filter Incomplete User
+  Turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns)
+  for the full LLM-gated turn-completion feature.
+</Tip>
+
+### Deferring finalization
+
+Some stop strategies should trigger LLM inference without ending the turn — finalization is owned by another strategy in the chain (such as the two above). Wrap a detector strategy with `deferred(...)` to suppress its `on_user_turn_stopped` event while keeping its [`on_user_turn_inference_triggered`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_inference_triggered) trigger:
+
+```python
+from pipecat.turns.user_stop import (
+    LLMTurnCompletionUserTurnStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+    deferred,
+)
+
+stop = [
+    deferred(TurnAnalyzerUserTurnStopStrategy(turn_analyzer=...)),
+    LLMTurnCompletionUserTurnStopStrategy(),
+]
+```
+
 ## Helper Functions
 
 Pipecat provides helper functions to compose custom strategy lists that extend the defaults.
@@ -437,9 +501,38 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 <Note>
   When an STT service acts as the turn controller, you can optionally include a
   VAD (such as `SileroVADAnalyzer`) in your transport. The VAD is not required
-  for core turn management functionality, but it does enable useful STT
-  metrics. Omit it if you don't need those metrics.
+  for core turn management functionality, but it does enable useful STT metrics.
+  Omit it if you don't need those metrics.
 </Note>
+
+## FilterIncompleteUserTurnStrategies
+
+A convenience class that preconfigures `UserTurnStrategies` for LLM-gated turn completion. It wraps your detector chain with `deferred(...)` and appends an `LLMTurnCompletionUserTurnStopStrategy`, so the public `on_user_turn_stopped` event fires only when the LLM confirms the turn is complete (`✓`). Detector strategies still drive LLM inference via `on_user_turn_inference_triggered`.
+
+```python
+from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=FilterIncompleteUserTurnStrategies(),
+    ),
+)
+```
+
+<ParamField path="config" type="UserTurnCompletionConfig" default="None">
+  Optional turn-completion configuration (instructions, incomplete-turn
+  timeouts, and re-prompts) applied to the LLM. Defaults are used if not
+  provided.
+</ParamField>
+
+The `start` and `stop` strategies default to the standard detector chain; override either to customize the detectors that trigger inference.
+
+<Tip>
+  See [Filter Incomplete User
+  Turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns)
+  for the full feature documentation, markers, and timeout behavior.
+</Tip>
 
 ## Usage Examples
 
