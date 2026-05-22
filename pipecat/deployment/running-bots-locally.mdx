@@ -1,0 +1,125 @@
+---
+title: "Running bots locally"
+description: "The bot entry point, the built-in development runner, and the transports it supports."
+---
+
+Pipecat ships a built-in development runner (`pipecat.runner.run`) that handles the server-side glue most bots need during development: creating Daily rooms, accepting WebRTC offers, terminating telephony WebSockets, and serving a prebuilt UI to talk to your bot. You write the bot; the runner does everything around it.
+
+This page covers the canonical shape: a bot file with a single async entry point, run via `pipecat.runner.run.main()`.
+
+## The bot entry point
+
+Every bot is a Python file with an async `bot()` function that takes a `RunnerArguments`. The runner calls this function once per session, passing in everything the bot needs to connect (room URL, token, WebRTC connection, WebSocket, etc.) as fields on the argument object.
+
+```python bot.py
+from pipecat.runner.types import RunnerArguments
+
+async def bot(runner_args: RunnerArguments):
+    """Entry point. The runner calls this once per session."""
+    # ... configure the transport from runner_args, build a pipeline, run it.
+    ...
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+    main()
+```
+
+The bot is encapsulated: it doesn't know how the request to start a session arrived, who authenticated it, or whether it's running locally or in production. Everything it needs to do its job is on `runner_args`. This is the property that makes the same bot file portable across the development runner, Pipecat Cloud, and most production self-hosting setups.
+
+## Choosing a transport
+
+`RunnerArguments` has transport-specific subclasses; the runner instantiates the right one based on how the session was initiated. A typical multi-transport bot pattern-matches:
+
+```python
+from pipecat.runner.types import (
+    DailyRunnerArguments,
+    RunnerArguments,
+    SmallWebRTCRunnerArguments,
+    WebSocketRunnerArguments,
+)
+
+async def bot(runner_args: RunnerArguments):
+    match runner_args:
+        case DailyRunnerArguments():
+            transport = DailyTransport(runner_args.room_url, runner_args.token, "Bot", ...)
+        case SmallWebRTCRunnerArguments():
+            transport = SmallWebRTCTransport(webrtc_connection=runner_args.webrtc_connection, ...)
+        case WebSocketRunnerArguments():
+            transport = FastAPIWebsocketTransport(websocket=runner_args.websocket, ...)
+
+    await run_pipeline(transport)
+```
+
+A bot can support a single transport or many. In both the local development runner and Pipecat Cloud, the client chooses how to start the session by sending a `transport` value in the `/start` request (`webrtc`, `daily`, `twilio`, `telnyx`, `plivo`, or `exotel`); `-t/--transport` only restricts the local runner to one transport and sets that default.
+
+For working files demonstrating each transport, see [`examples/runner-examples/`](https://github.com/pipecat-ai/pipecat-examples/tree/main/runner-examples) — the `01-` through `04-` files step from a single-transport bot through to a factory-driven multi-transport setup.
+
+## Installing and running
+
+```bash
+uv add "pipecat-ai[runner]"
+```
+
+Run the bot file directly:
+
+```bash
+uv run bot.py
+```
+
+By default, the development runner starts a local server on `localhost:7860`, serves the prebuilt client UI at `/client`, and lets clients start sessions through `POST /start`. Clients can request the transport in that start request; `-t/--transport` is available when you want to restrict the local runner to one transport.
+
+For the full `/start` request shape, transport-specific behavior, and CLI flags, see the [Development Runner guide](/api-reference/server/utilities/runner/guide).
+
+## What the runner does for you
+
+Behind `uv run bot.py` the runner is doing a fair amount of work depending on the transport the client requests:
+
+- **WebRTC (`smallwebrtc`)** — mounts a prebuilt UI at `/client`, accepts `POST /api/offer` (with ICE candidates via `PATCH /api/offer`), and bridges the resulting `SmallWebRTCConnection` to your `bot()` function. Also exposes a `POST /start` endpoint that returns a `sessionId`, mimicking Pipecat Cloud's start API.
+- **Daily** — calls Daily's REST API to create a room and issue tokens, then either redirects the browser to the room (for the `GET /` flow) or returns the room URL + token via `POST /start`.
+- **Telephony** — returns the carrier-specific XML stub (TwiML for Twilio, the equivalent for Telnyx/Plivo/Exotel) on `POST /`, then accepts the bidirectional media WebSocket at `/ws` and hands it to your bot wrapped in a `WebSocketRunnerArguments`.
+- **Daily PSTN dial-in** (`--dialin`) — handles Daily's pinless dial-in webhook, creates a SIP-enabled room, and dispatches the bot with full dial-in context.
+
+The `POST /start` and `/sessions/{id}/...` endpoints exposed in WebRTC and Daily modes are deliberately shaped the same way as [Pipecat Cloud](/pipecat-cloud/introduction)'s session API. That means a client built against the development runner works against PCC unchanged, and a custom production dispatcher can offer the same contract if you want clients to remain portable.
+
+## Adding your own routes
+
+The runner exports its FastAPI app as a module-level attribute, so you can add custom routes before calling `main()`:
+
+```python
+from pipecat.runner.run import app, main
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    main()
+```
+
+This is the simplest way to extend the runner — for things like health checks, internal status endpoints, or accepting metadata alongside session-start requests — without forking the dispatcher itself.
+
+## Containerizing for deployment
+
+A minimal Dockerfile for a bot file is unsurprising:
+
+```dockerfile
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY bot.py .
+# Bake model weights (e.g. Silero VAD) into the image so first-run is fast.
+RUN python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=True)"
+
+EXPOSE 7860
+CMD ["python", "bot.py", "--host", "0.0.0.0"]
+```
+
+For production-grade images, Pipecat Cloud's [base image](https://github.com/daily-co/pipecat-cloud-images) (`dailyco/pipecat-base`) is what most of the [examples](https://github.com/pipecat-ai/pipecat-examples) build from. It's also a reasonable starting point for self-hosted deployments — it provides a sensible runtime environment for a bot file, and you can use it without using PCC.
+
+## When the development runner isn't enough
+
+For small loads on a single machine, the development runner is genuinely a fine production target. Beyond that, you typically want different choices around capacity, lifecycle, and isolation. The next page, [Self-hosting in production](./self-hosting), walks through what changes and what the common patterns are.

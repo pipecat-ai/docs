@@ -1,0 +1,42 @@
+---
+title: "Warm pool with subprocess workers"
+description: "Pre-allocate transport resources and bot subprocesses on a long-lived host; replenish on use."
+---
+
+A long-lived dispatcher pre-creates the things that take time to set up — typically Daily rooms with tokens — and keeps them in an in-memory pool. When a session-start request arrives, the dispatcher pops a pre-warmed entry out of the pool, spawns a bot subprocess against it, and triggers a background task to replenish the pool back to its target size. The bot subprocess runs to completion in its own process; when it exits, the dispatcher cleans up the room.
+
+This is the shape used in the [`instant-voice`](https://github.com/pipecat-ai/pipecat-examples/tree/main/instant-voice) example. See `server/src/server.py` for a working `RoomPool` plus `BotManager` implementation with replenish-on-pop and process-exit cleanup.
+
+## When it fits
+
+- You care about session-start latency more than anything else. Popping from a pre-warmed pool and forking a subprocess on a host that already has the bot image loaded is fast.
+- Your traffic shape is steady enough that maintaining warm capacity isn't wasteful.
+- Your bot fits comfortably in a subprocess on a single host, and you're willing to scale across hosts by running multiple instances of the dispatcher.
+
+## When it doesn't
+
+- Your concurrency outgrows a single host. Subprocess fan-out is bounded by the host's CPU / memory / file descriptors / `pipe(2)` limits. Run this pattern across N hosts and you'll need a layer in front to route to the right one — at which point you may want a different shape.
+- You need strong per-session isolation (e.g. you're hosting bots for multiple customers and a crash in one must absolutely not affect another). Subprocesses share a kernel and a host; that's usually fine but isn't VM-level isolation.
+- Bots have large per-process memory footprints. The pool model is most efficient when one host can hold many bots.
+
+## How it usually looks
+
+The dispatcher (a single long-running process per host) has two pieces:
+
+1. **A resource pool.** At startup it pre-creates N transport resources (e.g. Daily rooms with tokens). When `/start` arrives, it pops one. After popping, it kicks off a background task to add one more, keeping the pool size stable.
+2. **A worker manager.** It spawns the bot as a subprocess with the room/token as arguments, tracks the PID, and cleans up associated resources (delete the room, free any session state) when the process exits.
+
+The bot file itself is the standard Pipecat shape — `async def bot(runner_args)`, transport configured from `runner_args`. It doesn't know whether the room it joined was pre-allocated or freshly created.
+
+## Tradeoffs worth being explicit about
+
+- **Latency vs. idle cost.** A warm pool of N pre-created rooms means you pay for those rooms even when nobody's using them. Set the pool size to match your typical idle-to-bursty ratio.
+- **Single-host concurrency ceiling.** The pattern works beautifully up to ~the host's capacity, then degrades sharply. Know what that ceiling is for your pipeline.
+- **Replenishment timing.** If you only refill after a pop, a sudden burst empties the pool faster than it can refill. A second background task that monitors pool size against a target can help.
+- **Process lifecycle.** Subprocesses crash; bots disconnect; transport sessions time out. The dispatcher needs to handle all three — typically by `await proc.wait()` in a background task that cleans up the associated transport resources on exit.
+- **Replicate the pattern, scale horizontally.** Running this dispatcher on multiple hosts is straightforward if your dispatch path doesn't need stickiness — put a load balancer in front and let the pools be per-host.
+
+## See also
+
+- [`instant-voice` example](https://github.com/pipecat-ai/pipecat-examples/tree/main/instant-voice) — a working implementation with both `RoomPool` and `BotManager`.
+- [VM per session](./vm-per-session) — the opposite tradeoff (no warm capacity, full per-session isolation).

@@ -1,0 +1,107 @@
+---
+title: "Self-hosting in production"
+description: "What plays the role of the development runner when you need to scale, and how to think about the choices."
+---
+
+The [development runner](./running-bots-locally) gets you a working bot you can talk to. Production raises a separate question: _what serves the session-start request, decides where the bot process runs, and manages its lifecycle once it's running?_
+
+There isn't one right answer. The right answer depends on traffic shape, isolation requirements, what operational surface your team already runs, and how much of the dispatcher you want to own. This page walks through the answer space at one paragraph per option, links out to concrete patterns, and ends with the cross-cutting concerns each option has to address one way or another.
+
+## What plays the runner's role
+
+The options below sit on a spectrum from "you run everything yourself" to "a managed runtime runs the bot for you". Strictly speaking, only the first two are self-hosting in the literal sense — the third is an alternative to self-hosting. They're walked through together because the decision space is the same one ("what serves session-start and runs the bot?") and most teams evaluating self-hosting are also weighing whether they want to be in that business at all.
+
+### Option 1 — Run the development runner in production
+
+For very modest traffic, `pipecat.runner.run` is a real option. It's a normal FastAPI/uvicorn app — you can put it behind a reverse proxy, deploy it as a container, and use it. For an internal tool, a prototype, or a low-volume product, that's often enough.
+
+It's worth being honest about what you don't get for free. The runner accepts unauthenticated `POST /start` requests; it has no built-in flow control or backpressure, so a traffic spike that exceeds the host's capacity will degrade silently before it fails; and a single instance is a single point of failure. You can mitigate the SPOF by running multiple instances behind a load balancer (the runner doesn't hold session-routing state of its own as long as your transport choice doesn't require stickiness), but the flow-control gap and the missing request authentication you still have to address yourself.
+
+A practical upper bound per host is "however many concurrent bot subprocesses one host can sustain", which depends heavily on what your pipeline does. CPU-light pipelines that mostly proxy between transport and third-party services can pack many sessions per host; pipelines with local STT/TTS, custom models, or significant VAD work will saturate sooner.
+
+### Option 2 — Build your own dispatcher
+
+You write the HTTP service that receives session-start requests, and you decide how bot processes get into existence. This is the most flexible option and the most work. The two patterns most teams reach for here are:
+
+- **[VM per session](./patterns/vm-per-session)** — your dispatcher calls a cloud provider's machines API (Fly.io, AWS, GCP) to spin up a fresh VM with the room/token baked into its entrypoint. Strong isolation, easy scale-out, no warm capacity to manage. Pays cold-start latency on every session.
+- **[Warm pool with subprocess workers](./patterns/warm-pool-subprocess)** — pre-allocate transport resources (e.g. Daily rooms) and a pool of bot subprocesses on one or more long-lived hosts. Replenish on use. Very low session-start latency; constrained by what one host can hold.
+
+These aren't the only shapes. Some teams build longer-lived orchestrated fleets on Kubernetes (with HPA or KEDA scaling on a custom session-count metric), or use a serverless platform's function-per-invocation model. The right shape is the one whose latency / cost / isolation profile matches the bot you're shipping and the traffic you're seeing.
+
+### Option 3 — Use a managed agent runtime
+
+This option steps out of self-hosting: a managed platform runs the bot process for you. You supply the bot file (and usually a thin proxy that forwards session-start traffic), and the platform owns the runtime, pool, and lifecycle. This minimizes the operational surface you carry but trades for vendor lock-in and whatever feature ceiling the runtime has. See [Managed agent runtime](./patterns/managed-runtime).
+
+[Pipecat Cloud](/pipecat-cloud/introduction) is one example: Daily's managed runtime, purpose-built for Pipecat. The development runner's session-start API is deliberately shaped the same way as PCC's (`POST /start`, `/sessions/{id}/...`), which means a bot file and client built against the runner work against PCC unchanged. Other managed runtimes — like AWS Bedrock AgentCore — are the same shape, with their own platform-specific tradeoffs.
+
+If you're considering self-hosting partly because you already have an ops team and existing infrastructure to leverage, options 1–2 are probably the right starting point. If you'd rather not build any of that surface, option 3 is the path designed to skip it.
+
+## What you'll need to address either way
+
+Whichever option you pick, a handful of concerns show up in production. None of them have a single right answer; the goal here is just to name them so they don't surprise you.
+
+### Request authentication
+
+The development runner accepts unauthenticated `POST /start` requests by design — that's fine on localhost and dangerous in production. Whatever serves session-start traffic in production needs some form of authentication, both to keep strangers from spinning up bots on your dime and to identify the user the bot is being started for. The shape varies: signed JWTs from your app server, bearer tokens, mutual-TLS, etc. If you're using a managed runtime this is usually handled by the runtime; if you're rolling your own dispatcher you'll need to add it.
+
+### Secret delivery
+
+Bots typically need a handful of API keys (Daily, your TTS/STT/LLM providers, your own service tokens). In development these come from a `.env` file. In production they should arrive through whatever mechanism your runtime supports — environment variables injected by a secrets manager, mounted files, an external secrets service. Avoid baking keys into images.
+
+### Image and model discipline
+
+Pipeline models (Silero VAD, any local TTS/STT/turn-detection models) want to be cached at build time, not download time. If you're using local model weights for anything substantial, decide between baking them into the image (faster cold start, larger image) versus mounting them from a network volume (smaller image, slower first-touch). Build runner and bot images separately if your dispatcher and your bot have meaningfully different dependencies.
+
+### Session lifecycle
+
+This is arguably the most distinctive operational fact about hosting bots and worth dwelling on. Most production HTTP workloads are short-lived: a request comes in, you do some work, you send a response, the worker is free again. Bot sessions are the opposite. A single session ties up a process (often a whole container or VM) for the entire duration of a conversation — typically minutes, sometimes hours — and that work can't be paused, migrated, or interrupted without dropping the user mid-sentence.
+
+That shape has consequences that ripple through every other operational choice:
+
+- **Autoscaling can't be reactive.** Traditional HPA-style "CPU is high, add more pods" works because new pods can immediately absorb new requests. With long-lived sessions, scale-up has to be predictive (anticipate demand, warm capacity ahead of it) and scale-down has to be patient (you can't terminate a pod that's mid-call; you have to stop sending it new sessions and wait for the existing ones to finish naturally). KEDA scaling on a custom "active sessions" metric is a closer fit than HPA on CPU, but neither solves the "wait for sessions to drain" problem.
+- **Pod and VM shutdowns need long graceful periods.** Kubernetes' default `terminationGracePeriodSeconds` is 30 seconds. For a typical bot host that might have sessions running for 10+ minutes, you need to either crank that up dramatically or accept that deploys will drop in-flight calls. Pair this with a `preStop` hook (or equivalent) that stops the host from accepting new sessions so the existing ones can drain.
+- **Readiness gating.** When do you tell the client "your bot is ready"? Returning a join URL the moment you've issued the dispatch is fast but lets the client try to connect before the bot has joined. Waiting until the bot has actually joined the transport is more reliable but adds latency to session start. Most teams pick somewhere in the middle: return optimistically and let the client poll or wait for a "bot joined" event from the transport provider.
+- **Crash handling.** Bots crash. Decide what the client sees, whether you retry, and whether the user-facing transport (Daily room, Twilio call) is reused or recreated. The right answer depends on how long sessions tend to last and how the user perceives a mid-call failure.
+- **Graceful drain on deploy.** Concretely, this usually looks like: mark the old version as not-accepting-new-sessions, redirect new traffic to the new version, wait for the old version's sessions to finish (with a deadline), then terminate. Without this you drop in-flight calls every deploy. With it, you accept that "rolling deploys" can take as long as your longest session.
+
+### Observability
+
+Bots are ephemeral and often distributed across hosts. Correlating events across "the dispatcher that accepted the request, the bot that ran the session, the transport provider that carried the audio" requires designing for it. A single session ID propagated through every log line (and ideally through your transport provider's session identifier as well) is the load-bearing piece. Beyond that, the metrics most teams find useful for voice bots are active-session count, dispatcher latency to "client ready", session duration, and pipeline-level metrics from the bot itself (Pipecat's `PipelineParams(enable_metrics=True, enable_usage_metrics=True)` gives you a starting point).
+
+### Networking and placement
+
+Most production deployments hit one or more of:
+
+- **Region selection for latency** — voice is latency-sensitive. Bots placed far from users introduce audible delay even when individual services are fast.
+- **Service quotas** — your cloud provider's machines API, your transport provider's rate limits, and the LLM/TTS providers your pipeline calls all have ceilings you'll find at scale.
+- **Telephony-specific networking** — SIP and PSTN setups can carry their own constraints depending on the carrier. See [Telephony in production](./telephony-in-production).
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="VM per session" icon="cube" href="./patterns/vm-per-session">
+    Dispatcher calls a cloud machines API to spawn a fresh VM per session.
+  </Card>
+  <Card
+    title="Warm pool with subprocess workers"
+    icon="layer-group"
+    href="./patterns/warm-pool-subprocess"
+  >
+    Pre-allocated resources and a worker pool on a single host, replenished on
+    use.
+  </Card>
+  <Card
+    title="Managed agent runtime"
+    icon="cloud"
+    href="./patterns/managed-runtime"
+  >
+    Hand the bot lifecycle off to a runtime that owns scaling and dispatch.
+  </Card>
+  <Card
+    title="Telephony in production"
+    icon="phone"
+    href="./telephony-in-production"
+  >
+    Webhook-driven dispatch, SIP gotchas, and where telephony differs.
+  </Card>
+</CardGroup>
