@@ -1,62 +1,65 @@
 ---
 title: "Agents and Runner"
-description: "Learn about agent types, the AgentRunner, and how to build your first agent."
+description: "Learn about agent types, the PipelineRunner, and how to build your first agent."
 ---
 
 ## Agent types
 
-Pipecat Subagents provides three built-in agent types, each building on the previous:
+Pipecat is a multi-agent system. It provides built-in worker types that back your agents, each building on the previous:
 
 | Type | Purpose |
 | --- | --- |
-| `BaseAgent` | Foundation for all agents. Owns a pipeline, manages lifecycle, handles tasks. |
-| `LLMAgent` | Extends `BaseAgent` with an LLM pipeline and automatic `@tool` registration. |
-| `FlowsAgent` | Extends `LLMAgent` with structured conversation flows via Pipecat Flows. |
+| `BaseWorker` | Foundation for all agents. Connects to the bus, manages lifecycle, coordinates jobs. |
+| `PipelineWorker` | Extends `BaseWorker` to run a Pipecat pipeline. The main transport agent is a `PipelineWorker`. |
+| `LLMWorker` | Extends `PipelineWorker` with an LLM pipeline and automatic `@tool` registration. |
 
-### BaseAgent
+### BaseWorker
 
-Every agent extends `BaseAgent`. It defines its own pipeline, manages its lifecycle, can hand off control to other agents, and can coordinate tasks with workers.
+Every worker extends `BaseWorker`. It connects to a `WorkerBus`, registers itself in the shared registry, accepts activation/deactivation, can hand off control to other agents, and can coordinate jobs with other workers.
 
-### LLMAgent
+### PipelineWorker
 
-`LLMAgent` extends `BaseAgent` with an LLM pipeline. You provide the LLM service and define tools via the `@tool` decorator -- the framework handles the rest.
+`PipelineWorker` extends `BaseWorker` to run a Pipecat pipeline. Your main transport agent -- the one that owns audio I/O -- is a `PipelineWorker` wrapping a pipeline that contains a `BusBridgeProcessor`.
 
-### FlowsAgent
+### LLMWorker
 
-`FlowsAgent` extends `LLMAgent` with structured conversation flows via Pipecat Flows. You define nodes and transitions for deterministic conversation paths.
+`LLMWorker` extends `PipelineWorker` with an LLM pipeline. You provide the LLM service and define tools via the `@tool` decorator -- the framework handles the rest.
 
 <Info>
-  `LLMAgent` and `FlowsAgent` are covered in detail in the Fundamentals section. This guide focuses on `BaseAgent` and the overall system.
+  `LLMWorker` is covered in detail in the Fundamentals section. This guide focuses on `PipelineWorker` and the overall system.
 </Info>
 
-## The AgentRunner
+## The PipelineRunner
 
-The `AgentRunner` is the entry point for every subagent system. It:
+The `PipelineRunner` is the entry point for every multi-agent system. It:
 
 - Creates and manages the shared message bus
-- Starts agent pipelines and manages their lifecycle
-- Tracks agent readiness through a registry
+- Starts worker pipelines and manages their lifecycle
+- Tracks worker readiness through a registry
 - Coordinates graceful shutdown
 
 ```python
-from pipecat_subagents.runner import AgentRunner
+from pipecat.pipeline.runner import PipelineRunner
 
-runner = AgentRunner()
+runner = PipelineRunner()
 ```
 
 When you don't provide a bus, the runner creates an `AsyncQueueBus` automatically -- an in-process bus backed by asyncio queues. For distributed setups, you can pass a `RedisBus` instead.
 
+Workers get their bus from the runner. You never pass a `bus=` argument to a worker constructor; instead you register workers with `runner.add_workers(...)`, which attaches them to the runner's bus and registry. Inside a running worker you can read `self.bus`.
+
 ## Your first agent
 
-Here's the simplest possible subagent system -- a single `BaseAgent` running a complete voice pipeline:
+Here's the simplest possible multi-agent system -- a main transport agent (a `PipelineWorker`) that bridges audio to the bus, plus a single `LLMWorker` that handles the conversation:
 
 ```python
 import os
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMMessagesAppendFrame
+from pipecat.bus import BusBridgeProcessor
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -64,119 +67,163 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
+from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.base_transport import BaseTransport
+from pipecat.workers.llm import LLMWorker, LLMWorkerActivationArgs
 
-from pipecat_subagents.agents import BaseAgent
-from pipecat_subagents.bus import AgentBus
-from pipecat_subagents.runner import AgentRunner
+MAIN_NAME = "acme"
 
 
-class SimpleAgent(BaseAgent):
-    def __init__(self, name: str, *, bus: AgentBus, transport: BaseTransport):
-        super().__init__(name, bus=bus)
-        self._transport = transport
+class AssistantAgent(LLMWorker):
+    """An LLM agent. ``@tool`` methods would go here."""
 
-    async def build_pipeline(self) -> Pipeline:
-        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            settings=CartesiaTTSSettings(
-                voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
-            ),
-        )
-        llm = OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            settings=OpenAILLMSettings(
-                system_instruction="You are a helpful voice assistant. Keep responses brief.",
-            ),
-        )
 
-        context = LLMContext()
-        context_aggregator = LLMContextAggregatorPair(
-            context,
-            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
-        )
-
-        @self._transport.event_handler("on_client_connected")
-        async def on_client_connected(transport, client):
-            await self.queue_frame(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "developer", "content": "Greet the user."}],
-                    run_llm=True,
-                )
-            )
-
-        @self._transport.event_handler("on_client_disconnected")
-        async def on_client_disconnected(transport, client):
-            await self.end()
-
-        return Pipeline(
-            [
-                self._transport.input(),
-                stt,
-                context_aggregator.user(),
-                llm,
-                tts,
-                self._transport.output(),
-                context_aggregator.assistant(),
-            ]
-        )
+def build_assistant() -> AssistantAgent:
+    llm = OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(
+            system_instruction="You are a helpful voice assistant. Keep responses brief.",
+        ),
+    )
+    return AssistantAgent("assistant", llm=llm, bridged=())
 ```
 
-This looks similar to a regular Pipecat pipeline -- and that's the point. A single agent wraps a standard pipeline with lifecycle management.
-
-## Running the agent
-
-To run the agent, create a runner, add the agent, and call `run()`:
+The main transport agent owns the transport pipeline. A `BusBridgeProcessor` sits in the middle of that pipeline: it tees user-side context onto the bus for the LLM agent and brings the LLM agent's generated text back so the TTS can speak it.
 
 ```python
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    runner = AgentRunner(handle_sigint=runner_args.handle_sigint)
-    agent = SimpleAgent("assistant", bus=runner.bus, transport=transport)
-    await runner.add_agent(agent)
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+
+    stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
+    tts = CartesiaTTSService(
+        api_key=os.environ["CARTESIA_API_KEY"],
+        settings=CartesiaTTSService.Settings(
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        ),
+    )
+
+    context = LLMContext()
+    aggregators = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
+
+    bridge = BusBridgeProcessor(
+        bus=runner.bus,
+        worker_name=MAIN_NAME,
+        name=f"{MAIN_NAME}::BusBridge",
+    )
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            aggregators.user(),
+            bridge,
+            tts,
+            transport.output(),
+            aggregators.assistant(),
+        ]
+    )
+
+    main = PipelineWorker(
+        pipeline,
+        name=MAIN_NAME,
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    )
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        await main.activate_worker(
+            "assistant",
+            args=LLMWorkerActivationArgs(
+                messages=[{"role": "developer", "content": "Greet the user."}],
+            ),
+        )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await runner.cancel()
+
+    await runner.add_workers(build_assistant(), main)
     await runner.run()
 ```
 
-The runner blocks until `end()` or `cancel()` is called. In this case, the agent calls `self.end()` when the client disconnects.
+The transport pipeline looks similar to a regular Pipecat pipeline -- and that's the point. The `BusBridgeProcessor` is the only addition, and it's what connects the main agent to the LLM agent over the bus.
 
-## Lifecycle hooks
+## Running the agent
 
-`BaseAgent` provides hooks you can override to react to lifecycle events. Always call `super()` in your overrides:
+To run the system, create a runner, add the workers, and call `run()`. Note that the bus comes from the runner -- you never pass `bus=` to a worker constructor:
 
 ```python
-class MyAgent(BaseAgent):
-    async def on_ready(self) -> None:
-        """Called once when the agent's pipeline is ready."""
-        await super().on_ready()
-        logger.info(f"Agent {self.name} is ready")
-
-    async def on_finished(self) -> None:
-        """Called when the agent's pipeline finishes."""
-        await super().on_finished()
-
-    async def on_error(self, error: str, fatal: bool) -> None:
-        """Called when a pipeline error occurs."""
-        await super().on_error(error, fatal)
+runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+await runner.add_workers(build_assistant(), main)
+await runner.run()
 ```
 
-## Adding child agents
+`add_workers(...)` attaches each worker to the runner's bus and registry and starts it in the background. The runner blocks until `end()` or `cancel()` is called. In the example above, the runner is cancelled when the client disconnects.
 
-Agents can have child agents. This is how you build multi-agent systems -- the main agent adds LLM agents as children:
+## Activating the first agent
+
+LLM agents start inactive (`active=False`). You activate the first one once the client connects, inside an `on_client_connected` handler, by calling `activate_worker` on the main agent:
 
 ```python
-@self._transport.event_handler("on_client_connected")
+@transport.event_handler("on_client_connected")
 async def on_client_connected(transport, client):
-    greeter = GreeterAgent("greeter", bus=self.bus)
-    support = SupportAgent("support", bus=self.bus)
-    await self.add_agent(greeter)
-    await self.add_agent(support)
+    await main.activate_worker(
+        "assistant",
+        args=LLMWorkerActivationArgs(
+            messages=[{"role": "developer", "content": "Greet the user."}],
+        ),
+    )
 ```
 
-When the parent shuts down, children are shut down too. To get notified when a child agent is ready, use `@agent_ready` or call `watch_agent()` explicitly.
+Activating a worker fires its `on_activated` hook. For an `LLMWorker`, the default `on_activated` sets the tools, injects the provided messages into the LLM context, and runs the LLM.
+
+## Reacting to other agents becoming ready
+
+`BaseWorker` provides hooks you can override to react to other workers becoming ready. Always call `super()` in your overrides:
+
+```python
+from pipecat.registry.types import WorkerReadyData
+
+
+class MyAgent(LLMWorker):
+    async def on_worker_ready(self, data: WorkerReadyData) -> None:
+        """Called when a watched worker registers as ready."""
+        await super().on_worker_ready(data)
+        logger.info(f"Worker {data.worker_name} is ready")
+```
+
+To react to a specific worker becoming ready, use the `@worker_ready` decorator instead:
+
+```python
+from pipecat.pipeline.worker_ready_decorator import worker_ready
+from pipecat.registry.types import WorkerReadyData
+
+
+class MyAgent(LLMWorker):
+    @worker_ready(name="greeter")
+    async def on_greeter_ready(self, data: WorkerReadyData) -> None:
+        await self.activate_worker(
+            "greeter",
+            args=LLMWorkerActivationArgs(
+                messages=[{"role": "developer", "content": "Welcome the user."}],
+            ),
+        )
+```
+
+## Adding more agents
+
+You add every agent to the runner the same way -- pass them all to `add_workers`:
+
+```python
+await runner.add_workers(build_greeter(), build_support(), main)
+```
+
+The runner attaches each worker to the shared bus and registry and starts it. To get notified when an agent is ready, use `@worker_ready` or call `watch_workers()` explicitly.
 
 ## What's next
 

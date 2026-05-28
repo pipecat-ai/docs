@@ -3,36 +3,38 @@ title: "LLM Agent and the @tool Decorator"
 description: "Build agents with LLM pipelines and automatic tool registration."
 ---
 
-## LLMAgent overview
+## LLMWorker overview
 
-`LLMAgent` extends `BaseAgent` with everything you need to run an LLM-powered agent:
+`LLMWorker` extends `PipelineWorker` with everything you need to run an LLM-powered agent:
 
 - A pipeline with your LLM service, automatically built
 - Tool registration via the `@tool` decorator
 - Activation handling that injects messages and runs the LLM
 
-To create an LLM agent, subclass `LLMAgent` and implement `build_llm()`:
+To create an LLM agent, subclass `LLMWorker` so you can host `@tool` methods, then instantiate it with its own LLM service. Pass `bridged=()` so the agent receives frames from the bus:
 
 ```python
-from pipecat.services.llm_service import LLMService
-from pipecat.services.openai.base_llm import OpenAILLMSettings
+import os
+
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat_subagents.agents import LLMAgent
+from pipecat.workers.llm import LLMWorker
 
-class MyAgent(LLMAgent):
-    def __init__(self, name, *, bus):
-        super().__init__(name, bus=bus, bridged=())
 
-    def build_llm(self) -> LLMService:
-        return OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            settings=OpenAILLMSettings(
-                system_instruction="You are a helpful assistant.",
-            ),
-        )
+class MyAgent(LLMWorker):
+    """An LLM agent. ``@tool`` methods go here."""
+
+
+def build_agent() -> MyAgent:
+    llm = OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(
+            system_instruction="You are a helpful assistant.",
+        ),
+    )
+    return MyAgent("assistant", llm=llm, bridged=())
 ```
 
-The default pipeline is: `LLM` (with tools from `build_tools()` automatically registered). When `bridged=()` is set, the framework wraps this pipeline with edge processors that connect it to the bus.
+You never pass a `bus=` argument to the constructor -- the worker gets its bus when you register it with `runner.add_workers(...)`. The default pipeline is `Pipeline([llm])`, with tools from `build_tools()` automatically registered. When `bridged=()` is set, the framework wraps this pipeline with edge processors that connect it to the bus.
 
 ## The @tool decorator
 
@@ -40,11 +42,10 @@ The `@tool` decorator marks a method as an LLM-callable tool. The framework auto
 
 ```python
 from pipecat.services.llm_service import FunctionCallParams
-from pipecat_subagents.agents import tool
+from pipecat.workers.llm import tool
 
-class MyAgent(LLMAgent):
-    # ... build_llm() ...
 
+class MyAgent(LLMWorker):
     @tool
     async def get_weather(self, params: FunctionCallParams, city: str):
         """Get the current weather for a city.
@@ -106,15 +107,15 @@ async def lookup(self, params: FunctionCallParams, item: str):
 
 ## Activation with messages
 
-When an `LLMAgent` is activated, you can inject messages into its context:
+When an `LLMWorker` is activated, you can inject messages into its context. Pass an `LLMWorkerActivationArgs` via the `args` parameter:
 
 ```python
-from pipecat_subagents.agents import LLMAgentActivationArgs
+from pipecat.workers.llm import LLMWorkerActivationArgs
 
-await self.activate_agent(
+await self.activate_worker(
     "support",
-    activation_args=LLMAgentActivationArgs(
-        messages=[{"role": "user", "content": "The user asked about pricing."}],
+    args=LLMWorkerActivationArgs(
+        messages=[{"role": "developer", "content": "The user asked about pricing."}],
         run_llm=True,  # Run the LLM immediately after injection
     ),
 )
@@ -124,21 +125,24 @@ The default `on_activated()` implementation:
 
 1. Sets the tools from `build_tools()`
 2. Injects the provided messages into the LLM context
-3. Runs the LLM if `run_llm` is `True` (the default)
+3. Runs the LLM if `run_llm` is `True` (the default when `messages` is set)
 
 ## Custom pipelines
 
-If you need more control, you can override `build_pipeline()` entirely. For example, to add TTS to the agent's own pipeline:
+If you need more control, you can pass a custom `pipeline=` to the `LLMWorker` constructor. For example, to add TTS to the agent's own pipeline:
 
 ```python
-class AgentWithTTS(LLMAgent):
-    async def build_pipeline(self) -> Pipeline:
-        pipeline = await super().build_pipeline()
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.services.cartesia.tts import CartesiaTTSService
+
+
+class AgentWithTTS(LLMWorker):
+    def __init__(self, name: str, *, llm, voice_id: str):
         tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            settings=CartesiaTTSSettings(voice="..."),
+            api_key=os.environ["CARTESIA_API_KEY"],
+            settings=CartesiaTTSService.Settings(voice=voice_id),
         )
-        return Pipeline([pipeline, tts])
+        super().__init__(name, llm=llm, pipeline=Pipeline([llm, tts]), bridged=())
 ```
 
 This is how [custom voices per agent](/pipecat/agents/learn/custom-voices-per-agent) works -- each agent adds its own TTS after the LLM.

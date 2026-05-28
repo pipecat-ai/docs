@@ -22,7 +22,8 @@ transport.input → STT → context_agg → BusBridge → TTS → transport.outp
 The bridge sends outgoing frames (like transcribed text) to the bus, and receives incoming frames (like LLM-generated text) from the active agent.
 
 <Info>
-  The examples above show a voice pipeline, but `BusBridgeProcessor` can be used in any type of pipeline. It works with any frames, not just audio.
+  The examples above show a voice pipeline, but `BusBridgeProcessor` can be used
+  in any type of pipeline. It works with any frames, not just audio.
 </Info>
 
 ## How it works
@@ -35,31 +36,45 @@ The bridge operates in two directions:
 
 Certain frames are never sent across the bus:
 
-- Lifecycle frames (`StartFrame`, `EndFrame`, `CancelFrame`)
+- Lifecycle frames (`StartFrame`, `EndFrame`, `CancelFrame`, `StopFrame`)
 - Transport-urgent frames (these pass through the bridge locally)
 
 ## Basic usage
 
+The main agent is a `PipelineWorker` wrapping a pipeline that contains a `BusBridgeProcessor`. The bridge gets its bus from `runner.bus`:
+
 ```python
-from pipecat_subagents.bus import BusBridgeProcessor
+from pipecat.bus import BusBridgeProcessor
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 
-class MainAgent(BaseAgent):
-    async def build_pipeline(self) -> Pipeline:
-        bridge = BusBridgeProcessor(
-            bus=self.bus,
-            agent_name=self.name,
-        )
+MAIN_NAME = "acme"
 
-        return Pipeline([
-            self._transport.input(),
-            stt,
-            context_aggregator.user(),
-            bridge,
-            tts,
-            self._transport.output(),
-            context_aggregator.assistant(),
-        ])
+runner = PipelineRunner()
+
+bridge = BusBridgeProcessor(
+    bus=runner.bus,
+    worker_name=MAIN_NAME,
+    name=f"{MAIN_NAME}::BusBridge",
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    bridge,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+
+main = PipelineWorker(pipeline, name=MAIN_NAME, params=PipelineParams())
+
+await runner.add_workers(main)
 ```
+
+The worker gets its bus from the runner when added with `runner.add_workers()`. You build the `BusBridgeProcessor` ahead of time with `runner.bus` and place it in the pipeline where an LLM would normally go.
 
 ## Named bridges
 
@@ -67,35 +82,41 @@ When you have multiple bridges in a system, you can name them to control which a
 
 ```python
 voice_bridge = BusBridgeProcessor(
-    bus=self.bus,
-    agent_name=self.name,
+    bus=runner.bus,
+    worker_name=MAIN_NAME,
+    name=f"{MAIN_NAME}::VoiceBridge",
     bridge="voice",
 )
 ```
 
-Agents can then filter which bridges they listen to:
+Agents control which bridges they listen to through the `bridged` argument when they are created:
 
 ```python
 # Receives frames from all bridges
-class AllBridgesAgent(LLMAgent):
-    def __init__(self, name, *, bus):
-        super().__init__(name, bus=bus, bridged=())
+all_bridges_agent = MyLLMWorker("all", llm=llm, bridged=())
 
 # Receives frames only from the "voice" bridge
-class VoiceOnlyAgent(LLMAgent):
-    def __init__(self, name, *, bus):
-        super().__init__(name, bus=bus, bridged=("voice",))
+voice_only_agent = MyLLMWorker("voice-only", llm=llm, bridged=("voice",))
 ```
 
 ## The bridged agent side
 
-When an agent sets `bridged=()` (or a tuple of bridge names), the framework automatically wraps its pipeline with edge processors that handle bus frame conversion:
+When an agent sets `bridged=()` (or a tuple of bridge names), the framework automatically wraps its pipeline with edge processors that handle bus frame conversion. An LLM agent subclasses `LLMWorker` and passes its own LLM service:
 
 ```python
-class MyLLMAgent(LLMAgent):
-    def __init__(self, name, *, bus):
-        super().__init__(name, bus=bus, bridged=())
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.workers.llm import LLMWorker, tool
+
+class MyLLMWorker(LLMWorker):
+    @tool
+    async def my_function(self, params, arg: str):
+        ...
+
+llm = OpenAILLMService(api_key="...")
+agent = MyLLMWorker("greeter", llm=llm, bridged=())
 ```
+
+A worker never takes a `bus=` argument. It receives its bus from the runner when you register it with `runner.add_workers()`.
 
 The resulting pipeline looks like:
 

@@ -1,59 +1,47 @@
 ---
-title: "BaseAgent"
+title: "BaseWorker"
 description: "Core agent class for the multi-agent framework"
 ---
 
 ## Overview
 
-`BaseAgent` is the abstract base class that all agents inherit from. It handles agent lifecycle, parent-child relationships, bus communication, and task coordination.
+`BaseWorker` is the abstract base class that all agents inherit from. It handles agent lifecycle, parent-child relationships, bus communication, and job coordination.
 
-Agents that return a pipeline from `build_pipeline()` run a Pipecat pipeline. Agents that don't override `build_pipeline()` operate purely through bus messages (e.g. coordinators, orchestrators).
+A `BaseWorker` connects to a [`WorkerBus`](/api-reference/agents/bus#workerbus), registers itself in the shared registry, accepts activation/deactivation, and exchanges job requests/responses with other agents. Agents that need to run a Pipecat pipeline use a concrete subclass like [`LLMWorker`](/api-reference/agents/llm-agent), while `BaseWorker` itself operates purely through bus messages (e.g. coordinators, orchestrators).
 
 ```python
-from pipecat_subagents.agents import BaseAgent
+from pipecat.pipeline.base_worker import BaseWorker, WorkerActivationArgs
 ```
 
 ## Configuration
 
-<ParamField path="name" type="str" required>
-  Unique name for this agent. Used for bus message routing and registry lookup.
-</ParamField>
-
-<ParamField path="bus" type="AgentBus" required>
-  The [`AgentBus`](/api-reference/agents/bus#agentbus) for
-  inter-agent communication.
+<ParamField path="name" type="str | None" default="None">
+  Unique name for this agent, used for bus message routing and registry lookup.
+  If `None`, an auto-generated name is used (useful for instances that don't
+  participate in inter-agent communication).
 </ParamField>
 
 <ParamField path="active" type="bool" default="True">
   Whether the agent starts active. When `False`, the agent waits for an
-  `activate_agent()` call before `on_activated` fires.
+  `activate_worker()` call before `on_activated` fires.
 </ParamField>
 
-<ParamField path="bridged" type="tuple[str, ...] | None" default="None">
-  Bridge configuration for receiving pipeline frames from the bus. `None` means
-  not bridged. An empty tuple `()` means bridged, accepting frames from all
-  bridges. A tuple of names like `("voice",)` means bridged, accepting only
-  frames from those bridges.
-</ParamField>
-
-<ParamField
-  path="exclude_frames"
-  type="tuple[type[Frame], ...] | None"
-  default="None"
->
-  Frame types to exclude from bus forwarding when bridged. Lifecycle frames
-  (`StartFrame`, `EndFrame`, `CancelFrame`, `StopFrame`) are always excluded.
-</ParamField>
+<Note>
+  The bus is not passed in the constructor. It is provided by the runner when
+  the agent is registered with
+  [`PipelineRunner.add_workers()`](/api-reference/agents/agent-runner#add-workers),
+  which calls `attach()` internally.
+</Note>
 
 ## Properties
 
 ### bus
 
 ```python
-agent.bus -> AgentBus
+agent.bus -> WorkerBus
 ```
 
-The bus instance for agent communication.
+The bus this agent is attached to. Raises `RuntimeError` if accessed before `attach()` has been called.
 
 ### active
 
@@ -66,7 +54,7 @@ Whether this agent is currently active.
 ### activation_args
 
 ```python
-agent.activation_args -> Optional[dict]
+agent.activation_args -> dict | None
 ```
 
 The arguments from the most recent activation, or `None` if the agent is inactive. The value is cleared when the agent is deactivated.
@@ -82,26 +70,10 @@ The name of the parent agent, or `None` if this is a root agent.
 ### registry
 
 ```python
-agent.registry -> AgentRegistry | None
+agent.registry -> WorkerRegistry
 ```
 
-The shared agent registry, if set by a runner.
-
-### bridged
-
-```python
-agent.bridged -> bool
-```
-
-Whether this agent is bridged (receives pipeline frames from the bus).
-
-### ready
-
-```python
-agent.ready -> bool
-```
-
-Whether this agent's pipeline has started and is ready to operate.
+The shared agent registry this agent is attached to. Raises `RuntimeError` if accessed before `attach()` has been called.
 
 ### started_at
 
@@ -111,70 +83,41 @@ agent.started_at -> float | None
 
 Unix timestamp when this agent became ready, or `None` if not yet started.
 
+### bridged
+
+```python
+agent.bridged -> bool
+```
+
+Whether this agent is bridged onto the bus (receives pipeline frames from the bus). Always `False` on `BaseWorker`; subclasses such as `PipelineWorker` override it.
+
 ### children
 
 ```python
-agent.children -> list[BaseAgent]
+agent.children -> list[BaseWorker]
 ```
 
-The list of child agents added via `add_agent()`.
+The list of child agents added via `add_workers()`.
 
-### pipeline_task
+### active_jobs
 
 ```python
-agent.pipeline_task -> PipelineTask
+agent.active_jobs -> dict[str, BusJobRequestMessage]
 ```
 
-The `PipelineTask` for this agent. Raises `RuntimeError` if the pipeline task has not been created yet.
+Active job requests this agent is currently working on, keyed by `job_id`.
 
-### task_id
+### job_groups
 
 ```python
-agent.task_id -> str | None
+agent.job_groups -> dict[str, JobGroup]
 ```
 
-The ID of the task this agent is currently working on, or `None` if idle.
-
-### task_groups
-
-```python
-agent.task_groups -> dict[str, TaskGroup]
-```
-
-Active task groups launched by this agent, keyed by `task_id`.
+Active job groups launched by this agent, keyed by `job_id`.
 
 ## Lifecycle Hooks
 
 Override these methods to react to lifecycle events. Always call `super()` when overriding.
-
-### on_ready
-
-```python
-async def on_ready(self) -> None
-```
-
-Called once when the agent's pipeline starts and the agent is ready to operate.
-
-### on_finished
-
-```python
-async def on_finished(self) -> None
-```
-
-Called when the agent's pipeline has finished.
-
-### on_error
-
-```python
-async def on_error(self, error: str, fatal: bool) -> None
-```
-
-Called when a pipeline error occurs. Override to handle errors (e.g. propagate via `send_error()`, fail a running task, or log and recover).
-
-| Parameter | Type   | Description                        |
-| --------- | ------ | ---------------------------------- |
-| `error`   | `str`  | Description of the error           |
-| `fatal`   | `bool` | Whether the error is unrecoverable |
 
 ### on_activated
 
@@ -184,8 +127,8 @@ async def on_activated(self, args: dict | None) -> None
 
 Called when this agent is activated. Override to react to activation.
 
-| Parameter | Type         | Description                        |
-| --------- | ------------ | ---------------------------------- |
+| Parameter | Type          | Description                        |
+| --------- | ------------- | ---------------------------------- |
 | `args`    | `dict | None` | Optional arguments from the caller |
 
 ### on_deactivated
@@ -196,103 +139,88 @@ async def on_deactivated(self) -> None
 
 Called when this agent is deactivated.
 
-### on_agent_ready
+### on_worker_ready
 
 ```python
-async def on_agent_ready(self, data: AgentReadyData) -> None
+async def on_worker_ready(self, data: WorkerReadyData) -> None
 ```
 
-Called when another agent is ready to receive messages. For local root agents this fires automatically. For remote agents it fires only for agents watched via `watch_agent()`. For child agents it fires only on the parent.
+Called when another agent is ready to receive messages. For local root agents this fires automatically. For remote agents it fires only for agents watched via `watch_workers()`. For child agents it fires only on the parent.
 
-| Parameter | Type                                                                      | Description                       |
-| --------- | ------------------------------------------------------------------------- | --------------------------------- |
-| `data`    | [`AgentReadyData`](/api-reference/agents/types#agentreadydata) | Information about the ready agent |
+| Parameter | Type                                                             | Description                       |
+| --------- | ---------------------------------------------------------------- | --------------------------------- |
+| `data`    | [`WorkerReadyData`](/api-reference/agents/types#workerreadydata) | Information about the ready agent |
 
-### on_agent_error
+### on_worker_failed
 
 ```python
-async def on_agent_error(self, data: AgentErrorData) -> None
+async def on_worker_failed(self, data: WorkerErrorData) -> None
 ```
 
 Called when a child agent reports an error.
 
-| Parameter | Type                                                                      | Description                 |
-| --------- | ------------------------------------------------------------------------- | --------------------------- |
-| `data`    | [`AgentErrorData`](/api-reference/agents/types#agenterrordata) | Information about the error |
+| Parameter | Type                                                             | Description                 |
+| --------- | ---------------------------------------------------------------- | --------------------------- |
+| `data`    | [`WorkerErrorData`](/api-reference/agents/types#workererrordata) | Information about the error |
 
 ## Agent Management
 
-### add_agent
+### add_workers
 
 ```python
-async def add_agent(self, agent: BaseAgent) -> None
+async def add_workers(self, *workers: BaseWorker, watch: bool = True) -> None
 ```
 
-Register a child agent under this parent. The child's lifecycle (end, cancel) is automatically managed by this parent agent.
+Register one or more child agents under this parent. Each child's lifecycle (end, cancel) is automatically managed by this parent agent. By default the children are also watched, so the parent receives `on_worker_ready` when each one starts.
 
-| Parameter | Type        | Description                     |
-| --------- | ----------- | ------------------------------- |
-| `agent`   | `BaseAgent` | The child agent instance to add |
+| Parameter  | Type         | Default | Description                                                   |
+| ---------- | ------------ | ------- | ------------------------------------------------------------- |
+| `*workers` | `BaseWorker` |         | One or more child agent instances to add                      |
+| `watch`    | `bool`       | `True`  | Whether to watch each newly added child for `on_worker_ready` |
 
-### activate_agent
+### activate_worker
 
 ```python
-async def activate_agent(
+async def activate_worker(
     self,
-    agent_name: str,
+    worker_name: str,
     *,
-    args: AgentActivationArgs | None = None,
+    args: WorkerActivationArgs | None = None,
+    deactivate_self: bool = False,
 ) -> None
 ```
 
-Activate an agent by name. The target agent's `on_activated` hook will be called with the provided arguments.
+Activate an agent by name. The target agent's `on_activated` hook will be called with the provided arguments. To hand off (deactivate this agent and activate the target), pass `deactivate_self=True`.
 
-| Parameter    | Type                        | Default | Description                           |
-| ------------ | --------------------------- | ------- | ------------------------------------- |
-| `agent_name` | `str`                       |         | Name of the agent to activate         |
-| `args`       | `AgentActivationArgs | None` | `None`  | Arguments forwarded to `on_activated` |
+| Parameter         | Type                          | Default | Description                                                   |
+| ----------------- | ----------------------------- | ------- | ------------------------------------------------------------- |
+| `worker_name`     | `str`                         |         | Name of the agent to activate                                 |
+| `args`            | `WorkerActivationArgs | None` | `None`  | Arguments forwarded to `on_activated`                         |
+| `deactivate_self` | `bool`                        | `False` | Whether to deactivate this agent before activating the target |
 
-### deactivate_agent
+### deactivate_worker
 
 ```python
-async def deactivate_agent(self, agent_name: str) -> None
+async def deactivate_worker(self, worker_name: str) -> None
 ```
 
 Deactivate an agent by name. The target agent's `on_deactivated` hook will be called.
 
-| Parameter    | Type  | Description                     |
-| ------------ | ----- | ------------------------------- |
-| `agent_name` | `str` | Name of the agent to deactivate |
+| Parameter     | Type  | Description                     |
+| ------------- | ----- | ------------------------------- |
+| `worker_name` | `str` | Name of the agent to deactivate |
 
-### handoff_to
-
-```python
-async def handoff_to(
-    self,
-    agent_name: str,
-    *,
-    args: AgentActivationArgs | None = None,
-) -> None
-```
-
-Hand off to another agent. Deactivates this agent and activates the target. For independent control, use `activate_agent()` and `deactivate_agent()` directly.
-
-| Parameter    | Type                        | Default | Description                           |
-| ------------ | --------------------------- | ------- | ------------------------------------- |
-| `agent_name` | `str`                       |         | Name of the agent to hand off to      |
-| `args`       | `AgentActivationArgs | None` | `None`  | Arguments forwarded to `on_activated` |
-
-### watch_agent
+### watch_workers
 
 ```python
-async def watch_agent(self, agent_name: str) -> None
+async def watch_workers(self, *worker_names: str) -> None
 ```
 
-Request notification when an agent registers. If the agent is already registered, `on_agent_ready` fires immediately. Otherwise it fires when the agent eventually registers.
+Request notification when one or more agents register. For each name: if the agent is already registered, `on_worker_ready` fires immediately. Otherwise it fires when the agent eventually registers.
 
-| Parameter    | Type  | Description                    |
-| ------------ | ----- | ------------------------------ |
-| `agent_name` | `str` | Name of the agent to watch for |
+| Parameter       | Type  | Description                      |
+| --------------- | ----- | -------------------------------- |
+| `*worker_names` | `str` | Names of the agents to watch for |
 
 ### end
 
@@ -302,26 +230,38 @@ async def end(self, *, reason: str | None = None) -> None
 
 Request a graceful end of the session.
 
-| Parameter | Type        | Default | Description                      |
-| --------- | ----------- | ------- | -------------------------------- |
+| Parameter | Type         | Default | Description                      |
+| --------- | ------------ | ------- | -------------------------------- |
 | `reason`  | `str | None` | `None`  | Human-readable reason for ending |
 
 ### cancel
 
 ```python
-async def cancel(self) -> None
+async def cancel(self, *, reason: str | None = None) -> None
 ```
 
 Request an immediate cancellation of all agents.
 
-## Task Coordination
+| Parameter | Type         | Default | Description                          |
+| --------- | ------------ | ------- | ------------------------------------ |
+| `reason`  | `str | None` | `None`  | Human-readable reason for cancelling |
 
-### request_task
+### wait
 
 ```python
-async def request_task(
+async def wait(self) -> None
+```
+
+Wait for this agent to finish.
+
+## Job Coordination
+
+### request_job
+
+```python
+async def request_job(
     self,
-    agent_name: str,
+    worker_name: str,
     *,
     name: str | None = None,
     payload: dict | None = None,
@@ -329,56 +269,56 @@ async def request_task(
 ) -> str
 ```
 
-Send a task request to a single agent (fire-and-forget). Waits for the agent to be ready before sending the request. Does not wait for the task to complete; use callbacks (`on_task_response`, `on_task_completed`) or `task()` for that.
+Send a job request to a single agent (fire-and-forget). Waits for the agent to be ready before sending the request. Does not wait for the job to complete; use callbacks (`on_job_response`, `on_job_completed`) or `job()` for that.
 
-| Parameter    | Type          | Default | Description                                          |
-| ------------ | ------------- | ------- | ---------------------------------------------------- |
-| `agent_name` | `str`         |         | Name of the agent to send the task to                |
-| `name`       | `str | None`   | `None`  | Task name for routing to a named `@task` handler     |
-| `payload`    | `dict | None`  | `None`  | Structured data describing the work                  |
-| `timeout`    | `float | None` | `None`  | Timeout in seconds; auto-cancels after this duration |
+| Parameter     | Type           | Default | Description                                          |
+| ------------- | -------------- | ------- | ---------------------------------------------------- |
+| `worker_name` | `str`          |         | Name of the agent to send the job to                 |
+| `name`        | `str | None`   | `None`  | Job name for routing to a named `@job` handler       |
+| `payload`     | `dict | None`  | `None`  | Structured data describing the work                  |
+| `timeout`     | `float | None` | `None`  | Timeout in seconds; auto-cancels after this duration |
 
-**Returns:** The generated `task_id`.
+**Returns:** The generated `job_id`.
 
-### task
+### job
 
 ```python
-def task(
+def job(
     self,
-    agent_name: str,
+    worker_name: str,
     *,
     name: str | None = None,
     payload: dict | None = None,
     timeout: float | None = None,
-) -> TaskContext
+) -> JobContext
 ```
 
-Create a single-agent task context manager. Waits for the agent to be ready, sends a task request, and waits for the response on exit. Supports `async for` inside the block to receive intermediate events.
+Create a single-agent job context manager. Waits for the agent to be ready, sends a job request, and waits for the response on exit. Supports `async for` inside the block to receive intermediate events.
 
-| Parameter    | Type          | Default | Description                                      |
-| ------------ | ------------- | ------- | ------------------------------------------------ |
-| `agent_name` | `str`         |         | Name of the agent to send the task to            |
-| `name`       | `str | None`   | `None`  | Task name for routing to a named `@task` handler |
-| `payload`    | `dict | None`  | `None`  | Structured data describing the work              |
-| `timeout`    | `float | None` | `None`  | Timeout in seconds                               |
+| Parameter     | Type           | Default | Description                                    |
+| ------------- | -------------- | ------- | ---------------------------------------------- |
+| `worker_name` | `str`          |         | Name of the agent to send the job to           |
+| `name`        | `str | None`   | `None`  | Job name for routing to a named `@job` handler |
+| `payload`     | `dict | None`  | `None`  | Structured data describing the work            |
+| `timeout`     | `float | None` | `None`  | Timeout in seconds                             |
 
-**Returns:** A [`TaskContext`](/api-reference/agents/types#taskcontext) to use with `async with`.
+**Returns:** A [`JobContext`](/api-reference/agents/types#jobcontext) to use with `async with`.
 
 ```python
-async with self.task("worker", payload=data) as t:
-    async for event in t:
-        if event.type == TaskGroupEvent.UPDATE:
+async with self.job("worker", payload=data) as j:
+    async for event in j:
+        if event.type == JobEvent.UPDATE:
             print(event.data)
 
-print(t.response)
+print(j.response)
 ```
 
-### request_task_group
+### request_job_group
 
 ```python
-async def request_task_group(
+async def request_job_group(
     self,
-    *agent_names: str,
+    *worker_names: str,
     name: str | None = None,
     payload: dict | None = None,
     timeout: float | None = None,
@@ -386,104 +326,107 @@ async def request_task_group(
 ) -> str
 ```
 
-Send a task request to multiple agents (fire-and-forget). Waits for all agents to be ready before sending requests.
+Send a job request to multiple agents (fire-and-forget). Waits for all agents to be ready before sending requests.
 
-| Parameter         | Type          | Default | Description                                     |
-| ----------------- | ------------- | ------- | ----------------------------------------------- |
-| `*agent_names`    | `str`         |         | Names of the agents to send the task to         |
-| `name`            | `str | None`   | `None`  | Task name for routing to named `@task` handlers |
-| `payload`         | `dict | None`  | `None`  | Structured data describing the work             |
-| `timeout`         | `float | None` | `None`  | Timeout in seconds                              |
-| `cancel_on_error` | `bool`        | `True`  | Whether to cancel the group if a worker errors  |
+| Parameter         | Type           | Default | Description                                    |
+| ----------------- | -------------- | ------- | ---------------------------------------------- |
+| `*worker_names`   | `str`          |         | Names of the agents to send the job to         |
+| `name`            | `str | None`   | `None`  | Job name for routing to named `@job` handlers  |
+| `payload`         | `dict | None`  | `None`  | Structured data describing the work            |
+| `timeout`         | `float | None` | `None`  | Timeout in seconds                             |
+| `cancel_on_error` | `bool`         | `True`  | Whether to cancel the group if a worker errors |
 
-**Returns:** The generated `task_id` shared by all agents in the group.
+**Returns:** The generated `job_id` shared by all agents in the group.
 
-### task_group
+### job_group
 
 ```python
-def task_group(
+def job_group(
     self,
-    *agent_names: str,
+    *worker_names: str,
     name: str | None = None,
     payload: dict | None = None,
     timeout: float | None = None,
     cancel_on_error: bool = True,
-) -> TaskGroupContext
+) -> JobGroupContext
 ```
 
-Create a task group context manager. Waits for agents to be ready, sends task requests, and waits for all responses on exit. Supports `async for` inside the block to receive intermediate events.
+Create a job group context manager. Waits for agents to be ready, sends job requests, and waits for all responses on exit. Supports `async for` inside the block to receive intermediate events.
 
-| Parameter         | Type          | Default | Description                                     |
-| ----------------- | ------------- | ------- | ----------------------------------------------- |
-| `*agent_names`    | `str`         |         | Names of the agents to send the task to         |
-| `name`            | `str | None`   | `None`  | Task name for routing to named `@task` handlers |
-| `payload`         | `dict | None`  | `None`  | Structured data describing the work             |
-| `timeout`         | `float | None` | `None`  | Timeout in seconds                              |
-| `cancel_on_error` | `bool`        | `True`  | Whether to cancel the group if a worker errors  |
+| Parameter         | Type           | Default | Description                                    |
+| ----------------- | -------------- | ------- | ---------------------------------------------- |
+| `*worker_names`   | `str`          |         | Names of the agents to send the job to         |
+| `name`            | `str | None`   | `None`  | Job name for routing to named `@job` handlers  |
+| `payload`         | `dict | None`  | `None`  | Structured data describing the work            |
+| `timeout`         | `float | None` | `None`  | Timeout in seconds                             |
+| `cancel_on_error` | `bool`         | `True`  | Whether to cancel the group if a worker errors |
 
-**Returns:** A [`TaskGroupContext`](/api-reference/agents/types#taskgroupcontext) to use with `async with`.
+**Returns:** A [`JobGroupContext`](/api-reference/agents/types#jobgroupcontext) to use with `async with`.
 
 ```python
-async with self.task_group("w1", "w2", payload=data) as tg:
-    async for event in tg:
-        if event.type == TaskGroupEvent.UPDATE:
-            print(f"{event.agent_name}: {event.data}")
+async with self.job_group("w1", "w2", payload=data) as jg:
+    async for event in jg:
+        if event.type == JobGroupEvent.UPDATE:
+            print(f"{event.worker_name}: {event.data}")
 
-for name, result in tg.responses.items():
+for name, result in jg.responses.items():
     print(name, result)
 ```
 
-### cancel_task
+### cancel_job_group
 
 ```python
-async def cancel_task(self, task_id: str, *, reason: str | None = None) -> None
+async def cancel_job_group(self, job_id: str, *, reason: str | None = None) -> None
 ```
 
-Cancel a running task group.
+Cancel a running job group.
 
-| Parameter | Type        | Default | Description                            |
-| --------- | ----------- | ------- | -------------------------------------- |
-| `task_id` | `str`       |         | The task identifier to cancel          |
+| Parameter | Type         | Default | Description                            |
+| --------- | ------------ | ------- | -------------------------------------- |
+| `job_id`  | `str`        |         | The job identifier to cancel           |
 | `reason`  | `str | None` | `None`  | Human-readable reason for cancellation |
 
-### request_task_update
+### request_job_update
 
 ```python
-async def request_task_update(self, task_id: str, agent_name: str) -> None
+async def request_job_update(self, job_id: str, worker_name: str) -> None
 ```
 
-Request a progress update from a task agent.
+Request a progress update from a worker agent.
 
-| Parameter    | Type  | Description                                 |
-| ------------ | ----- | ------------------------------------------- |
-| `task_id`    | `str` | The task identifier                         |
-| `agent_name` | `str` | Name of the agent to request an update from |
+| Parameter     | Type  | Description                                 |
+| ------------- | ----- | ------------------------------------------- |
+| `job_id`      | `str` | The job identifier                          |
+| `worker_name` | `str` | Name of the agent to request an update from |
 
-### send_task_response
+### send_job_response
 
 ```python
-async def send_task_response(
+async def send_job_response(
     self,
+    job_id: str,
     response: dict | None = None,
     *,
-    status: TaskStatus = TaskStatus.COMPLETED,
+    status: JobStatus = JobStatus.COMPLETED,
     urgent: bool = False,
 ) -> None
 ```
 
-Send a task response back to the requester. After sending, the agent is ready to accept a new task.
+Send a job response back to the requester. After sending, the job is removed from the set of active jobs.
 
-| Parameter  | Type                                                              | Default     | Description                  |
-| ---------- | ----------------------------------------------------------------- | ----------- | ---------------------------- |
-| `response` | `dict | None`                                                     | `None`      | Result data                  |
-| `status`   | [`TaskStatus`](/api-reference/agents/types#taskstatus) | `COMPLETED` | Completion status            |
-| `urgent`   | `bool`                                                            | `False`     | Deliver with system priority |
+| Parameter  | Type                                                 | Default     | Description                  |
+| ---------- | ---------------------------------------------------- | ----------- | ---------------------------- |
+| `job_id`   | `str`                                                |             | The job being responded to   |
+| `response` | `dict | None`                                        | `None`      | Result data                  |
+| `status`   | [`JobStatus`](/api-reference/agents/types#jobstatus) | `COMPLETED` | Completion status            |
+| `urgent`   | `bool`                                               | `False`     | Deliver with system priority |
 
-### send_task_update
+### send_job_update
 
 ```python
-async def send_task_update(
+async def send_job_update(
     self,
+    job_id: str,
     update: dict | None = None,
     *,
     urgent: bool = False,
@@ -492,217 +435,171 @@ async def send_task_update(
 
 Send a progress update to the requester.
 
-| Parameter | Type         | Default | Description                  |
-| --------- | ------------ | ------- | ---------------------------- |
+| Parameter | Type          | Default | Description                  |
+| --------- | ------------- | ------- | ---------------------------- |
+| `job_id`  | `str`         |         | The job being updated        |
 | `update`  | `dict | None` | `None`  | Progress data                |
-| `urgent`  | `bool`       | `False` | Deliver with system priority |
+| `urgent`  | `bool`        | `False` | Deliver with system priority |
 
-### send_task_stream_start
+### send_job_stream_start
 
 ```python
-async def send_task_stream_start(self, data: dict | None = None) -> None
+async def send_job_stream_start(self, job_id: str, data: dict | None = None) -> None
 ```
 
-Begin streaming task results back to the requester.
+Begin streaming job results back to the requester.
 
-| Parameter | Type         | Default | Description                        |
-| --------- | ------------ | ------- | ---------------------------------- |
+| Parameter | Type          | Default | Description                        |
+| --------- | ------------- | ------- | ---------------------------------- |
+| `job_id`  | `str`         |         | The job being streamed             |
 | `data`    | `dict | None` | `None`  | Optional metadata about the stream |
 
-### send_task_stream_data
+### send_job_stream_data
 
 ```python
-async def send_task_stream_data(self, data: dict | None = None) -> None
+async def send_job_stream_data(self, job_id: str, data: dict | None = None) -> None
 ```
 
 Send a streaming chunk to the requester.
 
-| Parameter | Type         | Default | Description       |
-| --------- | ------------ | ------- | ----------------- |
-| `data`    | `dict | None` | `None`  | The chunk payload |
+| Parameter | Type          | Default | Description            |
+| --------- | ------------- | ------- | ---------------------- |
+| `job_id`  | `str`         |         | The job being streamed |
+| `data`    | `dict | None` | `None`  | The chunk payload      |
 
-### send_task_stream_end
+### send_job_stream_end
 
 ```python
-async def send_task_stream_end(self, data: dict | None = None) -> None
+async def send_job_stream_end(self, job_id: str, data: dict | None = None) -> None
 ```
 
-End the current stream and mark this agent's task as complete.
+End the current stream and mark this agent's job as complete.
 
-| Parameter | Type         | Default | Description             |
-| --------- | ------------ | ------- | ----------------------- |
+| Parameter | Type          | Default | Description             |
+| --------- | ------------- | ------- | ----------------------- |
+| `job_id`  | `str`         |         | The job being streamed  |
 | `data`    | `dict | None` | `None`  | Optional final metadata |
 
-## Task Hooks
-
-Override these methods to handle task events. Always call `super()` when overriding.
-
-### on_task_request
+### create_job_group_and_request_job
 
 ```python
-async def on_task_request(self, message: BusTaskRequestMessage) -> None
-```
-
-Called when this agent receives a task request. Override to perform work. Use `send_task_update()` to report progress and `send_task_response()` to return results.
-
-### on_task_response
-
-```python
-async def on_task_response(self, message: BusTaskResponseMessage) -> None
-```
-
-Called when a task agent sends a response. Override to process individual results as they arrive.
-
-### on_task_update
-
-```python
-async def on_task_update(self, message: BusTaskUpdateMessage) -> None
-```
-
-Called when a task agent sends a progress update.
-
-### on_task_update_requested
-
-```python
-async def on_task_update_requested(self, message: BusTaskUpdateRequestMessage) -> None
-```
-
-Called when the requester asks for a progress update. Override to send back a progress update via `send_task_update()`.
-
-### on_task_completed
-
-```python
-async def on_task_completed(self, result: TaskGroupResponse) -> None
-```
-
-Called when all agents in a task group have responded.
-
-### on_task_error
-
-```python
-async def on_task_error(self, message: BusTaskResponseMessage) -> None
-```
-
-Called when a task group is cancelled due to a worker error. Fires when a worker responds with `ERROR` or `FAILED` status and `cancel_on_error` is set.
-
-### on_task_stream_start
-
-```python
-async def on_task_stream_start(self, message: BusTaskStreamStartMessage) -> None
-```
-
-Called when a task agent begins streaming.
-
-### on_task_stream_data
-
-```python
-async def on_task_stream_data(self, message: BusTaskStreamDataMessage) -> None
-```
-
-Called for each streaming chunk from a task agent.
-
-### on_task_stream_end
-
-```python
-async def on_task_stream_end(self, message: BusTaskStreamEndMessage) -> None
-```
-
-Called when a task agent finishes streaming.
-
-### on_task_cancelled
-
-```python
-async def on_task_cancelled(self, message: BusTaskCancelMessage) -> None
-```
-
-Called when this agent's task is cancelled by the requester. Override to clean up resources or stop in-progress work.
-
-## Pipeline
-
-### build_pipeline
-
-```python
-async def build_pipeline(self) -> Pipeline
-```
-
-Return this agent's pipeline. Override to define a processing pipeline. The default returns a no-op pipeline for agents that operate purely through bus messages.
-
-### create_pipeline
-
-```python
-async def create_pipeline(self, user_pipeline: Pipeline) -> Pipeline
-```
-
-Assemble the final pipeline from the user pipeline. When bridged, wraps the pipeline with bus edge processors.
-
-| Parameter       | Type       | Description                                 |
-| --------------- | ---------- | ------------------------------------------- |
-| `user_pipeline` | `Pipeline` | The pipeline returned by `build_pipeline()` |
-
-### build_pipeline_task
-
-```python
-def build_pipeline_task(self, pipeline: Pipeline) -> PipelineTask
-```
-
-Create the `PipelineTask` for this agent's pipeline. Override to customize task parameters (e.g. enable interruptions).
-
-| Parameter  | Type       | Description                  |
-| ---------- | ---------- | ---------------------------- |
-| `pipeline` | `Pipeline` | The fully assembled pipeline |
-
-### queue_frame
-
-```python
-async def queue_frame(
+async def create_job_group_and_request_job(
     self,
-    frame: Frame,
-    direction: FrameDirection = FrameDirection.DOWNSTREAM,
-) -> None
+    worker_names: list[str],
+    *,
+    name: str | None = None,
+    payload: dict | None = None,
+    timeout: float | None = None,
+    cancel_on_error: bool = True,
+) -> JobGroup
 ```
 
-Queue a frame into this agent's pipeline task.
+Wait for agents to be ready, create a job group, and send requests. Does not wait for the group to complete; call `group.wait()` or use `job_group()` for that. Used internally by `job()` and `job_group()`.
 
-| Parameter   | Type             | Default      | Description                       |
-| ----------- | ---------------- | ------------ | --------------------------------- |
-| `frame`     | `Frame`          |              | The frame to queue                |
-| `direction` | `FrameDirection` | `DOWNSTREAM` | Direction the frame should travel |
+**Returns:** The created [`JobGroup`](/api-reference/agents/types#jobgroup).
 
-### queue_frames
+## Job Hooks
+
+Override these methods to handle job events. Always call `super()` when overriding.
+
+### on_job_request
 
 ```python
-async def queue_frames(
-    self,
-    frames,
-    direction: FrameDirection = FrameDirection.DOWNSTREAM,
-) -> None
+async def on_job_request(self, message: BusJobRequestMessage) -> None
 ```
 
-Queue multiple frames into this agent's pipeline task.
+Called when this agent receives a job request that does not match a named `@job` handler. Override to perform work. Use `send_job_update()` to report progress and `send_job_response()` to return results.
 
-| Parameter   | Type             | Default      | Description                        |
-| ----------- | ---------------- | ------------ | ---------------------------------- |
-| `frames`    | `list[Frame]`    |              | The frames to queue                |
-| `direction` | `FrameDirection` | `DOWNSTREAM` | Direction the frames should travel |
+### on_job_response
+
+```python
+async def on_job_response(self, message: BusJobResponseMessage) -> None
+```
+
+Called when a worker agent sends a response. Override to process individual results as they arrive.
+
+### on_job_update
+
+```python
+async def on_job_update(self, message: BusJobUpdateMessage) -> None
+```
+
+Called when a worker agent sends a progress update.
+
+### on_job_update_requested
+
+```python
+async def on_job_update_requested(self, message: BusJobUpdateRequestMessage) -> None
+```
+
+Called when the requester asks for a progress update. Override to send back a progress update via `send_job_update()`.
+
+### on_job_completed
+
+```python
+async def on_job_completed(self, result: JobGroupResponse) -> None
+```
+
+Called when all agents in a job group have responded.
+
+### on_job_error
+
+```python
+async def on_job_error(self, message: BusJobResponseMessage) -> None
+```
+
+Called when a job group is cancelled due to a worker error. Fires when a worker responds with `ERROR` or `FAILED` status and `cancel_on_error` is set.
+
+### on_job_stream_start
+
+```python
+async def on_job_stream_start(self, message: BusJobStreamStartMessage) -> None
+```
+
+Called when a worker agent begins streaming.
+
+### on_job_stream_data
+
+```python
+async def on_job_stream_data(self, message: BusJobStreamDataMessage) -> None
+```
+
+Called for each streaming chunk from a worker agent.
+
+### on_job_stream_end
+
+```python
+async def on_job_stream_end(self, message: BusJobStreamEndMessage) -> None
+```
+
+Called when a worker agent finishes streaming.
+
+### on_job_cancelled
+
+```python
+async def on_job_cancelled(self, message: BusJobCancelMessage) -> None
+```
+
+Called when this agent's job is cancelled by the requester. Override to clean up resources or stop in-progress work.
 
 ## Bus
 
-### send_message
+### send_bus_message
 
 ```python
-async def send_message(self, message: BusMessage) -> None
+async def send_bus_message(self, message: BusMessage) -> None
 ```
 
 Send a message on the bus.
 
-| Parameter | Type                                                      | Description             |
-| --------- | --------------------------------------------------------- | ----------------------- |
+| Parameter | Type                                                     | Description             |
+| --------- | -------------------------------------------------------- | ----------------------- |
 | `message` | [`BusMessage`](/api-reference/agents/messages) | The bus message to send |
 
-### send_error
+### send_bus_error_message
 
 ```python
-async def send_error(self, error: str) -> None
+async def send_bus_error_message(self, error: str) -> None
 ```
 
 Report an error on the bus. Child agents send a local-only message to the parent. Root agents broadcast over the network.
@@ -719,6 +616,6 @@ async def on_bus_message(self, message: BusMessage) -> None
 
 Called for every bus message after built-in lifecycle handling. Override to handle custom message types.
 
-| Parameter | Type                                                      | Description                |
-| --------- | --------------------------------------------------------- | -------------------------- |
+| Parameter | Type                                                     | Description                |
+| --------- | -------------------------------------------------------- | -------------------------- |
 | `message` | [`BusMessage`](/api-reference/agents/messages) | The bus message to process |

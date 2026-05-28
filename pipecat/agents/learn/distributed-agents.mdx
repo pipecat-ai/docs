@@ -15,25 +15,25 @@ Distributed agents are agents connected to the **same bus** but running in diffe
 
 ## Setting up a distributed bus
 
-Pipecat Subagents provides two distributed bus implementations: RedisBus and PgmqBus. Choose based on your infrastructure.
+Pipecat provides two distributed bus implementations: RedisBus and PgmqBus. Choose based on your infrastructure.
 
 ### RedisBus
 
-Each process creates its own `AgentRunner` with a `RedisBus` connected to the same Redis channel:
+Each process creates its own `PipelineRunner` with a `RedisBus` connected to the same Redis channel:
 
 ```python
 from redis.asyncio import Redis
-from pipecat_subagents.bus.network.redis import RedisBus
-from pipecat_subagents.runner import AgentRunner
+from pipecat.bus.network.redis import RedisBus
+from pipecat.pipeline.runner import PipelineRunner
 
 redis = Redis.from_url("redis://localhost:6379")
 bus = RedisBus(redis=redis, channel="pipecat:my-app")
-runner = AgentRunner(bus=bus, handle_sigint=True)
+runner = PipelineRunner(bus=bus, handle_sigint=True)
 ```
 
 All runners sharing the same `channel` can exchange messages. Agents discover each other automatically through registry snapshots.
 
-<Info>Install the Redis extra: `uv add "pipecat-ai-subagents[redis]"`</Info>
+<Info>Install the Redis extra: `uv add "pipecat-ai[redis]"`</Info>
 
 ### PgmqBus
 
@@ -41,8 +41,8 @@ Alternatively, use `PgmqBus` backed by PostgreSQL Message Queue:
 
 ```python
 from pgmq.async_queue import PGMQueue
-from pipecat_subagents.bus.network.pgmq import PgmqBus
-from pipecat_subagents.runner import AgentRunner
+from pipecat.bus.network.pgmq import PgmqBus
+from pipecat.pipeline.runner import PipelineRunner
 
 pgmq = PGMQueue(
     host="localhost",
@@ -54,10 +54,10 @@ pgmq = PGMQueue(
 )
 await pgmq.init()
 bus = PgmqBus(pgmq=pgmq, channel="pipecat:my-app")
-runner = AgentRunner(bus=bus, handle_sigint=True)
+runner = PipelineRunner(bus=bus, handle_sigint=True)
 ```
 
-<Info>Install the PGMQ extra: `uv add "pipecat-ai-subagents[pgmq]"`</Info>
+<Info>Install the PGMQ extra: `uv add "pipecat-ai[pgmq]"`</Info>
 
 ## Example: distributed handoff
 
@@ -65,85 +65,145 @@ This example splits the two-agent handoff across separate processes. The main ag
 
 ### Process 1: Main transport agent
 
-The main agent owns the transport and bridges frames to the bus. It has no LLM -- it waits for a remote greeter agent to register, then activates it.
+The main agent owns the transport and bridges frames to the bus. It has no LLM -- it waits for the remote greeter agent to register, then activates it.
 
 ```python
-# main_agent.py
-from pipecat_subagents.agents import BaseAgent, LLMAgentActivationArgs, agent_ready
-from pipecat_subagents.bus import BusBridgeProcessor
-from pipecat_subagents.bus.network.redis import RedisBus
-from pipecat_subagents.runner import AgentRunner
-from pipecat_subagents.types import AgentReadyData
+# main.py
+import os
 
-class MainAgent(BaseAgent):
-    def __init__(self, name, *, bus, transport):
-        super().__init__(name, bus=bus)
-        self._transport = transport
+from redis.asyncio import Redis
 
-    @agent_ready(name="greeter")
-    async def on_greeter_ready(self, data: AgentReadyData) -> None:
-        await self.activate_agent(
-            "greeter",
-            activation_args=LLMAgentActivationArgs(
-                messages=[{"role": "user", "content": "Welcome the user."}],
-            ),
-        )
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.bus import BusBridgeProcessor
+from pipecat.bus.network.redis import RedisBus
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.registry.types import WorkerReadyData
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.workers.llm import LLMWorkerActivationArgs
 
-    async def build_pipeline(self) -> Pipeline:
-        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-        tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"))
-        context = LLMContext()
-        context_aggregator = LLMContextAggregatorPair(
-            context,
-            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
-        )
-        bridge = BusBridgeProcessor(bus=self.bus, agent_name=self.name)
-
-        return Pipeline([
-            self._transport.input(),
-            stt,
-            context_aggregator.user(),
-            bridge,
-            tts,
-            self._transport.output(),
-            context_aggregator.assistant(),
-        ])
+MAIN_NAME = "acme"
 
 
 async def run_bot(transport, runner_args):
     redis = Redis.from_url(runner_args.cli_args.redis_url)
     bus = RedisBus(redis=redis, channel=runner_args.cli_args.channel)
-    runner = AgentRunner(bus=bus, handle_sigint=True)
-    agent = MainAgent("acme", bus=bus, transport=transport)
-    await runner.add_agent(agent)
+    runner = PipelineRunner(bus=bus, handle_sigint=runner_args.handle_sigint)
+
+    stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
+    tts = CartesiaTTSService(
+        api_key=os.environ["CARTESIA_API_KEY"],
+        settings=CartesiaTTSService.Settings(
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        ),
+    )
+
+    context = LLMContext()
+    aggregators = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
+
+    bridge = BusBridgeProcessor(
+        bus=runner.bus,
+        worker_name=MAIN_NAME,
+        name=f"{MAIN_NAME}::BusBridge",
+    )
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            aggregators.user(),
+            bridge,
+            tts,
+            transport.output(),
+            aggregators.assistant(),
+        ]
+    )
+
+    main = PipelineWorker(
+        pipeline,
+        name=MAIN_NAME,
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    )
+
+    # The remote greeter may take a moment to register on the bus, so only
+    # activate it once both the client is connected and the greeter is ready.
+    state = {"client_connected": False, "greeter_ready": False}
+
+    async def maybe_activate():
+        if not (state["client_connected"] and state["greeter_ready"]):
+            return
+        await main.activate_worker(
+            "greeter",
+            args=LLMWorkerActivationArgs(
+                messages=[{"role": "developer", "content": "Welcome the user."}],
+            ),
+        )
+
+    async def on_greeter_ready(_data: WorkerReadyData) -> None:
+        state["greeter_ready"] = True
+        await maybe_activate()
+
+    await runner.registry.watch("greeter", on_greeter_ready)
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        state["client_connected"] = True
+        await maybe_activate()
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await runner.cancel()
+
+    await runner.add_workers(main)
     await runner.run()
 ```
 
 ```bash
-python main_agent.py --redis-url redis://localhost:6379
+python main.py --redis-url redis://localhost:6379
 ```
 
 ### Process 2 & 3: LLM agents
 
-Each LLM agent runs as a standalone process. It connects to the same Redis channel and waits for activation:
+Each LLM agent runs as a standalone process. It connects to the same Redis channel and waits for activation. Subclass `LLMWorker` to host `@tool` methods and pass the LLM service in the constructor:
 
 ```python
-# llm_agent.py
+# llm.py
+import argparse
 import asyncio
-from pipecat_subagents.agents import LLMAgent, LLMAgentActivationArgs, tool
-from pipecat_subagents.bus.network.redis import RedisBus
-from pipecat_subagents.runner import AgentRunner
+import os
 
-class AcmeLLMAgent(LLMAgent):
-    def __init__(self, name, *, bus, system_instruction):
-        super().__init__(name, bus=bus, bridged=())
-        self._system_instruction = system_instruction
+from redis.asyncio import Redis
 
-    def build_llm(self) -> LLMService:
-        return OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            settings=OpenAILLMSettings(system_instruction=self._system_instruction),
+from pipecat.bus.network.redis import RedisBus
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.workers.llm import LLMWorker, LLMWorkerActivationArgs, tool
+
+
+class AcmeLLMAgent(LLMWorker):
+    def __init__(self, name: str, *, system_instruction: str, watch: list[str]):
+        llm = OpenAILLMService(
+            api_key=os.environ["OPENAI_API_KEY"],
+            settings=OpenAILLMService.Settings(system_instruction=system_instruction),
         )
+        super().__init__(name, llm=llm, bridged=())
+        self._watch = watch
+
+    async def start(self) -> None:
+        """Watch sibling agents so handoff knows when they are available."""
+        await super().start()
+        await self.watch_workers(*self._watch)
 
     @tool(cancel_on_interruption=False)
     async def transfer_to_agent(self, params: FunctionCallParams, agent: str, reason: str):
@@ -153,35 +213,53 @@ class AcmeLLMAgent(LLMAgent):
             agent (str): The target agent.
             reason (str): Transfer reason.
         """
-        await self.handoff_to(
+        await self.activate_worker(
             agent,
-            activation_args=LLMAgentActivationArgs(messages=[{"role": "user", "content": reason}]),
+            args=LLMWorkerActivationArgs(
+                messages=[{"role": "developer", "content": reason}]
+            ),
+            deactivate_self=True,
             result_callback=params.result_callback,
         )
 
 
-async def main():
-    redis = Redis.from_url("redis://localhost:6379")
-    bus = RedisBus(redis=redis, channel="pipecat:my-app")
-    agent = AcmeLLMAgent("greeter", bus=bus, system_instruction="You are a greeter...")
-    runner = AgentRunner(bus=bus, handle_sigint=True)
-    await runner.add_agent(agent)
+async def main_async():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("worker", choices=["greeter", "support"])
+    parser.add_argument("--redis-url", default="redis://localhost:6379")
+    parser.add_argument("--channel", default="pipecat:my-app")
+    args = parser.parse_args()
+
+    redis = Redis.from_url(args.redis_url)
+    bus = RedisBus(redis=redis, channel=args.channel)
+
+    agent = AcmeLLMAgent(
+        args.worker,
+        system_instruction="You are a greeter..." if args.worker == "greeter" else "You are support...",
+        watch=["support"] if args.worker == "greeter" else ["greeter"],
+    )
+
+    runner = PipelineRunner(bus=bus, handle_sigint=True)
+    await runner.add_workers(agent)
     await runner.run()
 
-asyncio.run(main())
+
+asyncio.run(main_async())
 ```
 
 ```bash
 # Run on Machine B
-python llm_agent.py greeter --redis-url redis://your-redis-host:6379
+python llm.py greeter --redis-url redis://your-redis-host:6379
 
 # Run on Machine C
-python llm_agent.py support --redis-url redis://your-redis-host:6379
+python llm.py support --redis-url redis://your-redis-host:6379
 ```
+
+Each LLM agent watches its sibling so that, when the user is transferred, the target is already known to be available. You can do the same with the `@worker_ready` decorator on a worker subclass to react automatically when a specific agent registers.
 
 ## How discovery works
 
-Runners exchange registry information automatically over the shared bus. To get notified when an agent is ready, use `@agent_ready` or `watch_agent()` -- they work the same way locally and distributed.
+Runners exchange registry information automatically over the shared bus. To get notified when an agent is ready, watch it with `runner.registry.watch(...)`, call `watch_workers()` from inside a worker, or use the `@worker_ready` decorator -- they all work the same way locally and distributed.
 
 ## Considerations
 

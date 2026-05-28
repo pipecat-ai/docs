@@ -1,151 +1,150 @@
 ---
-title: "Task Coordination"
+title: "Job Coordination"
 description: "Dispatch work to other agents and collect results."
 ---
 
-## What are tasks?
+## What are jobs?
 
-Tasks let one agent dispatch work to other agents. While handoff transfers the conversation, tasks are for background work -- an agent asks workers to do something and collects their results.
+Jobs let one agent dispatch work to other agents. While handoff transfers the conversation, jobs are for background work -- an agent asks other agents to do something and collects their results.
 
-Use cases for tasks:
+Use cases for jobs:
 
 - Researching a topic from multiple perspectives in parallel
 - Running a code analysis while talking to the user
 - Fetching data from multiple sources simultaneously
 
-## Single task
+## Single job
 
-The simplest form is `self.task()`, which sends a task to one agent and waits for the response:
+The simplest form is `self.job()`, which sends a job to one agent and waits for the response:
 
 ```python
-async with self.task("worker", payload={"question": "What is Pipecat?"}, timeout=30) as t:
+async with self.job("worker", payload={"question": "What is Pipecat?"}, timeout=30) as j:
     pass
 
-print(t.response)
+print(j.response)
 ```
 
-`self.task()` is a context manager that handles the full lifecycle: it waits for the agent to be ready, sends the request, and collects the response. Under the hood, this is equivalent to calling `request_task()` (fire-and-forget) and then handling `on_task_response()` and `on_task_completed()` yourself.
+`self.job()` is a context manager that handles the full lifecycle: it waits for the agent to be ready, sends the request, and collects the response. Under the hood, this is equivalent to calling `request_job()` (fire-and-forget) and then handling `on_job_response()` and `on_job_completed()` yourself.
 
-## Task group
+## Job group
 
-When you need to dispatch work to multiple agents in parallel, use `self.task_group()`:
+When you need to dispatch work to multiple agents in parallel, use `self.job_group()`:
 
 ```python
-async with self.task_group("worker1", "worker2", "worker3", payload={"topic": "AI safety"}, timeout=30) as tg:
+async with self.job_group("worker1", "worker2", "worker3", payload={"topic": "AI safety"}, timeout=30) as jg:
     pass
 
-for agent_name, response in tg.responses.items():
-    print(f"{agent_name}: {response}")
+for worker_name, response in jg.responses.items():
+    print(f"{worker_name}: {response}")
 ```
 
-`self.task_group()` works the same way but for multiple agents: it waits for all of them to be ready, sends a request to each, and collects all responses. Under the hood, this is equivalent to calling `request_task_group()` and then handling `on_task_response()` for each agent and a final `on_task_completed()` yourself.
+`self.job_group()` works the same way but for multiple agents: it waits for all of them to be ready, sends a request to each, and collects all responses. Under the hood, this is equivalent to calling `request_job_group()` and then handling `on_job_response()` for each agent and a final `on_job_completed()` yourself.
 
-The same payload is sent to every agent. If you need different arguments per agent, you can structure the payload so each worker reads its own key:
+The same payload is sent to every agent. If you need different arguments per agent, you can structure the payload so each one reads its own key:
 
 ```python
-async with self.task_group("researcher", "fact_checker", payload={
+async with self.job_group("researcher", "fact_checker", payload={
     "researcher": {"topic": "AI safety", "depth": "detailed"},
     "fact_checker": {"claims": ["AI can self-improve", "AGI is near"]},
-}, timeout=30) as tg:
+}, timeout=30) as jg:
     pass
 ```
 
-## Handling task requests
+## Handling job requests
 
-Workers handle incoming tasks in two ways.
+Agents handle incoming jobs in two ways.
 
-### The @task decorator
+### The @job decorator
 
-The `@task` decorator marks a method as a task handler. The framework automatically dispatches matching requests to it. The decorator requires a `name` argument. The worker passes `message.task_id` when sending the response:
+The `@job` decorator marks a method as a job handler. The framework automatically dispatches matching requests to it. The decorator requires a `name` argument. The handler responds with `message.job_id`:
 
 ```python
-from pipecat_subagents.agents import task
+from pipecat.pipeline.job_decorator import job
 
-class MyWorker(BaseAgent):
-    @task(name="process")
-    async def on_process(self, message: BusTaskRequestMessage):
+class MyWorker(BaseWorker):
+    @job(name="process")
+    async def on_process(self, message: BusJobRequestMessage):
         result = await self._do_work(message.payload)
-        await self.send_task_response(message.task_id, result)
+        await self.send_job_response(message.job_id, result)
 ```
 
-You can use different task names to route work to different handlers:
+You can use different job names to route work to different handlers:
 
 ```python
-class MyWorker(BaseAgent):
-    @task(name="research")
-    async def on_research(self, message: BusTaskRequestMessage):
-        await self.send_task_response(message.task_id, {"answer": "..."})
+class MyWorker(BaseWorker):
+    @job(name="research")
+    async def on_research(self, message: BusJobRequestMessage):
+        await self.send_job_response(message.job_id, {"answer": "..."})
 
-    @task(name="summarize")
-    async def on_summarize(self, message: BusTaskRequestMessage):
-        await self.send_task_response(message.task_id, {"summary": "..."})
+    @job(name="summarize")
+    async def on_summarize(self, message: BusJobRequestMessage):
+        await self.send_job_response(message.job_id, {"summary": "..."})
 ```
 
-The requester specifies the task name when dispatching:
+The requester specifies the job name when dispatching:
 
 ```python
-async with self.task("worker", name="research", payload={"topic": "AI"}) as t:
+async with self.job("worker", name="research", payload={"topic": "AI"}) as j:
     pass
 ```
 
 Each request runs in its own asyncio task, so multiple requests to the same handler are executed concurrently without blocking the bus message loop.
 
-### Overriding on_task_request
+### Overriding on_job_request
 
-Alternatively, you can override `on_task_request()` directly without the `@task` decorator:
+Alternatively, you can override `on_job_request()` directly without the `@job` decorator:
 
 ```python
-class MyWorker(BaseAgent):
-    async def on_task_request(self, message: BusTaskRequestMessage) -> None:
-        await super().on_task_request(message)
+class MyWorker(BaseWorker):
+    async def on_job_request(self, message: BusJobRequestMessage) -> None:
+        await super().on_job_request(message)
         result = await self._do_work(message.payload)
-        await self.send_task_response(message.task_id, result)
+        await self.send_job_response(message.job_id, result)
 ```
 
 This is useful when you need custom routing logic or want to integrate with an existing pipeline, as shown in the example below.
 
 <Note>
-  `send_task_response()`, `send_task_update()`, and `send_task_stream_*()` all require an explicit `task_id`. This lets a worker handle multiple concurrent tasks and respond to each one correctly. For simple handlers, pass `message.task_id` from the request. For asynchronous responses (see the example below), track the `task_id` yourself until you're ready to respond.
+  `send_job_response()`, `send_job_update()`, and `send_job_stream_*()` all
+  require an explicit `job_id`. This lets an agent handle multiple concurrent
+  jobs and respond to each one correctly. For simple handlers, pass
+  `message.job_id` from the request. For asynchronous responses (see the example
+  below), track the `job_id` yourself until you're ready to respond.
 </Note>
 
-## Building a task system
+## Building a job system
 
-Let's build a debate system where a moderator dispatches a topic to three workers, each arguing from a different perspective.
+Let's build a debate system where a moderator dispatches a topic to three agents, each arguing from a different perspective.
 
 ### Worker agents
 
-Each worker runs its own LLM pipeline. The LLM response arrives asynchronously through an event handler, so the worker tracks the current task ID until it has something to respond with:
+Each debate agent runs its own LLM pipeline. The LLM response arrives asynchronously through an event handler, so the agent tracks the current job ID until it has something to respond with:
 
 ```python
-from pipecat_subagents.agents import LLMContextAgent
-from pipecat_subagents.bus.messages import BusTaskRequestMessage
+from pipecat.workers.llm import LLMContextWorker
+from pipecat.bus.messages import BusJobRequestMessage
+from pipecat.frames.frames import LLMMessagesAppendFrame
 
-class DebateWorker(LLMContextAgent):
-    def __init__(self, name, *, bus, role):
-        super().__init__(name, bus=bus)
-        self._role = role
-        self._current_task_id = ""
-
-    def build_llm(self) -> LLMService:
-        return OpenAILLMService(
+class DebateWorker(LLMContextWorker):
+    def __init__(self, role: str):
+        llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
-            settings=OpenAILLMSettings(system_instruction=f"You argue as a {self._role}."),
+            settings=OpenAILLMService.Settings(system_instruction=f"You argue as a {role}."),
         )
-
-    async def on_ready(self) -> None:
-        await super().on_ready()
+        super().__init__(role, llm=llm)
+        self._role = role
+        self._current_job_id: str | None = None
 
         @self.assistant_aggregator.event_handler("on_assistant_turn_stopped")
         async def on_assistant_turn_stopped(aggregator, message):
-            text = message.content
-            if self._current_task_id:
-                task_id = self._current_task_id
-                await self.send_task_response(task_id, {"role": self._role, "text": text})
-                self._current_task_id = ""
+            if self._current_job_id:
+                job_id = self._current_job_id
+                self._current_job_id = None
+                await self.send_job_response(job_id, {"role": self._role, "text": message.content})
 
-    async def on_task_request(self, message: BusTaskRequestMessage) -> None:
-        await super().on_task_request(message)
-        self._current_task_id = message.task_id
+    async def on_job_request(self, message: BusJobRequestMessage) -> None:
+        await super().on_job_request(message)
+        self._current_job_id = message.job_id
         await self.queue_frame(
             LLMMessagesAppendFrame(
                 messages=[{"role": "developer", "content": f"Topic: {message.payload['topic']}"}],
@@ -155,43 +154,27 @@ class DebateWorker(LLMContextAgent):
 ```
 
 <Note>
-  `LLMContextAgent` extends `LLMAgent` with a built-in `LLMContext` and aggregator pair. It automatically builds the pipeline as `[user_aggregator, llm, assistant_aggregator]`, so you don't need to wire the context plumbing yourself. Access the aggregators via `self.user_aggregator` and `self.assistant_aggregator` in `on_ready()` or later hooks.
+  `LLMContextWorker` extends `LLMWorker` with a built-in `LLMContext` and
+  aggregator pair. It builds the pipeline as `[user_aggregator, llm,
+  assistant_aggregator]` automatically, so you don't need to wire the context
+  plumbing yourself. Access the aggregators via `self.user_aggregator` and
+  `self.assistant_aggregator`.
 </Note>
 
-The worker:
+The agent:
 
-1. Receives a task request and stores the `task_id`
+1. Receives a job request and stores the `job_id`
 2. Injects the topic into its LLM context and runs the LLM
-3. When the LLM finishes its turn, the event handler sends the response with the stored `task_id`
+3. When the LLM finishes its turn, the event handler sends the response with the stored `job_id`
 
 ### Coordinator agent
 
-The coordinator creates workers, triggers tasks via a tool, and synthesizes results:
+The moderator triggers jobs via a tool and synthesizes the results:
 
 ```python
-class ModeratorAgent(LLMAgent):
-    def __init__(self, name, *, bus):
-        super().__init__(name, bus=bus, bridged=())
-        self._workers = []
+from pipecat.workers.llm import LLMWorker, tool
 
-    def build_llm(self) -> LLMService:
-        return OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            settings=OpenAILLMSettings(
-                system_instruction=(
-                    "You are a debate moderator. When the user gives a topic, "
-                    "call the debate tool. Then synthesize the results."
-                ),
-            ),
-        )
-
-    async def on_ready(self) -> None:
-        await super().on_ready()
-        for role in ("advocate", "critic", "analyst"):
-            worker = DebateWorker(role, bus=self.bus, role=role)
-            self._workers.append(worker)
-            await self.add_agent(worker)
-
+class ModeratorAgent(LLMWorker):
     @tool(cancel_on_interruption=False)
     async def debate(self, params: FunctionCallParams, topic: str):
         """Analyze a topic from multiple perspectives.
@@ -199,105 +182,108 @@ class ModeratorAgent(LLMAgent):
         Args:
             topic (str): The topic to debate.
         """
-        worker_names = [str(w) for w in self._workers]
-        async with self.task_group(*worker_names, payload={"topic": topic}, timeout=30) as tg:
+        async with self.job_group("advocate", "critic", "analyst", payload={"topic": topic}, timeout=30) as jg:
             pass
 
         result = "\n\n".join(
-            f"{r['role'].upper()}: {r['text']}" for r in tg.responses.values()
+            f"{r['role'].upper()}: {r['text']}" for r in jg.responses.values()
         )
         await params.result_callback(result)
 ```
 
+Create the debate agents and the moderator, then register them all with `runner.add_workers(ModeratorAgent("moderator", llm=...), DebateWorker("advocate"), DebateWorker("critic"), DebateWorker("analyst"))`.
+
 When the user says "debate whether AI should be regulated," the moderator:
 
 1. The LLM calls the `debate` tool
-2. `task_group()` sends the topic to all three workers in parallel
-3. Each worker runs its own LLM and responds with its perspective
+2. `job_group()` sends the topic to all three agents in parallel
+3. Each agent runs its own LLM and responds with its perspective
 4. The moderator collects all responses and returns them to the LLM
 5. The LLM synthesizes a balanced summary and speaks it to the user
 
-## Task lifecycle
+## Job lifecycle
 
 <Steps>
   <Step title="Request">
-    Parent calls `task()` or `task_group()`. The framework waits for workers to be ready, then sends a task request to each.
+    The requester calls `job()` or `job_group()`. The framework waits for agents
+    to be ready, then sends a job request to each.
   </Step>
   <Step title="Process">
-    Workers receive the request in `on_task_request()` and do their work.
+    Agents receive the request in `on_job_request()` and do their work.
   </Step>
   <Step title="Respond">
-    Workers call `send_task_response(task_id, ...)` with their results.
+    Agents call `send_job_response(job_id, ...)` with their results.
   </Step>
   <Step title="Complete">
-    When all workers respond (or timeout occurs), the context manager exits and results are available.
+    When all agents respond (or timeout occurs), the context manager exits and
+    results are available.
   </Step>
 </Steps>
 
-The framework also supports fire-and-forget tasks, progress updates, and streaming.
+The framework also supports fire-and-forget jobs, progress updates, and streaming.
 
-## Task cancellation
+## Job cancellation
 
-Tasks can be cancelled in several ways. The framework handles cleanup automatically and notifies workers so they can stop in-progress work.
+Jobs can be cancelled in several ways. The framework handles cleanup automatically and notifies agents so they can stop in-progress work.
 
 ### Automatic cancellation with context managers
 
-When using `task()` or `task_group()`, cancellation happens automatically if the context block raises an exception. This includes tool interruptions (`CancelledError`) when using `cancel_on_interruption=True`:
+When using `job()` or `job_group()`, cancellation happens automatically if the context block raises an exception. This includes tool interruptions (`CancelledError`) when using `cancel_on_interruption=True`:
 
 ```python
 # If an exception or CancelledError is raised inside the block,
-# all workers are cancelled automatically
-async with self.task_group("w1", "w2", payload=data) as tg:
-    # ... if this raises, workers get cancelled
+# all agents are cancelled automatically
+async with self.job_group("w1", "w2", payload=data) as jg:
+    # ... if this raises, the agents get cancelled
     pass
 ```
 
 ### Worker errors
 
-By default (`cancel_on_error=True`), if any worker responds with an error status, the remaining workers in the group are cancelled and `TaskGroupError` is raised:
+By default (`cancel_on_error=True`), if any agent responds with an error status, the remaining agents in the group are cancelled and `JobGroupError` is raised:
 
 ```python
 try:
-    async with self.task_group("w1", "w2", payload=data) as tg:
+    async with self.job_group("w1", "w2", payload=data) as jg:
         pass
-except TaskGroupError as e:
-    # A worker errored -- remaining workers were cancelled
+except JobGroupError as e:
+    # An agent errored -- remaining agents were cancelled
     pass
 ```
 
-### Manual cancellation with cancel_task()
+### Manual cancellation
 
-For fire-and-forget tasks (using `request_task()`), you manage cancellation yourself by tracking task IDs:
+For fire-and-forget jobs (using `request_job()`), you manage cancellation yourself by tracking job IDs:
 
 ```python
-task_ids = []
+job_ids = []
 try:
-    task_ids.append(await self.request_task("w1", payload={"job": 1}))
-    task_ids.append(await self.request_task("w2", payload={"job": 2}))
+    job_ids.append(await self.request_job("w1", payload={"job": 1}))
+    job_ids.append(await self.request_job("w2", payload={"job": 2}))
     # ...
 except asyncio.CancelledError:
-    for tid in task_ids:
-        await self.cancel_task(tid, reason="tool cancelled")
+    for jid in job_ids:
+        await self.cancel_job_group(jid, reason="tool cancelled")
 ```
 
-### Handling cancellation on the worker side
+### Handling cancellation on the agent side
 
-When a task is cancelled, the worker's `on_task_cancelled` hook fires. The framework automatically sends a `CANCELLED` response back to the requester, so you only need to override this hook if you have resources to clean up:
+When a job is cancelled, the agent's `on_job_cancelled` hook fires. The framework automatically sends a `CANCELLED` response back to the requester, so you only need to override this hook if you have resources to clean up:
 
 ```python
-class MyWorker(BaseAgent):
-    async def on_task_cancelled(self, message: BusTaskCancelMessage) -> None:
+class MyWorker(BaseWorker):
+    async def on_job_cancelled(self, message: BusJobCancelMessage) -> None:
         # Optional: clean up resources, stop in-progress work
-        logger.info(f"Task {message.task_id} cancelled: {message.reason}")
+        logger.info(f"Job {message.job_id} cancelled: {message.reason}")
 ```
 
 ### Agent shutdown
 
-When a worker agent stops with tasks still in flight, it automatically sends a `CANCELLED` response for each active task so requesters aren't left waiting on a timeout.
+When an agent stops with jobs still in flight, it automatically sends a `CANCELLED` response for each active job so requesters aren't left waiting on a timeout.
 
 ## What's next
 
-You now understand the core concepts of Pipecat Subagents: agents, the bus, handoff, and tasks. The Fundamentals section covers specific patterns in depth.
+You now understand the core concepts of Pipecat's multi-agent system: agents, the bus, handoff, and jobs. The Fundamentals section covers specific patterns in depth.
 
 <Card
   title="What's Next"

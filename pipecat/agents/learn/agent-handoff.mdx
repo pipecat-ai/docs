@@ -7,92 +7,90 @@ description: "Transfer control between agents with activation, deactivation, and
 
 In a multi-agent system, only one agent is **active** at a time (per bridge). The active agent receives frames from the bus. Inactive agents exist but don't process frames.
 
-Every agent has an `active` property that defaults to `True`. In handoff scenarios, voice agents should start with `active=False` so only one is active at a time -- the parent then activates the first one explicitly.
+Every worker has an `active` property. `LLMWorker` defaults to `active=False`, so in a handoff setup the LLM agents start inactive and the main agent activates the first one explicitly.
 
-You control which agent is active using three methods:
+You control which agent is active with two methods:
 
-| Method                       | What it does                              |
-|------------------------------|-------------------------------------------|
-| `activate_agent(name, args)` | Activate another agent                    |
-| `deactivate_agent(name)`     | Deactivate another agent                  |
-| `handoff_to(name, args)`     | Deactivate self, then activate the target |
+| Method                                        | What it does                               |
+| --------------------------------------------- | ------------------------------------------ |
+| `activate_worker(name, args=...)`             | Activate another agent                     |
+| `deactivate_worker(name)`                     | Deactivate another agent                   |
+| `activate_worker(name, deactivate_self=True)` | Hand off: deactivate self, activate target |
 
-`handoff_to()` is the most common -- it's a single call that transfers control from the current agent to another.
+Passing `deactivate_self=True` to `activate_worker()` is the most common form -- it's a single call that transfers control from the current agent to another.
 
 ## Building a handoff system
 
-Let's walk through how the two-agent handoff works. You need three pieces:
+Let's walk through how the two-agent handoff works. You need three pieces.
 
 ### 1. A main agent with a bus bridge
 
-The main agent owns the transport (audio I/O) and places a `BusBridgeProcessor` in its pipeline instead of an LLM. The bridge routes frames to whichever LLM agent is active:
+The main agent owns the transport (audio I/O) and places a `BusBridgeProcessor` in its pipeline instead of an LLM. The bridge routes frames to whichever LLM agent is active. The main agent is a `PipelineWorker` wrapping that pipeline:
 
 ```python
-from pipecat_subagents.agents import BaseAgent
-from pipecat_subagents.bus import BusBridgeProcessor
+from pipecat.bus import BusBridgeProcessor
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 
-class MainAgent(BaseAgent):
-    def __init__(self, name, *, bus, transport):
-        super().__init__(name, bus=bus)
-        self._transport = transport
+MAIN_NAME = "main"
 
-    async def build_pipeline(self) -> Pipeline:
-        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-        tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"))
+stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"))
 
-        context = LLMContext()
-        context_aggregator = LLMContextAggregatorPair(
-            context,
-            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
-        )
+context = LLMContext()
+aggregators = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+)
 
-        bridge = BusBridgeProcessor(bus=self.bus, agent_name=self.name)
+bridge = BusBridgeProcessor(bus=runner.bus, worker_name=MAIN_NAME)
 
-        return Pipeline([
-            self._transport.input(),
-            stt,
-            context_aggregator.user(),
-            bridge,                        # Where the LLM would go
-            tts,
-            self._transport.output(),
-            context_aggregator.assistant(),
-        ])
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    aggregators.user(),
+    bridge,                  # Where the LLM would go
+    tts,
+    transport.output(),
+    aggregators.assistant(),
+])
+
+main = PipelineWorker(pipeline, name=MAIN_NAME, params=PipelineParams())
 ```
 
 ### 2. LLM agents with bridged=()
 
-LLM agents set `bridged=()` to receive frames from the bus. Each one runs its own LLM and defines its own system prompt:
+Each LLM agent is an `LLMWorker` created with `bridged=()` so it receives frames from the bus. Subclass `LLMWorker` to add tools, then instantiate it with its own LLM:
 
 ```python
-from pipecat_subagents.agents import LLMAgent
+from pipecat.workers.llm import LLMWorker, tool
 
-class GreeterAgent(LLMAgent):
-    def __init__(self, name, *, bus):
-        super().__init__(name, bus=bus, bridged=())
+class AcmeAgent(LLMWorker):
+    # tools defined below
 
-    def build_llm(self) -> LLMService:
-        return OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            settings=OpenAILLMSettings(
-                system_instruction="You are a friendly greeter. Route product questions to support.",
-            ),
-        )
+def build_greeter() -> AcmeAgent:
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAILLMService.Settings(
+            system_instruction="You are a friendly greeter. Route product questions to support.",
+        ),
+    )
+    return AcmeAgent("greeter", llm=llm, bridged=())
 ```
 
 <Note>
-  `bridged=()` means the agent receives frames from all bridges. You can filter by bridge name with `bridged=("voice",)` if you have multiple bridges.
+  `bridged=()` means the agent receives frames from all bridges. You can filter
+  by bridge name with `bridged=("voice",)` if you have multiple bridges.
 </Note>
 
 ### 3. Handoff via tools
 
-The LLM decides when to transfer by calling a tool. The tool calls `handoff_to()`:
+The LLM decides when to transfer by calling a tool. The tool calls `activate_worker()` with `deactivate_self=True`:
 
 ```python
-from pipecat_subagents.agents import tool, LLMAgentActivationArgs
+from pipecat.workers.llm import LLMWorker, LLMWorkerActivationArgs, tool
 
-class GreeterAgent(LLMAgent):
-    # ... build_llm() as above ...
-
+class AcmeAgent(LLMWorker):
     @tool(cancel_on_interruption=False)
     async def transfer_to_agent(self, params: FunctionCallParams, agent: str, reason: str):
         """Transfer the user to another agent.
@@ -101,29 +99,31 @@ class GreeterAgent(LLMAgent):
             agent (str): The agent to transfer to (e.g. 'support').
             reason (str): Why the user is being transferred.
         """
-        await self.handoff_to(
+        await self.activate_worker(
             agent,
-            activation_args=LLMAgentActivationArgs(
+            args=LLMWorkerActivationArgs(
                 messages=[{"role": "developer", "content": reason}],
             ),
+            deactivate_self=True,
             result_callback=params.result_callback,
         )
 ```
 
-For `LLMAgent`, `handoff_to()` also accepts a `messages` parameter. These messages are injected and spoken by the current agent *before* the transfer happens -- useful for announcing the handoff:
+For `LLMWorker`, `activate_worker()` also accepts a `messages` parameter. These messages are injected and spoken by the current agent _before_ the transfer happens -- useful for announcing the handoff:
 
 ```python
-await self.handoff_to(
+await self.activate_worker(
     agent,
     messages=[{"role": "developer", "content": f"Tell the user about the transfer ({reason})."}],
-    activation_args=LLMAgentActivationArgs(
+    args=LLMWorkerActivationArgs(
         messages=[{"role": "developer", "content": reason}],
     ),
+    deactivate_self=True,
     result_callback=params.result_callback,
 )
 ```
 
-When the greeter calls `handoff_to("support", ...)`:
+When the greeter calls `activate_worker("support", deactivate_self=True, ...)`:
 
 1. The greeter is deactivated -- it stops receiving frames from the bus
 2. The support agent is activated with the provided arguments
@@ -134,14 +134,14 @@ The transition is seamless -- the user experiences it as a natural conversation 
 
 ## Activation arguments
 
-When activating an `LLMAgent`, you can pass `LLMAgentActivationArgs` to give the target agent context about why it was activated:
+When activating an `LLMWorker`, pass `LLMWorkerActivationArgs` via `args=` to give the target agent context about why it was activated:
 
 ```python
-from pipecat_subagents.agents import LLMAgentActivationArgs
+from pipecat.workers.llm import LLMWorkerActivationArgs
 
-await self.activate_agent(
+await self.activate_worker(
     "support",
-    activation_args=LLMAgentActivationArgs(
+    args=LLMWorkerActivationArgs(
         messages=[{"role": "developer", "content": "The user asked about Rocket Boots."}],
     ),
 )
@@ -149,25 +149,22 @@ await self.activate_agent(
 
 The target agent receives these messages in its LLM context and immediately runs the LLM to respond.
 
-## Waiting for agents to be ready
+## Activating the first agent
 
-Before you can activate an agent, it needs to be ready (its pipeline must be started). Use the `@agent_ready` decorator to declare a handler that fires when a specific agent registers:
+Before you can activate an agent, it needs to be ready (its pipeline must be started). The simplest place to kick off the conversation is the transport's `on_client_connected` handler, where you activate the first agent:
 
 ```python
-from pipecat_subagents.agents import agent_ready
-
-class MainAgent(BaseAgent):
-    @agent_ready(name="greeter")
-    async def on_greeter_ready(self, data: AgentReadyData) -> None:
-        await self.activate_agent(
-            "greeter",
-            activation_args=LLMAgentActivationArgs(
-                messages=[{"role": "developer", "content": "Welcome the user."}],
-            ),
-        )
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    await main.activate_worker(
+        "greeter",
+        args=LLMWorkerActivationArgs(
+            messages=[{"role": "developer", "content": "Welcome the user."}],
+        ),
+    )
 ```
 
-The framework automatically watches for the named agent when the main agent starts. If the agent is already registered, the handler fires immediately. This is the typical pattern: the main agent waits for the first LLM agent, then activates it to start the conversation.
+If you need to react to a specific agent registering (for example in a distributed setup), use the `@worker_ready` decorator instead. See [Agent registry and discovery](/pipecat/agents/fundamentals/agent-registry-and-discovery).
 
 ## Putting it all together
 
@@ -175,31 +172,32 @@ Here's the full flow:
 
 <Steps>
   <Step title="Runner starts">
-    `AgentRunner` creates the bus and starts the main agent's pipeline.
+    `PipelineRunner` creates the bus. You add every agent (the main agent and
+    the LLM agents) with `runner.add_workers(...)`.
   </Step>
   <Step title="Client connects">
-    The main agent creates child LLM agents and adds them via `add_agent()`.
-  </Step>
-  <Step title="Agent becomes ready">
-    The `@agent_ready` handler fires on the parent. The main agent activates the greeter.
+    The transport's `on_client_connected` handler activates the greeter.
   </Step>
   <Step title="User speaks">
-    Audio flows: transport -> STT -> BusBridge -> bus -> greeter's LLM -> bus -> BusBridge -> TTS -> transport.
+    Audio flows: transport -> STT -> BusBridge -> bus -> greeter's LLM -> bus ->
+    BusBridge -> TTS -> transport.
   </Step>
   <Step title="LLM decides to transfer">
-    The greeter's LLM calls `transfer_to_agent`. The tool calls `handoff_to("support", ...)`.
+    The greeter's LLM calls `transfer_to_agent`. The tool calls
+    `activate_worker("support", deactivate_self=True, ...)`.
   </Step>
   <Step title="Handoff completes">
-    Greeter deactivates, support activates with context. Audio now flows through the support agent.
+    Greeter deactivates, support activates with context. Audio now flows through
+    the support agent.
   </Step>
 </Steps>
 
 ## What's next
 
-Handoff transfers a conversation between agents. But sometimes you need agents to do work in parallel. Next, let's look at task coordination.
+Handoff transfers a conversation between agents. But sometimes you need agents to do work in parallel. Next, let's look at job coordination.
 
 <Card
-  title="Task Coordination"
+  title="Job Coordination"
   icon="arrow-right"
   href="/pipecat/agents/learn/task-coordination"
 >

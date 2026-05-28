@@ -1,46 +1,44 @@
 ---
-title: "The Agent Bus"
-description: "How agents communicate through the shared message bus."
+title: "The Worker Bus"
+description: "How workers communicate through the shared message bus."
 ---
 
 ## What is the bus?
 
-The agent bus is the communication backbone of every subagent system. All agents connect to the same bus and exchange typed messages for frame routing, lifecycle events, and task coordination.
+The worker bus is the communication backbone of every multi-worker system. All workers connect to the same bus and exchange typed messages for frame routing, lifecycle events, and job coordination.
 
-Think of it as an internal event bus -- agents publish messages and other agents receive them through their subscriptions. The bus handles priority queuing so that urgent messages (like cancellations) are delivered before queued data.
+Think of it as an internal event bus -- workers publish messages and other workers receive them through their subscriptions. The bus handles priority queuing so that urgent messages (like cancellations) are delivered before queued data.
 
 ## Bus implementations
 
-Pipecat Subagents provides three bus implementations:
+Pipecat provides three bus implementations:
 
 ### AsyncQueueBus (local)
 
-The default bus, created automatically by `AgentRunner` when you don't provide one. It uses asyncio queues for in-process communication with no serialization overhead.
+The default bus, created automatically by `PipelineRunner` when you don't provide one. It uses asyncio queues for in-process communication with no serialization overhead.
 
 ```python
-runner = AgentRunner()  # Creates AsyncQueueBus automatically
+runner = PipelineRunner()  # Creates AsyncQueueBus automatically
 ```
 
-This is all you need for single-process applications where all agents run together.
+This is all you need for single-process applications where all workers run together.
 
 ### RedisBus (distributed)
 
-For distributed setups where agents run in separate processes or on different machines, use `RedisBus`. It uses Redis pub/sub to relay messages across process boundaries.
+For distributed setups where workers run in separate processes or on different machines, use `RedisBus`. It uses Redis pub/sub to relay messages across process boundaries.
 
 ```python
 from redis.asyncio import Redis
-from pipecat_subagents.bus.network.redis import RedisBus
+from pipecat.bus.network.redis import RedisBus
 
 redis = Redis.from_url("redis://localhost:6379")
 bus = RedisBus(redis=redis, channel="pipecat:my-app")
-runner = AgentRunner(bus=bus)
+runner = PipelineRunner(bus=bus)
 ```
 
 All processes that share the same Redis channel can exchange messages. The programming model stays the same -- your agent code doesn't change between local and distributed setups.
 
-<Info>
-  `RedisBus` requires the `redis` extra: `uv add "pipecat-ai-subagents[redis]"`
-</Info>
+<Info>`RedisBus` requires the `redis` extra: `uv add "pipecat-ai[redis]"`</Info>
 
 ### PgmqBus (distributed)
 
@@ -48,7 +46,7 @@ An alternative distributed bus backed by PGMQ (PostgreSQL Message Queue). Each i
 
 ```python
 from pgmq.async_queue import PGMQueue
-from pipecat_subagents.bus.network.pgmq import PgmqBus
+from pipecat.bus.network.pgmq import PgmqBus
 
 pgmq = PGMQueue(
     host="localhost",
@@ -60,16 +58,14 @@ pgmq = PGMQueue(
 )
 await pgmq.init()
 bus = PgmqBus(pgmq=pgmq, channel="pipecat:my-app")
-runner = AgentRunner(bus=bus)
+runner = PipelineRunner(bus=bus)
 ```
 
-<Info>
-  `PgmqBus` requires the `pgmq` extra: `uv add "pipecat-ai-subagents[pgmq]"`
-</Info>
+<Info>`PgmqBus` requires the `pgmq` extra: `uv add "pipecat-ai[pgmq]"`</Info>
 
 ## Message types
 
-Messages on the bus fall into three categories:
+Messages on the bus fall into four categories:
 
 ### Data messages
 
@@ -77,11 +73,11 @@ Normal-priority messages that carry data between agents. The most important one 
 
 ### System messages
 
-High-priority messages for lifecycle events: activation, deactivation, shutdown, and agent readiness. These are delivered before data messages in the queue.
+High-priority messages for lifecycle events: activation, deactivation, shutdown, and worker readiness. These are delivered before data messages in the queue.
 
-### Task messages
+### Job messages
 
-Messages for coordinating work between agents: task requests, responses, progress updates, streaming, and cancellation.
+Messages for coordinating work between agents: job requests, responses, progress updates, streaming, and cancellation.
 
 ### Local messages
 
@@ -94,19 +90,21 @@ Messages have `source` and `target` fields:
 - **Targeted messages** (with a specific `target`) are delivered only to the named agent
 - **Broadcast messages** (with no `target`) are delivered to all subscribers
 
-The bus handles this routing automatically. When you call `activate_agent("greeter")`, it sends a `BusActivateAgentMessage` targeted at `"greeter"` -- only that agent receives it.
+The bus handles this routing automatically. When you call `activate_worker("greeter")`, it sends a `BusActivateWorkerMessage` targeted at `"greeter"` -- only that agent receives it.
 
 ## The agent registry
 
-The runner maintains an `AgentRegistry` that tracks which agents are available. To get notified when an agent is ready, use the `@agent_ready` decorator (or call `watch_agent()` explicitly):
+The runner maintains a `WorkerRegistry` that tracks which agents are available. To get notified when an agent is ready, use the `@worker_ready` decorator (or call `watch_workers()` explicitly):
 
 ```python
-from pipecat_subagents.agents import agent_ready
+from pipecat.pipeline.base_worker import BaseWorker
+from pipecat.pipeline.worker_ready_decorator import worker_ready
+from pipecat.registry.types import WorkerReadyData
 
-class MainAgent(BaseAgent):
-    @agent_ready(name="greeter")
-    async def on_greeter_ready(self, data: AgentReadyData) -> None:
-        await self.activate_agent("greeter")
+class MainAgent(BaseWorker):
+    @worker_ready(name="greeter")
+    async def on_greeter_ready(self, data: WorkerReadyData) -> None:
+        await self.activate_worker("greeter")
 ```
 
-The framework automatically calls `watch_agent()` for each `@agent_ready` handler when the agent starts. If the watched agent is already registered, the handler fires immediately, so you don't need to worry about race conditions.
+The framework automatically calls `watch_workers()` for each `@worker_ready` handler when the agent starts. If the watched agent is already registered, the handler fires immediately, so you don't need to worry about race conditions.
