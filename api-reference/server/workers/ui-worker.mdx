@@ -1,0 +1,345 @@
+---
+title: "UIWorker"
+description: "LLM agent that observes and drives a client GUI over the RTVI UI channel"
+---
+
+`UIWorker` extends [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker) with the ability to see and act on whatever the user is looking at. It connects an LLM to the client GUI over the RTVI UI channel: it receives the screen as accessibility snapshots, reacts to the user's UI events, and acts on the page by sending commands back to the client.
+
+A `UIWorker` is the delegate side of a voice/UI split. A voice layer (the main pipeline's LLM, or a separate [`LLMWorker`](/api-reference/server/workers/llm-worker)) handles speech and hands screen-relevant work to the `UIWorker`. Because the worker auto-injects the latest screen state into _its_ LLM context, the conversational voice LLM stays small and screen-unaware — keeping each LLM's context focused and efficient.
+
+```python
+from pipecat.workers.llm import tool
+from pipecat.workers.ui import UIWorker
+
+
+class MyUIWorker(UIWorker):
+    @tool
+    async def answer(self, params, text: str):
+        await self.respond_to_job(text, tts_speak=True)
+        await params.result_callback(None)
+
+
+worker = MyUIWorker("ui", llm=OpenAILLMService(api_key="..."))
+```
+
+[`PipelineWorker`](/api-reference/server/workers/base-worker) connects a `UIWorker` to the client automatically when RTVI is enabled (the default) — no extra wiring. A working subclass needs only an LLM and a `@tool` that calls `respond_to_job()`.
+
+<Note>
+  The client streams the screen as `ui-snapshot` messages and the worker drives
+  it with `ui-command` / `ui-job-group` messages. See [The RTVI
+  Standard](/client/rtvi-standard#user-interface) for the wire protocol and
+  [UIWorker patterns](/pipecat/fundamentals/ui-worker) for the delegation and
+  parallel-handling patterns end to end.
+</Note>
+
+## Configuration
+
+Inherits `name`, `llm`, `active`, `bridged`, and `defer_tool_frames` from [`LLMWorker`](/api-reference/server/workers/llm-worker#configuration), plus:
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  Optional pre-built `LLMContext`. Seeded messages are part of the mutable
+  history and are cleared on each `keep_history=False` reset; put durable
+  instructions in the LLM's `system_instruction` instead.
+</ParamField>
+
+<ParamField
+  path="assistant_params"
+  type="LLMAssistantAggregatorParams | None"
+  default="None"
+>
+  Optional assistant-aggregator parameters, e.g. to enable context summarization
+  for `keep_history=True` workers.
+</ParamField>
+
+<ParamField path="inject_events" type="bool" default="True">
+  When `True` (the default), append each UI event to the context as a
+  `<ui_event>` developer message. Override `render_ui_event()` to change the
+  content, or set `False` to disable.
+</ParamField>
+
+<ParamField path="auto_inject_ui_state" type="bool" default="True">
+  When `True` (the default), append the latest `<ui_state>` snapshot to the
+  context before every inference (via the LLM's `on_before_process_frame` hook).
+  Set `False` to inject manually with `inject_ui_state()`.
+</ParamField>
+
+<ParamField path="keep_history" type="bool" default="False">
+  When `False` (the default), the context is cleared at the start of every job,
+  so each turn sees only the current `<ui_state>` and query — best for the
+  stateless-delegate role. When `True`, history accumulates across jobs so the
+  LLM can resolve multi-turn references ("the next one", "the Pro version"), at
+  the cost of more tokens. Pair with context summarization to prune history.
+</ParamField>
+
+<ParamField path="prompt_guide" type="str | None" default="UI_STATE_PROMPT_GUIDE">
+  Wire-format guide appended to the LLM's `system_instruction` so it can parse
+  the `<ui_state>` / `<ui_event>` messages. Defaults to `UI_STATE_PROMPT_GUIDE`;
+  pass a string to override or `None` to disable. Living in `system_instruction`,
+  it survives context resets.
+</ParamField>
+
+## Properties
+
+Inherits all properties from [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker) (including `context`, `user_aggregator`, `assistant_aggregator`, `llm`).
+
+### current_job
+
+```python
+worker.current_job -> BusJobRequestMessage | None
+```
+
+The job this worker is currently processing, or `None` when idle. Set when a respond turn starts and cleared when the job completes. Lets `@tool` methods inspect the in-flight job without threading the message through every call.
+
+## UI commands
+
+These helpers send commands to the client. They are plain methods, not LLM tools: compose them inside a custom `@tool` body, or use [`ReplyToolMixin`](#replytoolmixin) for the standard shape. Each is a convenience wrapper around [`send_command`](#send-command) with a typed payload model from [`pipecat.processors.frameworks.rtvi.models`](/client/rtvi-standard#user-interface).
+
+### send_command
+
+```python
+async def send_command(self, name: str, payload: Any = None) -> None
+```
+
+Send a named UI command to the client. Publishes a `BusUICommandMessage`; when RTVI is enabled, `PipelineWorker` translates it into an `RTVIUICommandFrame` on the pipeline. Client-side handlers subscribed to [`RTVIEvent.UICommand`](/api-reference/client/js/callbacks#user-interface-events) (or React's [`useUICommandHandler`](/api-reference/client/react/hooks#useuicommandhandler)) dispatch on the command name.
+
+| Parameter | Type  | Default | Description                                                                                                           |
+| --------- | ----- | ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `name`    | `str` |         | App-defined command name (e.g. `"toast"`, `"navigate"`, or any app-specific name).                                    |
+| `payload` | `Any` | `None`  | A pydantic `BaseModel` or dataclass (converted to a dict), a `dict` (forwarded as-is), or `None` (forwarded as `{}`). |
+
+### scroll_to
+
+```python
+async def scroll_to(self, ref: str) -> None
+```
+
+Bring an element into view. `ref` is a snapshot ref (e.g. `"e42"`) from the latest `<ui_state>`.
+
+### highlight
+
+```python
+async def highlight(self, ref: str) -> None
+```
+
+Briefly flash an element to draw the user's attention.
+
+### select_text
+
+```python
+async def select_text(
+    self,
+    ref: str,
+    *,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
+) -> None
+```
+
+Select an element's text — used for deixis (pointing at content via the page's text selection). Selects the whole element by default, or the `start_offset`..`end_offset` character sub-range when both are given.
+
+### click
+
+```python
+async def click(self, ref: str) -> None
+```
+
+Click an element (checkboxes, radios, submit buttons). The standard client handler no-ops on `disabled` targets.
+
+### set_input_value
+
+```python
+async def set_input_value(self, ref: str, value: str, *, replace: bool = True) -> None
+```
+
+Fill a text input or textarea. With `replace=True` (the default) the field is overwritten; with `replace=False` the value is appended.
+
+## Responding to jobs
+
+A `UIWorker` answers via a built-in single-flight `respond` job. When a requester dispatches `self.job("ui", name="respond", payload={"query": "..."})`, the worker clears its context (unless `keep_history=True`), injects the current `<ui_state>`, appends the query as a user message, and runs one LLM turn. A `@tool` ends the turn by calling `respond_to_job()`.
+
+### respond_to_job
+
+```python
+async def respond_to_job(
+    self,
+    answer: str | None = None,
+    *,
+    tts_speak: bool = False,
+    status: JobStatus = JobStatus.COMPLETED,
+) -> None
+```
+
+Complete the in-flight job with the worker's answer. The two delivery modes are mutually exclusive (one voice per turn):
+
+- **default** — the job responds with `{"answer": answer}` for the requester's voice LLM to phrase.
+- **`tts_speak=True`** — `answer` is spoken verbatim by the requester's TTS (and added to its context) while the job responds `None` so the voice LLM doesn't also speak.
+
+A falsy `answer` completes the turn silently — useful for the [parallel-handling pattern](/pipecat/fundamentals/ui-worker) where a separate voice layer owns speech. No-op when no job is in flight.
+
+| Parameter   | Type          | Default               | Description                                                              |
+| ----------- | ------------- | --------------------- | ------------------------------------------------------------------------ |
+| `answer`    | `str \| None` | `None`                | The worker's answer — spoken verbatim or handed to the voice LLM.        |
+| `tts_speak` | `bool`        | `False`               | Speak `answer` verbatim via the requester's TTS instead of returning it. |
+| `status`    | `JobStatus`   | `JobStatus.COMPLETED` | Completion status.                                                       |
+
+### render_query
+
+```python
+def render_query(self, message: BusJobRequestMessage) -> str
+```
+
+Extract the user's query text from a job request. The default reads `payload["query"]`. Override to read a different payload shape; the returned string is appended to the context as a user message before the LLM runs.
+
+### render_ui_state
+
+```python
+def render_ui_state(self) -> str
+```
+
+Render the latest accessibility snapshot as a `<ui_state>` block (Playwright-MCP-style indented text with stable element refs). When the snapshot carries a text selection, a nested `<selection ref="...">...</selection>` block is appended so the LLM can resolve deictic references. Returns an empty string if no snapshot has been received. Override to customize the rendered form.
+
+### inject_ui_state
+
+```python
+async def inject_ui_state(self) -> None
+```
+
+Append the latest `<ui_state>` block to the LLM context manually. No-op when no snapshot has been received. Use this when `auto_inject_ui_state=False`.
+
+### render_ui_event
+
+```python
+def render_ui_event(self, message: BusUIEventMessage) -> str
+```
+
+Render a UI event as a string for context injection. The default wraps the event in a single `<ui_event name="...">` tag with a JSON-encoded payload. Override to customize the injected content.
+
+## Job groups
+
+A `UIWorker` can fan work out to peer workers and surface the work to the client as a cancellable progress card. These are distinct from the inherited worker-to-worker [`job_group`](/api-reference/server/workers/base-worker) (which is invisible to the client).
+
+### ui_job_group
+
+```python
+def ui_job_group(
+    self,
+    *worker_names: str,
+    name: str | None = None,
+    payload: dict | None = None,
+    timeout: float | None = None,
+    cancel_on_error: bool = True,
+    label: str | None = None,
+    cancellable: bool = True,
+) -> UIJobGroupContext
+```
+
+Dispatch a job group whose lifecycle is forwarded to the client as `ui-job-group` envelopes (`group_started` → `job_update*` → `job_completed` × N → `group_completed`). Use as an `async with` context manager to consume worker events inline.
+
+| Parameter         | Type            | Default | Description                                                            |
+| ----------------- | --------------- | ------- | ---------------------------------------------------------------------- |
+| `*worker_names`   | `str`           |         | Names of the workers to send the job to.                               |
+| `name`            | `str \| None`   | `None`  | Optional job name for routing to named `@job` handlers.                |
+| `payload`         | `dict \| None`  | `None`  | Optional structured data describing the work.                          |
+| `timeout`         | `float \| None` | `None`  | Optional timeout (seconds) covering both the ready-wait and execution. |
+| `cancel_on_error` | `bool`          | `True`  | Whether to cancel the group if a worker errors.                        |
+| `label`           | `str \| None`   | `None`  | Human-readable label the client uses to title the in-flight card.      |
+| `cancellable`     | `bool`          | `True`  | Whether the client may cancel the group via `ui-cancel-job-group`.     |
+
+```python
+async with self.ui_job_group(
+    "researcher_a", "researcher_b",
+    payload={"query": query},
+    label=f"Research: {query}",
+) as tg:
+    async for event in tg:
+        ...
+    results = tg.responses
+```
+
+### start_ui_job_group
+
+```python
+async def start_ui_job_group(self, *worker_names: str, ...) -> str
+```
+
+Fire-and-forget version of `ui_job_group` with the same parameters. Dispatches the group in the background and returns the `job_id` immediately (the lifecycle still forwards to the client). Use it when a `@tool` wants to kick off work and unblock the voice worker.
+
+```python
+@tool
+async def reply(self, params, answer, research_query=None):
+    if research_query:
+        await self.start_ui_job_group(
+            "wikipedia", "news", "scholar",
+            payload={"query": research_query},
+            label=f"Research: {research_query}",
+        )
+    await self.respond_to_job(answer)
+    await params.result_callback(None)
+```
+
+## Handling UI events
+
+### @ui_event
+
+```python
+from pipecat.workers.ui import ui_event
+```
+
+```python
+def ui_event(name: str)
+```
+
+Mark a worker method as a handler for a named UI event. When the client dispatches an event via `PipecatClient.sendUIEvent(event, payload)`, the matching handler runs in its own task. The handler receives the `BusUIEventMessage` (read `message.payload` for the event data).
+
+```python
+class MyUIWorker(UIWorker):
+    @ui_event("note_click")
+    async def on_note_click(self, message):
+        ref = (message.payload or {}).get("ref")
+        await self.scroll_to(ref)
+        await self.select_text(ref)
+```
+
+<Note>
+  Two handlers can't share the same event name on the same subclass. Overrides
+  in subclasses take precedence over base-class definitions.
+</Note>
+
+## ReplyToolMixin
+
+```python
+from pipecat.workers.ui import ReplyToolMixin
+```
+
+`ReplyToolMixin` exposes a single bundled `reply` tool covering the full standard action set, for subclasses that don't need a custom tool schema. Compose it ahead of `UIWorker`:
+
+```python
+class MyUIWorker(ReplyToolMixin, UIWorker):
+    ...
+```
+
+The tool requires a spoken `answer` (enforced by the schema, so the model can't omit the terminator) plus optional visual and state-changing actions. It's called exactly once per turn:
+
+```python
+async def reply(
+    self,
+    params: FunctionCallParams,
+    answer: str,
+    scroll_to: str | None = None,
+    highlight: list[str] | None = None,
+    select_text: str | None = None,
+    fills: list[dict] | None = None,
+    click: list[str] | None = None,
+)
+```
+
+| Field         | Type                 | Description                                         |
+| ------------- | -------------------- | --------------------------------------------------- |
+| `answer`      | `str` (required)     | The spoken reply in plain language.                 |
+| `scroll_to`   | `str \| None`        | Snapshot ref to scroll into view.                   |
+| `highlight`   | `list[str] \| None`  | Snapshot refs to flash briefly.                     |
+| `select_text` | `str \| None`        | Snapshot ref to place the page's text selection on. |
+| `fills`       | `list[dict] \| None` | `{"ref", "value"}` objects to write into inputs.    |
+| `click`       | `list[str] \| None`  | Snapshot refs to click in order.                    |
+
+Dispatch order within a turn is `scroll_to` → `highlight` → `select_text` → `fills` → `click` → speak the answer. The answer is delivered as verbatim TTS (`respond_to_job(answer, tts_speak=True)`). Apps that want a minimal schema, app-specific commands, or the requester's voice LLM to phrase the reply should write their own `@tool reply` on the `UIWorker` subclass instead.

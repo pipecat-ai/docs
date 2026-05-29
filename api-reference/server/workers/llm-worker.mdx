@@ -1,0 +1,232 @@
+---
+title: "LLMWorker"
+description: "Agent with LLM pipeline and automatic tool registration"
+---
+
+## Overview
+
+`LLMWorker` extends [`PipelineWorker`](/api-reference/server/workers/base-worker) with an LLM pipeline and automatic tool registration. Pass an `LLMService` to the constructor and define tools with the [`@tool`](#tool) decorator. Decorated methods are registered as direct functions on the LLM and tracked so frames queued during tool execution can be deferred until all tools complete.
+
+```python
+from pipecat.workers.llm import LLMWorker, tool
+```
+
+```python
+class MyAgent(LLMWorker):
+    @tool
+    async def my_function(self, params, arg: str):
+        ...
+
+agent = MyAgent("my_agent", llm=OpenAILLMService(api_key="..."))
+```
+
+## Configuration
+
+<ParamField path="name" type="str" required>
+  Unique name for this agent.
+</ParamField>
+
+<ParamField path="llm" type="LLMService" required>
+  The LLM service. `@tool` decorated methods are automatically registered on it.
+</ParamField>
+
+<ParamField path="pipeline" type="Pipeline | None" default="None">
+  Optional pipeline override. When `None`, defaults to `Pipeline([llm])`.
+  Subclasses can pass a custom pipeline that wraps the LLM with additional
+  processors.
+</ParamField>
+
+<ParamField path="active" type="bool" default="False">
+  Whether the agent starts active. Defaults to `False`, since LLM agents
+  typically wait to be activated.
+</ParamField>
+
+<ParamField path="bridged" type="tuple[str, ...] | None" default="None">
+  Bridge configuration forwarded to `PipelineWorker`. Pass `()` to wrap the LLM
+  pipeline with bus edge processors so it can exchange frames with another
+  bridged agent. See
+  [`PipelineWorker`](/api-reference/server/workers/base-worker#configuration)
+  for details.
+</ParamField>
+
+<ParamField path="defer_tool_frames" type="bool" default="True">
+  Whether to defer frames queued during tool execution until all tools complete.
+  When `True`, any frames queued via `queue_frame()` while a `@tool` method is
+  running are held in an internal queue and delivered automatically once the
+  last tool finishes.
+</ParamField>
+
+## Properties
+
+Inherits all properties from [`PipelineWorker`](/api-reference/server/workers/base-worker#properties).
+
+### llm
+
+```python
+agent.llm -> LLMService
+```
+
+The LLM service this agent wraps.
+
+### tool_call_active
+
+```python
+agent.tool_call_active -> bool
+```
+
+`True` when one or more `@tool` methods are executing.
+
+## Methods
+
+### build_tools
+
+```python
+def build_tools(self) -> list
+```
+
+Return the tools for this agent's LLM. By default, returns all methods decorated with [`@tool`](#tool). Override to provide additional or different tools.
+
+**Returns:** List of tool functions.
+
+### on_activated
+
+```python
+async def on_activated(self, args: dict | None) -> None
+```
+
+Configure the LLM with tools and activation messages. The decorated `@tool` methods are set on the LLM. When `args` contains `messages`, they are appended to the LLM context. When `args` contains `run_llm` (defaults to `True` when messages are set), the LLM is triggered after appending.
+
+| Parameter | Type           | Description                                                                                                         |
+| --------- | -------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `args`    | `dict \| None` | Activation arguments (see [`LLMWorkerActivationArgs`](/api-reference/server/workers/types#llmworkeractivationargs)) |
+
+### activate_worker
+
+```python
+async def activate_worker(
+    self,
+    worker_name: str,
+    *,
+    args: WorkerActivationArgs | None = None,
+    deactivate_self: bool = False,
+    messages: list | None = None,
+    result_callback: FunctionCallResultCallback | None = None,
+) -> None
+```
+
+Activate another agent, optionally finishing an in-progress tool call. When called from a `@tool` handler, pass `params.result_callback` to ensure any pending LLM output is fully delivered before the target is activated. To hand off (deactivate this agent and activate the target), pass `deactivate_self=True`.
+
+| Parameter         | Type                                 | Default | Description                                                   |
+| ----------------- | ------------------------------------ | ------- | ------------------------------------------------------------- |
+| `worker_name`     | `str`                                |         | Name of the agent to activate                                 |
+| `args`            | `WorkerActivationArgs \| None`       | `None`  | Arguments forwarded to `on_activated`                         |
+| `deactivate_self` | `bool`                               | `False` | Whether to deactivate this agent before activating the target |
+| `messages`        | `list \| None`                       | `None`  | LLM messages to inject and speak before activating            |
+| `result_callback` | `FunctionCallResultCallback \| None` | `None`  | The `result_callback` from `FunctionCallParams`               |
+
+### end
+
+```python
+async def end(
+    self,
+    *,
+    reason: str | None = None,
+    messages: list | None = None,
+    result_callback: FunctionCallResultCallback | None = None,
+) -> None
+```
+
+Request a graceful end of the session. When called from a `@tool` handler, pass `params.result_callback` to ensure any pending LLM output is fully delivered before ending.
+
+| Parameter         | Type                                 | Default | Description                                     |
+| ----------------- | ------------------------------------ | ------- | ----------------------------------------------- |
+| `reason`          | `str \| None`                        | `None`  | Human-readable reason for ending                |
+| `messages`        | `list \| None`                       | `None`  | LLM messages to inject and speak before ending  |
+| `result_callback` | `FunctionCallResultCallback \| None` | `None`  | The `result_callback` from `FunctionCallParams` |
+
+### queue_frame
+
+```python
+async def queue_frame(
+    self,
+    frame: Frame,
+    direction: FrameDirection = FrameDirection.DOWNSTREAM,
+) -> None
+```
+
+Queue a frame, deferring delivery until all tools complete (if any). When tool calls are in progress, the frame is held in an internal queue and delivered automatically once the last tool finishes. When no tools are active, the frame is queued immediately.
+
+| Parameter   | Type             | Default      | Description                       |
+| ----------- | ---------------- | ------------ | --------------------------------- |
+| `frame`     | `Frame`          |              | The frame to queue                |
+| `direction` | `FrameDirection` | `DOWNSTREAM` | Direction the frame should travel |
+
+### process_deferred_tool_frames
+
+```python
+async def process_deferred_tool_frames(
+    self,
+    frames: list[tuple[Frame, FrameDirection]],
+) -> list[tuple[Frame, FrameDirection]]
+```
+
+Process deferred frames before they are flushed. Called after all in-flight tools complete, before the deferred frames are queued into the pipeline. Override to inspect, modify, reorder, or filter the frames.
+
+| Parameter | Type                                 | Description                                         |
+| --------- | ------------------------------------ | --------------------------------------------------- |
+| `frames`  | `list[tuple[Frame, FrameDirection]]` | The deferred frames collected during tool execution |
+
+**Returns:** The frames to queue. Return the list as-is for default behavior.
+
+## Decorators
+
+### @tool
+
+Mark an `LLMWorker` method as an LLM tool. Decorated methods are automatically registered with the LLM and included in `build_tools()`.
+
+```python
+from pipecat.workers.llm import tool
+```
+
+Can be used with or without arguments:
+
+```python
+@tool
+async def my_tool(self, params, arg: str):
+    ...
+
+
+@tool(cancel_on_interruption=False, timeout=60)
+async def my_tool(self, params, arg: str):
+    ...
+```
+
+#### Parameters
+
+<ParamField path="cancel_on_interruption" type="bool" default="True">
+  Whether to cancel this tool call when an interruption occurs.
+</ParamField>
+
+<ParamField path="timeout" type="float | None" default="None">
+  Timeout in seconds for this tool call. Defaults to `None` (uses the LLM
+  service default).
+</ParamField>
+
+#### Method signature
+
+Tool methods receive the LLM function call parameters object as their first argument (after `self`), followed by the tool's declared parameters:
+
+```python
+@tool
+async def get_weather(self, params, location: str, unit: str = "celsius"):
+    """Get the current weather for a location."""
+    result = await fetch_weather(location, unit)
+    await params.result_callback(result)
+```
+
+<Note>
+  Tool methods must call `params.result_callback()` to return a result to the
+  LLM. The method signature (parameter names, types, and docstring) is
+  automatically used to generate the tool schema.
+</Note>
+

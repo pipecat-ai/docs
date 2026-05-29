@@ -1,0 +1,186 @@
+---
+title: "Your First Agent"
+description: "Build and run a single agent: a PipelineWorker, the WorkerRunner, and the pipeline lifecycle."
+---
+
+In Pipecat, an **agent** is a worker that runs a pipeline. A standalone voice bot is a single agent. Pipecat is a multi-agent system, so once you have one agent you can add more that coordinate over a shared bus -- but let's start with one. This page shows the whole shape; the sections that follow break down each piece (transports, speech-to-text, the LLM, text-to-speech, and more).
+
+## Agent types
+
+Pipecat provides built-in worker types, each building on the previous:
+
+| Type               | Purpose                                                                                             |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| `BaseWorker`       | Foundation for all agents. Connects to the bus, manages lifecycle, coordinates jobs.                |
+| `PipelineWorker`   | Extends `BaseWorker` to run a Pipecat pipeline. A standalone agent is a single `PipelineWorker`.    |
+| `LLMWorker`        | Extends `PipelineWorker` with an LLM pipeline and automatic `@tool` registration.                   |
+| `LLMContextWorker` | Extends `LLMWorker` with a built-in `LLMContext` and aggregator pair (its own or a shared context). |
+| `UIWorker`         | Extends `LLMContextWorker` to read and drive a client GUI over the RTVI UI channel.                 |
+
+<Note>
+  If you've built a Pipecat bot before, you've already used these.
+  `PipelineTask` is a deprecated alias for `PipelineWorker`, and
+  `PipelineRunner` for `WorkerRunner`, so existing `PipelineRunner().run(task)`
+  code keeps working unchanged. New code should use `PipelineWorker` and
+  `WorkerRunner` directly.
+</Note>
+
+<Info>
+  `LLMWorker` gives an agent its own LLM and tools. It's covered in [LLM Worker
+  and Tools](/pipecat/learn/llm-agent-and-tool-decorator); this page focuses on
+  building and running a single agent with a `PipelineWorker`.
+</Info>
+
+## The WorkerRunner
+
+The `WorkerRunner` is the entry point. It:
+
+- Creates and manages the message bus
+- Starts agents and manages their lifecycle
+- Tracks agent readiness through a registry
+- Coordinates graceful shutdown
+
+When you don't provide a bus, the runner creates an `AsyncQueueBus` automatically -- an in-process bus backed by asyncio queues. For distributed setups, you can pass a network bus such as `RedisBus` or `PgmqBus` instead.
+
+Agents get their bus from the runner. You never pass a `bus=` argument to a worker constructor; you register agents with `runner.add_workers(...)`, which attaches them to the runner's bus and registry. Inside a running agent you can read `self.bus`.
+
+## Building the agent
+
+A single agent is one `PipelineWorker` wrapping a complete pipeline -- the same `transport -> STT -> LLM -> TTS -> transport` flow you'd build for a standalone bot. The LLM runs inline in the pipeline.
+
+```python
+import os
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.workers.runner import WorkerRunner
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+
+transport_params = {
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+}
+
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+    stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
+    llm = OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(
+            system_instruction="You are a helpful voice assistant. Keep responses brief.",
+        ),
+    )
+    tts = CartesiaTTSService(
+        api_key=os.environ["CARTESIA_API_KEY"],
+        settings=CartesiaTTSService.Settings(
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        ),
+    )
+
+    context = LLMContext()
+    aggregators = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            aggregators.user(),
+            llm,
+            tts,
+            transport.output(),
+            aggregators.assistant(),
+        ]
+    )
+
+    agent = PipelineWorker(
+        pipeline,
+        name="assistant",
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await runner.cancel()
+
+    await runner.add_workers(agent)
+    await runner.run()
+
+
+async def bot(runner_args: RunnerArguments):
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
+
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+
+    main()
+```
+
+That's a complete agent: one worker running one pipeline.
+
+## Running the agent
+
+`runner.add_workers(...)` attaches each agent to the runner's bus and registry and starts it. `runner.run()` then blocks until one of these happens:
+
+- The session ends normally (the agent calls `end()`)
+- A signal is received (`SIGINT`/`SIGTERM`, when `handle_sigint=True`)
+- You call `runner.cancel()`
+- An unhandled error occurs
+
+In the example above, the runner is cancelled when the client disconnects.
+
+## Configuring execution
+
+`PipelineParams` controls how the agent runs -- audio sample rates, metrics, and more:
+
+```python
+params = PipelineParams(
+    audio_in_sample_rate=16000,
+    audio_out_sample_rate=24000,
+    enable_metrics=True,
+    enable_usage_metrics=True,
+)
+```
+
+<Card
+  title="Pipeline Parameters"
+  icon="screwdriver-wrench"
+  href="/api-reference/server/pipeline/pipeline-params"
+>
+  The full list of execution parameters
+</Card>
+
+## Adding more agents
+
+This is a single agent. Because Pipecat is a multi-agent system, you can run several agents that each handle part of a conversation and coordinate over the shared bus. Later in this guide you'll see how: giving an agent its own LLM and tools, transferring control between agents with handoff, and dispatching work as jobs.
+
+## What's next
+
+Now you've seen the shape of an agent. Next, let's connect users to it, starting with session initialization.
+
+<Card
+  title="Session Initialization"
+  icon="arrow-right"
+  href="/pipecat/learn/session-initialization"
+>
+  Connect users and set up a session
+</Card>
