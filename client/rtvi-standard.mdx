@@ -625,3 +625,142 @@ For each metric type, the data structure is an array of objects with the followi
   }
 }
 ```
+
+### User Interface
+
+These messages let a server-side agent observe and drive a GUI on the client. The client streams the screen as accessibility snapshots and dispatches user events; the agent acts on the page with commands and surfaces long-running work as job-group cards. On the server, [`UIWorker`](/api-reference/server/workers/ui-worker) builds higher-level abstractions on top of these messages, but single-LLM apps can target the wire format directly. The matching client implementation lives in `@pipecat-ai/client-js` and `@pipecat-ai/client-react`.
+
+#### ui-snapshot 🏄
+
+A serialized accessibility tree describing what is currently on screen. Sent whenever the page changes so the agent always reasons over the latest state.
+
+- **type**: `'ui-snapshot'`
+- **data**:
+  - **tree**: `A11ySnapshot Object`
+
+    The accessibility snapshot. The agent renders it into a `<ui_state>` block for its LLM. The `A11ySnapshot` object follows this structure:
+
+    <Expandable title="A11ySnapshot">
+      <ParamField path="root" type="A11yNode" required>
+        The root accessibility node. Each `A11yNode` has `ref` (a stable
+        client-assigned element reference like `"e42"`), `role`, and optional
+        `name`, `value`, `state` (short tags such as `"focused"`, `"disabled"`,
+        `"offscreen"`), `level`, `colcount`, `rowcount`, and `children`.
+      </ParamField>
+      <ParamField path="captured_at" type="number" required>
+        Client-side epoch milliseconds when the snapshot was captured.
+      </ParamField>
+      <ParamField path="selection" type="A11ySelection">
+        The user's current text selection, if any: `ref`, `text`, and optional
+        `start_offset` / `end_offset`. Used so the agent can resolve deictic
+        references like "this paragraph".
+      </ParamField>
+    </Expandable>
+
+    Extra fields are allowed on the snapshot models so clients can add platform-specific or future metadata without breaking older servers.
+
+#### ui-event 🏄
+
+An app-defined event dispatched by the client (e.g. a button click, a custom interaction). On the server these route to `@ui_event(name)` handlers.
+
+- **type**: `'ui-event'`
+- **data**:
+  - **event**: `string`
+
+    The app-defined event name.
+
+  - **payload**: `any` (optional)
+
+    App-defined payload, schemaless by design.
+
+#### ui-cancel-job-group 🏄
+
+Requests cancellation of an in-flight job group the agent started (see `ui-job-group`). Honored only when the group was started as cancellable.
+
+- **type**: `'ui-cancel-job-group'`
+- **data**:
+  - **job_id**: `string`
+
+    The job-group id the client wants cancelled.
+
+  - **reason**: `string` (optional)
+
+    A human-readable reason.
+
+#### ui-command 🤖
+
+A command from the agent for the client to act on the page. Client-side handlers dispatch on the command name; `@pipecat-ai/client-react` ships default handlers for the standard commands below.
+
+- **type**: `'ui-command'`
+- **data**:
+  - **command**: `string`
+
+    The command name (e.g. `"scroll_to"`, `"toast"`, or any app-specific name).
+
+  - **payload**: `any` (optional)
+
+    The command payload. Standard command payloads:
+
+    <Expandable title="Standard command payloads">
+      <ParamField path="scroll_to" type="ScrollTo">
+        Scroll a target into view. `ref` (snapshot ref) or `target_id`
+        (`document.getElementById`), plus optional `behavior`
+        (`"smooth"` / `"instant"`).
+      </ParamField>
+      <ParamField path="highlight" type="Highlight">
+        Briefly emphasize a target. `ref` or `target_id`, plus optional
+        `duration_ms`.
+      </ParamField>
+      <ParamField path="select_text" type="SelectText">
+        Select text on the page (deixis). `ref` or `target_id`, plus optional
+        `start_offset` / `end_offset` (whole element when omitted).
+      </ParamField>
+      <ParamField path="click" type="Click">
+        Click an element (checkboxes, radios, submit buttons). `ref` or
+        `target_id`. The standard handler no-ops on `disabled` targets.
+      </ParamField>
+      <ParamField path="set_input_value" type="SetInputValue">
+        Write into a text input/textarea. `value`, `ref` or `target_id`, and
+        `replace` (overwrite when `true`, append when `false`). No-ops on
+        `disabled` / `readonly` / hidden inputs.
+      </ParamField>
+      <ParamField path="toast" type="Toast">
+        Show a transient notification. `title`, plus optional `subtitle`,
+        `description`, `image_url`, `duration_ms`.
+      </ParamField>
+      <ParamField path="navigate" type="Navigate">
+        Navigate to a named view. `view`, plus optional `params`.
+      </ParamField>
+    </Expandable>
+
+#### ui-job-group 🤖
+
+Lifecycle envelopes for a user-facing job group the agent dispatched to peer workers, so the client can render a progress card. Each envelope carries a `kind` field the client dispatches on. The kinds form the group's lifecycle:
+
+```
+group_started → job_update* → job_completed × N → group_completed
+```
+
+where N is the number of workers in the group.
+
+- **type**: `'ui-job-group'`
+- **data**: one of the four `kind`-discriminated shapes:
+
+  <Expandable title="ui-job-group data kinds">
+    <ParamField path="group_started" type="object">
+      `kind: "group_started"`, `job_id`, `workers` (worker names), optional
+      `label`, `cancellable`, `at` (epoch ms).
+    </ParamField>
+    <ParamField path="job_update" type="object">
+      `kind: "job_update"`, `job_id`, `worker_name`, `data` (the worker's update
+      payload, forwarded verbatim), `at`.
+    </ParamField>
+    <ParamField path="job_completed" type="object">
+      `kind: "job_completed"`, `job_id`, `worker_name`, `status`, `response`,
+      `at`. Emitted once per worker.
+    </ParamField>
+    <ParamField path="group_completed" type="object">
+      `kind: "group_completed"`, `job_id`, `at`. Emitted once when the whole
+      group finishes or is cancelled.
+    </ParamField>
+  </Expandable>
