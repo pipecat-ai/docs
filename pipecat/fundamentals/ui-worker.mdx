@@ -1,0 +1,255 @@
+---
+title: "Voice-enabling a client UI"
+description: "Bridge a voice agent and a client GUI with a UIWorker over a two-way RTVI interface."
+---
+
+## What is a UIWorker?
+
+When you put a voice agent in front of an app, talking isn't enough — the agent needs to _see what the user sees_ and _act on the screen_: read the page, point at things, fill in fields, click buttons. A `UIWorker` is the server-side agent that makes this possible. It voice-enables a client UI by connecting an LLM to whatever the user is looking at.
+
+The connection is **two-way**, over the RTVI UI channel:
+
+- **Client → server.** The client streams the screen to the worker as accessibility snapshots, and forwards the user's UI interactions as events.
+- **Server → client.** The worker drives the page back — scrolling, highlighting, selecting text, filling inputs, clicking, or running app-defined commands — and can surface long-running work as progress cards.
+
+A `UIWorker` is the screen half of a voice/UI split: a **voice agent** owns the conversation, and the `UIWorker` owns the screen. Each is a separate LLM with its own focused context. The worker auto-injects the latest screen state into _its_ context before every turn, so the conversational voice LLM never has to carry a giant accessibility tree:
+
+- The **voice agent** converses and decides what's worth saying.
+- The **UIWorker** reasons over the current page and acts on it.
+
+The result is two small, fast contexts instead of one bloated one — cheaper, and less prone to the model getting lost.
+
+<Note>
+  The two directions map to RTVI UI messages: the client sends `ui-snapshot` and
+  `ui-event`; the worker sends `ui-command` and `ui-job-group`. You rarely touch
+  these directly — `PipelineWorker` wires the channel up automatically when RTVI
+  is enabled (the default). See [The RTVI
+  Standard](/client/rtvi-standard#user-interface) for the wire protocol and the
+  [UIWorker API reference](/api-reference/server/workers/ui-worker) for the
+  class.
+</Note>
+
+## The two-way interface
+
+A `UIWorker` gives an LLM a handful of capabilities, split across the two directions of the interface. Everything below works out of the box on any `UIWorker` subclass.
+
+### What the worker sees (client → server)
+
+**The screen, as a snapshot.** The client sends an accessibility snapshot of the page whenever it changes. The worker renders the latest one as a `<ui_state>` block and — with `auto_inject_ui_state` on (the default) — injects it into the LLM context before every turn, so the model always reasons over what's currently on screen. Each element carries a stable `ref` the worker uses to act on it:
+
+```
+<ui_state>
+- heading "Shopping list" [level=1] [ref=e3]
+- list:
+  - checkbox "milk" [checked] [ref=e5]
+  - checkbox "eggs" [ref=e6]
+</ui_state>
+```
+
+When the user has text selected, the snapshot includes a `<selection>` block so the LLM can resolve deictic references like "this paragraph" or "what I selected".
+
+**User interactions, as events.** The client dispatches app-defined events (a button click, a custom gesture) with `sendUIEvent(name, payload)`. Route them to handlers with `@ui_event(name)`; each runs in its own task:
+
+```python
+from pipecat.workers.ui import UIWorker, ui_event
+
+class MyUIWorker(UIWorker):
+    @ui_event("note_click")
+    async def on_note_click(self, message):
+        ref = (message.payload or {}).get("ref")
+        await self.scroll_to(ref)
+        await self.select_text(ref)
+```
+
+### What the worker does (server → client)
+
+**Drives the page.** The worker acts on the screen by sending UI commands. The built-in helpers cover the common actions, and `send_command(name, payload)` sends any app-defined command:
+
+| Helper                        | Effect                                       |
+| ----------------------------- | -------------------------------------------- |
+| `scroll_to(ref)`              | Bring an element into view                   |
+| `highlight(ref)`              | Briefly flash an element                     |
+| `select_text(ref)`            | Select an element's text (pointing / deixis) |
+| `click(ref)`                  | Click a checkbox, radio, or button           |
+| `set_input_value(ref, value)` | Fill a text input or textarea                |
+| `send_command(name, payload)` | Any app-defined command (e.g. `"add_note"`)  |
+
+The standard client handlers ship in `@pipecat-ai/client-react`; apps can override them or define their own command names.
+
+**Answers back.** A `UIWorker` answers via a built-in single-flight `respond` job: a requester dispatches `job("ui", name="respond", payload={"query": ...})`, the worker runs one screen-grounded LLM turn, and a `@tool` ends it by calling `respond_to_job()`. That call chooses how the answer reaches the user:
+
+- `respond_to_job(text, tts_speak=True)` — speak `text` verbatim through the requester's TTS.
+- `respond_to_job(text)` — return `{"answer": text}` for the requester's voice LLM to phrase.
+- `respond_to_job()` — complete the turn silently (the worker acted, but said nothing).
+
+**Surfaces long work.** When a turn kicks off background work, `ui_job_group` / `start_ui_job_group` fan it out to peer workers _and_ surface it to the client as a cancellable progress card, streaming each worker's updates as they arrive:
+
+```python
+await self.start_ui_job_group(
+    "wikipedia", "news", "scholar",
+    payload={"query": research_query},
+    label=f"Research: {research_query}",
+)
+```
+
+<Note>
+  By default a `UIWorker` is stateless: it clears its context at the start of each
+  `respond` job, so every turn sees only the current `<ui_state>` and query. Set
+  `keep_history=True` to accumulate history across turns — useful for multi-turn
+  references like "can we add a note for that?" — at the cost of more tokens.
+</Note>
+
+## Hello world
+
+The smallest `UIWorker` ties the interface together: a delegate that answers questions about the page. The voice agent forwards screen-relevant utterances to it; the worker reads the screen (client → server) and speaks the reply (server → client).
+
+The worker needs only an LLM and one `@tool` that ends the turn with `respond_to_job()`:
+
+```python
+from pipecat.workers.ui import UIWorker
+from pipecat.workers.llm import tool
+
+class HelloWorker(UIWorker):
+    @tool
+    async def answer(self, params, text: str):
+        """Speak `text` back to the user."""
+        await self.respond_to_job(text, tts_speak=True)
+        await params.result_callback(None)
+```
+
+The voice agent exposes a tool that dispatches a `respond` job to the worker and speaks back whatever it returns:
+
+```python
+async def answer_about_screen(params, query: str):
+    """Ask the screen-aware UI layer to answer about the current page."""
+    async with params.pipeline_worker.job(
+        "hello", name="respond", payload={"query": query}, timeout=30
+    ) as t:
+        pass
+    await params.result_callback(t.response)
+```
+
+Register both with the runner — the `UIWorker` comes online to receive snapshots and jobs as soon as its pipeline starts:
+
+```python
+await runner.add_workers(HelloWorker(), worker)
+```
+
+Here's the full round trip for one utterance:
+
+<Steps>
+  <Step title="Snapshot">
+    The client streams the current screen as a `ui-snapshot`. `PipelineWorker`
+    broadcasts it on the bus; the `UIWorker` stores the latest one.
+  </Step>
+  <Step title="Route">
+    The user speaks. The voice LLM calls `answer_about_screen`, which dispatches
+    a `respond` job to the `UIWorker`.
+  </Step>
+  <Step title="Ground">
+    The worker's `respond` job runs one LLM turn with the latest `<ui_state>`
+    auto-injected, so its answer is grounded in what's on screen.
+  </Step>
+  <Step title="Speak">
+    The worker's `answer` tool calls `respond_to_job(text, tts_speak=True)`. The
+    voice agent speaks the reply verbatim.
+  </Step>
+</Steps>
+
+## Patterns
+
+How the worker gets triggered — and who speaks — falls into two patterns.
+
+### Delegation
+
+In the hello-world example, the voice agent is the gatekeeper: it decides which turns involve the screen and routes those to the `UIWorker`, then voices the result. This is the **delegation** pattern, and it's the common one. The voice LLM stays small and screen-unaware; the worker owns all screen reasoning.
+
+Most apps don't need a custom tool per action. `ReplyToolMixin` provides a single bundled `reply` tool — a required spoken `answer` plus optional `scroll_to`, `highlight`, `select_text`, `fills`, and `click` — covering pointing, reading, and form apps:
+
+```python
+from pipecat.workers.ui import ReplyToolMixin, UIWorker
+
+class FormWorker(ReplyToolMixin, UIWorker):
+    def __init__(self):
+        super().__init__("ui", llm=OpenAILLMService(api_key="..."))
+```
+
+The LLM uses whichever fields fit the turn — `select_text` to point at "this paragraph", `fills` + `click` to complete a form — and unused fields stay `null`.
+
+Delegation also scales to background work. A `@tool` can fan out to peer workers with `start_ui_job_group`, which surfaces a cancellable progress card on the client and returns immediately so the voice agent isn't blocked:
+
+```python
+class ResearchWorker(UIWorker):
+    @tool
+    async def reply(self, params, answer: str, research_query: str | None = None):
+        if research_query:
+            await self.start_ui_job_group(
+                "wikipedia", "news", "scholar",
+                payload={"query": research_query},
+                label=f"Research: {research_query}",
+            )
+        await self.respond_to_job(answer)
+        await params.result_callback(None)
+```
+
+### Parallel handling
+
+Sometimes the screen should react to _every_ user turn, not only the ones the voice agent chooses to delegate. In the **parallel handling** pattern, both agents receive each turn and act in parallel: the voice agent converses while the `UIWorker` updates the screen, independently.
+
+The key difference: there's no tool call routing work to the worker. Instead, the voice pipeline's user aggregator fires `on_user_turn_stopped` once per turn, and that handler dispatches the transcript to the worker as a `respond` job. Because it runs in its own task, the voice LLM (running from the same turn) and the worker act concurrently:
+
+```python
+@user_aggregator.event_handler("on_user_turn_stopped")
+async def on_user_turn_stopped(aggregator, strategy, message):
+    transcript = (message.content or "").strip()
+    if not transcript:
+        return
+    async with worker.job("ui", name="respond", payload={"query": transcript}, timeout=15):
+        pass  # fire-and-forget; the worker acts on its own
+```
+
+The worker acts **silently** — its `@tool` completes the job with `respond_to_job()` and no answer, so nothing it does reaches TTS. The separate voice layer owns speech:
+
+```python
+class ListWorker(UIWorker):
+    @tool
+    async def update_list(self, params, add=None, check=None, remove=None):
+        for text in add or []:
+            await self.send_command("add_item", {"text": text})
+        for ref in check or []:
+            await self.send_command("set_checked", {"ref": ref, "checked": True})
+        for ref in remove or []:
+            await self.send_command("remove_item", {"ref": ref})
+        await self.respond_to_job()  # no answer — acts silently
+        await params.result_callback(None)
+```
+
+Here the **snapshot is the shared source of truth**. The worker acts on it, and the voice agent reads it through a read-only tool — so the voice agent can answer "what's left on my list?" from what's actually on screen (including items the user checked off by hand), not from conversation memory:
+
+```python
+async def check_list(params):
+    """Look up what's currently on the list."""
+    await params.result_callback(list_worker.list_summary())  # reads the live snapshot
+```
+
+### Choosing a pattern
+
+|                                 | Delegation                                                                        | Parallel handling                                             |
+| ------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| **How the worker is triggered** | The voice LLM calls a tool                                                        | The voice pipeline's `on_user_turn_stopped` event, every turn |
+| **Who speaks**                  | Often the worker (`tts_speak=True`), or the voice LLM phrases the worker's result | The voice agent; the worker acts silently                     |
+| **Voice LLM's role**            | Gatekeeper — decides what's screen-relevant                                       | Converses; reads shared state but never mutates the UI        |
+| **Best when**                   | The page matters only for some turns                                              | Every turn should drive the UI and speech is incidental       |
+
+Both keep the voice LLM's context small. Delegation gives the voice agent control over when the screen is involved; parallel handling makes the screen a first-class output of every turn.
+
+## What's next
+
+<Card
+  title="UIWorker API Reference"
+  icon="book"
+  href="/api-reference/server/workers/ui-worker"
+>
+  Full reference for the `UIWorker` class, UI commands, job groups, and
+  `ReplyToolMixin`.
+</Card>
