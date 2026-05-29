@@ -1,0 +1,165 @@
+---
+title: "UIWorker"
+description: "LLM worker that reads and drives a client GUI over the RTVI UI channel"
+---
+
+`UIWorker` extends [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker) to connect an LLM to whatever the user is looking at. It sees the screen as accessibility snapshots, reacts to UI events, and drives the page by sending commands to the client. It's the delegate side of a voice/UI split: a voice layer (the main pipeline's LLM, or a separate `LLMWorker`) handles speech and hands screen-relevant work to this worker.
+
+When RTVI is enabled, `PipelineWorker` connects a `UIWorker` to the client automatically, no extra wiring. A working subclass needs only an LLM and a `@tool` that calls `respond_to_job`.
+
+```python
+from pipecat.workers.llm import tool
+from pipecat.workers.ui import UIWorker, ui_event
+
+
+class MyUIWorker(UIWorker):
+    @ui_event("nav_click")
+    async def on_nav(self, message):
+        view = message.payload.get("view")
+        ...
+
+    @tool
+    async def answer(self, params, text: str):
+        await self.respond_to_job(text)
+        await params.result_callback(None)
+
+
+worker = MyUIWorker("ui", llm=OpenAILLMService(api_key="..."))
+```
+
+## Configuration
+
+Inherits `name` and `llm` from [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker), plus:
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  Optional pre-built `LLMContext`. Seeded messages are part of the mutable
+  history and are cleared on each `keep_history=False` reset; put durable
+  instructions in the LLM's `system_instruction` instead.
+</ParamField>
+
+<ParamField
+  path="assistant_params"
+  type="LLMAssistantAggregatorParams | None"
+  default="None"
+>
+  Optional assistant-aggregator parameters, e.g. to enable context
+  summarization for `keep_history=True` workers.
+</ParamField>
+
+<ParamField path="inject_events" type="bool" default="True">
+  Append each UI event to the context as a `<ui_event>` developer message.
+  Override `render_ui_event` to change the content, or set `False` to disable.
+</ParamField>
+
+<ParamField path="auto_inject_ui_state" type="bool" default="True">
+  Append the latest `<ui_state>` snapshot to the context before every inference.
+  Set `False` to inject manually with `inject_ui_state()`.
+</ParamField>
+
+<ParamField path="keep_history" type="bool" default="False">
+  When `False`, the context is cleared at the start of every job, so each turn
+  sees only the current `<ui_state>` and query (best for the stateless-delegate
+  role). When `True`, history accumulates across jobs so the LLM can resolve
+  multi-turn references, at the cost of more tokens.
+</ParamField>
+
+<ParamField path="prompt_guide" type="str | None" default="UI_STATE_PROMPT_GUIDE">
+  Wire-format guide appended to the LLM's `system_instruction` so it can parse
+  the `<ui_state>` / `<ui_event>` messages. Pass a string to override or `None`
+  to disable.
+</ParamField>
+
+## The @ui_event decorator
+
+Mark a method as a handler for a named UI event. The handler is dispatched when a `BusUIEventMessage` with a matching name arrives.
+
+```python
+from pipecat.workers.ui import ui_event
+
+
+class MyUIWorker(UIWorker):
+    @ui_event("nav_click")
+    async def on_nav(self, message: BusUIEventMessage):
+        ...
+```
+
+## Driving the UI
+
+These are plain methods, not LLM tools: compose them inside a custom `@tool` body, or use `ReplyToolMixin` for the standard shape. `ref` is a snapshot ref (e.g. `"e42"`) from the latest `<ui_state>`.
+
+### send_command
+
+```python
+async def send_command(self, name: str, payload: Any = None) -> None
+```
+
+Send a named UI command to the client. Publishes a `BusUICommandMessage`; when RTVI is enabled, `PipelineWorker` translates it into an `RTVIUICommandFrame`, and client-side handlers dispatch on the command name.
+
+### scroll_to / highlight / click
+
+```python
+async def scroll_to(self, ref: str) -> None
+async def highlight(self, ref: str) -> None
+async def click(self, ref: str) -> None
+```
+
+Bring an element into view, briefly flash it, or click it (checkboxes, radios, submit buttons). The standard client `click` handler no-ops on disabled targets.
+
+### select_text
+
+```python
+async def select_text(self, ref: str, *, start_offset: int | None = None, end_offset: int | None = None) -> None
+```
+
+Select an element's text (the whole element by default, or an offset range).
+
+### set_input_value
+
+```python
+async def set_input_value(self, ref: str, value: str, *, replace: bool = True) -> None
+```
+
+Fill a text input or textarea.
+
+## Responding to jobs
+
+### respond_to_job
+
+```python
+async def respond_to_job(self, answer: str | None = None, *, tts_speak: bool = False, status: JobStatus = JobStatus.COMPLETED) -> None
+```
+
+Complete the in-flight job with the worker's answer. Called from a `@tool` once the worker has decided how to answer.
+
+### current_job
+
+```python
+worker.current_job -> BusJobRequestMessage | None
+```
+
+The job this worker is currently processing, or `None` when idle. Lets `@tool` methods inspect the in-flight job without threading the message through every call.
+
+## Surfacing long work
+
+### ui_job_group / start_ui_job_group
+
+```python
+def ui_job_group(self, *worker_names: str, name=None, payload=None, timeout=None, cancel_on_error=True, label=None, cancellable=True) -> UIJobGroupContext
+async def start_ui_job_group(self, *worker_names: str, name=None, payload=None, timeout=None, cancel_on_error=True, label=None, cancellable=True) -> str
+```
+
+Fan work out to peer workers as cancellable job-group cards on the client. Use `ui_job_group` as a context manager, or `start_ui_job_group` to kick one off and return its `job_id`.
+
+## Customization hooks
+
+### render_query
+
+```python
+def render_query(self, message: BusJobRequestMessage) -> str
+```
+
+Extract the user's query text from a job request. Override to read a different payload shape; the default reads `payload["query"]`.
+
+### inject_ui_state / render_ui_state / render_ui_event
+
+Override to control how the `<ui_state>` snapshot and `<ui_event>` messages are rendered into the LLM context. `inject_ui_state()` appends the current snapshot manually when `auto_inject_ui_state=False`.
