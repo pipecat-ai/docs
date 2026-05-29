@@ -21,13 +21,20 @@ A bot runner typically creates transport sessions (like Daily WebRTC rooms), gen
 
 ## How the Development Runner Works
 
-The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. When you start the runner, it creates the necessary web endpoints and infrastructure for your chosen transport type.
+The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. By default it starts a **single server that supports all transports simultaneously** — WebRTC, Daily, telephony (Twilio, Telnyx, Plivo, Exotel), and plain WebSocket. Clients choose which transport they want per-request by sending a `"transport"` field in the `POST /start` body; you no longer restart the server to switch transports.
 
 - **WebRTC connections**: It serves a built-in web interface where users can connect directly as well as an endpoint to create new WebRTC sessions
 - **Daily integration**: It provides endpoints that create new rooms and tokens and redirect users to join them
-- **Telephony providers**: For Twilio, it sets up webhook endpoints that handle incoming calls and establish WebSocket connections for audio streaming
+- **Telephony providers**: For Twilio, Telnyx, and Plivo, it sets up webhook endpoints that handle incoming calls and establish WebSocket connections for audio streaming
+- **Plain WebSocket**: It exposes a `/ws-client` endpoint for non-telephony WebSocket clients (e.g. browser apps using protobuf framing)
 
-The runner automatically detects which transport type you're using and configures the appropriate infrastructure. It then discovers your bot function and spawns new instances whenever users connect. This means you can focus on writing your bot logic while the runner handles all the server infrastructure, connection management, and transport-specific details.
+The runner registers the infrastructure for every transport and dispatches each connection to the right handler. It then discovers your bot function and spawns new instances whenever users connect. This means you can focus on writing your bot logic while the runner handles all the server infrastructure, connection management, and transport-specific details.
+
+<Tip>
+  Passing `-t/--transport` is optional. Omit it to support all transports at
+  once (the default). Pass it (e.g. `-t daily`) to **restrict** the server to a
+  single transport and make it the default for `/start`.
+</Tip>
 
 Your bot code receives runner arguments that contain everything it needs, including Daily room URLs and tokens, WebRTC connections, or WebSocket streams for telephony. The runner abstracts away the complexity of managing these different connection types, providing a unified interface for building bots that work across multiple platforms.
 
@@ -135,11 +142,17 @@ if __name__ == "__main__":
     main()
 ```
 
-Now you can run your bot with different transports:
+Now you can run your bot. A single server supports every transport at once, and the client picks which one to use when it starts a session:
 
 ```bash
-python bot.py -t webrtc  # Uses SmallWebRTCRunnerArguments
-python bot.py -t daily   # Uses DailyRunnerArguments
+python bot.py            # All transports; client selects via the /start request
+```
+
+If you want to limit the server to one transport (and make it the default for `/start`), pass `-t/--transport`:
+
+```bash
+python bot.py -t webrtc  # Restrict to WebRTC → SmallWebRTCRunnerArguments
+python bot.py -t daily   # Restrict to Daily → DailyRunnerArguments
 ```
 
 ### Understanding Runner Arguments
@@ -148,7 +161,7 @@ Runner arguments are how the runner communicates transport-specific information 
 
 - **`DailyRunnerArguments`**: Contains `room_url`, `token` (Optional), `body` (Optional) for joining Daily rooms
 - **`SmallWebRTCRunnerArguments`**: Contains `webrtc_connection` for local WebRTC sessions
-- **`WebSocketRunnerArguments`**: Contains `websocket` for telephony connections
+- **`WebSocketRunnerArguments`**: Contains `websocket` for both telephony and plain WebSocket connections. The `transport_type` field distinguishes them — `"websocket"` for plain (non-telephony) clients connecting via `/ws-client`, or a telephony provider value for connections via `/ws`.
 
 All runner arguments also include:
 
@@ -211,38 +224,44 @@ This allows you to easily customize behavior between development and production 
 
 ## All Supported Transports
 
-The development runner supports six transport types, each designed for different use cases:
+The development runner supports seven transport types, each designed for different use cases. By default all are available from one server; the client selects one per session via the `"transport"` field in the `/start` request. The `-t <transport>` form below is the optional way to **restrict** the server to a single transport.
 
-### WebRTC (`-t webrtc`)
+### WebRTC (`"transport": "webrtc"`)
 
-Local WebRTC connections with a built-in browser interface. Perfect for development and testing.
+Local WebRTC connections with a built-in browser interface. Perfect for development and testing. This is the default transport when a `/start` request omits the `"transport"` field.
 
 ```bash
+python bot.py
+# Prebuilt UI at http://localhost:7860/client
+
+# Restrict to WebRTC only
 python bot.py -t webrtc
-# Opens http://localhost:7860/client
 
 # ESP32 compatibility mode
-python bot.py -t webrtc --esp32 --host 192.168.1.100
+python bot.py --esp32 --host 192.168.1.100
 ```
 
 **Runner Arguments**: `SmallWebRTCRunnerArguments`
 
 - `webrtc_connection`: Pre-configured WebRTC peer connection
 
-### Daily (`-t daily`)
+### Daily (`"transport": "daily"`)
 
 Integration with Daily for production video conferencing with rooms, participant management, and Pipecat client compatibility.
 
 ```bash
+python bot.py
+# POST /start with {"transport": "daily", "createDailyRoom": true}
+# GET /daily redirects the browser into a freshly created room
+
+# Restrict to Daily only
 python bot.py -t daily
-# Opens http://localhost:7860 with room creation interface
-# Also provides POST /start endpoint for Pipecat clients
 
 # Direct connection for testing (bypasses web server)
 python bot.py -d
 
 # Enable PSTN dial-in webhook handling
-python bot.py -t daily --dialin
+python bot.py --dialin
 ```
 
 **Runner Arguments**: `DailyRunnerArguments`
@@ -253,11 +272,16 @@ python bot.py -t daily --dialin
 
 **Available Endpoints**:
 
-- `GET /`: Web interface for creating rooms
-- `POST /start`: RTVI-compatible endpoint for programmatic access
+- `GET /daily`: Browser redirect that creates a room and joins it
+- `POST /start`: RTVI-compatible endpoint for programmatic access (send `"transport": "daily"`)
 - `POST /daily-dialin-webhook`: PSTN dial-in webhook handler (requires `--dialin` flag)
 
-### Telephony (`-t twilio|telnyx|plivo|exotel`)
+<Note>
+  `GET /` redirects to the prebuilt client UI at `/client/` for all transports.
+  The Daily browser redirect moved to `GET /daily` in Pipecat 1.3.0.
+</Note>
+
+### Telephony (`"transport": "twilio" | "telnyx" | "plivo" | "exotel"`)
 
 Phone call integration through telephony providers. Requires a public webhook endpoint and provider credentials.
 
@@ -266,9 +290,11 @@ Phone call integration through telephony providers. Requires a public webhook en
 export TWILIO_ACCOUNT_SID=your_account_sid
 export TWILIO_AUTH_TOKEN=your_auth_token
 
-# Then run with public proxy
+# Restrict to Twilio and expose the webhook via a public proxy
 python bot.py -t twilio -x yourproxy.ngrok.io
 ```
+
+The provider-specific XML webhook (`POST /`) is only registered when you select a single telephony transport with `-t` (the XML template needs the `--proxy` hostname). The media WebSocket at `/ws` is always available.
 
 **Environment Variables**:
 
@@ -285,6 +311,22 @@ Environment variables are optional, but when provided will attempt to hang up th
 
 The runner automatically detects the telephony provider from incoming WebSocket messages and configures the appropriate serializers and audio settings. Your bot receives a pre-configured FastAPI WebSocket connection ready for telephony audio streaming.
 
+### WebSocket (`"transport": "websocket"`)
+
+Plain (non-telephony) WebSocket connections, for clients such as browser apps that speak protobuf framing directly. Selecting this transport on `/start` returns a `wsUrl` pointing at the `/ws-client` endpoint, which the client then connects to.
+
+```bash
+python bot.py
+# POST /start with {"transport": "websocket"} → returns wsUrl for /ws-client
+```
+
+**Runner Arguments**: `WebSocketRunnerArguments`
+
+- `websocket`: WebSocket connection for audio streaming
+- `transport_type`: `"websocket"` for plain clients (distinguishes them from telephony connections, which arrive on `/ws`)
+
+Use the `transport_type` field to branch your bot's setup — plain WebSocket clients typically use a `ProtobufFrameSerializer`, whereas telephony clients use a provider-specific serializer.
+
 ## Command Line Options
 
 The development runner accepts several command-line arguments to customize its behavior:
@@ -295,17 +337,20 @@ python bot.py [OPTIONS]
 Options:
   --host TEXT          Server host address (default: localhost)
   --port INTEGER       Server port (default: 7860)
-  -t, --transport      Transport type: daily, webrtc, twilio, telnyx, plivo, exotel (default: webrtc)
+  -t, --transport      Restrict to a single transport and set it as the default
+                       for /start: daily, webrtc, twilio, telnyx, plivo, exotel.
+                       Omit to support all transports simultaneously (default).
   -x, --proxy TEXT     Public proxy hostname for telephony webhooks (required for telephony)
   --esp32              Enable SDP munging for ESP32 WebRTC compatibility
   -d, --direct         Connect directly to Daily room for testing (automatically sets transport to daily)
-  --dialin             Enable Daily PSTN dial-in webhook handling (requires Daily transport)
+  --dialin             Enable Daily PSTN dial-in webhook handling
+  --whatsapp           Verify required WhatsApp environment variables are present
   -v, --verbose        Increase logging verbosity
 ```
 
 ### Key Arguments
 
-**`--transport` / `-t`**: Determines which transport infrastructure to set up
+**`--transport` / `-t`**: Optional. When omitted, the server supports **all** transports at once and the client chooses one per `/start` request. When provided, it restricts the server to a single transport and makes it the default for `/start`; requests for any other transport are rejected with HTTP 400. Valid values:
 
 - `webrtc`: Local WebRTC with browser interface
 - `daily`: Daily.co integration with room management
@@ -315,7 +360,7 @@ Options:
 
 **`--direct` / `-d`**: Special mode for Daily that bypasses the web server and connects your bot directly to a Daily room. Useful for quick testing but not recommended for production use.
 
-**`--dialin`**: Enables the `/daily-dialin-webhook` endpoint for handling Daily PSTN dial-in calls. Only works with Daily transport (`-t daily`). This endpoint receives webhook data from Daily when a phone call dials into your configured phone number, creates a SIP-enabled room, and spawns your bot.
+**`--dialin`**: Enables the `/daily-dialin-webhook` endpoint for handling Daily PSTN dial-in calls. This endpoint receives webhook data from Daily when a phone call dials into your configured phone number, creates a SIP-enabled room, and spawns your bot. (It no longer requires `-t daily`, though dial-in is a Daily feature.)
 
 **`--esp32`**: Enables SDP (Session Description Protocol) modifications needed for ESP32 WebRTC compatibility. Must be used with a specific IP address via `--host`.
 
@@ -359,6 +404,11 @@ transport_params = {
         audio_out_enabled=True,
         # add_wav_header and serializer handled automatically
     ),
+    "websocket": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        # plain (non-telephony) WebSocket clients, e.g. protobuf framing
+    ),
 }
 
 async def bot(runner_args):
@@ -372,9 +422,9 @@ The utility automatically:
 - Detects the telephony provider from WebSocket messages
 - Configures the appropriate serializer (Twilio, Telnyx, Plivo, or Exotel)
 - Sets up authentication using environment variables
-- Handles WebRTC and Daily transport creation
+- Handles WebRTC, Daily, and plain WebSocket transport creation
 
-Now your bot supports all six transport types with just two lines of code in the bot() function.
+Now your bot supports all seven transport types with just two lines of code in the bot() function.
 
 ## RTVI Integration
 
@@ -382,28 +432,46 @@ The development runner provides RTVI (Real-Time Voice Interface) compatible endp
 
 ### The `/start` Endpoint
 
-For Daily transports, the runner automatically creates a `/start` POST endpoint that:
-
-1. **Creates Daily rooms and tokens** using your `DAILY_API_KEY`
-2. **Spawns bot instances** with request `body` data
-3. **Returns connection details** in RTVI-compatible format
+The runner exposes a single unified `POST /start` endpoint that works for **all** transports. The client picks the transport via the `"transport"` field in the request body (default: `"webrtc"`); the runner then spawns the bot and returns transport-specific connection details in RTVI-compatible format.
 
 ```bash
-# Start the Daily runner
-python bot.py -t daily
+# Start the runner (all transports available)
+python bot.py
 
-# The /start endpoint is now available at:
+# The /start endpoint is available at:
 # POST http://localhost:7860/start
 ```
 
-**Request Format:**
+If you started the runner with `-t <transport>`, a `/start` request for any other transport is rejected with HTTP 400.
+
+**Request Format (`"transport": "webrtc"`, the default):**
 
 ```json
 {
+  "transport": "webrtc",
+  "enableDefaultIceServers": false,
+  "body": {
+    "custom_data": "your_value",
+    "user_id": "user123"
+  }
+}
+```
+
+Returns a `sessionId` (and an `iceConfig` when `enableDefaultIceServers` is set). The bot starts when the WebRTC offer arrives.
+
+**Request Format (`"transport": "daily"`):**
+
+```json
+{
+  "transport": "daily",
   "createDailyRoom": true,
   "dailyRoomProperties": {
     "start_video_off": true,
     "start_audio_off": false
+  },
+  "dailyMeetingTokenProperties": {
+    "is_owner": true,
+    "user_name": "Bot"
   },
   "body": {
     "custom_data": "your_value",
@@ -412,14 +480,36 @@ python bot.py -t daily
 }
 ```
 
-<Note>`dailyRoomProperties` are not yet handled by the runner.</Note>
-
-**Response Format:**
+`createDailyRoom: true` (or a configured `DAILY_ROOM_URL`) makes the runner create a room and token using your `DAILY_API_KEY`. `dailyRoomProperties` and `dailyMeetingTokenProperties` are applied when provided. Response:
 
 ```json
 {
   "dailyRoom": "https://domain.daily.co/room-name",
-  "dailyToken": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+  "dailyToken": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
+  "sessionId": "uuid"
+}
+```
+
+**Request Format (telephony or plain WebSocket):**
+
+For `"transport": "twilio" | "telnyx" | "plivo" | "exotel"` or `"transport": "websocket"`, `/start` returns the WebSocket URL the client should connect to:
+
+```json
+{
+  "wsUrl": "ws://localhost:7860/ws"
+}
+```
+
+Telephony connections use `/ws`; plain WebSocket clients use `/ws-client` (and also receive a `sessionId`). The bot starts when the connection is established.
+
+### The `/status` Endpoint
+
+`GET /status` reports which transports the running instance accepts — all of them by default, or the single transport passed via `-t`:
+
+```json
+{
+  "status": "ready",
+  "transports": ["webrtc", "daily", "twilio", "telnyx", "plivo", "exotel", "websocket"]
 }
 ```
 
@@ -460,8 +550,9 @@ await client.connect({ endpoint: "http://localhost:7860/start" });
 ```
 
 <Info>
-  The `/start` endpoint is only available for Daily transports (`-t daily`).
-  WebRTC and telephony transports use different connection methods.
+  The `/start` endpoint serves every transport. The client SDK's transport
+  (e.g. `DailyTransport`, `SmallWebRTCTransport`) determines the `"transport"`
+  value sent in the request.
 </Info>
 
 ## Daily Dial-In Webhook
@@ -555,23 +646,28 @@ ngrok http 7860
 ```
 
 <Note>
-  The `--dialin` flag requires the Daily transport (`-t daily`) and a valid
-  `DAILY_API_KEY` environment variable.
+  Dial-in is a Daily feature and requires a valid `DAILY_API_KEY` environment
+  variable. `--dialin` no longer requires `-t daily`, but you can still pass it
+  to restrict the runner to Daily.
 </Note>
 
 ## Quick Reference
 
+All transports are available from `python bot.py`; the `-t` form below restricts the server to one. Access columns assume the default `localhost:7860`.
+
 | Transport     | Command                                             | Access                       | Environment Variables                               |
 | ------------- | --------------------------------------------------- | ---------------------------- | --------------------------------------------------- |
-| WebRTC        | `python bot.py`                                     | http://localhost:7860/client | None                                                |
-| Daily         | `python bot.py -t daily`                            | http://localhost:7860        | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional) |
+| All (default) | `python bot.py`                                     | http://localhost:7860/client | Per transport (see below)                           |
+| WebRTC        | `python bot.py -t webrtc`                           | http://localhost:7860/client | None                                                |
+| Daily         | `python bot.py -t daily`                            | `GET /daily`, `POST /start`  | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional) |
 | Daily Direct  | `python bot.py -d`                                  | Direct connection            | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional) |
-| Daily Dial-In | `python bot.py -t daily --dialin`                   | Phone calls via Daily PSTN   | `DAILY_API_KEY` (Required)                          |
+| Daily Dial-In | `python bot.py --dialin`                            | Phone calls via Daily PSTN   | `DAILY_API_KEY` (Required)                          |
 | Twilio        | `python bot.py -t twilio -x proxy.ngrok.io`         | Phone calls                  | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`           |
 | Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io`         | Phone calls                  | `TELNYX_API_KEY`                                    |
 | Plivo         | `python bot.py -t plivo -x proxy.ngrok.io`          | Phone calls                  | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                 |
 | Exotel        | `python bot.py -t exotel`                           | Phone calls                  | None                                                |
-| ESP32 WebRTC  | `python bot.py -t webrtc --esp32 --host <ESP32_IP>` | ESP32 WebRTC connection      | None                                                |
+| WebSocket     | `python bot.py`                                     | `ws://localhost:7860/ws-client` | None                                             |
+| ESP32 WebRTC  | `python bot.py --esp32 --host <ESP32_IP>`           | ESP32 WebRTC connection      | None                                                |
 
 ## Examples
 
