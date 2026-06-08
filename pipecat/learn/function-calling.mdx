@@ -95,7 +95,7 @@ The bot's personality (e.g. "You are a helpful assistant") is set via [`system_i
 
 #### Using Direct Functions (Shorthand)
 
-You can bypass specifying a function configuration as a `FunctionSchema` and instead pass the function directly to your `ToolsSchema`. Pipecat will auto-configure the function, gathering relevant metadata from its signature and docstring. Metadata includes:
+You can bypass specifying a function configuration as a `FunctionSchema` and instead pass the function directly to your `LLMContext`. Pipecat will auto-configure the function, gathering relevant metadata from its signature and docstring. Metadata includes:
 
 - name
 - description
@@ -105,7 +105,6 @@ You can bypass specifying a function configuration as a `FunctionSchema` and ins
 Note that the function signature is a bit different when using direct functions. The first parameter is `FunctionCallParams`, followed by any others necessary for the function.
 
 ```python
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 
 # Define a direct function
@@ -119,12 +118,26 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
     weather_data = {"conditions": "sunny", "temperature": "75"}
     await params.result_callback(weather_data)
 
-# Create a tools schema, passing your function directly to it
-tools = ToolsSchema(standard_tools=[get_current_weather])
-
-# Pass this to your LLM context
-context = LLMContext(tools=tools)
+# Pass your functions directly to LLM context
+# Functions listed here are automatically registered with the LLM service
+context = LLMContext(tools=[get_current_weather])
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+```
+
+**Auto-registration**: Direct functions listed in `LLMContext(tools=[...])` are automatically registered with the LLM service when the context is used. No separate `register_direct_function()` call is needed unless you want to override the default call options.
+
+You can also mix direct functions with `FunctionSchema` objects in the list, or pass a `ToolsSchema` if you need provider-specific `custom_tools`:
+
+```python
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+# Mix direct functions and FunctionSchema objects
+context = LLMContext(tools=[get_current_weather, weather_function])
+
+# Or use ToolsSchema for advanced cases (custom_tools, etc.)
+tools = ToolsSchema(standard_tools=[get_current_weather])
+context = LLMContext(tools=tools)
 ```
 
 #### Provider-Specific Custom Tools
@@ -203,12 +216,23 @@ tools = ToolsSchema(
 
 ### 2. Register Function Handlers
 
-Register handlers for your functions using one of these [LLM service methods](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#llm-service):
+**Auto-registration (Recommended)**: Direct functions listed in `LLMContext(tools=[...])` are automatically registered with the LLM service. No explicit registration call is needed:
 
-- `register_function`
-- `register_direct_function`
+```python
+# Direct functions are auto-registered
+context = LLMContext(tools=[get_current_weather, get_restaurant_recommendation])
+```
 
-Which one you use depends on whether your function is a ["direct" function](#using-direct-functions-shorthand).
+**Explicit registration**: Use these [LLM service methods](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#llm-service) when you need more control:
+
+- `register_function` — for non-direct functions (separate schema and handler)
+- `register_direct_function` — for direct functions with custom call options or not in context
+
+Explicit registration is useful when:
+- You want to override call options (`cancel_on_interruption`, `timeout_secs`)
+- You're registering a catch-all handler (`function_name=None`)
+- You're registering a function that's not advertised in the context
+- You need the handler registered before the context is created
 
 <CodeGroup>
 
@@ -232,10 +256,8 @@ llm.register_function(
 )
 ```
 
-```python Direct Function
+```python Direct Function (Auto-registered)
 from pipecat.services.llm_service import FunctionCallParams
-
-llm = OpenAILLMService(api_key="your-api-key")
 
 # Direct function
 async def get_current_weather(params: FunctionCallParams, location: str, format: str):
@@ -248,11 +270,15 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
     weather_data = {"conditions": "sunny", "temperature": "75"}
     await params.result_callback(weather_data)
 
-# Register direct function
+# Auto-registered when listed in LLMContext
+context = LLMContext(tools=[get_current_weather])
+
+# Or explicitly register to override call options
+llm = OpenAILLMService(api_key="your-api-key")
 llm.register_direct_function(
     get_current_weather,
     cancel_on_interruption=False,  # Don't cancel on interruption
-    timeout_secs=60.0,  # Optional: Override global timeout for this function
+    timeout_secs=60.0,  # Override global timeout for this function
 )
 ```
 
@@ -270,6 +296,41 @@ Use `cancel_on_interruption=True` (the default) when the LLM should wait for the
 
 Use `timeout_secs` to set a specific timeout for a function that differs from the global default. For example, you might want a longer timeout for database queries or shorter timeouts for quick lookups.
 
+#### Using the @direct_function decorator
+
+The optional `@direct_function` decorator allows you to specify call options directly on your function definition. This is useful when you want to set custom options but still benefit from auto-registration:
+
+```python
+from pipecat.adapters.schemas.direct_function import direct_function
+from pipecat.services.llm_service import FunctionCallParams
+
+@direct_function(cancel_on_interruption=False, timeout=60)
+async def end_call(params: FunctionCallParams, reason: str):
+    """End the call.
+
+    Args:
+        reason: Why the call is ending.
+    """
+    await params.result_callback({"status": "ending"})
+
+# Auto-registered with the decorator's options
+context = LLMContext(tools=[end_call])
+```
+
+The decorator can be used with or without arguments:
+
+```python
+@direct_function  # Uses defaults: cancel_on_interruption=True, timeout=None
+async def quick_lookup(params: FunctionCallParams, query: str):
+    ...
+
+@direct_function(cancel_on_interruption=False, timeout=120)
+async def long_running_task(params: FunctionCallParams, task_id: str):
+    ...
+```
+
+The decorator does not register the function itself — it only attaches metadata that the auto-registration system reads when the function appears in `LLMContext(tools=[...])`.
+
 #### Async Function Call Cancellation
 
 If you register async function calls with `cancel_on_interruption=False`, you can also enable model-directed cancellation:
@@ -285,11 +346,12 @@ When `enable_async_tool_cancellation=True` and at least one async function is re
 
 ### 3. Create the Pipeline
 
-Include your LLM service in your pipeline with the registered functions:
+Include your LLM service in your pipeline with your functions:
 
 ```python
-# Initialize the LLM context with your function schemas
-context = LLMContext(tools=tools)
+# Initialize the LLM context with your functions
+# Direct functions are auto-registered with the LLM service
+context = LLMContext(tools=[get_current_weather, get_restaurant_recommendation])
 
 # Create the context aggregator to collect the user and assistant context
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
