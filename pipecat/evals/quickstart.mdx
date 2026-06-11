@@ -1,0 +1,149 @@
+---
+title: "Evals Quickstart"
+sidebarTitle: "Quickstart"
+description: "Run your first behavioral eval against an existing agent."
+---
+
+This guide takes an existing agent, starts it with the eval transport, and runs a two-turn scenario against it. Total time: a few minutes.
+
+## Prerequisites
+
+- A working Pipecat agent that uses `create_transport()` and the development runner (the standard pattern from the [quickstart](/pipecat/get-started/quickstart) and all Pipecat examples), with its usual service API keys in `.env`.
+- The Pipecat CLI: `pip install "pipecat-ai[cli]"`.
+- A judge LLM. Either:
+  - **Ollama** (local, the default): install [Ollama](https://ollama.com) and run `ollama pull gemma2:9b`, or
+  - **OpenAI**: set `OPENAI_API_KEY` and point the scenario's `judge:` block at it (shown below).
+
+<Steps>
+  <Step title="Run your agent with the eval transport">
+    If your agent uses `create_transport()`, it supports the eval transport with a one-line addition to its `transport_params`:
+
+    ```python
+    from pipecat.transports.websocket.server import WebsocketServerParams
+
+    transport_params = {
+        "eval": lambda: WebsocketServerParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+        # ... your other transports (daily, webrtc, twilio, ...)
+    }
+    ```
+
+    Then start the agent with `-t eval`:
+
+    ```bash
+    python bot.py -t eval
+    ```
+
+    ```
+    🚀 Bot ready! (eval transport on ws://localhost:7860)
+    ```
+
+    Instead of connecting to Daily or WebRTC, the agent now hosts a local WebSocket server and waits for the eval harness to connect. Nothing else in the agent changes: same pipeline, same services, same event handlers.
+
+    <Note>
+      The harness talks to your agent over RTVI. `PipelineWorker` adds an
+      `RTVIProcessor` and `RTVIObserver` automatically, so the standard agent
+      setup needs no extra wiring. All Pipecat example agents already include
+      the `"eval"` transport entry.
+    </Note>
+
+  </Step>
+
+  <Step title="Write a scenario">
+    A scenario is a YAML file describing a scripted conversation and the behavior you expect. Save this as `scenarios/capital_question.yaml`:
+
+    <Tabs>
+      <Tab title="Ollama judge (default)">
+        ```yaml
+        name: capital_question
+
+        turns:
+          # The agent greets on connect; wait for the greeting before speaking.
+          - expect:
+              - event: response
+                eval: "the bot opens the conversation with a greeting or an offer to help"
+
+          - user: "What is the capital of Germany?"
+            expect:
+              - event: response
+                eval: "the response says the capital of Germany is Berlin"
+        ```
+      </Tab>
+      <Tab title="OpenAI judge">
+        ```yaml
+        name: capital_question
+
+        judge:
+          eval:
+            service: openai
+            model: gpt-4o-mini
+
+        turns:
+          # The agent greets on connect; wait for the greeting before speaking.
+          - expect:
+              - event: response
+                eval: "the bot opens the conversation with a greeting or an offer to help"
+
+          - user: "What is the capital of Germany?"
+            expect:
+              - event: response
+                eval: "the response says the capital of Germany is Berlin"
+        ```
+      </Tab>
+    </Tabs>
+
+    Each turn optionally sends a user utterance and lists the events expected in response. The `eval:` field is a natural-language criterion checked by the judge LLM, so the test passes whether the agent says "Berlin is the capital of Germany" or "That would be Berlin!".
+
+    This scenario runs in **text mode** (the default): the user turn is sent as text and the agent's TTS is skipped automatically, so the whole conversation costs nothing in audio services and finishes in seconds.
+
+  </Step>
+
+  <Step title="Run the eval">
+    With the agent still running, run the scenario from another terminal:
+
+    ```bash
+    pipecat eval run scenarios/capital_question.yaml
+    ```
+
+    The harness connects to `ws://localhost:7860` (override with `--bot-url`), drives the conversation, and reports the result. Pass `-v` to watch each turn resolve:
+
+    ```
+          turn 0 → (observe)
+            ✓ llm_response — "Hello! How can I help you today?"
+          turn 1 → "What is the capital of Germany?"
+            ✓ llm_response — "The capital of Germany is Berlin."
+
+      ✓ ws://localhost:7860 capital_question (3402ms)
+
+      1/1 passed  ·  3.4s
+    ```
+
+    The command exits `0` when everything passes and `1` otherwise, so it slots directly into scripts and CI. Each scenario also writes a decision trace to `<scenario>.eval.log`, which shows every event the harness saw and why each assertion passed or failed.
+
+  </Step>
+
+  <Step title="Make it fail (optional but recommended)">
+    Change the criterion to something false, for example `"the response says the capital of Germany is Madrid"`, and run again:
+
+    ```
+      ✗ ws://localhost:7860 capital_question
+
+      Failed (1):
+      ✗ ws://localhost:7860 capital_question
+          • turn 1 expectation 0 (llm_response): judge said no: the reply says the capital is Berlin, not Madrid
+
+      0/1 passed, 1 failed  ·  4.1s
+    ```
+
+    A failing eval tells you which turn, which expectation, and why. That message (plus the `.eval.log` trace) is what you, or your AI coding assistant, iterate against.
+
+  </Step>
+</Steps>
+
+## Where to go next
+
+- Learn the full scenario format, including multi-turn conversations, function call assertions, interruptions, latency budgets, and audio mode, in [Writing Scenarios](/pipecat/evals/scenarios).
+- Have many scenarios or agents? Let Pipecat spawn the agents for you with [Eval Suites](/pipecat/evals/suites).
+- Want your coding assistant to run these for you? See [Agent Self-Improvement](/pipecat/evals/agent-self-improvement).

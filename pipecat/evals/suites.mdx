@@ -1,0 +1,120 @@
+---
+title: "Eval Suites"
+description: "Spawn agents and run many scenarios concurrently from a single manifest."
+---
+
+`pipecat eval run` tests scenarios against an agent you started yourself. A **suite** goes one step further: you list agents and scenarios in a manifest, and `pipecat eval suite` spawns each agent with its eval transport on its own port, runs its scenarios, tears it down, and aggregates the results, several runs at a time.
+
+Suites are the right tool when you have more than one agent, more than a handful of scenarios, or want a single command for CI. Pipecat's own release evals are a manifest with 100+ example agents plus this command.
+
+## The manifest
+
+```yaml manifest.yaml
+concurrency: 4 # how many runs execute at once
+runs_dir: eval-runs # logs + recordings go to <runs_dir>/<timestamp>/
+record: false # record conversation audio (audio-mode scenarios)
+scenarios_dir: scenarios # scenario names resolve to <dir>/<name>.yaml
+
+# How to start each agent. {python}, {bot}, and {port} are substituted per run.
+spawn: "{python} {bot} -t eval --port {port}"
+
+suite:
+  - bot: bots/support-agent.py
+    scenarios: [greeting, capital_question, multi_turn]
+  - bot: bots/sales-agent.py
+    scenarios: [greeting, weather_function_call]
+  - bot: bots/vision-agent.py
+    runner_body: scenarios/vision-body.json # optional --runner-body data
+    scenarios: [vision_describe]
+```
+
+Paths in the manifest (`bots_dir`, `scenarios_dir`, `runs_dir`, the `bot:` entries) resolve relative to the manifest file, so a manifest is portable: check it into your repo and run it from anywhere.
+
+Scenarios are reusable across agents. One `greeting` scenario can cover every agent in the suite.
+
+<Note>
+  An optional `runner_body:` points at a JSON file passed to the agent as
+  `--runner-body`. It supplies session data the agent would normally receive in
+  a `/start` request body (for example, a vision agent's image path).
+</Note>
+
+## Running a suite
+
+```bash
+pipecat eval suite manifest.yaml
+```
+
+In a terminal, a live dashboard shows each run's status, a running tally, and total time. When piped (in CI, or driven by a coding assistant), it streams one plain result line per run instead. The command exits `0` only if every run passes.
+
+Useful flags:
+
+```bash
+pipecat eval suite manifest.yaml -p support       # only bots whose path contains "support"
+pipecat eval suite manifest.yaml -s greeting      # only the greeting scenario
+pipecat eval suite manifest.yaml -c 8             # 8 runs at a time
+pipecat eval suite manifest.yaml -n nightly       # output to eval-runs/nightly/
+pipecat eval suite manifest.yaml -a               # record conversation audio
+pipecat eval suite manifest.yaml -d               # save full per-pipeline debug logs
+```
+
+Everything except the `suite:` list can live in the manifest or be passed on the command line (the command line wins), so a manifest can be as minimal as a `suite:` list.
+
+## Run output
+
+Each invocation writes to `<runs_dir>/<name>/` (a timestamp when `-n` is omitted):
+
+```
+eval-runs/20260610_142200/
+  logs/
+    bots_support-agent.py__greeting.log        # the agent process output
+    bots_support-agent.py__greeting.eval.log   # the harness's decision trace
+    bots_support-agent.py__greeting.debug.log  # per-pipeline harness logs (-d only)
+  recordings/
+    bots_support-agent.py__greeting.wav        # conversation audio (record: true or -a)
+```
+
+When a run fails, start with the `.eval.log` decision trace: it's a timestamped record of every event the harness saw, what it matched, what the judge said, and why an assertion failed. The agent's own log sits next to it.
+
+## Testing one agent with many scenarios
+
+If you just want to run a batch of scenarios against an agent you already have running, you don't need a manifest. `pipecat eval run` accepts multiple scenario files and shares the suite's dashboard and tally:
+
+```bash
+pipecat eval run scenarios/*.yaml --bot-url ws://localhost:7860
+```
+
+By default the agent is left running afterward so it can serve more evals; pass `--stop-bot` to shut it down when the batch finishes.
+
+## Suites in CI
+
+The exit code makes suites CI-ready with no extra glue:
+
+```yaml
+# e.g. GitHub Actions
+- name: Run behavioral evals
+  run: pipecat eval suite manifest.yaml
+```
+
+For deterministic, key-free CI runs, prefer text-mode scenarios and an OpenAI-compatible judge endpoint you control. Audio-mode scenarios work in CI too, but need the harness's TTS and STT services available (local models by default, which also need more CPU).
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Using the Library"
+    icon="code"
+    iconType="duotone"
+    href="/pipecat/evals/library"
+  >
+    Orchestrate suites programmatically with `EvalManifest` and `EvalSuite`.
+  </Card>
+
+  <Card
+    title="Agent Self-Improvement"
+    icon="arrows-rotate"
+    iconType="duotone"
+    href="/pipecat/evals/agent-self-improvement"
+  >
+    Let an AI coding assistant run your suite and iterate until it's green.
+  </Card>
+</CardGroup>
