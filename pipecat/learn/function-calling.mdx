@@ -45,7 +45,7 @@ For example, you could give your bot the ability to:
 
 Here's how it works:
 
-1. You define functions the LLM can use and register them to the LLM service used in your pipeline
+1. You define functions the LLM can use and make them available to the LLM service used in your pipeline
 2. When needed, the LLM requests a function call
 3. Your application executes any corresponding functions
 4. The result is sent back to the LLM
@@ -53,19 +53,160 @@ Here's how it works:
 
 ## Implementation
 
-### 1. Define Functions
+### 1. Define a tool
 
-Pipecat provides a standardized `FunctionSchema` that works across all supported LLM providers. This makes it easy to define functions once and use them with any provider.
+The preferred way to define a tool is a **direct function**: a single async function that is _both_ the schema and the handler. Pipecat auto-derives the tool's metadata — name, description, parameter properties (with their descriptions), and which parameters are required — from the function's signature and docstring, so there's no separate schema to write or keep in sync.
 
-As a shorthand, you could also bypass specifying a function configuration at all and instead use "direct" functions. Under the hood, these are converted to `FunctionSchema`s.
+The signature differs slightly from a regular function: the first parameter is always `params` (a `FunctionCallParams`), followed by the tool's own arguments. Document each argument in a Google-style docstring.
 
-#### Using the Standard Schema (Recommended)
+```python
+from pipecat.services.llm_service import FunctionCallParams
+
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit". Infer this from the user's location.
+    """
+    weather_data = {"conditions": "sunny", "temperature": "75"}
+    await params.result_callback(weather_data)
+```
+
+<Note>
+  The direct-function schema generator doesn't yet map `Literal` types to a
+  JSON-schema `enum`. Express enum-like constraints in the docstring prose
+  instead (e.g. _'Must be either "celsius" or "fahrenheit"'_), as shown above.
+  If you need a strict `enum` in the schema, use the [verbose
+  `FunctionSchema`](#advanced-defining-tools-with-functionschema) pattern.
+</Note>
+
+### 2. Add the tool to the context
+
+List your direct functions in `LLMContext(tools=[...])`. That's all that's required — Pipecat registers each direct function's handler with the LLM service **automatically**. There's no separate registration call.
+
+```python
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+
+# Direct functions listed in the context are registered with the LLM automatically
+context = LLMContext(tools=[get_current_weather, get_restaurant_recommendation])
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+```
+
+The bot's personality (e.g. "You are a helpful assistant") is set via [`system_instruction`](/pipecat/learn/context-management#using-system_instruction-recommended) in the LLM service's Settings, not as a context message. Tools are automatically converted to the correct format for your LLM provider through adapters.
+
+### 3. Create the pipeline
+
+Include your LLM service in the pipeline. Because the tools are registered through the context, no extra wiring is needed:
+
+```python
+# Create the pipeline
+pipeline = Pipeline([
+    transport.input(),     # Input from the transport
+    stt,                   # STT processing
+    user_aggregator,       # User context aggregation
+    llm,                   # LLM processing
+    tts,                   # TTS processing
+    transport.output(),    # Output to the transport
+    assistant_aggregator,  # Assistant context aggregation
+])
+```
+
+## Per-Tool Options with `@tool_options`
+
+By default, a direct function is cancelled if the user interrupts and uses the LLM service's global timeout. To override either, decorate the function with `@tool_options`. The decorator only attaches call options — the schema is still auto-derived — so decorated functions can stay at module level.
+
+```python
+import asyncio
+
+from pipecat.adapters.schemas.direct_function import tool_options
+from pipecat.services.llm_service import FunctionCallParams
+
+@tool_options(cancel_on_interruption=False, timeout_secs=30)
+async def get_current_weather(params: FunctionCallParams, location: str, format: str):
+    """Get the current weather.
+
+    Args:
+        location: The city and state, e.g. "San Francisco, CA".
+        format: The temperature unit to use. Must be either "celsius" or "fahrenheit". Infer this from the user's location.
+    """
+    # Simulate a long-running API call.
+    await asyncio.sleep(20)
+    await params.result_callback({"conditions": "nice", "temperature": "75"})
+```
+
+**Options:**
+
+- **`cancel_on_interruption`** (default `True`): When `True`, the call is cancelled if the user interrupts. When `False`, the call is treated as **asynchronous** — see below.
+- **`timeout_secs`** (default `None`): Per-tool timeout in seconds. Overrides the global `function_call_timeout_secs` for this function. Use a longer timeout for slow operations (e.g. database queries) or a shorter one for quick lookups.
+
+<Note>
+  On an [`LLMWorker`](/api-reference/server/workers/llm-context-worker), mark
+  tool methods with `@tool` instead. It applies the same options _and_ marks the
+  method for automatic collection as one of the worker's own tools.
+</Note>
+
+### Synchronous vs. asynchronous calls
+
+With `cancel_on_interruption=True` (the default), the call is **synchronous**: the LLM waits for the result before generating its next response. This ensures the LLM has complete information before responding.
+
+With `cancel_on_interruption=False`, the call is **asynchronous**: the LLM continues the conversation immediately without waiting. Once the result returns, it's injected back into the context as a developer message, triggering a new LLM inference at that point. This enables truly non-blocking calls where the conversation proceeds while the function runs in the background. Async calls can also send [intermediate updates](#intermediate-results-for-async-functions) before their final result.
+
+#### Async function call cancellation
+
+For async functions (`cancel_on_interruption=False`), you can also enable model-directed cancellation:
+
+```python
+llm = OpenAILLMService(
+    api_key="your-api-key",
+    enable_async_tool_cancellation=True,
+)
+```
+
+When `enable_async_tool_cancellation=True` and at least one async function is registered, Pipecat automatically adds the built-in `cancel_async_tool_call` tool and supporting system instructions. The LLM can call that tool to cancel a stale in-progress async function call — for example, when the user changes their request before a long-running lookup completes.
+
+## Changing Tools Mid-Conversation
+
+To change the set of tools the LLM can see during a session, push an `LLMSetToolsFrame`. Its `tools` field accepts the same things as `LLMContext` — a plain list of direct functions (and/or `FunctionSchema` objects). Direct functions advertised this way are auto-registered, and any direct function dropped from the advertised set is automatically unregistered.
+
+```python
+from pipecat.frames.frames import LLMSetToolsFrame
+from pipecat.processors.aggregators.llm_context import NOT_GIVEN
+
+# Advertise a new set of tools (direct-function handlers auto-register)
+await worker.queue_frame(LLMSetToolsFrame(tools=[get_current_weather]))
+
+# Clear all tools
+await worker.queue_frame(LLMSetToolsFrame(tools=NOT_GIVEN))
+```
+
+## Tools Across Service Switches
+
+When you use an [`LLMSwitcher`](/api-reference/server/utilities/service-switchers/llm-switcher) to swap LLM providers mid-session, direct functions listed in `LLMContext(tools=[...])` are auto-registered on **every** member LLM — active or not. The tools keep working across switches with no per-member registration.
+
+```python
+from pipecat.pipeline.llm_switcher import LLMSwitcher
+
+llm_switcher = LLMSwitcher(llms=[llm_openai, llm_google])
+
+# Direct functions are registered on every member LLM automatically,
+# so tools keep working after a switch.
+context = LLMContext(tools=[get_current_weather, get_restaurant_recommendation])
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+```
+
+## Advanced: Defining Tools with `FunctionSchema`
+
+Direct functions cover most cases. Reach for the verbose `FunctionSchema` pattern when you need explicit control over the schema — for example, a strict `enum` constraint (which the direct-function generator doesn't yet emit) — or when the tool's handler isn't a direct function.
+
+With this pattern you define the schema and the handler separately, then link them by registering the handler.
 
 ```python
 from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.llm_service import FunctionCallParams
 
-# Define a function using the standard schema
+# 1. Define the schema
 weather_function = FunctionSchema(
     name="get_current_weather",
     description="Get the current weather in a location",
@@ -80,63 +221,39 @@ weather_function = FunctionSchema(
             "description": "The temperature unit to use.",
         },
     },
-    required=["location", "format"]
+    required=["location", "format"],
 )
 
-# Create a tools schema with your functions
-tools = ToolsSchema(standard_tools=[weather_function])
-
-# Pass this to your LLM context
-context = LLMContext(tools=tools)
-user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
-```
-
-The bot's personality (e.g. "You are a helpful assistant") is set via [`system_instruction`](/pipecat/learn/context-management#using-system_instruction-recommended) in the LLM service's Settings, not as a context message. The `ToolsSchema` will be automatically converted to the correct format for your LLM provider through adapters.
-
-#### Using Direct Functions (Shorthand)
-
-You can bypass specifying a function configuration as a `FunctionSchema` and instead pass the function directly to your `ToolsSchema`. Pipecat will auto-configure the function, gathering relevant metadata from its signature and docstring. Metadata includes:
-
-- name
-- description
-- properties (including individual property descriptions)
-- list of required properties
-
-Note that the function signature is a bit different when using direct functions. The first parameter is `FunctionCallParams`, followed by any others necessary for the function.
-
-```python
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.services.llm_service import FunctionCallParams
-
-# Define a direct function
-async def get_current_weather(params: FunctionCallParams, location: str, format: str):
-    """Get the current weather.
-
-    Args:
-        location: The city and state, e.g. "San Francisco, CA".
-        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
-    """
+# 2. Define the handler (arguments come from params.arguments)
+async def fetch_weather_from_api(params: FunctionCallParams):
     weather_data = {"conditions": "sunny", "temperature": "75"}
     await params.result_callback(weather_data)
 
-# Create a tools schema, passing your function directly to it
-tools = ToolsSchema(standard_tools=[get_current_weather])
+# 3. Register the handler, linking it to the schema by name
+llm.register_function(
+    "get_current_weather",
+    fetch_weather_from_api,
+    cancel_on_interruption=True,  # Cancel if user interrupts (default: True)
+    timeout_secs=30.0,  # Optional: override global timeout for this function
+)
 
-# Pass this to your LLM context
-context = LLMContext(tools=tools)
-user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+# 4. Advertise the schema via the context
+context = LLMContext(tools=[weather_function])
 ```
 
-#### Provider-Specific Custom Tools
+`register_function` takes the same `cancel_on_interruption` and `timeout_secs` options as [`@tool_options`](#per-tool-options-with-@tool_options), with the same [synchronous vs. asynchronous](#synchronous-vs-asynchronous-calls) semantics. As with direct functions, you can change `FunctionSchema` tools mid-conversation by pushing an `LLMSetToolsFrame`.
 
-`LLMContext` expects tools to be provided as a `ToolsSchema`. For normal
-function calling, prefer `standard_tools` with `FunctionSchema` or direct
-functions so Pipecat can convert them to each provider's native format.
+<Note>
+  `register_direct_function()` and `unregister_direct_function()` are
+  **deprecated** (since 1.4.0). Direct functions now register automatically from
+  the advertised tool set — list them in `LLMContext(tools=[...])` for tools
+  available at session start, or push an `LLMSetToolsFrame` to change tools
+  mid-session.
+</Note>
 
-When a provider has tools that don't fit Pipecat's standard function schema,
-add those provider-native definitions through `ToolsSchema.custom_tools`. These
-custom tools are passed only to the matching adapter and are appended to the
-converted standard tools.
+### Provider-Specific Custom Tools
+
+For normal function calling, prefer `standard_tools` with `FunctionSchema` or direct functions so Pipecat can convert them to each provider's native format. When a provider has tools that don't fit Pipecat's standard function schema, add those provider-native definitions through `ToolsSchema.custom_tools`. These custom tools are passed only to the matching adapter and are appended to the converted standard tools.
 
 <CodeGroup>
 
@@ -195,116 +312,11 @@ tools = ToolsSchema(
 </Note>
 
 <Tip>
-  For normal callable functions, use `FunctionSchema` or direct functions
+  For normal callable functions, use direct functions or `FunctionSchema`
   instead of provider-native function definitions. Today, `custom_tools` is
   supported for OpenAI-family adapters and Gemini. Anthropic standard functions
   should be represented with `FunctionSchema`.
 </Tip>
-
-### 2. Register Function Handlers
-
-Register handlers for your functions using one of these [LLM service methods](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#llm-service):
-
-- `register_function`
-- `register_direct_function`
-
-Which one you use depends on whether your function is a ["direct" function](#using-direct-functions-shorthand).
-
-<CodeGroup>
-
-```python Non-Direct Function
-from pipecat.services.llm_service import FunctionCallParams
-
-llm = OpenAILLMService(api_key="your-api-key")
-
-# Main function handler - called to execute the function
-async def fetch_weather_from_api(params: FunctionCallParams):
-    # Fetch weather data from your API
-    weather_data = {"conditions": "sunny", "temperature": "75"}
-    await params.result_callback(weather_data)
-
-# Register the function
-llm.register_function(
-    "get_current_weather",
-    fetch_weather_from_api,
-    cancel_on_interruption=True,  # Cancel if user interrupts (default: True)
-    timeout_secs=30.0,  # Optional: Override global timeout for this function
-)
-```
-
-```python Direct Function
-from pipecat.services.llm_service import FunctionCallParams
-
-llm = OpenAILLMService(api_key="your-api-key")
-
-# Direct function
-async def get_current_weather(params: FunctionCallParams, location: str, format: str):
-    """Get the current weather.
-
-    Args:
-        location: The city and state, e.g. "San Francisco, CA".
-        format: The temperature unit to use. Must be either "celsius" or "fahrenheit".
-    """
-    weather_data = {"conditions": "sunny", "temperature": "75"}
-    await params.result_callback(weather_data)
-
-# Register direct function
-llm.register_direct_function(
-    get_current_weather,
-    cancel_on_interruption=False,  # Don't cancel on interruption
-    timeout_secs=60.0,  # Optional: Override global timeout for this function
-)
-```
-
-</CodeGroup>
-
-**Key registration options:**
-
-- **`cancel_on_interruption=True`** (default): Function call is cancelled if user interrupts
-- **`cancel_on_interruption=False`**: Function call continues as async; LLM doesn't wait for result before continuing
-- **`timeout_secs=None`** (default): Optional per-tool timeout in seconds. Overrides the global `function_call_timeout_secs` for this specific function
-
-Use `cancel_on_interruption=False` for long-running operations or when you want the LLM to continue the conversation without waiting. When set to `False`, the function call is treated as **asynchronous**: the LLM continues the conversation immediately without waiting for the result. Once the result returns, it's injected back into the context as a developer message, triggering a new LLM inference at that point. This allows for truly non-blocking function calls where the conversation can proceed while the function executes in the background. Async function calls can also send intermediate updates before the final result.
-
-Use `cancel_on_interruption=True` (the default) when the LLM should wait for the function result before responding. This ensures the LLM has the complete information before generating its next response.
-
-Use `timeout_secs` to set a specific timeout for a function that differs from the global default. For example, you might want a longer timeout for database queries or shorter timeouts for quick lookups.
-
-#### Async Function Call Cancellation
-
-If you register async function calls with `cancel_on_interruption=False`, you can also enable model-directed cancellation:
-
-```python
-llm = OpenAILLMService(
-    api_key="your-api-key",
-    enable_async_tool_cancellation=True,
-)
-```
-
-When `enable_async_tool_cancellation=True` and at least one async function is registered, Pipecat automatically adds the built-in `cancel_async_tool_call` tool and supporting system instructions. The LLM can call that tool to cancel a stale in-progress async function call, for example when the user changes their request before a long-running lookup completes.
-
-### 3. Create the Pipeline
-
-Include your LLM service in your pipeline with the registered functions:
-
-```python
-# Initialize the LLM context with your function schemas
-context = LLMContext(tools=tools)
-
-# Create the context aggregator to collect the user and assistant context
-user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
-
-# Create the pipeline
-pipeline = Pipeline([
-    transport.input(),     # Input from the transport
-    stt,                   # STT processing
-    user_aggregator,       # User context aggregation
-    llm,                   # LLM processing
-    tts,                   # TTS processing
-    transport.output(),    # Output to the transport
-    assistant_aggregator,  # Assistant context aggregation
-])
-```
 
 ## Function Handler Details
 
@@ -363,7 +375,7 @@ Your function handler should:
 
 1. Receive necessary arguments, either:
    - From `params.arguments`
-   - Directly from function arguments, if using [direct functions](#using-direct-functions-shorthand)
+   - Directly from function arguments, if using [direct functions](#1-define-a-tool)
 2. Process data or call external services
 3. Return results via `params.result_callback(result)`
 
@@ -470,8 +482,8 @@ async def query_user_preferences(params: FunctionCallParams):
 - Useful for database connections, API clients, caches, or any shared state
 
 <Note>
-  `PipelineWorker(tool_resources=...)` and `FunctionCallParams.tool_resources` are
-  deprecated aliases retained for compatibility. Prefer
+  `PipelineWorker(tool_resources=...)` and `FunctionCallParams.tool_resources`
+  are deprecated aliases retained for compatibility. Prefer
   `PipelineWorker(app_resources=...)` and `params.app_resources`.
 </Note>
 
@@ -571,7 +583,7 @@ Intermediate results are injected into the LLM context as async-tool developer m
 
 - **Function calling extends LLM capabilities** beyond training data to real-time information
 - **Context integration is automatic** - function calls and results are stored in conversation history
-- **Multiple definition approaches** - use standard schema for portability, direct functions for simplicity
+- **Direct functions are the preferred approach** - one async function is both schema and handler, registered automatically via `LLMContext(tools=[...])`; use `FunctionSchema` + `register_function` when you need explicit schema control
 - **Async function calls are opt-in** - set `cancel_on_interruption=False` for deferred results, intermediate updates, and optional async-tool cancellation
 - **Pipeline integration is seamless** - functions work within your existing voice AI architecture
 - **Advanced control available** - fine-tune LLM execution and monitor function call lifecycle
