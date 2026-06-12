@@ -127,6 +127,51 @@ context = LLMContext(tools=tools)
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 ```
 
+#### Bundling Handlers on Schemas
+
+You can bundle a handler directly on a `FunctionSchema` by passing it as the `handler` parameter. The LLM service will automatically register the handler wherever the schema is advertised in an `LLMContext`, so you don't need a separate `register_function` call. This combines the explicit schema control of the standard approach with the automatic wiring of direct functions.
+
+```python
+from pipecat.adapters.schemas.direct_function import tool_options
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.services.llm_service import FunctionCallParams
+
+# Define the handler (call options come from @tool_options)
+@tool_options(cancel_on_interruption=False, timeout_secs=120)
+async def generate_report(params: FunctionCallParams):
+    report_type = params.arguments["report_type"]
+    # ... generate report ...
+    await params.result_callback({"url": f"https://reports.example.com/{report_type}.pdf"})
+
+# Bundle the handler on the schema
+report_function = FunctionSchema(
+    name="generate_report",
+    description="Generate a report and return a link when ready",
+    properties={
+        "report_type": {
+            "type": "string",
+            "enum": ["sales", "inventory", "usage"],
+            "description": "Which report to generate",
+        },
+    },
+    required=["report_type"],
+    handler=generate_report,  # Handler is bundled on the schema
+)
+
+# Listing the schema in the context is all the wiring needed
+context = LLMContext(tools=[report_function])
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+```
+
+**When to use this approach:**
+
+- When you need precise control over the schema (e.g., `enum` constraints) but want automatic registration
+- When you want the handler and its schema to stay together as a unit
+- When you're defining reusable tools that other parts of your application can import
+
+**Handler call options:** Use the `@tool_options` decorator on the handler to override `cancel_on_interruption` and `timeout_secs`, just like with direct functions.
+
 #### Provider-Specific Custom Tools
 
 `LLMContext` expects tools to be provided as a `ToolsSchema`. For normal
@@ -203,12 +248,23 @@ tools = ToolsSchema(
 
 ### 2. Register Function Handlers
 
-Register handlers for your functions using one of these [LLM service methods](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#llm-service):
+Handlers advertised in an `LLMContext` are **automatically registered** when the context is used. This includes:
 
-- `register_function`
-- `register_direct_function`
+- **Direct functions** — automatically registered with call options from the `@tool_options` decorator
+- **Handler-carrying schemas** — `FunctionSchema` objects with a `handler` parameter set
 
-Which one you use depends on whether your function is a ["direct" function](#using-direct-functions-shorthand).
+For functions defined separately from their schemas (the classic pattern), you'll need to register them explicitly using one of these [LLM service methods](https://reference-server.pipecat.ai/en/latest/api/pipecat.services.llm_service.html#llm-service):
+
+- `register_function` — for standard (non-direct) function handlers
+- `register_direct_function` — for direct functions (though listing them in the context is usually simpler)
+
+<Note>
+  Most applications won't need explicit `register_function` calls — prefer
+  listing direct functions or handler-carrying schemas in your `LLMContext` for
+  automatic registration. Use explicit registration when you need to register a
+  handler for a handlerless `FunctionSchema`, or when you need different call
+  options than what the `@tool_options` decorator provides.
+</Note>
 
 <CodeGroup>
 
@@ -227,7 +283,7 @@ async def fetch_weather_from_api(params: FunctionCallParams):
 llm.register_function(
     "get_current_weather",
     fetch_weather_from_api,
-    cancel_on_interruption=True,  # Cancel if user interrupts (default: True)
+    cancel_on_interruption=True,  # Cancel if user interrupts
     timeout_secs=30.0,  # Optional: Override global timeout for this function
 )
 ```
@@ -260,9 +316,13 @@ llm.register_direct_function(
 
 **Key registration options:**
 
-- **`cancel_on_interruption=True`** (default): Function call is cancelled if user interrupts
+- **`cancel_on_interruption`**: Whether to cancel the function call if the user interrupts. Defaults to `None`, which falls back to the `@tool_options` decorator value on the handler, then to `True`. Set explicitly to `True` or `False` to override.
+- **`timeout_secs`**: Per-tool timeout in seconds. Defaults to `None`, which falls back to the `@tool_options` decorator value on the handler, then to the global `function_call_timeout_secs`. Set explicitly to override.
+
+**Common patterns:**
+
+- **`cancel_on_interruption=True`**: Function call is cancelled if user interrupts (the final default)
 - **`cancel_on_interruption=False`**: Function call continues as async; LLM doesn't wait for result before continuing
-- **`timeout_secs=None`** (default): Optional per-tool timeout in seconds. Overrides the global `function_call_timeout_secs` for this specific function
 
 Use `cancel_on_interruption=False` for long-running operations or when you want the LLM to continue the conversation without waiting. When set to `False`, the function call is treated as **asynchronous**: the LLM continues the conversation immediately without waiting for the result. Once the result returns, it's injected back into the context as a developer message, triggering a new LLM inference at that point. This allows for truly non-blocking function calls where the conversation can proceed while the function executes in the background. Async function calls can also send intermediate updates before the final result.
 
