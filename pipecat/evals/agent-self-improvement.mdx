@@ -1,0 +1,104 @@
+---
+title: "Agent Self-Improvement"
+description: "Close the loop: let an AI coding assistant write agent code, run evals, and iterate until they pass."
+---
+
+Evals do more than catch regressions. They turn agent quality into a signal that an AI coding assistant can read, which changes how you build: instead of asking an assistant to "improve the prompt" and judging the result by hand, you describe the desired behavior as a scenario and let the assistant iterate until the eval passes.
+
+## The loop
+
+1. **Describe the behavior as a scenario.** A scenario file is an executable specification: the conversation, the expected events, and the criteria a response must meet.
+2. **The assistant changes the agent.** A prompt edit, a new tool, a pipeline change.
+3. **The assistant runs the evals.** One command, either against a running agent (`pipecat eval run`) or letting the suite spawn the agent itself (`pipecat eval suite`).
+4. **The assistant reads the result.** A non-zero exit code, a per-assertion failure message ("turn 1 expectation 0 (llm_response): judge said no: ..."), and a full decision trace in `<scenario>.eval.log`.
+5. **Repeat until green.**
+
+Steps 2 through 5 need no human in the loop. You review the final diff with the evidence that it works attached.
+
+## Why this works well for coding assistants
+
+The framework was built to be driven by tools, not just humans:
+
+- **One command, one exit code.** `pipecat eval run scenarios/*.yaml` exits `0` on success and `1` on failure, so an assistant knows mechanically whether it's done.
+- **Plain-text output when piped.** Outside a terminal the CLI streams one result line per scenario instead of rendering a live dashboard, which is exactly what an assistant running shell commands sees.
+- **Actionable failures.** Failures name the turn, the expectation, and the reason, including what the judge said. The `.eval.log` decision trace shows every event the harness observed, so "why did this fail" is answerable from files.
+- **Suites are self-contained.** `pipecat eval suite` spawns the agents itself, so an autonomous loop doesn't need to manage processes: edit, run one command, read the result.
+- **Text mode is fast and cheap.** Iterating on prompts and logic skips STT and TTS entirely, so an assistant can afford to run the evals after every change.
+
+## Setting up your project
+
+Keep scenarios in the repo next to the agent and tell your assistant how to run them. For example, in your project's `CLAUDE.md` or `AGENTS.md`:
+
+```markdown
+## Behavioral evals
+
+Evals live in `scenarios/`. To verify any change to the agent's behavior:
+
+1. Start the agent: `uv run bot.py -t eval` (serves ws://localhost:7860)
+2. Run the evals: `pipecat eval run scenarios/*.yaml`
+
+The command exits non-zero on failure and prints each failed assertion.
+Each scenario writes a decision trace to `<scenario>.eval.log`; read it
+to understand a failure before changing code.
+
+When you add or change agent behavior, add or update a scenario in
+`scenarios/` to cover it.
+```
+
+With that in place, a request like this becomes fully verifiable:
+
+> Add a `get_order_status` tool to the agent and make sure it gets called when the user asks where their order is. Add a scenario for it and run the evals until they pass.
+
+The assistant writes the tool, writes the scenario (a `function_call` assertion plus a judged response), runs `pipecat eval run`, reads any failure, and fixes its own work.
+
+## Evals as acceptance criteria
+
+You can also run the loop in the other direction: write the scenario first, watch it fail, and hand the failure to the assistant. The scenario is the spec, and "make this pass" is the task.
+
+```yaml order_status.yaml
+name: order_status
+
+turns:
+  - user: "Where's my order? The number is 12345."
+    expect:
+      - event: function_call
+        calls:
+          - name: get_order_status
+            args: { order_id: "12345" }
+      - event: response
+        eval: "tells the user the status of their order"
+```
+
+This is test-driven development for agent behavior, with the judge LLM absorbing the fuzziness that makes conversational output hard to assert on with string matching.
+
+## Guardrails
+
+A few practices keep autonomous loops honest:
+
+- **Review scenario changes like code.** An assistant that can edit scenarios can also weaken them. Failing evals should usually be fixed in the agent, not in the scenario.
+- **Keep a regression set.** As behaviors accumulate, so should scenarios. Run the full set (or a suite) before merging, not just the scenario being worked on.
+- **Gate merges in CI.** `pipecat eval suite manifest.yaml` in CI makes "the evals pass" a property of the branch, whoever (or whatever) wrote it. See [Eval Suites](/pipecat/evals/suites).
+- **Use audio mode for the final check.** Iterate in text mode for speed, then run the audio variants before release to cover the full STT, LLM, and TTS path.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="AI-Assisted Development"
+    icon="robot"
+    iconType="duotone"
+    href="/pipecat/get-started/ai-tools"
+  >
+    Give your coding assistant access to Pipecat docs and source context.
+  </Card>
+
+  <Card
+    title="Production Evaluation"
+    icon="chart-line"
+    iconType="duotone"
+    href="/pipecat/evals/overview#production-evaluation"
+  >
+    Layer in simulation platforms and observability once your agent is
+    deployed.
+  </Card>
+</CardGroup>

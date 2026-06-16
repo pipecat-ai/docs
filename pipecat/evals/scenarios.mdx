@@ -1,0 +1,327 @@
+---
+title: "Writing Scenarios"
+description: "The scenario file format: turns, expectations, assertions, and text vs audio modes."
+---
+
+A scenario is a YAML file describing a scripted conversation and the events you expect your agent to emit. This page covers the full format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
+
+## Anatomy of a scenario
+
+```yaml
+name: multi_turn # required: the eval's name
+
+judge: # optional: judge modality and LLM (defaults shown below)
+  eval:
+    service: ollama
+    model: gemma2:9b
+
+turns: # required: the conversation, in order
+  - user: "My name is Alex, and I'm planning a trip to Italy."
+    expect:
+      - event: response
+        eval: "acknowledges the user's message (the name Alex and/or the trip to Italy)"
+
+  - user: "Remind me — what's my name and where am I going?"
+    expect:
+      - event: response
+        eval: "recalls that the user's name is Alex and the destination is Italy"
+```
+
+Each turn optionally sends a user utterance (`user:`) and lists the events expected in response (`expect:`). Expected events must arrive in the order listed, but the agent may emit other events in between, so you don't have to enumerate everything it does.
+
+A turn without a `user:` field is observation-only: the harness just waits for the expected events. This is how you test agent-first behavior like an on-connect greeting:
+
+```yaml
+turns:
+  # No user input: just wait for the agent to speak first.
+  - expect:
+      - event: response
+        eval: "the bot opens the conversation with a greeting or an offer to help"
+```
+
+## Events
+
+Scenarios assert on a small set of semantic events, mapped from the RTVI messages the agent emits:
+
+| Event                   | Meaning                                                                                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `response`              | The agent's reply. In audio mode this is a transcription of the agent's actual synthesized speech; in text mode it resolves to `llm_response`. Prefer this for content checks. |
+| `llm_response`          | The LLM's text output for the turn. Available in both modes.                                                                                                                   |
+| `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                     |
+| `llm_started`           | The LLM began generating a response.                                                                                                                                           |
+| `function_call`         | The LLM called a function.                                                                                                                                                     |
+| `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only.                                                                                                        |
+| `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode only.                                                                                                            |
+| `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode only.                                                                                                              |
+
+<Tip>
+  Use `response` for the agent's reply unless you have a reason not to. It's
+  modality-agnostic: the same scenario judges LLM text in text mode and the
+  transcription of real spoken audio in audio mode, so one file covers both.
+</Tip>
+
+## Assertions
+
+Each entry in `expect:` names an event and, optionally, asserts on its content or timing.
+
+### Semantic judging with `eval`
+
+The `eval:` field is a natural-language criterion that the event's text must satisfy, decided by the judge LLM:
+
+```yaml
+- user: "What's 2 plus 2?"
+  expect:
+    - event: response
+      eval: "the response says the answer is four"
+```
+
+The judge sees the whole conversation so far, so it can resolve terse or context-dependent replies (like "That's four"). It also understands that audio-mode responses come from a speech-to-text pass and judges intended meaning rather than exact spelling, so "for" transcribed instead of "four" still passes.
+
+The judge handles interim replies gracefully: if the agent says "Let me check on that." before the real answer, the harness keeps accumulating response text and re-judges until the criterion is met or the time budget runs out.
+
+`eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`).
+
+### Substring checks with `text_contains`
+
+For exact content, `text_contains` does a plain substring check, with no judge round-trip:
+
+```yaml
+- user: "What is the capital of France?"
+  expect:
+    - event: response
+      text_contains: "Paris"
+```
+
+### Latency budgets with `within_ms`
+
+`within_ms` bounds how long after the turn's user send the event may arrive. All of a turn's expectations share that one anchor:
+
+```yaml
+- user: "What is the capital of France?"
+  expect:
+    - event: llm_started
+      within_ms: 2000 # the LLM must start responding within 2s
+    - event: response
+      text_contains: "Paris"
+```
+
+When omitted, an expectation defaults to a generous 60 second budget (configurable with `--timeout`), so timing is only asserted when you ask for it.
+
+Because every deadline is measured from the send, time spent matching earlier expectations counts against later ones. In the example above, if `llm_started` arrives at 1.5 seconds, the `response` (with the default 60 second budget) has 58.5 seconds left, and a turn that stalls completely fails within a single budget rather than one per expectation.
+
+### Function calls
+
+A `function_call` expectation asserts that the turn invoked one or more tools. List the expected calls under `calls:`; they're matched by name in any order, and the expectation passes once all are found:
+
+```yaml
+- user: "What's the weather in San Francisco? And recommend a restaurant."
+  expect:
+    - event: function_call
+      calls:
+        - name: get_current_weather
+          args: { location: "San Francisco" }
+        - name: get_restaurant_recommendation
+    - event: response
+      eval: "describes the weather and recommends a restaurant"
+```
+
+`args` is a subset check: every listed key/value must be present in the call's arguments, and extra arguments are ignored. A single expected call can use the `name:`/`args:` shorthand directly on the expectation, and a bare `function_call` with neither just asserts that some call happened.
+
+## Interruptions
+
+`send_after:` schedules a turn's user send relative to a prior event, which is how you script barge-in tests:
+
+```yaml
+turns:
+  - user: "Tell me a long, detailed story about the history of Paris."
+    expect:
+      - event: llm_started
+
+  # Interrupt 2 seconds after the agent starts its long answer.
+  - user: "Actually, never mind that — what's the capital of Japan?"
+    send_after:
+      event: llm_started
+      delay_ms: 2000
+    expect:
+      - event: response
+        eval: "the response says the capital of Japan is Tokyo, instead of continuing the Paris story"
+```
+
+## Vision turns
+
+A turn may register an image with `image:` (a path relative to the scenario file). When a vision agent requests a user image during the turn, the eval transport serves it:
+
+```yaml
+turns:
+  - user: "What do you see in this image?"
+    image: assets/cat.jpg
+    expect:
+      - event: response
+        eval: "the response describes a cat"
+```
+
+## Text and audio modes
+
+Two top-level blocks control a scenario's modalities, and each has its own `modality:` field:
+
+- `user:` sets how each turn's utterance is delivered to the agent: sent as text, bypassing its STT (`modality: text`), or synthesized into real speech (`modality: audio`).
+- `judge:` sets what the judge evaluates: the agent's LLM text, with its TTS skipped (`modality: text`), or a transcription of its actual spoken audio (`modality: audio`).
+
+When `modality:` isn't specified, or a block is omitted entirely, it defaults to `text`. The two sides are also independent: you can drive the agent with text while judging its real speech, or speak to it and judge the LLM text.
+
+A scenario with neither block runs entirely in text mode. No audio flows on either side, so this is the fastest and cheapest way to test prompts, conversational logic, and function calling: no audio service cost, and a multi-turn scenario finishes in seconds. The judge LLM is the only service the harness itself needs (Ollama with `gemma2:9b` by default).
+
+<Note>
+  The top-level `user:` block only configures delivery. Each turn's `user:`
+  field is the utterance itself, and is written the same way in both modes.
+</Note>
+
+### User input with `user:`
+
+**Text (the default).** Each turn's utterance is sent to the agent as text, bypassing its STT. This needs no configuration; it's equivalent to:
+
+```yaml
+user:
+  modality: text
+```
+
+**Audio.** Each turn's utterance is synthesized by a TTS the harness runs and streamed into your agent's pipeline at real-time cadence, exercising its VAD, turn detection, and STT exactly as a live microphone would. Synthesized audio is cached across runs, so repeated turns don't re-synthesize. The `speech:` block (the TTS service and voice) is required:
+
+```yaml
+user:
+  modality: audio
+  speech:
+    service: kokoro # local TTS, no API key, no per-run cost
+    voice: af_heart
+    sample_rate: 16000
+```
+
+<Note>
+  The built-in speech services are `kokoro`, a local model and the recommended
+  default, and `cartesia` (HTTP) when you want a cloud voice.
+</Note>
+
+### Judging with `judge:`
+
+**Text (the default).** The agent's TTS is skipped automatically, including any on-connect greeting, and the judge evaluates the LLM's text output. Fast and silent; equivalent to:
+
+```yaml
+judge:
+  modality: text
+```
+
+**Audio.** The agent speaks for real. The harness captures its synthesized audio, transcribes it with the configured STT, and the `response` event becomes that transcription, so the judge evaluates what a user would actually have heard. This is the true end-to-end check: STT in, LLM in the middle, TTS out. The `transcription:` block is required:
+
+```yaml
+judge:
+  modality: audio
+  transcription:
+    service: moonshine # STT for the agent's audio (or: whisper)
+    model: small-streaming
+  eval:
+    service: ollama # the judge LLM
+    model: gemma2:9b
+```
+
+<Note>
+  The built-in transcribers are `moonshine` and `whisper`, both local models.
+  When `transcription.service:` is omitted, it defaults to `moonshine`.
+</Note>
+
+In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma2:9b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`.
+
+### Custom services with `factory:`
+
+To use a TTS or STT beyond the built-ins, both blocks accept a `factory:` escape hatch: a dotted path to a callable that receives the block's mapping and the resolved sample rate, and returns the service. Any extra keys you put in the block are passed through to your factory:
+
+```yaml
+user:
+  modality: audio
+  speech:
+    factory: "my_evals.services.make_tts"
+    voice: luna # available to your factory as speech_cfg["voice"]
+
+judge:
+  modality: audio
+  transcription:
+    factory: "my_evals.services.make_stt"
+```
+
+```python my_evals/services.py
+import os
+
+from pipecat.services.fal.stt import FalSTTService
+from pipecat.services.rime.tts import RimeHttpTTSService
+
+
+def make_tts(speech_cfg, sample_rate):
+    return RimeHttpTTSService(
+        api_key=os.environ["RIME_API_KEY"],
+        settings=RimeHttpTTSService.Settings(voice=speech_cfg["voice"]),
+        sample_rate=sample_rate,
+    )
+
+
+def make_stt(transcription_cfg, sample_rate):
+    return FalSTTService(api_key=os.environ["FAL_KEY"])
+```
+
+<Note>
+  The service your factory returns must be a local model or an HTTP-based
+  service. WebSocket-streaming services aren't supported: they need a running
+  pipeline to manage their connection lifecycle, and keeping them out keeps the
+  evals code simple.
+</Note>
+
+For a fully custom setup (your own caching, a pre-built service instance), construct `EvalSpeech` or `EvalTranscriber` directly and inject them through the [library](/pipecat/evals/library).
+
+### Sharing config across scenarios
+
+Any value can be pulled from another file with `!include`, resolved relative to the scenario file. This keeps per-scenario noise down when a whole directory of scenarios shares the same audio setup:
+
+```yaml
+name: capital_question
+
+user: !include user_audio.yaml
+judge: !include judge_audio.yaml
+
+turns:
+  - user: "What is the capital of Germany?"
+    expect:
+      - event: response
+        eval: "the response says the capital of Germany is Berlin"
+```
+
+## Seed the conversation context with `reset:`
+
+Before driving the turns, the harness resets the agent's LLM context. By default the context is cleared; provide `reset:` to seed it with messages instead, which lets a scenario start mid-conversation:
+
+```yaml
+reset:
+  - role: developer
+    content: "The user has already introduced themselves as Alex."
+  - role: assistant
+    content: "Nice to meet you, Alex! How can I help?"
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Eval Suites"
+    icon="list-check"
+    iconType="duotone"
+    href="/pipecat/evals/suites"
+  >
+    Run many scenarios against many agents concurrently from a manifest.
+  </Card>
+
+  <Card
+    title="Using the Library"
+    icon="code"
+    iconType="duotone"
+    href="/pipecat/evals/library"
+  >
+    Load, build, and run scenarios from Python instead of YAML.
+  </Card>
+</CardGroup>

@@ -1,0 +1,168 @@
+---
+title: "Using the Library"
+description: "Run, build, and orchestrate evals from Python with the pipecat.evals API."
+---
+
+Everything the `pipecat eval` CLI does is available as a library under `pipecat.evals`. Use it to run evals from your own test runner (pytest, a CI script, a custom dashboard), to build scenarios in code instead of YAML, or to customize pieces like the judge LLM.
+
+## Running a scenario
+
+`EvalScenario.load()` parses a scenario file, and `EvalSession.from_scenario()` builds a ready-to-run session, constructing the judge, user speech, and transcriber the scenario calls for:
+
+```python
+import asyncio
+
+from pipecat.evals.harness import EvalSession
+from pipecat.evals.scenario import EvalScenario
+
+
+async def main():
+    scenario = EvalScenario.load("scenarios/capital_question.yaml")
+    session = EvalSession.from_scenario(scenario, "ws://localhost:7860")
+    result = await session.run()
+
+    if result.passed:
+        print(f"PASS ({result.duration_ms}ms)")
+    else:
+        for failure in result.failures:
+            print(f"  {failure}")
+
+
+asyncio.run(main())
+```
+
+The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`.
+
+### The result
+
+`run()` returns an `EvalResult`:
+
+| Field           | Description                                                                                 |
+| --------------- | ------------------------------------------------------------------------------------------- |
+| `scenario_name` | Name of the scenario that ran.                                                              |
+| `passed`        | Whether every assertion passed.                                                             |
+| `failures`      | The failed assertions, each with the turn index, expectation index, event name, and reason. |
+| `duration_ms`   | Wall-clock time the run took.                                                               |
+| `events_seen`   | Every semantic event observed, for diagnostics.                                             |
+| `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).    |
+| `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.  |
+
+This maps cleanly onto a pytest test:
+
+```python
+import pytest
+
+from pipecat.evals.harness import EvalSession
+from pipecat.evals.scenario import EvalScenario
+
+
+@pytest.mark.asyncio
+async def test_capital_question():
+    scenario = EvalScenario.load("scenarios/capital_question.yaml")
+    result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
+    assert result.passed, "\n".join(str(f) for f in result.failures)
+```
+
+## Building scenarios in code
+
+Scenarios are plain dataclasses, so you can construct them programmatically, generating turns from a dataset, parameterizing a template, or skipping YAML entirely:
+
+```python
+from pipecat.evals.scenario import EvalExpectation, EvalScenario, EvalTurn
+
+scenario = EvalScenario(
+    name="capital_question",
+    turns=[
+        EvalTurn(
+            user="What is the capital of Germany?",
+            expect=[
+                EvalExpectation(
+                    event="llm_response",
+                    eval="the response says the capital of Germany is Berlin",
+                )
+            ],
+        )
+    ],
+)
+```
+
+<Note>
+  The modality-agnostic `response` event is resolved while parsing YAML. When
+  constructing scenarios in code, use `llm_response` for text mode directly (or
+  `response` only when you also configure audio judging).
+</Note>
+
+## Customizing the judge
+
+`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` works with any Pipecat LLM service backed by an OpenAI-compatible API:
+
+```python
+import os
+
+from pipecat.evals.harness import EvalSession
+from pipecat.evals.judge import EvalJudge
+from pipecat.services.openai.llm import OpenAILLMService
+
+llm = OpenAILLMService(
+    api_key=os.environ["OPENAI_API_KEY"],
+    settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+)
+
+session = EvalSession.from_scenario(
+    scenario,
+    "ws://localhost:7860",
+    judge=EvalJudge(llm),
+)
+```
+
+The same injection points exist for the user's synthesized voice (`speech=`, wrapping any `TTSService` in an `EvalSpeech`) and the transcriber used for the agent's spoken audio (`transcriber=`, wrapping any `STTService` in an `EvalTranscriber`). The wrapped services can be local models or HTTP-based; WebSocket-streaming services are rejected, since they need a running pipeline to manage their connection lifecycle.
+
+## Observing progress
+
+Pass `on_progress` to get a callback as each turn and expectation resolves, which is how the CLI implements its `--verbose` output:
+
+```python
+from pipecat.evals.harness import EvalSession, EvalTurnProgress
+
+
+def show(p: EvalTurnProgress):
+    print(f"turn {p.turn_index} [{p.status}] {p.event_name} {p.detail}")
+
+
+session = EvalSession.from_scenario(scenario, url, on_progress=show)
+```
+
+## Orchestrating suites
+
+`EvalManifest` and `EvalSuite` are the library behind `pipecat eval suite`: the suite spawns each agent with its eval transport on its own port, runs its scenarios, and executes several runs concurrently:
+
+```python
+import asyncio
+from pathlib import Path
+
+from pipecat.evals.suite import EvalManifest, EvalSuite
+
+
+async def main():
+    manifest = EvalManifest.load("manifest.yaml")
+    suite = EvalSuite(manifest)
+
+    # Optionally narrow the runs, like the CLI's -p / -s flags.
+    suite.filter(pattern="support")
+
+    await suite.run(
+        Path("eval-runs/logs"),
+        on_update=lambda run: print(run.bot, run.scenario, run.status),
+    )
+
+    for run in suite.runs:
+        verdict = run.error or ("passed" if run.result and run.result.passed else "failed")
+        print(f"{run.bot} / {run.scenario}: {verdict}")
+
+
+asyncio.run(main())
+```
+
+Each run is mutated in place as it executes (`status`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`.
+
+`EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, and so on), mirroring the CLI flags.
