@@ -90,19 +90,46 @@ task = PipelineWorker(
 </ParamField>
 
 <ParamField path="bot_output_transforms" default="None">
-A list of tuples to transform text just before sending it to TTS. Each tuple should be of the form `(aggregation_type, transform_function)`, where `aggregation_type` is a string (or `'*'` for all types), and `transform_function` is a callable that takes `(text, aggregation_type)` and returns the transformed text.
+A list of tuples to transform text before sending it to the client. Each tuple should be of the form `(aggregation_type, transform_function)`.
+
+The preferred transform signature is:
+
+```python
+async def my_transform(
+    text: str,
+    agg_type: AggregationType | str,
+    accumulated_text: str | None = None,
+    remaining_text: str | None = None,
+) -> BotOutputTransformResult:
+    ...
+```
+
+When `accumulated_text` and `remaining_text` are `None`, the transform is being called for the full segment text (`bot-output` message). When they are provided, the transform is being called for a progress event and must return a `BotOutputTransformResult` with `accumulated_text` and `remaining_text` set, enabling word-level transforms on the client side.
+
+The legacy 2-parameter signature `(text, agg_type) -> str` is deprecated but still works. Transforms using it will emit a `DeprecationWarning` at registration time.
 
 **Example:**
 
 ```python
-def redact_sensitive(text, agg_type):
-    # Example: redact numbers
+from pipecat.processors.frameworks.rtvi import BotOutputTransformResult
+
+async def redact_sensitive(text, agg_type, accumulated_text=None, remaining_text=None):
     import re
-    return re.sub(r"\d+", "[REDACTED]", text)
+    # Transform the full text
+    redacted = re.sub(r"\d{4}", "****", text)
+    
+    # If this is a progress event, also transform the partial strings
+    if accumulated_text is not None and remaining_text is not None:
+        return BotOutputTransformResult(
+            text=redacted,
+            accumulated_text=re.sub(r"\d{4}", "****", accumulated_text),
+            remaining_text=re.sub(r"\d{4}", "****", remaining_text),
+        )
+    return BotOutputTransformResult(text=redacted)
 
 bot_output_transforms = [
-    ("credit_card", redact_sensitive),  # Only for 'credit_card' type
-    ("*", lambda text, agg_type: text.upper()),  # For all types, make uppercase
+    ("sentence", redact_sensitive),  # Only for 'sentence' type
+    ("*", my_other_transform),  # For all types
 ]
 
 observer = RTVIObserver(
