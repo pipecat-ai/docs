@@ -7,7 +7,7 @@ description: "Text-to-speech service implementation using NVIDIA Nemotron Speech
 
 NVIDIA Nemotron Speech provides three TTS service implementations:
 
-- **`NvidiaTTSService`** -- High-quality TTS via NVIDIA's cloud-based gRPC API with multilingual support, configurable quality settings, and cross-sentence audio stitching.
+- **`NvidiaTTSService`** -- High-quality TTS using both locally deployed and cloud-based NVIDIA TTS models. Supports multilingual synthesis, configurable quality settings, per-sentence and stitched synthesis modes, and zero-shot voice cloning.
 - **`NvidiaSageMakerHTTPTTSService`** -- Single HTTP invocation to an AWS SageMaker endpoint, streaming raw PCM audio back for each text segment.
 - **`NvidiaSageMakerTTSService`** -- Persistent HTTP/2 bidi-stream to an AWS SageMaker endpoint with full interruption support via `InterruptibleTTSService`.
 
@@ -114,6 +114,27 @@ _Deprecated in v0.0.105. Use `settings=NvidiaTTSService.Settings(...)` instead._
 </ParamField>
 
 <ParamField
+  path="zero_shot_audio_prompt_file"
+  type="str | os.PathLike[str]"
+  default="None"
+>
+  Optional audio prompt file for Magpie zero-shot voice cloning. NVIDIA
+  recommends a 16-bit mono WAV prompt, sample rate 22.05 kHz or higher, and
+  duration 3 to 10 seconds. Access to NVIDIA's hosted zero-shot models requires
+  approval through [NVIDIA Riva TTS Zero-Shot
+  Models](https://developer.nvidia.com/riva-tts-zeroshot-models).
+</ParamField>
+
+<ParamField
+  path="audio_prompt_encoding"
+  type="AudioEncoding"
+  default="AudioEncoding.ENCODING_UNSPECIFIED"
+>
+  Audio encoding for `zero_shot_audio_prompt_file`. Use this when the server
+  expects a specific prompt encoding for Magpie zero-shot voice cloning.
+</ParamField>
+
+<ParamField
   path="encoding"
   type="AudioEncoding"
   default="AudioEncoding.LINEAR_PCM"
@@ -137,12 +158,13 @@ _Deprecated in v0.0.105. Use `settings=NvidiaTTSService.Settings(...)` instead._
 
 Runtime-configurable settings passed via the `settings` constructor argument using `NvidiaTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter  | Type              | Default     | Description                            |
-| ---------- | ----------------- | ----------- | -------------------------------------- |
-| `model`    | `str`             | `None`      | Model identifier. _(Inherited.)_       |
-| `voice`    | `str`             | `None`      | Voice identifier. _(Inherited.)_       |
-| `language` | `Language \| str` | `None`      | Language for synthesis. _(Inherited.)_ |
-| `quality`  | `int`             | `NOT_GIVEN` | Audio quality setting.                 |
+| Parameter          | Type                        | Default                                       | Description                                                                                  |
+| ------------------ | --------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `model`            | `str`                       | `None`                                        | Model identifier. _(Inherited.)_                                                             |
+| `voice`            | `str`                       | `None`                                        | Voice identifier. _(Inherited.)_                                                             |
+| `language`         | `Language \| str`           | `None`                                        | Language for synthesis. _(Inherited.)_                                                       |
+| `quality`          | `int`                       | `NOT_GIVEN`                                   | Audio quality setting (0-100). For Magpie zero-shot, NVIDIA expects values in range 1 to 40. |
+| `synthesis_mode`   | `NvidiaTTSSynthesisMode`    | `NvidiaTTSSynthesisMode.PER_SENTENCE`         | Whether to synthesize one sentence per request or stitch multiple sentences in one stream.   |
 
 ## Usage
 
@@ -185,8 +207,11 @@ tts = NvidiaTTSService(
 ## Notes
 
 - **gRPC-based**: NVIDIA Nemotron Speech uses gRPC (not HTTP or WebSocket) for communication with the TTS service.
-- **Cross-sentence stitching**: Multiple sentences within an LLM turn are fed into a single `SynthesizeOnline` gRPC stream for seamless audio across sentence boundaries (requires Magpie TTS model v1.7.0+).
-- **Runtime settings updates**: Voice, language, and quality can be updated mid-conversation with `TTSUpdateSettingsFrame`. New values take effect on the next synthesis turn, not for the current turn's in-flight requests.
+- **Synthesis modes**: The service supports two synthesis modes via the `synthesis_mode` setting:
+  - `PER_SENTENCE` (default): Opens a separate `SynthesizeOnline` call for each sentence. Compatible with all NVIDIA TTS NIMs, including Chatterbox, Magpie multilingual, and Magpie zero-shot.
+  - `STITCHED`: Reuses one `SynthesizeOnline` stream across multiple sentences within the same LLM response for improved multi-sentence synthesis quality. Only use with models that support cross-sentence stitching, such as Magpie multilingual and Magpie zero-shot v1.7.0 or later.
+- **Zero-shot voice cloning**: Magpie zero-shot models support voice cloning via the `zero_shot_audio_prompt_file` parameter. NVIDIA recommends a 16-bit mono WAV prompt (22.05 kHz or higher, 3-10 seconds duration). Access to hosted zero-shot models requires approval.
+- **Runtime settings updates**: Voice, language, quality, and synthesis mode can be updated mid-conversation with `TTSUpdateSettingsFrame`. New values take effect on the next synthesis turn, not for the current turn's in-flight requests.
 - **Model cannot be changed after initialization**: The model and function ID must be set during construction via `model_function_map`. Calling `set_model()` after initialization will log a warning and have no effect.
 - **SSL enabled by default**: The service connects to NVIDIA's cloud endpoint with SSL. Set `use_ssl=False` only for local or custom Nemotron Speech deployments.
 - **Metrics generation**: This service supports metric generation via `can_generate_metrics()`. Metrics are automatically stopped when an audio context is interrupted.
