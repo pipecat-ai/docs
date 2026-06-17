@@ -292,17 +292,54 @@ turns:
         eval: "the response says the capital of Germany is Berlin"
 ```
 
-## Seed the conversation context with `reset:`
+## Seed the conversation context with `context:`
 
-Before driving the turns, the harness resets the agent's LLM context. By default the context is cleared; provide `reset:` to seed it with messages instead, which lets a scenario start mid-conversation:
+By default the harness leaves the bot's LLM context alone: whatever the bot sets up for itself — for example, a system prompt added in its connect handler — is what the scenario runs against. Provide `context:` to replace that with messages of your own, which lets a scenario start mid-conversation:
 
 ```yaml
-reset:
+context:
   - role: developer
     content: "The user has already introduced themselves as Alex."
   - role: assistant
     content: "Nice to meet you, Alex! How can I help?"
 ```
+
+The harness sends these right after the bot-ready handshake as an `LLMMessagesUpdateFrame` that replaces the bot's context wholesale. Omit `context:` and the harness sends nothing, leaving the bot's own context in place.
+
+## Running scenarios back to back
+
+By default the bot keeps running between scenarios. When a scenario ends its eval connection closes, but the eval transport suppresses the bot's `on_client_disconnected` handler, so the pipeline stays up to serve the next scenario. This is what lets `pipecat eval run a.yaml b.yaml c.yaml` drive a whole list against one bot instance with no reboot between them, which keeps a run fast.
+
+The trade-off is that anything the bot accumulated in one scenario is still there for the next. For results to be independent, each scenario has to start from a clean slate, and clearing that state is split between the harness and your bot:
+
+- **Conversation context** — seed or clear it per scenario with [`context:`](#seed-the-conversation-context-with-context). The harness replaces the bot's LLM context with the messages you provide (via an `LLMMessagesUpdateFrame`); without it, the previous conversation carries forward, which is rarely what you want across independent scenarios.
+- **Application state** — counters, flags, cached data, anything your bot holds outside the LLM context. The harness can't see this, so resetting it is your bot's job. A common place is the bot's connect handler, which runs again for each scenario's connection.
+
+### Exercising the disconnect path
+
+Some bots do meaningful work in `on_client_disconnected` — a goodbye message, session teardown, resource cleanup. Because that handler is suppressed by default, set `trigger_disconnect: true` on a scenario to fire it when that scenario ends:
+
+```yaml
+name: test_goodbye_on_disconnect
+trigger_disconnect: true
+
+turns:
+  - user: "Thanks for your help!"
+    expect:
+      - event: response
+        eval: "the agent acknowledges the thanks"
+  # on_client_disconnected fires after this turn, so the agent can
+  # send a goodbye message or clean up resources.
+```
+
+Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with `trigger_disconnect: true` usually ends the bot process — treat it as a terminal run, last in a list.
+
+<Note>
+  Enable it for every scenario in a run with `pipecat eval run
+  --trigger-disconnect`; a scenario's own `trigger_disconnect` field still takes
+  precedence. This is independent of `--stop-bot`, which tears the bot down via
+  an `eval-cancel` message regardless of the disconnect handler.
+</Note>
 
 ## Next steps
 
