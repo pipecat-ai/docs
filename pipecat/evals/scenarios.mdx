@@ -29,11 +29,11 @@ turns: # required: the conversation, in order
 
 Each turn optionally sends a user utterance (`user:`) and lists the events expected in response (`expect:`). Expected events must arrive in the order listed, but the agent may emit other events in between, so you don't have to enumerate everything it does.
 
-The rest of this page is in four parts: [Configuration](#configuration) for scenario-wide setup (modalities, the judge, context, lifecycle), then [Input](#input) for driving each turn, and [Events](#events) and [Assertions](#assertions) for checking what the agent emits.
+The rest of this page is in four parts: [Configuration](#configuration) for scenario-wide setup (modalities, the judge, context, lifecycle), then [User turns](#user-turns) for driving each turn, and [Events](#events) and [Assertions](#assertions) for checking what the agent emits.
 
 ## Configuration
 
-Everything in this section is optional. A scenario with no configuration blocks runs entirely in [text mode](#text-and-audio-modes) with the default judge, which is the fastest way to start. To write the turns themselves, skip ahead to [Input](#input) and [Events](#events).
+Everything in this section is optional. A scenario with no configuration blocks runs entirely in [text mode](#text-and-audio-modes) with the default judge, which is the fastest way to start. To write the turns themselves, skip ahead to [User turns](#user-turns) and [Events](#events).
 
 ### Text and audio modes
 
@@ -217,11 +217,11 @@ Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with
   an `eval-cancel` message regardless of the disconnect handler.
 </Note>
 
-## Input
+## User turns
 
-Each turn drives the agent one of three ways: a spoken `user:` utterance, a `dtmf:` keypress sequence, or no input at all (observation-only). `send_after:` controls when that input is sent.
+Each turn drives the agent by speaking (a `user:` utterance) or pressing keys (a `dtmf:` sequence); the two are mutually exclusive. A turn can also register an `image:`, or be observation-only with no input. `send_after:` controls when the input is sent.
 
-### User turns
+### Utterances with `user:`
 
 Each turn's `user:` field is the user's utterance for that turn, a plain string. You write it the same way in both modes; whether it's delivered as text or synthesized into real speech is set once by the [`user:` block](#user-delivery-with-user), not per turn.
 
@@ -235,7 +235,7 @@ turns:
         eval: "the bot opens the conversation with a greeting or an offer to help"
 ```
 
-### DTMF turns
+### DTMF keypresses with `dtmf:`
 
 Instead of a `user:` utterance, a turn can press phone keypad keys with `dtmf:`. The two are mutually exclusive: a turn either speaks or presses keys. This drives keypad menus (IVR) and any agent that reacts to telephony tones:
 
@@ -260,7 +260,7 @@ Each character is sent as one `InputDTMFFrame`, the same path a telephony transp
 
 A bot running a [`DTMFAggregator`](/api-reference/server/utilities/dtmf-aggregator) accumulates the keys and flushes them into a `DTMF: ...` transcription, which (with the default transcription-based turn-start strategy) drives a full user turn: `user_started_speaking`, `user_transcription`, `user_stopped_speaking`, and the agent's response. So a `dtmf:` turn can assert on `user_transcription` and `response` just like a spoken turn.
 
-The aggregator flushes either on the `#` terminator or on its idle timeout. To exercise the idle-timeout path, omit the `#` and pace the keys with a time-based [`send_after:`](#scheduling-input-with-send_after):
+The aggregator flushes either on the `#` terminator or on its idle timeout. To exercise the idle-timeout path, omit the `#` and pace the keys with a time-based [`send_after:`](#scheduling-with-send_after):
 
 ```yaml
 turns:
@@ -279,7 +279,7 @@ turns:
 
 Like any input turn, `expect:` is optional on a `dtmf:` turn: omit it for a turn that only presses keys, with the assertion living on a later turn.
 
-### Vision turns
+### Vision with `image:`
 
 A turn may register an image with `image:` (a path relative to the scenario file). When a vision agent requests a user image during the turn, the eval transport serves it:
 
@@ -292,9 +292,9 @@ turns:
         eval: "the response describes a cat"
 ```
 
-### Scheduling input with `send_after:`
+### Scheduling with `send_after:`
 
-`send_after:` controls when a turn's input (its `user:` utterance or [`dtmf:`](#dtmf-turns) keypresses) is sent, either relative to a prior event or after a plain delay. Anchoring it to an event is how you script barge-in tests:
+`send_after:` controls when a turn's input (its `user:` utterance or [`dtmf:`](#dtmf-keypresses-with-dtmf) keypresses) is sent, either relative to a prior event or after a plain delay. Anchoring it to an event is how you script barge-in tests:
 
 ```yaml
 turns:
@@ -312,7 +312,7 @@ turns:
         eval: "the response says the capital of Japan is Tokyo, instead of continuing the Paris story"
 ```
 
-The `event:` anchor is optional. A bare `send_after: { delay_ms: 500 }` is a pure time delay measured from the previous turn's send, with no event to wait on. This is handy for pacing turns by time rather than off a bot event (for example, spacing out [DTMF keypresses](#dtmf-turns) to exercise an aggregator's idle-timeout flush):
+The `event:` anchor is optional. A bare `send_after: { delay_ms: 500 }` is a pure time delay measured from the previous turn's send, with no event to wait on. This is handy for pacing turns by time rather than off a bot event (for example, spacing out [DTMF keypresses](#dtmf-keypresses-with-dtmf) to exercise an aggregator's idle-timeout flush):
 
 ```yaml
 turns:
@@ -329,16 +329,16 @@ A `send_after:` with no `event:` and a zero `delay_ms` is rejected as a no-op: g
 
 Scenarios assert on a small set of semantic events, mapped from the RTVI messages the agent emits:
 
-| Event                   | Meaning                                                                                                                                                                        |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `response`              | The agent's reply. In audio mode this is a transcription of the agent's actual synthesized speech; in text mode it resolves to `llm_response`. Prefer this for content checks. |
-| `llm_response`          | The LLM's text output for the turn. Available in both modes.                                                                                                                   |
-| `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                     |
-| `llm_started`           | The LLM began generating a response.                                                                                                                                           |
-| `function_call`         | The LLM called a function.                                                                                                                                                     |
-| `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-turns), where the aggregated keys become a transcription in either mode.  |
-| `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode, or a [DTMF turn](#dtmf-turns) in either mode.                                                                   |
-| `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode, or a [DTMF turn](#dtmf-turns) in either mode.                                                                     |
+| Event                   | Meaning                                                                                                                                                                                      |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `response`              | The agent's reply. In audio mode this is a transcription of the agent's actual synthesized speech; in text mode it resolves to `llm_response`. Prefer this for content checks.               |
+| `llm_response`          | The LLM's text output for the turn. Available in both modes.                                                                                                                                 |
+| `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                                   |
+| `llm_started`           | The LLM began generating a response.                                                                                                                                                         |
+| `function_call`         | The LLM called a function.                                                                                                                                                                   |
+| `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-keypresses-with-dtmf), where the aggregated keys become a transcription in either mode. |
+| `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                  |
+| `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                    |
 
 <Tip>
   Use `response` for the agent's reply unless you have a reason not to. It's
@@ -350,7 +350,7 @@ Scenarios assert on a small set of semantic events, mapped from the RTVI message
 
 Each entry in `expect:` names an event and, optionally, asserts on its content or timing.
 
-### Semantic judging with `eval`
+### Semantic judging with `eval:`
 
 The `eval:` field is a natural-language criterion that the event's text must satisfy, decided by the [judge LLM](#judging-with-judge):
 
@@ -367,9 +367,9 @@ The judge handles interim replies gracefully: if the agent says "Let me check on
 
 `eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`).
 
-### Substring checks with `text_contains`
+### Substring checks with `text_contains:`
 
-For exact content, `text_contains` does a plain substring check, with no judge round-trip:
+For exact content, `text_contains:` does a plain substring check, with no judge round-trip:
 
 ```yaml
 - user: "What is the capital of France?"
@@ -378,9 +378,9 @@ For exact content, `text_contains` does a plain substring check, with no judge r
       text_contains: "Paris"
 ```
 
-### Latency budgets with `within_ms`
+### Latency budgets with `within_ms:`
 
-`within_ms` bounds how long after the turn's user send the event may arrive. All of a turn's expectations share that one anchor:
+`within_ms:` bounds how long after the turn's user send the event may arrive. All of a turn's expectations share that one anchor:
 
 ```yaml
 - user: "What is the capital of France?"
