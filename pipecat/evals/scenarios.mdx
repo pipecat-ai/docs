@@ -1,6 +1,6 @@
 ---
 title: "Writing Scenarios"
-description: "The scenario file format: turns, expectations, assertions, and text vs audio modes."
+description: "The scenario file format: configuration, turns, events, and assertions."
 ---
 
 A scenario is a YAML file describing a scripted conversation and the events you expect your agent to emit. This page covers the full format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
@@ -21,7 +21,7 @@ turns: # required: the conversation, in order
       - event: response
         eval: "acknowledges the user's message (the name Alex and/or the trip to Italy)"
 
-  - user: "Remind me — what's my name and where am I going?"
+  - user: "Remind me, what's my name and where am I going?"
     expect:
       - event: response
         eval: "recalls that the user's name is Alex and the destination is Italy"
@@ -29,138 +29,28 @@ turns: # required: the conversation, in order
 
 Each turn optionally sends a user utterance (`user:`) and lists the events expected in response (`expect:`). Expected events must arrive in the order listed, but the agent may emit other events in between, so you don't have to enumerate everything it does.
 
-A turn without a `user:` field is observation-only: the harness just waits for the expected events. This is how you test agent-first behavior like an on-connect greeting:
+The rest of this page is in four parts:
 
-```yaml
-turns:
-  # No user input: just wait for the agent to speak first.
-  - expect:
-      - event: response
-        eval: "the bot opens the conversation with a greeting or an offer to help"
-```
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="#configuration">
+    Scenario-wide setup: modalities, the judge, context, and lifecycle.
+  </Card>
+  <Card title="User turns" icon="comments" href="#user-turns">
+    Drive each turn with an utterance, keypresses, an image, or timing.
+  </Card>
+  <Card title="Events" icon="bolt" href="#events">
+    The semantic events the agent emits, and what each one means.
+  </Card>
+  <Card title="Assertions" icon="circle-check" href="#assertions">
+    Check an event's content or timing with `eval:`, `text_contains:`, and more.
+  </Card>
+</CardGroup>
 
-## Events
+## Configuration
 
-Scenarios assert on a small set of semantic events, mapped from the RTVI messages the agent emits:
+Everything in this section is optional. A scenario with no configuration blocks runs entirely in [text mode](#text-and-audio-modes) with the default judge, which is the fastest way to start. To write the turns themselves, skip ahead to [User turns](#user-turns) and [Events](#events).
 
-| Event                   | Meaning                                                                                                                                                                        |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `response`              | The agent's reply. In audio mode this is a transcription of the agent's actual synthesized speech; in text mode it resolves to `llm_response`. Prefer this for content checks. |
-| `llm_response`          | The LLM's text output for the turn. Available in both modes.                                                                                                                   |
-| `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                     |
-| `llm_started`           | The LLM began generating a response.                                                                                                                                           |
-| `function_call`         | The LLM called a function.                                                                                                                                                     |
-| `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only.                                                                                                        |
-| `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode only.                                                                                                            |
-| `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode only.                                                                                                              |
-
-<Tip>
-  Use `response` for the agent's reply unless you have a reason not to. It's
-  modality-agnostic: the same scenario judges LLM text in text mode and the
-  transcription of real spoken audio in audio mode, so one file covers both.
-</Tip>
-
-## Assertions
-
-Each entry in `expect:` names an event and, optionally, asserts on its content or timing.
-
-### Semantic judging with `eval`
-
-The `eval:` field is a natural-language criterion that the event's text must satisfy, decided by the judge LLM:
-
-```yaml
-- user: "What's 2 plus 2?"
-  expect:
-    - event: response
-      eval: "the response says the answer is four"
-```
-
-The judge sees the whole conversation so far, so it can resolve terse or context-dependent replies (like "That's four"). It also understands that audio-mode responses come from a speech-to-text pass and judges intended meaning rather than exact spelling, so "for" transcribed instead of "four" still passes.
-
-The judge handles interim replies gracefully: if the agent says "Let me check on that." before the real answer, the harness keeps accumulating response text and re-judges until the criterion is met or the time budget runs out.
-
-`eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`).
-
-### Substring checks with `text_contains`
-
-For exact content, `text_contains` does a plain substring check, with no judge round-trip:
-
-```yaml
-- user: "What is the capital of France?"
-  expect:
-    - event: response
-      text_contains: "Paris"
-```
-
-### Latency budgets with `within_ms`
-
-`within_ms` bounds how long after the turn's user send the event may arrive. All of a turn's expectations share that one anchor:
-
-```yaml
-- user: "What is the capital of France?"
-  expect:
-    - event: llm_started
-      within_ms: 2000 # the LLM must start responding within 2s
-    - event: response
-      text_contains: "Paris"
-```
-
-When omitted, an expectation defaults to a generous 60 second budget (configurable with `--timeout`), so timing is only asserted when you ask for it.
-
-Because every deadline is measured from the send, time spent matching earlier expectations counts against later ones. In the example above, if `llm_started` arrives at 1.5 seconds, the `response` (with the default 60 second budget) has 58.5 seconds left, and a turn that stalls completely fails within a single budget rather than one per expectation.
-
-### Function calls
-
-A `function_call` expectation asserts that the turn invoked one or more tools. List the expected calls under `calls:`; they're matched by name in any order, and the expectation passes once all are found:
-
-```yaml
-- user: "What's the weather in San Francisco? And recommend a restaurant."
-  expect:
-    - event: function_call
-      calls:
-        - name: get_current_weather
-          args: { location: "San Francisco" }
-        - name: get_restaurant_recommendation
-    - event: response
-      eval: "describes the weather and recommends a restaurant"
-```
-
-`args` is a subset check: every listed key/value must be present in the call's arguments, and extra arguments are ignored. A single expected call can use the `name:`/`args:` shorthand directly on the expectation, and a bare `function_call` with neither just asserts that some call happened.
-
-## Interruptions
-
-`send_after:` schedules a turn's user send relative to a prior event, which is how you script barge-in tests:
-
-```yaml
-turns:
-  - user: "Tell me a long, detailed story about the history of Paris."
-    expect:
-      - event: llm_started
-
-  # Interrupt 2 seconds after the agent starts its long answer.
-  - user: "Actually, never mind that — what's the capital of Japan?"
-    send_after:
-      event: llm_started
-      delay_ms: 2000
-    expect:
-      - event: response
-        eval: "the response says the capital of Japan is Tokyo, instead of continuing the Paris story"
-```
-
-## Vision turns
-
-A turn may register an image with `image:` (a path relative to the scenario file). When a vision agent requests a user image during the turn, the eval transport serves it:
-
-```yaml
-turns:
-  - user: "What do you see in this image?"
-    image: assets/cat.jpg
-    expect:
-      - event: response
-        eval: "the response describes a cat"
-```
-
-## Text and audio modes
+### Text and audio modes
 
 Two top-level blocks control a scenario's modalities, and each has its own `modality:` field:
 
@@ -172,11 +62,12 @@ When `modality:` isn't specified, or a block is omitted entirely, it defaults to
 A scenario with neither block runs entirely in text mode. No audio flows on either side, so this is the fastest and cheapest way to test prompts, conversational logic, and function calling: no audio service cost, and a multi-turn scenario finishes in seconds. The judge LLM is the only service the harness itself needs (Ollama with `gemma2:9b` by default).
 
 <Note>
-  The top-level `user:` block only configures delivery. Each turn's `user:`
-  field is the utterance itself, and is written the same way in both modes.
+  The top-level `user:` block here only configures delivery. Each turn's `user:`
+  field (see [User turns](#user-turns)) is the utterance itself, and is written
+  the same way in both modes.
 </Note>
 
-### User input with `user:`
+### User delivery with `user:`
 
 **Text (the default).** Each turn's utterance is sent to the agent as text, bypassing its STT. This needs no configuration; it's equivalent to:
 
@@ -228,7 +119,7 @@ judge:
   When `transcription.service:` is omitted, it defaults to `moonshine`.
 </Note>
 
-In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma2:9b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`.
+In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma2:9b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`. This is the LLM that decides [`eval:`](#semantic-judging-with-eval) assertions.
 
 ### Custom services with `factory:`
 
@@ -275,7 +166,21 @@ def make_stt(transcription_cfg, sample_rate):
 
 For a fully custom setup (your own caching, a pre-built service instance), construct `EvalSpeech` or `EvalTranscriber` directly and inject them through the [library](/pipecat/evals/library).
 
-### Sharing config across scenarios
+### Seeding the context with `context:`
+
+By default the harness leaves the bot's LLM context alone: whatever the bot sets up for itself (for example, a system prompt added in its connect handler) is what the scenario runs against. Provide `context:` to replace that with messages of your own, which lets a scenario start mid-conversation:
+
+```yaml
+context:
+  - role: developer
+    content: "The user has already introduced themselves as Alex."
+  - role: assistant
+    content: "Nice to meet you, Alex! How can I help?"
+```
+
+The harness sends these right after the bot-ready handshake as an `LLMMessagesUpdateFrame` that replaces the bot's context wholesale. Omit `context:` and the harness sends nothing, leaving the bot's own context in place.
+
+### Sharing config with `!include`
 
 Any value can be pulled from another file with `!include`, resolved relative to the scenario file. This keeps per-scenario noise down when a whole directory of scenarios shares the same audio setup:
 
@@ -292,32 +197,18 @@ turns:
         eval: "the response says the capital of Germany is Berlin"
 ```
 
-## Seed the conversation context with `context:`
-
-By default the harness leaves the bot's LLM context alone: whatever the bot sets up for itself — for example, a system prompt added in its connect handler — is what the scenario runs against. Provide `context:` to replace that with messages of your own, which lets a scenario start mid-conversation:
-
-```yaml
-context:
-  - role: developer
-    content: "The user has already introduced themselves as Alex."
-  - role: assistant
-    content: "Nice to meet you, Alex! How can I help?"
-```
-
-The harness sends these right after the bot-ready handshake as an `LLMMessagesUpdateFrame` that replaces the bot's context wholesale. Omit `context:` and the harness sends nothing, leaving the bot's own context in place.
-
-## Running scenarios back to back
+### Running scenarios back to back
 
 By default the bot keeps running between scenarios. When a scenario ends its eval connection closes, but the eval transport suppresses the bot's `on_client_disconnected` handler, so the pipeline stays up to serve the next scenario. This is what lets `pipecat eval run a.yaml b.yaml c.yaml` drive a whole list against one bot instance with no reboot between them, which keeps a run fast.
 
 The trade-off is that anything the bot accumulated in one scenario is still there for the next. For results to be independent, each scenario has to start from a clean slate, and clearing that state is split between the harness and your bot:
 
-- **Conversation context** — seed or clear it per scenario with [`context:`](#seed-the-conversation-context-with-context). The harness replaces the bot's LLM context with the messages you provide (via an `LLMMessagesUpdateFrame`); without it, the previous conversation carries forward, which is rarely what you want across independent scenarios.
-- **Application state** — counters, flags, cached data, anything your bot holds outside the LLM context. The harness can't see this, so resetting it is your bot's job. A common place is the bot's connect handler, which runs again for each scenario's connection.
+- **Conversation context**: seed or clear it per scenario with [`context:`](#seeding-the-context-with-context). The harness replaces the bot's LLM context with the messages you provide (via an `LLMMessagesUpdateFrame`); without it, the previous conversation carries forward, which is rarely what you want across independent scenarios.
+- **Application state**: counters, flags, cached data, anything your bot holds outside the LLM context. The harness can't see this, so resetting it is your bot's job. A common place is the bot's connect handler, which runs again for each scenario's connection.
 
 ### Exercising the disconnect path
 
-Some bots do meaningful work in `on_client_disconnected` — a goodbye message, session teardown, resource cleanup. Because that handler is suppressed by default, set `trigger_disconnect: true` on a scenario to fire it when that scenario ends:
+Some bots do meaningful work in `on_client_disconnected`, like a goodbye message, session teardown, or resource cleanup. Because the eval transport suppresses that handler by default, set `trigger_disconnect: true` on a scenario to fire it when that scenario ends:
 
 ```yaml
 name: test_goodbye_on_disconnect
@@ -332,7 +223,7 @@ turns:
   # send a goodbye message or clean up resources.
 ```
 
-Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with `trigger_disconnect: true` usually ends the bot process — treat it as a terminal run, last in a list.
+Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with `trigger_disconnect: true` usually ends the bot process. Treat it as a terminal run, last in a list.
 
 <Note>
   Enable it for every scenario in a run with `pipecat eval run
@@ -340,6 +231,202 @@ Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with
   precedence. This is independent of `--stop-bot`, which tears the bot down via
   an `eval-cancel` message regardless of the disconnect handler.
 </Note>
+
+## User turns
+
+Each turn drives the agent by speaking (a `user:` utterance) or pressing keys (a `dtmf:` sequence); the two are mutually exclusive. A turn can also register an `image:`, or be observation-only with no input. `send_after:` controls when the input is sent.
+
+### Utterances with `user:`
+
+Each turn's `user:` field is the user's utterance for that turn, a plain string. You write it the same way in both modes; whether it's delivered as text or synthesized into real speech is set once by the [`user:` block](#user-delivery-with-user), not per turn.
+
+A turn without a `user:` field is observation-only: the harness just waits for the expected events. This is how you test agent-first behavior like an on-connect greeting:
+
+```yaml
+turns:
+  # No user input: just wait for the agent to speak first.
+  - expect:
+      - event: response
+        eval: "the bot opens the conversation with a greeting or an offer to help"
+```
+
+### DTMF keypresses with `dtmf:`
+
+Instead of a `user:` utterance, a turn can press phone keypad keys with `dtmf:`. The two are mutually exclusive: a turn either speaks or presses keys. This drives keypad menus (IVR) and any agent that reacts to telephony tones:
+
+```yaml
+turns:
+  - dtmf: "123#"
+    expect:
+      - event: user_transcription
+        text_contains: "DTMF: 123#"
+      - event: response
+        eval: "confirms the entered digits"
+```
+
+Each character is sent as one `InputDTMFFrame`, the same path a telephony transport's keypress takes, regardless of the scenario's `user:`/`judge:` modality. Valid characters are the keypad entries `0`-`9`, `*`, and `#`; any other character is a parse error.
+
+<Warning>
+  Quote the value in YAML (`dtmf: "123#"`). An unquoted `#` starts a YAML
+  comment, so `dtmf: 123#` would silently drop the `#`. An unquoted all-digit
+  sequence (`dtmf: 123`) is coerced to a string for you, but quoting is the safe
+  habit.
+</Warning>
+
+A bot running a [`DTMFAggregator`](/api-reference/server/utilities/dtmf-aggregator) accumulates the keys and flushes them into a `DTMF: ...` transcription, which (with the default transcription-based turn-start strategy) drives a full user turn: `user_started_speaking`, `user_transcription`, `user_stopped_speaking`, and the agent's response. So a `dtmf:` turn can assert on `user_transcription` and `response` just like a spoken turn.
+
+The aggregator flushes either on the `#` terminator or on its idle timeout. To exercise the idle-timeout path, omit the `#` and pace the keys with a time-based [`send_after:`](#scheduling-with-send_after):
+
+```yaml
+turns:
+  # Flushes immediately on the '#' terminator.
+  - dtmf: "1#"
+    expect:
+      - event: response
+        eval: "states the business hours"
+
+  # No terminator: the aggregator flushes on its idle timeout instead.
+  - dtmf: "2"
+    expect:
+      - event: response
+        eval: "gives the office location"
+```
+
+Like any input turn, `expect:` is optional on a `dtmf:` turn: omit it for a turn that only presses keys, with the assertion living on a later turn.
+
+### Vision with `image:`
+
+A turn may register an image with `image:` (a path relative to the scenario file). When a vision agent requests a user image during the turn, the eval transport serves it:
+
+```yaml
+turns:
+  - user: "What do you see in this image?"
+    image: assets/cat.jpg
+    expect:
+      - event: response
+        eval: "the response describes a cat"
+```
+
+### Scheduling with `send_after:`
+
+`send_after:` controls when a turn's input (its `user:` utterance or [`dtmf:`](#dtmf-keypresses-with-dtmf) keypresses) is sent, either relative to a prior event or after a plain delay. Anchoring it to an event is how you script barge-in tests:
+
+```yaml
+turns:
+  - user: "Tell me a long, detailed story about the history of Paris."
+    expect:
+      - event: llm_started
+
+  # Interrupt 2 seconds after the agent starts its long answer.
+  - user: "Actually, never mind that. What's the capital of Japan?"
+    send_after:
+      event: llm_started
+      delay_ms: 2000
+    expect:
+      - event: response
+        eval: "the response says the capital of Japan is Tokyo, instead of continuing the Paris story"
+```
+
+The `event:` anchor is optional. A bare `send_after: { delay_ms: 500 }` is a pure time delay measured from the previous turn's send, with no event to wait on. This is handy for pacing turns by time rather than off a bot event (for example, spacing out [DTMF keypresses](#dtmf-keypresses-with-dtmf) to exercise an aggregator's idle-timeout flush):
+
+```yaml
+turns:
+  - dtmf: "1"
+  # Wait 1.5s after the first keypress before sending the next.
+  - dtmf: "2"
+    send_after:
+      delay_ms: 1500
+```
+
+A `send_after:` with no `event:` and a zero `delay_ms` is rejected as a no-op: give it an `event:`, a positive `delay_ms`, or both.
+
+## Events
+
+Scenarios assert on a small set of semantic events, mapped from the RTVI messages the agent emits:
+
+| Event                   | Meaning                                                                                                                                                                                      |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `response`              | The agent's reply. In audio mode this is a transcription of the agent's actual synthesized speech; in text mode it resolves to `llm_response`. Prefer this for content checks.               |
+| `llm_response`          | The LLM's text output for the turn. Available in both modes.                                                                                                                                 |
+| `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                                   |
+| `llm_started`           | The LLM began generating a response.                                                                                                                                                         |
+| `function_call`         | The LLM called a function.                                                                                                                                                                   |
+| `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-keypresses-with-dtmf), where the aggregated keys become a transcription in either mode. |
+| `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                  |
+| `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                    |
+
+<Tip>
+  Use `response` for the agent's reply unless you have a reason not to. It's
+  modality-agnostic: the same scenario judges LLM text in text mode and the
+  transcription of real spoken audio in audio mode, so one file covers both.
+</Tip>
+
+## Assertions
+
+Each entry in `expect:` names an event and, optionally, asserts on its content or timing.
+
+### Semantic judging with `eval:`
+
+The `eval:` field is a natural-language criterion that the event's text must satisfy, decided by the [judge LLM](#judging-with-judge):
+
+```yaml
+- user: "What's 2 plus 2?"
+  expect:
+    - event: response
+      eval: "the response says the answer is four"
+```
+
+The judge sees the whole conversation so far, so it can resolve terse or context-dependent replies (like "That's four"). It also understands that audio-mode responses come from a speech-to-text pass and judges intended meaning rather than exact spelling, so "for" transcribed instead of "four" still passes.
+
+The judge handles interim replies gracefully: if the agent says "Let me check on that." before the real answer, the harness keeps accumulating response text and re-judges until the criterion is met or the time budget runs out.
+
+`eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`).
+
+### Substring checks with `text_contains:`
+
+For exact content, `text_contains:` does a plain substring check, with no judge round-trip:
+
+```yaml
+- user: "What is the capital of France?"
+  expect:
+    - event: response
+      text_contains: "Paris"
+```
+
+### Latency budgets with `within_ms:`
+
+`within_ms:` bounds how long after the turn's user send the event may arrive. All of a turn's expectations share that one anchor:
+
+```yaml
+- user: "What is the capital of France?"
+  expect:
+    - event: llm_started
+      within_ms: 2000 # the LLM must start responding within 2s
+    - event: response
+      text_contains: "Paris"
+```
+
+When omitted, an expectation defaults to a generous 60 second budget (configurable with `--timeout`), so timing is only asserted when you ask for it.
+
+Because every deadline is measured from the send, time spent matching earlier expectations counts against later ones. In the example above, if `llm_started` arrives at 1.5 seconds, the `response` (with the default 60 second budget) has 58.5 seconds left, and a turn that stalls completely fails within a single budget rather than one per expectation.
+
+### Function calls
+
+A `function_call` expectation asserts that the turn invoked one or more tools. List the expected calls under `calls:`; they're matched by name in any order, and the expectation passes once all are found:
+
+```yaml
+- user: "What's the weather in San Francisco? And recommend a restaurant."
+  expect:
+    - event: function_call
+      calls:
+        - name: get_current_weather
+          args: { location: "San Francisco" }
+        - name: get_restaurant_recommendation
+    - event: response
+      eval: "describes the weather and recommends a restaurant"
+```
+
+`args` is a subset check: every listed key/value must be present in the call's arguments, and extra arguments are ignored. A single expected call can use the `name:`/`args:` shorthand directly on the expectation, and a bare `function_call` with neither just asserts that some call happened.
 
 ## Next steps
 
