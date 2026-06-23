@@ -276,48 +276,6 @@ stt = AssemblyAISTTService(
 
 Context carryover helps with short answers, spelled-out entities (emails, IDs), and similar-sounding words. Set `previous_context_n_turns=0` to disable automatic carryover.
 
-#### How it works in Pipecat
-
-Carryover is driven by Pipecat's standard turn aggregation — you don't register an observer or call anything yourself:
-
-1. As the bot's reply streams, the **assistant context aggregator** (the second processor returned by `LLMContextAggregatorPair`) accumulates the spoken text for the turn.
-2. When the assistant turn ends, that aggregator broadcasts an `LLMContextAssistantTurnFrame` carrying the aggregated reply text, both upstream and downstream through the pipeline.
-3. The base `STTService` handles that frame and calls its `_process_assistant_turn()` hook. `AssemblyAISTTService` overrides the hook to forward the text to `update_agent_context()`, which sends an `UpdateConfiguration` message over the live AssemblyAI WebSocket — no reconnect.
-4. AssemblyAI folds that reply, alongside recent user transcripts, into its rolling carryover budget (~1500 characters) and uses it to transcribe the user's next turn.
-
-The hook is a no-op unless the model is `universal-3-5-pro` and `previous_context_n_turns` is non-zero.
-
-#### What your agent needs
-
-Nothing carryover-specific — as long as your pipeline already includes the standard context aggregators (nearly every Pipecat voice agent does). The `assistant_aggregator` placed at the end of the pipeline is what emits the turn frame that drives carryover:
-
-```python
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-
-context = LLMContext()
-user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
-
-pipeline = Pipeline(
-    [
-        transport.input(),
-        stt,  # AssemblyAISTTService(settings=...Settings(model="universal-3-5-pro"))
-        user_aggregator,
-        llm,
-        tts,
-        transport.output(),
-        assistant_aggregator,  # emits LLMContextAssistantTurnFrame → drives carryover
-    ]
-)
-```
-
-For finer control:
-
-- **Seed the opening line** with `agent_context=` so the first user turn benefits before any bot reply has streamed (e.g. a fixed greeting).
-- **Update manually** with `await stt.update_agent_context(text)` when what the bot actually said differs from the LLM context text (dynamic TTS, an interrupted reply).
-- **Tune the window** with `previous_context_n_turns` (`0` disables carryover; the server default is 3).
-
 ### With Voice Focus
 
 Voice focus (`universal-3-5-pro` only) isolates the primary speaker and suppresses background noise:
