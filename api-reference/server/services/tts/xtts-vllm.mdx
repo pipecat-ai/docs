@@ -1,0 +1,163 @@
+---
+title: "XTTS-vLLM"
+description: "Streaming text-to-speech using a self-hosted XTTSv2 + vLLM server"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="wuxuedaifu"
+  maintainerUrl="https://github.com/wuxuedaifu"
+  repo="https://github.com/wuxuedaifu/pipecat-xtts-vllm"
+/>
+
+## Overview
+
+`XTTSVLLMTTSService` streams audio from a self-hosted
+[XTTSv2-vLLM streaming server](https://github.com/wuxuedaifu/xttsv2-vllm-streaming-server) —
+Coqui XTTSv2 served with vLLM for real-time, low-latency synthesis (~0.45s
+time-to-first-byte on the maintainer's test hardware). It is a thin HTTP client:
+the heavy model server runs
+separately (as a Docker image, typically on a GPU host) and the service talks to
+it over an OpenAI-compatible streaming endpoint, outputting `TTSAudioRawFrame`
+audio into your Pipecat pipeline.
+
+Voice cloning conditioning is computed once from a short reference sample and
+cached for the lifetime of the service, so per-utterance requests stay fast.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/wuxuedaifu/pipecat-xtts-vllm"
+  >
+    Source code, examples, and issues for the XTTS-vLLM integration
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-xtts-vllm/"
+  >
+    The `pipecat-xtts-vllm` package on PyPI
+  </Card>
+  <Card
+    title="Model Server"
+    icon="server"
+    href="https://github.com/wuxuedaifu/xttsv2-vllm-streaming-server"
+  >
+    The XTTSv2-vLLM streaming server this client connects to
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-xtts-vllm
+```
+
+## Prerequisites
+
+This service is a client for a self-hosted model server; there is no third-party
+account or API key.
+
+1. **Run the model server.** Deploy the
+   [XTTSv2-vLLM streaming server](https://github.com/wuxuedaifu/xttsv2-vllm-streaming-server)
+   (Docker image, GPU recommended) and note its URL for `base_url`. See the
+   server repository for deployment instructions.
+2. **Provide a reference voice.** A ~6-second reference audio clip (as bytes) is
+   used for voice cloning. Alternatively, supply precomputed `conditioning`.
+
+<Note>
+  The integration code is MIT-licensed, but the underlying XTTSv2 **model
+  weights** are distributed under the Coqui Public Model License (non-commercial
+  use only). Review the server repository for licensing details before
+  production use.
+</Note>
+
+## Configuration
+
+<ParamField path="base_url" type="str" required>
+  Base URL of the running XTTSv2-vLLM streaming server, e.g.
+  `http://localhost:8000`.
+</ParamField>
+
+<ParamField path="reference_audio" type="bytes" default="None">
+  Reference voice sample (~6 seconds) used to compute voice-cloning
+  conditioning. Required unless `conditioning` is provided.
+</ParamField>
+
+<ParamField path="conditioning" type="XTTSVLLMConditioning" default="None">
+  Optional precomputed conditioning (`gpt_cond_latent_b64` +
+  `speaker_embeddings_b64`). If set, it takes precedence over `reference_audio`
+  and skips the conditioning request.
+</ParamField>
+
+<ParamField path="language" type="str" default="en">
+  Language code for synthesis. XTTSv2 supports 17 languages: `en` (English),
+  `es` (Spanish), `fr` (French), `de` (German), `it` (Italian), `pt`
+  (Portuguese), `pl` (Polish), `tr` (Turkish), `ru` (Russian), `nl` (Dutch),
+  `cs` (Czech), `ar` (Arabic), `zh-cn` (Chinese, Simplified), `hu` (Hungarian),
+  `ko` (Korean), `ja` (Japanese), and `hi` (Hindi). Pass `auto` to let the
+  server auto-detect the language.
+</ParamField>
+
+<ParamField path="chunk_size" type="int" default="20">
+  Token-delta streaming chunk size sent to the server.
+</ParamField>
+
+<ParamField path="speed" type="float" default="1.0">
+  Speech speed multiplier.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="24000">
+  Output audio sample rate in Hz (XTTSv2 native is 24&nbsp;kHz, 16-bit mono
+  PCM).
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession" default="None">
+  Optional shared aiohttp session used for requests. If not provided, the
+  service creates and manages its own session.
+</ParamField>
+
+## Usage
+
+```python
+from pathlib import Path
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_xtts_vllm import XTTSVLLMTTSService
+
+tts = XTTSVLLMTTSService(
+    base_url="http://localhost:8000",
+    reference_audio=Path("reference.wav").read_bytes(),
+    language="en",
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),               # audio/user input
+        stt,                             # speech to text
+        context_aggregator.user(),       # add user text to context
+        llm,                             # LLM generates response
+        tts,                             # XTTS-vLLM synthesis
+        transport.output(),              # stream audio back to user
+        context_aggregator.assistant(),  # store assistant response
+    ]
+)
+```
+
+To reuse precomputed conditioning instead of a reference clip, import
+`XTTSVLLMConditioning` alongside the service
+(`from pipecat_xtts_vllm import XTTSVLLMConditioning, XTTSVLLMTTSService`) and
+pass it via the `conditioning=` argument.
+
+See the [foundational example](https://github.com/wuxuedaifu/pipecat-xtts-vllm/tree/main/examples/foundational)
+in the source repository for a complete, runnable script.
+
+## Compatibility
+
+Tested with `pipecat-ai` v1.4.0. Check the [source
+repository](https://github.com/wuxuedaifu/pipecat-xtts-vllm) for the latest
+tested version and changelog.
