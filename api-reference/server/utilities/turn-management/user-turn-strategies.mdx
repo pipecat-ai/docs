@@ -14,6 +14,13 @@ By default, Pipecat uses a combination of VAD (Voice Activity Detection) and AI-
 
 You can customize this behavior by providing your own strategies for more sophisticated turn detection, such as requiring a minimum number of words before triggering a turn, or using AI-powered turn detection models.
 
+<Note>
+  In Pipecat >=1.0.0, the `turn_analyzer` must be specified in the
+  `TurnAnalyzerUserTurnStopStrategy`. See the [migration
+  guide](/pipecat/migration/migration-1.0#3-vad-&-turn-analyzer-configuration)
+  for more information.
+</Note>
+
 ## How It Works
 
 1. **Turn Start Detection**: When any start strategy triggers, the user aggregator:
@@ -29,6 +36,49 @@ You can customize this behavior by providing your own strategies for more sophis
    - Pushes the aggregated user message to the LLM context
 
 4. **Timeout Handling**: If no stop strategy triggers within `user_turn_stop_timeout` seconds (default: 5.0), the turn is automatically ended. This timeout is configurable via `LLMUserAggregatorParams` (see [Configuration](#configuration) below). When the timeout fires, the [`on_user_turn_stop_timeout`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_stop_timeout) event is emitted.
+
+### When a user turn ends
+
+A **user turn stop strategy** decides when the user is done talking and the bot should respond. You choose the strategy; the rest of the timing follows from it. **If you want to adjust how long the bot waits before responding, do it in the stop strategy** — that's the knob built for it.
+
+Whatever the strategy, closing a turn takes two ingredients:
+
+1. **A transcript.** Every stop strategy waits for the STT service to transcribe what the user said (`wait_for_transcript`, on by default). This is usually the largest and most variable part of the delay, and it's dominated by your STT provider's latency — see the [STT benchmark](https://github.com/pipecat-ai/stt-benchmark) to compare services.
+2. **The strategy's own end-of-turn criteria.** Once the transcript is in, the strategy applies its logic to decide whether the turn is actually complete.
+
+The turn closes only when both are satisfied.
+
+#### Choosing a strategy
+
+| Strategy                             | How it decides the turn is complete                                                           |
+| ------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `SpeechTimeoutUserTurnStopStrategy`  | A fixed silence window (`user_speech_timeout`, default `0.6s`) elapses after the user pauses. |
+| `TurnAnalyzerUserTurnStopStrategy`   | A turn-detection ("smart turn") model predicts end-of-turn from the audio and transcript.     |
+| `FilterIncompleteUserTurnStrategies` | An LLM assesses whether the user's utterance is semantically complete.                        |
+| Custom                               | Your own logic implementing the stop-strategy interface.                                      |
+
+This is also where you tune responsiveness. For example, raise or lower `user_speech_timeout` on `SpeechTimeoutUserTurnStopStrategy` to give users more or less time to resume before the bot replies.
+
+#### Where the latency comes from
+
+Before any strategy can act, two things have to happen:
+
+- **VAD silence (`stop_secs`):** The VAD waits a short, fixed interval (default `0.2s`) after audio goes quiet before reporting that the user stopped speaking. This is a low-level detection threshold — leave it alone. To change wait time, use the stop strategy, not `stop_secs`.
+- **Transcription:** STT returns a transcript. Latency here is mostly your STT provider's; strategies use the provider's reported p99 latency as a fallback timer and short-circuit it the moment a finalized transcript arrives.
+
+Then the strategy's criteria run (the silence window, the turn model, or the LLM check) to finalize the turn.
+
+<Note>
+  Extra silence users notice usually isn't one tunable value — it's VAD silence
+  plus transcription latency plus the strategy's own window stacking up. If your
+  STT service is slow to return transcripts, that delay shows up in every turn
+  regardless of which strategy you use. Adjust responsiveness in the stop
+  strategy, and check the [STT
+  benchmark](https://github.com/pipecat-ai/stt-benchmark) if transcription is
+  the bottleneck.
+</Note>
+
+`user_turn_stop_timeout` (default `5.0s`, on `LLMUserAggregatorParams`) is a backstop, not part of normal timing: if a turn somehow never finalizes, it forces the turn to end so the bot isn't stuck waiting.
 
 ## Configuration
 
@@ -73,6 +123,14 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     ),
 )
 ```
+
+<ParamField path="vad_analyzer" type="VADAnalyzer" default="None">
+  The Voice Activity Detection analyzer instance used to produce VAD signals for
+  turn detection. In Pipecat 1.x, VAD is configured on the aggregator rather
+  than the transport. This is separate from `VADUserTurnStartStrategy`: the
+  analyzer _produces_ the VAD signals; the start strategy decides _what to do_
+  with them.
+</ParamField>
 
 ## Start Strategies
 
@@ -317,11 +375,12 @@ strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)
 <Note>
   Built-in STT P99 latency values assume `VADParams.stop_secs=0.2` (the
   recommended default). If you change `stop_secs`, the strategy will log a
-  warning suggesting you re-run the [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark)
-  with your VAD settings and pass the measured TTFS P99 latency to your STT
-  service constructor via `ttfs_p99_latency`. The strategy will also warn if
-  `stop_secs >= STT p99 latency`, which collapses the STT wait timeout to 0s
-  and may cause delayed turn detection.
+  warning suggesting you re-run the
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) with your VAD
+  settings and pass the measured TTFS P99 latency to your STT service
+  constructor via `ttfs_p99_latency`. The strategy will also warn if `stop_secs
+  >= STT p99 latency`, which collapses the STT wait timeout to 0s and may cause
+  delayed turn detection.
 </Note>
 
 ### TurnAnalyzerUserTurnStopStrategy
@@ -359,11 +418,12 @@ strategy = TurnAnalyzerUserTurnStopStrategy(
 <Note>
   Built-in STT P99 latency values assume `VADParams.stop_secs=0.2` (the
   recommended default). If you change `stop_secs`, the strategy will log a
-  warning suggesting you re-run the [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark)
-  with your VAD settings and pass the measured TTFS P99 latency to your STT
-  service constructor via `ttfs_p99_latency`. The strategy will also warn if
-  `stop_secs >= STT p99 latency`, which collapses the STT wait timeout to 0s
-  and may cause delayed turn detection.
+  warning suggesting you re-run the
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) with your VAD
+  settings and pass the measured TTFS P99 latency to your STT service
+  constructor via `ttfs_p99_latency`. The strategy will also warn if `stop_secs
+  >= STT p99 latency`, which collapses the STT wait timeout to 0s and may cause
+  delayed turn detection.
 </Note>
 
 ### ExternalUserTurnStopStrategy

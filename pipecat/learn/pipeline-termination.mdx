@@ -29,6 +29,23 @@ pipeline = Pipeline([
 
 Both frames flow downstream through the pipeline, allowing each processor to clean up resources appropriately.
 
+### Termination frames at a glance
+
+| Frame               | Job                                                | Push from / direction                                                                                   |
+| ------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `EndFrame`          | Graceful shutdown (drains pending frames)          | From outside the pipeline via `worker.queue_frame(EndFrame())`                                          |
+| `CancelFrame`       | Immediate shutdown (discards pending frames)       | Via `worker.cancel()`                                                                                   |
+| `EndWorkerFrame`    | Graceful shutdown signal from inside the pipeline  | `push_frame(EndWorkerFrame(), FrameDirection.DOWNSTREAM)`; the source converts it to an `EndFrame`      |
+| `CancelWorkerFrame` | Immediate shutdown signal from inside the pipeline | `push_frame(CancelWorkerFrame(), FrameDirection.DOWNSTREAM)`; the source converts it to a `CancelFrame` |
+
+<Note>
+  If you see `EndTaskFrame`, `CancelTaskFrame`, `PipelineTask`, or
+  `task.cancel()` in older code or examples, those are **deprecated aliases**
+  (since 1.3.0/1.4.0) of `EndWorkerFrame`, `CancelWorkerFrame`,
+  `PipelineWorker`, and `worker.cancel()`. They still work but will be removed
+  in 2.0.0. Use the `Worker` names in new code.
+</Note>
+
 ## Termination Methods
 
 Pipecat provides two primary approaches for pipeline termination, each designed for different scenarios:
@@ -49,24 +66,43 @@ Push an `EndFrame` from outside your pipeline:
 
 ```python
 # From outside the pipeline
-from pipecat.frames.frames import EndFrame, TTSSpeakFrame
+from pipecat.frames.frames import EndFrame
 
 await worker.queue_frame(EndFrame())
 ```
 
-Push an `EndWorkerFrame` downstream from inside your pipeline:
+Push an `EndWorkerFrame` downstream from inside your pipeline. Here `end_conversation` is a **direct function** — an `async` function whose first parameter is `params: FunctionCallParams`, with a Google-style docstring that becomes the tool description. Register it by passing the function itself in your tools list:
 
 ```python
-# From inside a function call
 from pipecat.frames.frames import EndWorkerFrame, TTSSpeakFrame
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.llm_service import FunctionCallParams
+
 
 async def end_conversation(params: FunctionCallParams):
+    """End the conversation and shut down the bot.
+
+    Call this when the user says goodbye or the task is complete.
+    """
     await params.llm.push_frame(TTSSpeakFrame("Have a nice day!"))
+
+    # Resolve the function call so the LLM call doesn't hang
+    await params.result_callback({"status": "ended"})
 
     # Signal that the worker should end after processing this frame
     await params.llm.push_frame(EndWorkerFrame(), FrameDirection.DOWNSTREAM)
+
+
+# Pass the function directly in the tools list; it's registered automatically
+context = LLMContext(tools=[end_conversation])
 ```
+
+<Warning>
+  Always call `params.result_callback(...)` in your handler before pushing the
+  end frame. Skipping it can leave the LLM function call unresolved. If you
+  don't want the LLM to respond, you can provide `None` as the result.
+</Warning>
 
 **How graceful termination works:**
 
@@ -133,8 +169,8 @@ worker = PipelineWorker(
     pipeline,
     # Configure idle detection timeout
     cancel_on_idle_timeout=True, # Default is True
-    idle_timeout_seconds=600,  # Default is 300 seconds
-    idle_timeout_frames=(BotSpeakingFrame,), # Default is (BotSpeakingFrame, LLMFullResponseEndFrame)
+    idle_timeout_secs=600,  # Default is 300 seconds
+    idle_timeout_frames=(BotSpeakingFrame,), # Default is (BotSpeakingFrame, UserSpeakingFrame)
 )
 ```
 
@@ -151,6 +187,31 @@ You can further configure the idle detection behavior. To learn more, refer to t
 <Note>
   Pipeline Idle Detection is enabled by default and helps prevent resources from
   being wasted on inactive conversations.
+</Note>
+
+### Maximum Call Duration
+
+Idle detection ends a call that goes quiet, but it does not cap the total length of an active call. To enforce a maximum call duration, run an `asyncio` timer that speaks a goodbye and then queues an `EndFrame` so the bot can sign off gracefully before shutdown:
+
+```python
+import asyncio
+from pipecat.frames.frames import EndFrame, TTSSpeakFrame
+
+async def end_after(worker, timeout_secs: float):
+    await asyncio.sleep(timeout_secs)
+    await worker.queue_frame(TTSSpeakFrame("We've reached our time limit. Goodbye!"))
+    await worker.queue_frame(EndFrame())  # Graceful: plays the goodbye, then shuts down
+
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    asyncio.create_task(end_after(worker, timeout_secs=300))  # 5-minute cap
+```
+
+<Note>
+  On Pipecat Cloud, there is also a platform-level hard cap via
+  [`maxSessionDuration`](/pipecat-cloud/fundamentals/active-sessions#session-duration-limits)
+  (default 7200s). That cap is a forced cut with no goodbye, so use the
+  bot-level timer above when you want the bot to speak before the call ends.
 </Note>
 
 ## Implementation Patterns
@@ -205,6 +266,19 @@ except Exception as e:
     await worker.cancel()
 ```
 
+### Running Cleanup Code on Shutdown
+
+To run cleanup or persist data when a call ends, use the `on_pipeline_finished` event handler. It fires after the pipeline reaches any terminal state, so it runs for **both** graceful (`EndFrame`) and cancelled (`CancelFrame`) shutdowns. This makes it the single write point for end-of-call work like saving a transcript or recording:
+
+```python
+@worker.event_handler("on_pipeline_finished")
+async def on_pipeline_finished(worker, frame):
+    # Runs for both graceful and cancelled shutdown
+    await save_transcript_to_db()
+```
+
+`on_client_disconnected`, by contrast, fires only when the client disconnects. Use it to _tag the reason_ for the shutdown (for example, "user hung up"), and do the actual persistence in `on_pipeline_finished` so you write data exactly once regardless of how the call ended. See the [`PipelineWorker` events](/api-reference/server/pipeline/pipeline-worker) reference for the full event signature.
+
 ## Troubleshooting
 
 If your pipeline isn't shutting down properly, check these common issues:
@@ -244,6 +318,12 @@ await self.push_frame(CancelWorkerFrame(), FrameDirection.DOWNSTREAM)
   `CancelWorkerFrame` to `CancelFrame` when pushing downstream, ensuring proper
   termination handling throughout the pipeline.
 </Note>
+
+### "dangling tasks detected" Warning
+
+**Problem:** On shutdown you see a log warning like `PipelineWorker#0 dangling tasks detected: [...]`.
+
+**Solution:** This means `asyncio` tasks created during the session were never cancelled or awaited before the pipeline shut down. The usual causes are the two above: a custom processor that doesn't propagate termination frames, or a background task started inside a processor (for example, a timer or long-running coroutine) that isn't cleaned up. Create background tasks through the pipeline task manager so they are tracked and cancelled on shutdown, and make sure your processors push `EndFrame`/`CancelFrame` downstream.
 
 ## Key Takeaways
 
