@@ -15,16 +15,15 @@ By default, Pipecat uses a combination of VAD (Voice Activity Detection) and AI-
 You can customize this behavior by providing your own strategies for more sophisticated turn detection, such as requiring a minimum number of words before triggering a turn, or using AI-powered turn detection models.
 
 <Note>
-  The user turn strategies API is new in Pipecat 1.x. If you're coming from
-  0.0.x (where turn detection was configured via `turn_analyzer` on the
-  transport params), see the [migration guide](/pipecat/migration/migration-1.0)
-  for where each setting moved.
+  In Pipecat >=1.0.0, the `turn_analyzer` must be specified in the
+  `TurnAnalyzerUserTurnStopStrategy`. See the [migration
+  guide](/pipecat/migration/migration-1.0#3-vad-&-turn-analyzer-configuration)
+  for more information.
 </Note>
 
 ## How It Works
 
 1. **Turn Start Detection**: When any start strategy triggers, the user aggregator:
-
    - Marks the start of a user turn
    - Optionally emits `UserStartedSpeakingFrame`
    - Optionally emits an interruption frame (if the bot is speaking)
@@ -32,30 +31,54 @@ You can customize this behavior by providing your own strategies for more sophis
 2. **During User Turn**: The aggregator collects transcriptions and audio frames.
 
 3. **Turn Stop Detection**: When a stop strategy triggers, the user aggregator:
-
    - Marks the end of the user turn
    - Emits `UserStoppedSpeakingFrame`
    - Pushes the aggregated user message to the LLM context
 
 4. **Timeout Handling**: If no stop strategy triggers within `user_turn_stop_timeout` seconds (default: 5.0), the turn is automatically ended. This timeout is configurable via `LLMUserAggregatorParams` (see [Configuration](#configuration) below). When the timeout fires, the [`on_user_turn_stop_timeout`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_stop_timeout) event is emitted.
 
-### Turn timing timeline
+### When a user turn ends
 
-Several timers combine to decide when a user turn ends. They fire in this order after the user stops talking:
+A **user turn stop strategy** decides when the user is done talking and the bot should respond. You choose the strategy; the rest of the timing follows from it. **If you want to adjust how long the bot waits before responding, do it in the stop strategy** — that's the knob built for it.
 
-1. **VAD `stop_secs`**: The VAD waits this long (default `0.2s`) after audio goes quiet before it reports the user stopped speaking. Configured on your `VADParams`, not here.
-2. **`user_speech_timeout`** (on `SpeechTimeoutUserTurnStopStrategy`, default `0.6s`): The policy floor. After VAD silence, this is the window in which the user may resume speaking. It always runs to completion.
-3. **STT finalization / `ttfs_p99_latency`** _or_ **smart-turn analysis**: A safety net for STT latency. With `SpeechTimeoutUserTurnStopStrategy`, the turn waits for the STT service to return a final transcript (short-circuited when the STT service emits a finalized transcript). With `TurnAnalyzerUserTurnStopStrategy`, the smart-turn model decides end-of-turn instead.
-4. **Turn finalized**: Once the active stop strategy's conditions are met, the turn ends and the bot responds.
+Whatever the strategy, closing a turn takes two ingredients:
 
-`user_turn_stop_timeout` (default `5.0s`, on `LLMUserAggregatorParams`) sits outside all of this as an outer watchdog: if none of the above finalizes the turn in time, it forces the turn to end.
+1. **A transcript.** Every stop strategy waits for the STT service to transcribe what the user said (`wait_for_transcript`, on by default). This is usually the largest and most variable part of the delay, and it's dominated by your STT provider's latency — see the [STT benchmark](https://github.com/pipecat-ai/stt-benchmark) to compare services.
+2. **The strategy's own end-of-turn criteria.** Once the transcript is in, the strategy applies its logic to decide whether the turn is actually complete.
+
+The turn closes only when both are satisfied.
+
+#### Choosing a strategy
+
+| Strategy                             | How it decides the turn is complete                                                           |
+| ------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `SpeechTimeoutUserTurnStopStrategy`  | A fixed silence window (`user_speech_timeout`, default `0.6s`) elapses after the user pauses. |
+| `TurnAnalyzerUserTurnStopStrategy`   | A turn-detection ("smart turn") model predicts end-of-turn from the audio and transcript.     |
+| `FilterIncompleteUserTurnStrategies` | An LLM assesses whether the user's utterance is semantically complete.                        |
+| Custom                               | Your own logic implementing the stop-strategy interface.                                      |
+
+This is also where you tune responsiveness. For example, raise or lower `user_speech_timeout` on `SpeechTimeoutUserTurnStopStrategy` to give users more or less time to resume before the bot replies.
+
+#### Where the latency comes from
+
+Before any strategy can act, two things have to happen:
+
+- **VAD silence (`stop_secs`):** The VAD waits a short, fixed interval (default `0.2s`) after audio goes quiet before reporting that the user stopped speaking. This is a low-level detection threshold — leave it alone. To change wait time, use the stop strategy, not `stop_secs`.
+- **Transcription:** STT returns a transcript. Latency here is mostly your STT provider's; strategies use the provider's reported p99 latency as a fallback timer and short-circuit it the moment a finalized transcript arrives.
+
+Then the strategy's criteria run (the silence window, the turn model, or the LLM check) to finalize the turn.
 
 <Note>
-  The extra silence some users notice (for example, "the aggregator waits an
-  extra 800ms") is usually steps 2 and 3 stacking: `stop_secs` plus
-  `user_speech_timeout` plus the STT wait. Tune each timer independently rather
-  than expecting one value to control total latency.
+  Extra silence users notice usually isn't one tunable value — it's VAD silence
+  plus transcription latency plus the strategy's own window stacking up. If your
+  STT service is slow to return transcripts, that delay shows up in every turn
+  regardless of which strategy you use. Adjust responsiveness in the stop
+  strategy, and check the [STT
+  benchmark](https://github.com/pipecat-ai/stt-benchmark) if transcription is
+  the bottleneck.
 </Note>
+
+`user_turn_stop_timeout` (default `5.0s`, on `LLMUserAggregatorParams`) is a backstop, not part of normal timing: if a turn somehow never finalizes, it forces the turn to end so the bot isn't stuck waiting.
 
 ## Configuration
 
@@ -490,87 +513,6 @@ stop = [
     LLMTurnCompletionUserTurnStopStrategy(),
 ]
 ```
-
-### Custom stop strategy
-
-Pipecat has no built-in strategy for capping how long a single user turn can run (there is no "max speech" or "max turn duration" strategy). If you need to end a turn after a fixed amount of time, for example to stop a customer from monologuing, write your own stop strategy by subclassing `BaseUserTurnStopStrategy`.
-
-A stop strategy inspects incoming frames in `process_frame` and calls `trigger_user_turn_stopped()` when it decides the turn is over. The example below starts a timer when the user begins speaking and forces the turn to end once the timer fires:
-
-```python
-import asyncio
-
-from pipecat.frames.frames import Frame, VADUserStartedSpeakingFrame
-from pipecat.turns.types import ProcessFrameResult
-from pipecat.turns.user_stop import BaseUserTurnStopStrategy
-
-
-class MaxTurnDurationStopStrategy(BaseUserTurnStopStrategy):
-    """End the user turn after a fixed number of seconds.
-
-    Starts a timer when the user starts speaking. If the user is still
-    holding the turn when the timer fires, the turn is finalized so the
-    bot can respond.
-    """
-
-    def __init__(self, *, max_turn_seconds: float = 10.0, **kwargs):
-        super().__init__(**kwargs)
-        self._max_turn_seconds = max_turn_seconds
-        self._timer_task: asyncio.Task | None = None
-
-    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
-        if isinstance(frame, VADUserStartedSpeakingFrame) and self._timer_task is None:
-            self._timer_task = self.task_manager.create_task(
-                self._max_turn_handler(),
-                f"{self}::_max_turn_handler",
-            )
-        return ProcessFrameResult.CONTINUE
-
-    async def _max_turn_handler(self):
-        try:
-            await asyncio.sleep(self._max_turn_seconds)
-        except asyncio.CancelledError:
-            return
-        finally:
-            self._timer_task = None
-        # Time is up: end the turn so the bot responds.
-        await self.trigger_user_turn_stopped()
-
-    async def reset(self):
-        await super().reset()
-        await self._cancel_timer()
-
-    async def cleanup(self):
-        await super().cleanup()
-        await self._cancel_timer()
-
-    async def _cancel_timer(self):
-        if self._timer_task:
-            await self.task_manager.cancel_task(self._timer_task)
-            self._timer_task = None
-```
-
-Pair it with a normal detector so regular turn-end still works. The first strategy to trigger ends the turn, so the timer acts as a backstop on top of smart-turn detection:
-
-```python
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
-
-strategies = UserTurnStrategies(
-    stop=[
-        TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3()),
-        MaxTurnDurationStopStrategy(max_turn_seconds=10.0),
-    ],
-)
-```
-
-<Note>
-  Ending the turn lets the bot respond, but it does not stop the user's audio
-  from being processed if they keep talking. To also ignore further user input
-  for a window, combine this with [User Input
-  Muting](/pipecat/fundamentals/user-input-muting).
-</Note>
 
 ## Helper Functions
 
