@@ -322,9 +322,25 @@ To test dial-out functionality:
 
 ## Call Transfers
 
-Daily supports cold transfers, allowing you to transfer an active call to another phone number. The bot can initiate a transfer and then leave the call, connecting the caller directly to the transfer destination.
+Daily supports two transfer patterns:
 
-### How Call Transfers Work
+- **Cold transfer** — the bot hands the caller off to another number and leaves. The caller is connected directly to the destination; the bot is no longer involved.
+- **Warm transfer** — the bot stays on the call, dials a specialist, briefs them while the caller is on hold, then bridges everyone together.
+
+<Note>
+  The bot is the room owner, so when it leaves, the Daily room terminates and any
+  remaining PSTN legs drop — there's no "bot leaves, the two callers keep talking"
+  mode (`max_idle_timeout_sec` only holds a bot-less room open for a fixed
+  countdown). To keep a caller and a human on Daily together, use a warm transfer
+  (the bot stays as the bridge); to drop the bot entirely, use a cold transfer
+  off Daily via SIP REFER.
+</Note>
+
+## Cold transfer
+
+A cold transfer hands the caller off to another number and the bot exits.
+
+### How cold transfer works
 
 1. **Bot receives transfer request** (via function call or user input)
 2. **Bot informs the caller** about the transfer
@@ -333,7 +349,7 @@ Daily supports cold transfers, allowing you to transfer an active call to anothe
 5. **Bot leaves the call** (cold transfer)
 6. **Caller and destination** continue the conversation
 
-### Implementing Call Transfers
+### Implementing a cold transfer
 
 Call transfers are typically implemented as LLM function calls that your bot can invoke:
 
@@ -371,6 +387,50 @@ async def on_dialout_answered(transport, data):
 >
   See the full call transfer example with LLM function calls, event handling,
   and error management
+</Card>
+
+## Warm transfer
+
+A warm transfer connects the caller to a human specialist after the bot briefs that specialist on the call. Unlike a cold transfer, **the bot stays in the room for the entire call and acts as the audio bridge** between the caller and the specialist.
+
+### How warm transfer works
+
+1. **Caller dials in** and talks to the bot.
+2. **Caller asks for a specialist.** The bot calls an `initiate_warm_transfer` LLM function with the target and a short summary of the caller's issue.
+3. **Bot puts the caller on hold** — it plays a hold message, enables hold music, and gates the caller's audio so they don't hear the briefing.
+4. **Bot dials the specialist** with `start_dialout`.
+5. **Specialist answers** (`on_dialout_answered`). The bot briefs the specialist while the caller remains on hold.
+6. **Everyone is connected.** The bot takes the caller off hold and stays in the room, bridging the audio.
+7. **Call ends** when the specialist hangs up after a successful connection, or when a participant leaves — the bot ends its own session with an `EndWorkerFrame`.
+
+### Room configuration
+
+The room only needs dial-out and SIP enabled. No `max_idle_timeout_sec` or other keep-alive setting is required, because the bot stays in the room:
+
+```python server_utils.py
+from pipecat.transports.daily.utils import DailyRoomProperties, DailyRoomSipParams
+
+room_properties = DailyRoomProperties(
+    enable_dialout=True,
+    sip=DailyRoomSipParams(display_name=call_data.from_phone),
+)
+```
+
+### Key components
+
+The example builds the flow from a few reusable pieces:
+
+- **A coordinator processor** (`TransferCoordinator`) — a `FrameProcessor` that drives the transfer as a small state machine: start transfer → hold caller and dial specialist → connect on answer → end on hang-up. Keeping the state in one processor avoids scattering call-flow logic across event handlers.
+- **Hold music** via `SoundfileMixer`, toggled with `MixerEnableFrame(True/False)` so the caller hears music while on hold and the specialist's ringing once dial-out connects.
+- **Audio gating** with a mute strategy and a `CustomerHoldFrame`, so the caller's audio is held during the briefing and released once everyone is connected.
+
+<Card
+  title="Complete Warm Transfer Implementation"
+  icon="code"
+  href="https://github.com/pipecat-ai/pipecat-examples/tree/main/phone-chatbot/daily-pstn-warm-transfer"
+>
+  See the full warm transfer example: the transfer coordinator, hold music,
+  audio gating, the LLM transfer function, and dial-out event handling.
 </Card>
 
 ## Deployment
