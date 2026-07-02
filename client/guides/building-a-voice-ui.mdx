@@ -23,6 +23,11 @@ You are currently viewing the React Native version of this page. Use the dropdow
 You are currently viewing the iOS version of this page. Use the dropdown to the right to customize this page for your client framework.
 </Callout>
 </View>
+<View title="Android" icon="android">
+<Callout icon="android" color="#FFC107">
+You are currently viewing the Android version of this page. Use the dropdown to the right to customize this page for your client framework.
+</Callout>
+</View>
 
 <View title="React" icon="react">
 This guide walks through building a React voice app without any UI abstractions — just the Pipecat React SDK directly. You'll see exactly how the client, provider, hooks, and audio output fit together, which is useful whether you're building a fully custom UI or want to understand what the [CLI-generated app](/client/get-started/quickstart) is doing under the hood.
@@ -38,6 +43,9 @@ This guide walks through building a React Native voice app using the Pipecat Jav
 
 <View title="iOS" icon="apple">
 This guide walks through building a SwiftUI voice app using the Pipecat iOS SDK. You'll see how to create the client, implement the delegate, and connect to your bot — with audio handled automatically by the SDK.
+</View>
+<View title="Android" icon="android">
+This guide walks through building an Android voice app using the Pipecat Android SDK. You'll see how to set up a client manager, implement the event callbacks in Kotlin, and build a Jetpack Compose UI — with audio handled automatically by the transport.
 </View>
 
 ## Prerequisites
@@ -57,6 +65,10 @@ This guide walks through building a SwiftUI voice app using the Pipecat iOS SDK.
 </View>
 <View title="iOS" icon="apple">
 - Xcode 15+
+- A running Pipecat bot
+</View>
+<View title="Android" icon="android">
+- Android Studio
 - A running Pipecat bot
 </View>
 
@@ -162,6 +174,26 @@ Then add `NSMicrophoneUsageDescription` to your `Info.plist`:
 <key>NSMicrophoneUsageDescription</key>
 <string>This app uses the microphone to talk to your voice AI assistant.</string>
 ```
+
+</View>
+
+<View title="Android" icon="android">
+
+In Android Studio, create a new project using the **Empty Activity** template (Kotlin, Jetpack Compose). Then add the SmallWebRTC transport to your `app/build.gradle.kts`:
+
+```kotlin
+dependencies {
+    implementation("ai.pipecat:small-webrtc-transport:1.2.0")
+}
+```
+
+Add the microphone permission to `AndroidManifest.xml`:
+
+```xml
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
+```
+
+You'll also need to request the permission at runtime before connecting. The simplest approach is via the [Accompanist Permissions](https://google.github.io/accompanist/permissions/) library or the standard `ActivityResultContracts.RequestPermission` API.
 
 </View>
 
@@ -271,6 +303,39 @@ class VoiceClientModel: ObservableObject {
   }
 }
 extension CallContainerModel:PipecatClientDelegate {
+}
+```
+
+Audio output is handled automatically — no additional setup required.
+
+</View>
+
+<View title="Android" icon="android">
+
+Create a `VoiceClientManager.kt` class that holds state Compose can observe. This is analogous to the SwiftUI `ObservableObject`:
+
+```kotlin
+import ai.pipecat.client.PipecatClientOptions
+import ai.pipecat.client.PipecatEventCallbacks
+import ai.pipecat.client.small_webrtc_transport.PipecatClientSmallWebRTC
+import ai.pipecat.client.small_webrtc_transport.SmallWebRTCTransport
+import ai.pipecat.client.types.APIRequest
+import ai.pipecat.client.types.BotOutputData
+import ai.pipecat.client.types.Transcript
+import ai.pipecat.client.types.TransportState
+import ai.pipecat.client.types.Value
+import android.content.Context
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+
+data class Message(val role: String, val text: String)
+
+@Stable
+class VoiceClientManager(private val context: Context) {
+    private var client: PipecatClientSmallWebRTC? = null
+    val state = mutableStateOf<TransportState?>(null)
+    val messages = mutableStateListOf<Message>()
 }
 ```
 
@@ -622,6 +687,116 @@ struct ContentView: View {
 
 </View>
 
+<View title="Android" icon="android">
+
+Add the connect/disconnect logic and event callbacks to `VoiceClientManager.kt`, then create `MainActivity.kt` with the Compose UI.
+
+Add these methods to `VoiceClientManager`:
+
+```kotlin
+// Android emulators can't reach the host via `localhost` — use 10.0.2.2 instead.
+// On a physical device, replace this with your machine's local network IP.
+private val BOT_URL = "http://10.0.2.2:7860/api/offer"
+
+fun connect() {
+    val callbacks = object : PipecatEventCallbacks() {
+        override fun onTransportStateChanged(state: TransportState) {
+            this@VoiceClientManager.state.value = state
+        }
+        override fun onUserTranscript(data: Transcript) {
+            if (data.final) messages.add(Message("user", data.text))
+        }
+        override fun onBotOutput(data: BotOutputData) {
+            messages.add(Message("bot", data.text))
+        }
+        override fun onDisconnected() {
+            client?.release()
+            client = null
+            state.value = null
+        }
+        override fun onBackendError(message: String) {
+            // log or show the error
+        }
+    }
+
+    val options = PipecatClientOptions(callbacks = callbacks, enableMic = true)
+
+    client = PipecatClientSmallWebRTC(SmallWebRTCTransport(context), options)
+    client?.startBotAndConnect(APIRequest(endpoint = BOT_URL, requestData = Value.Object()))
+}
+
+fun disconnect() {
+    client?.disconnect()
+}
+```
+
+Create `MainActivity.kt`:
+
+```kotlin
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val manager = VoiceClientManager(this)
+        setContent {
+            MaterialTheme {
+                VoiceScreen(manager)
+            }
+        }
+    }
+}
+
+@Composable
+fun VoiceScreen(manager: VoiceClientManager) {
+    val state = manager.state.value
+    val stateStr = state?.toString()?.lowercase() ?: "disconnected"
+    val isConnected = stateStr == "ready"
+    val isConnecting = state != null && !isConnected
+
+    Column(Modifier.fillMaxSize().padding(40.dp)) {
+        Text("Pipecat Voice App", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.height(16.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Button(
+                onClick = { if (isConnected) manager.disconnect() else manager.connect() },
+                enabled = !isConnecting
+            ) {
+                Text(when { isConnected -> "Disconnect"; isConnecting -> "Connecting…"; else -> "Connect" })
+            }
+            Text(stateStr, color = MaterialTheme.colorScheme.outline)
+        }
+        Spacer(Modifier.height(16.dp))
+        LazyColumn {
+            items(manager.messages) { msg ->
+                Row(Modifier.padding(bottom = 8.dp)) {
+                    Text(
+                        if (msg.role == "user") "You: " else "Bot: ",
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(msg.text)
+                }
+            }
+        }
+    }
+}
+```
+
+</View>
+
 ## Step 3: Run it
 
 Start your Pipecat bot (if it isn't already running), then start the app:
@@ -684,6 +859,20 @@ Tap **Connect**, allow microphone access, and start talking.
 
 </View>
 
+<View title="Android" icon="android">
+
+In Android Studio, press **Run** (▶) and select your emulator or connected device.
+
+The `BOT_URL` in `VoiceClientManager` is set to `http://10.0.2.2:7860/api/offer`, which is correct for Android emulators (the emulator's alias for the host machine). For a physical device, replace it with your Mac's local network IP:
+
+```bash
+ipconfig getifaddr en0
+```
+
+Tap **Connect**, grant microphone access when prompted, and start talking.
+
+</View>
+
 ## What each piece does
 
 <View title="React" icon="react">
@@ -738,6 +927,21 @@ Tap **Connect**, allow microphone access, and start talking.
 | `onTransportStateChanged` | Drives button state and status display |
 | `onBotOutput` | Receives the bot's text output |
 | `onUserTranscript` | Receives finalized speech-to-text from the user |
+
+</View>
+
+<View title="Android" icon="android">
+
+| Piece | Role |
+|---|---|
+| `PipecatClientSmallWebRTC` | Manages the connection and session lifecycle |
+| `SmallWebRTCTransport` | Handles the WebRTC peer connection to your bot |
+| `PipecatEventCallbacks` | Abstract class — override the methods you care about |
+| `mutableStateOf` / `mutableStateListOf` | Compose-observable state for UI reactivity |
+| `onTransportStateChanged` | Drives button state and status display |
+| `onBotOutput` | Receives the bot's text output |
+| `onUserTranscript` | Receives finalized speech-to-text from the user |
+| `onDisconnected` | Cleanup hook — call `release()` here |
 
 </View>
 
