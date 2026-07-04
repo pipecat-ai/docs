@@ -25,6 +25,13 @@ By default, Soniox uses the `stt-rt-v5` model with `vad_force_turn_endpoint=True
     Complete example with interruption handling
   </Card>
   <Card
+    title="Built-in Turn Detection Example"
+    icon="bolt"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-soniox-turn-detection.py"
+  >
+    Example using Soniox's built-in endpoint detection
+  </Card>
+  <Card
     title="Soniox Documentation"
     icon="book"
     href="https://soniox.com/docs/speech-to-text/get-started"
@@ -113,9 +120,19 @@ Before using Soniox STT services, you need:
 </ParamField>
 
 <ParamField path="vad_force_turn_endpoint" type="bool" default="True">
-  Listen to `VADUserStoppedSpeakingFrame` to send a finalize message to Soniox.
-  When enabled, Pipecat's local VAD triggers transcript finalization. When
-  disabled, Soniox detects the end of speech natively.
+  Controls turn detection mode. When `True` (Pipecat mode, default): Soniox
+  endpoint detection is disabled and a `VADUserStoppedSpeakingFrame` sends a
+  finalize message to Soniox. When `False` (Soniox turn detection mode): Soniox
+  endpoint detection is enabled and controls turn endings. Emits
+  `UserStartedSpeakingFrame` on the local VAD signal when a VAD analyzer is
+  configured (most responsive) or on the first transcript token otherwise, and
+  `UserStoppedSpeakingFrame` when the endpoint is detected.
+</ParamField>
+
+<ParamField path="should_interrupt" type="bool" default="True">
+  Whether to interrupt the bot when the user starts speaking in Soniox turn
+  detection mode (`vad_force_turn_endpoint=False`). Only applies when using
+  Soniox's built-in endpoint detection.
 </ParamField>
 
 ### Settings
@@ -188,20 +205,42 @@ stt = SonioxSTTService(
 )
 ```
 
-### With Soniox Native Turn Detection
+### With Soniox Built-in Turn Detection
+
+Soniox's built-in endpoint detection provides natural turn taking. For the most responsive barge-in, configure a local VAD analyzer so the turn opens on the local VAD signal instead of waiting for the first transcript token:
 
 ```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.services.soniox.stt import SonioxSTTService
+from pipecat.transcriptions.language import Language
 
 stt = SonioxSTTService(
     api_key=os.getenv("SONIOX_API_KEY"),
-    vad_force_turn_endpoint=False,
+    vad_force_turn_endpoint=False,  # Use Soniox's built-in endpoint detection
+    settings=SonioxSTTService.Settings(
+        language_hints=[Language.EN],
+        # Optional: Tune endpoint detection timing
+        # endpoint_sensitivity=0.3,
+        # endpoint_latency_adjustment_level=2,
+    ),
+)
+
+# Configure user aggregator with VAD for responsive turn opening
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
 )
 ```
 
 ## Notes
 
-- **Turn finalization**: By default (`vad_force_turn_endpoint=True`), when Pipecat's VAD detects the user has stopped speaking, a finalize message is sent to Soniox to get the final transcript immediately. This significantly reduces latency.
+- **Turn detection modes**:
+  - **Pipecat mode** (`vad_force_turn_endpoint=True`, default): Soniox endpoint detection is disabled and a `VADUserStoppedSpeakingFrame` sends a finalize message to Soniox to get the final transcript immediately. This significantly reduces latency. The service emits no turn frames; the user aggregator runs local VAD/smart-turn analysis.
+  - **Soniox mode** (`vad_force_turn_endpoint=False`): Soniox endpoint detection is enabled and controls turn endings. The service emits `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame` based on Soniox's detection. The turn opens on the local VAD signal when a VAD analyzer is configured (most responsive) or on the first transcript token otherwise. The `should_interrupt` parameter (default `True`) controls whether the bot is interrupted when the user starts speaking.
 - **Endpoint detection settings**: The `max_endpoint_delay_ms`, `endpoint_sensitivity`, and `endpoint_latency_adjustment_level` settings control Soniox's native endpoint detection and only take effect when `vad_force_turn_endpoint=False`. When `vad_force_turn_endpoint=True` (the default), Pipecat's local VAD handles turn detection and these settings are ignored.
 - **Keepalive**: The service automatically sends protocol-level keepalive messages to maintain the WebSocket connection.
 - **Context versions**: Use a string for `context` with older models (context_version 1) and `SonioxContextObject` for newer models (stt-rt-v3-preview and higher, context_version 2). See the [Soniox context documentation](https://soniox.com/docs/stt/concepts/context) for details.
