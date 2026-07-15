@@ -1,25 +1,33 @@
 ---
 title: "Self-hosting in production"
-description: "What plays the role of the development runner when you need to scale, and how to think about the choices."
+description: "What plays the role of the development runner when you run bots in production, and how to think about the choices."
 ---
 
-The [development runner](./running-bots-locally) gets you a working bot you can talk to. Production raises a separate question: _what serves the session-start request, decides where the bot process runs, and manages its lifecycle once it's running?_
+The [development runner](./running-bots-locally) gets you a working bot you can talk to on your own machine. Production raises a separate question: _what serves the session-start request, decides where the bot process runs, and manages its lifecycle once it's running?_
 
-There isn't one right answer. The right answer depends on traffic shape, isolation requirements, what operational surface your team already runs, and how much of the dispatcher you want to own. This page walks through the answer space at one paragraph per option, links out to concrete patterns, and ends with the cross-cutting concerns each option has to address one way or another.
+<Warning>
+  **The development runner (`pipecat.runner.run`) is not built for
+  production, and is not supported there.** It's a local development tool. Its
+  session-start and transport-webhook endpoints accept requests from anyone,
+  with no authentication, no request signing, and no rate limiting — and a
+  single request can cause it to create paid resources (rooms, bots) on your
+  account. It has no flow control and is a single point of failure.
+
+Production self-hosting means putting one of the options below in front of
+your bots — not exposing the runner to real traffic. If you're only
+prototyping, [Exposing the runner for
+prototyping](#exposing-the-runner-for-prototyping) covers the minimum you'd
+want in front of it, and where that stops being enough.
+
+</Warning>
+
+There isn't one right answer for the production version. It depends on traffic shape, isolation requirements, what operational surface your team already runs, and how much of the dispatcher you want to own. This page walks through the answer space at one paragraph per option, links out to concrete patterns, and ends with the cross-cutting concerns each option has to address one way or another.
 
 ## What plays the runner's role
 
-The options below sit on a spectrum from "you run everything yourself" to "a managed runtime runs the bot for you". Strictly speaking, only the first two are self-hosting in the literal sense — the third is an alternative to self-hosting. They're walked through together because the decision space is the same one ("what serves session-start and runs the bot?") and most teams evaluating self-hosting are also weighing whether they want to be in that business at all.
+The two options below span the range from "you run everything yourself" to "a managed runtime runs the bot for you". The first is self-hosting in the literal sense; the second is an alternative to it. They're walked through together because the decision space is the same one ("what serves session-start and runs the bot?") and most teams evaluating self-hosting are also weighing whether they want to be in that business at all.
 
-### Option 1 — Run the development runner in production
-
-For very modest traffic, `pipecat.runner.run` is a real option. It's a normal FastAPI/uvicorn app — you can put it behind a reverse proxy, deploy it as a container, and use it. For an internal tool, a prototype, or a low-volume product, that's often enough.
-
-It's worth being honest about what you don't get for free. The runner accepts unauthenticated `POST /start` requests; it has no built-in flow control or backpressure, so a traffic spike that exceeds the host's capacity will degrade silently before it fails; and a single instance is a single point of failure. You can mitigate the SPOF by running multiple instances behind a load balancer (the runner doesn't hold session-routing state of its own as long as your transport choice doesn't require stickiness), but the flow-control gap and the missing request authentication you still have to address yourself.
-
-A practical upper bound per host is "however many concurrent bot subprocesses one host can sustain", which depends heavily on what your pipeline does. CPU-light pipelines that mostly proxy between transport and third-party services can pack many sessions per host; pipelines with local STT/TTS, custom models, or significant VAD work will saturate sooner.
-
-### Option 2 — Build your own dispatcher
+### Option 1 — Build your own dispatcher
 
 You write the HTTP service that receives session-start requests, and you decide how bot processes get into existence. This is the most flexible option and the most work. The two patterns most teams reach for here are:
 
@@ -28,13 +36,28 @@ You write the HTTP service that receives session-start requests, and you decide 
 
 These aren't the only shapes. Some teams build longer-lived orchestrated fleets on Kubernetes (with HPA or KEDA scaling on a custom session-count metric), or use a serverless platform's function-per-invocation model. The right shape is the one whose latency / cost / isolation profile matches the bot you're shipping and the traffic you're seeing.
 
-### Option 3 — Use a managed agent runtime
+### Option 2 — Use a managed agent runtime
 
 This option steps out of self-hosting: a managed platform runs the bot process for you. You supply the bot file (and usually a thin proxy that forwards session-start traffic), and the platform owns the runtime, pool, and lifecycle. This minimizes the operational surface you carry but trades for vendor lock-in and whatever feature ceiling the runtime has. See [Managed agent runtime](./patterns/managed-runtime).
 
 [Pipecat Cloud](/pipecat-cloud/introduction) is one example: Daily's managed runtime, purpose-built for Pipecat. The development runner's session-start API is deliberately shaped the same way as PCC's (`POST /start`, `/sessions/{id}/...`), which means a bot file and client built against the runner work against PCC unchanged. Other managed runtimes — like AWS Bedrock AgentCore — are the same shape, with their own platform-specific tradeoffs.
 
-If you're considering self-hosting partly because you already have an ops team and existing infrastructure to leverage, options 1–2 are probably the right starting point. If you'd rather not build any of that surface, option 3 is the path designed to skip it.
+If you're considering self-hosting partly because you already have an ops team and existing infrastructure to leverage, Option 1 is probably the right starting point. If you'd rather not build any of that surface, Option 2 is the path designed to skip it.
+
+## Exposing the runner for prototyping
+
+Sometimes you need something reachable before you've built either option above — a demo, an alpha test, a prototype a handful of people will hit. If you're going to put the development runner on a public address at all, treat it as **prototyping-only** and put a reverse proxy in front of it that adds, at minimum:
+
+- **Authentication on `POST /start`** — the runner accepts start requests from anyone. A shared secret or bearer token checked at the proxy keeps strangers from spawning bots (and paid rooms) on your account.
+- **Rate limiting** — the runner has no backpressure. A per-IP and global request cap at the proxy bounds both load and cost if the address is discovered.
+- **TLS termination** — the runner speaks plain HTTP.
+
+Two things this does _not_ solve, which is why it stays prototyping-only:
+
+- **The transport webhooks have a different caller than `POST /start`.** Endpoints like the Daily dial-in webhook are invoked by the transport provider, not your app, so a single proxy secret doesn't fit them — they'd need provider-appropriate verification (signature checks, IP allowlists) that the runner doesn't perform. Enabling a telephony transport exposes these endpoints too.
+- **None of this addresses lifecycle, capacity, or isolation.** You still have a single point of failure, no graceful drain, and no way to scale past one host.
+
+If you find yourself building this out, that's the signal you've outgrown the runner — move to Option 1 or Option 2.
 
 ## What you'll need to address either way
 
@@ -42,7 +65,7 @@ Whichever option you pick, a handful of concerns show up in production. None of 
 
 ### Request authentication
 
-The development runner accepts unauthenticated `POST /start` requests by design — that's fine on localhost and dangerous in production. Whatever serves session-start traffic in production needs some form of authentication, both to keep strangers from spinning up bots on your dime and to identify the user the bot is being started for. The shape varies: signed JWTs from your app server, bearer tokens, mutual-TLS, etc. If you're using a managed runtime this is usually handled by the runtime; if you're rolling your own dispatcher you'll need to add it.
+Whatever serves session-start traffic in production needs some form of authentication, both to keep strangers from spinning up bots on your dime and to identify the user the bot is being started for. The shape varies: signed JWTs from your app server, bearer tokens, mutual-TLS, etc. If you're using a managed runtime this is usually handled by the runtime; if you're rolling your own dispatcher you'll need to add it. (This is the same gap that makes the development runner unsafe to expose — see the warning above.)
 
 ### Secret delivery
 
