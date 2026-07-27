@@ -9,13 +9,51 @@ Pipecat's docs, examples, and API surface change often and span several reposito
 
 Every tool runs two ways: as a one-shot CLI command and as an MCP server. Use the CLI for a quick lookup. Add the MCP server when a session needs repeated, exploratory queries.
 
+<Note>
+  This is a tool for *your* coding agent, not something your bot uses at
+  runtime. For a bot that connects to MCP servers, see
+  [`MCPClient`](/api-reference/server/utilities/mcp/mcp) and the
+  `pipecat-ai[mcp]` extra.
+</Note>
+
 ## Setup
 
-The hub is published to PyPI as `pipecat-ai-context-hub` and runs with [`uv`](https://docs.astral.sh/uv/), no clone required. The examples on this page use `uvx`, uv's one-shot runner, which fetches and runs the hub on demand. Build the local index once:
+The hub is published to PyPI as `pipecat-ai-context-hub`. Co-install it with the Pipecat CLI, then let it configure your coding agent and build the index in one step:
+
+```bash
+uv tool install "pipecat-ai[cli]" --with pipecat-ai-context-hub
+pipecat mcp install
+```
+
+`install` registers the MCP server with each coding agent it finds, echoing each command it runs, then builds the index — a few minutes the first time, since it downloads local embedding models. Every hub command is then available as `pipecat mcp <command>`; see the [`pipecat mcp` reference](/api-reference/cli/mcp) for the full flag surface.
+
+<Warning>
+  `--with` replaces the tool environment rather than adding to it. If you also
+  use `pipecat cloud`, name both plugins: `uv tool install "pipecat-ai[cli]"
+  --with pipecatcloud --with pipecat-ai-context-hub`.
+</Warning>
+
+If the index gets corrupted, force a rebuild:
+
+```bash
+pipecat mcp refresh --force
+```
+
+If your project targets an older Pipecat version, pin the hub to it so results match what you're running:
+
+```bash
+pipecat mcp refresh --framework-version v0.0.96
+```
+
+### Without the Pipecat CLI
+
+The hub runs standalone too. [`uvx`](https://docs.astral.sh/uv/), uv's one-shot runner, fetches and runs it on demand with nothing installed:
 
 ```bash
 uvx pipecat-ai-context-hub refresh   # build local index (~2 min first run)
 ```
+
+Every command on this page works either way — `pipecat mcp refresh` and `uvx pipecat-ai-context-hub refresh` are the same command.
 
 <Tip>
   To install it once instead of fetching on demand, run `uv tool install
@@ -24,17 +62,14 @@ uvx pipecat-ai-context-hub refresh   # build local index (~2 min first run)
   name.
 </Tip>
 
-If the index gets corrupted, you can force a rebuild:
+### Which install to choose
 
-```bash
-uvx pipecat-ai-context-hub refresh --force
-```
+The two installs expose different things, because a command is only visible inside the environment its package was installed into:
 
-If your project targets an older Pipecat version, pin the hub to it so results match what you're running:
+- **Co-installed with the CLI** (`--with`) gives you `pipecat mcp`, but does not put `pipecat-context-hub` on your `PATH`.
+- **Installed on its own** (`uv tool install pipecat-ai-context-hub`) gives you `pipecat-context-hub` on your `PATH`, but not `pipecat mcp`.
 
-```bash
-uvx pipecat-ai-context-hub refresh --framework-version v0.0.96
-```
+Doing both works and gives you both names, at the cost of a second copy on disk — the hub's retrieval stack is around 1 GB, and the two environments share very little. Pick one unless you have a reason not to.
 
 ## Custom sources
 
@@ -91,14 +126,26 @@ To make your coding agent reach for these tools automatically, add the [recommen
 Every tool is also a one-shot CLI command, so you can query the index from a shell with no MCP setup. Reach for this when you need a single answer fast, like a deprecation check, an API signature, or an index health check. Each command prints the tool's JSON to stdout:
 
 ```bash
-uvx pipecat-ai-context-hub check-deprecation PipelineTask     # is this symbol deprecated?
-uvx pipecat-ai-context-hub search-api "WebsocketServerParams"  # find an API signature
-uvx pipecat-ai-context-hub status                              # index health / freshness
+pipecat mcp check-deprecation PipelineTask      # is this symbol deprecated?
+pipecat mcp search-api "WebsocketServerParams"  # find an API signature
+pipecat mcp status                              # index health / freshness
 ```
+
+Or, without the Pipecat CLI, the same commands under `uvx pipecat-ai-context-hub`. The [`pipecat mcp` reference](/api-reference/cli/mcp) documents every command and flag.
 
 ## MCP server
 
 For a longer build or debugging session where the model probes the index repeatedly, add the hub as an MCP server instead of shelling out per query. It keeps the index warm for the whole session and exposes the same tools to your coding tool directly.
+
+`pipecat mcp install` does this for you wherever the client ships its own CLI, and prints the config to paste where it doesn't:
+
+```bash
+pipecat mcp install                     # every detected client, then build the index
+pipecat mcp install --client cursor     # print the config for one client
+pipecat mcp install --print-config      # show what would be registered, change nothing
+```
+
+To register by hand instead:
 
 <Tabs>
   <Tab title="Claude Code">
@@ -146,6 +193,22 @@ For a longer build or debugging session where the model probes the index repeate
 A newly added MCP server loads when your coding tool starts a session, so add it before opening the session you want to use it in.
 
 See the [repo docs](https://github.com/pipecat-ai/pipecat-context-hub) for additional configuration options.
+
+## Keeping the index current
+
+A stale index is invisible: your agent answers just as confidently from month-old APIs, and you find out when the generated code doesn't match the version you're running. So the Pipecat CLI checks on the way past and prints a one-line notice on stderr when something needs attention:
+
+```
+⚠ Pipecat Context Hub index is 42 days old — run `pipecat mcp refresh` so coding agents don't cite stale APIs.
+⚠ Pipecat Context Hub index was built for pipecat-ai 1.2.0, but this project uses 1.6.0 — run `pipecat mcp refresh` so coding agents match your version.
+```
+
+The version comparison is deliberately quiet. It compares only major and minor, so a patch or dev release never triggers it, and it stays silent when your project has an editable Pipecat checkout or when the index is _ahead_ of your project — an index built from `main` legitimately runs ahead of a released version.
+
+The notice is silent when no index exists, so it never appears for people who don't use the hub. Two environment variables tune it:
+
+- `PIPECAT_HUB_STALE_AFTER_DAYS` — index age in days before it's called stale. Defaults to `7`; `0` disables the age check.
+- `PIPECAT_HUB_CHECK=0` — turn the notice off entirely.
 
 ## Next steps
 
