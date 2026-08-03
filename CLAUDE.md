@@ -1,3 +1,8 @@
+---
+noindex: true
+searchable: false
+---
+
 # CLAUDE.md
 
 ## Project overview
@@ -12,6 +17,14 @@ mint dev
 
 # Check for broken links (also runs in CI)
 mint broken-links
+
+# Lint frontmatter metadata: title/description uniqueness, lengths,
+# llms.txt staleness (also runs in CI)
+node scripts/docs-meta-lint.mjs
+
+# Regenerate llms.txt after adding, moving, or retitling pages
+# (CI fails if the checked-in file is stale)
+node scripts/gen-llms-txt.mjs
 
 # Format files with Prettier
 npx prettier --write .
@@ -35,14 +48,35 @@ images/            # Static images
 
 ### MDX frontmatter
 
-Every page needs a `title` and optional `description`:
+Every page needs a `title` and a `description`. The frontmatter `title` becomes
+the `<title>` tag, the H1, the llms.txt entry, and the citation label in AI
+tools (Kapa, Pipecat Context Hub) — so it must be unique across the site and
+self-describing without navigation context. `sidebarTitle` controls only the
+sidebar label; use it to keep nav labels short when the title carries context.
 
 ```mdx
 ---
-title: "Page Title"
-description: "Short description for SEO and navigation."
+title: "Deepgram Speech-to-Text"
+sidebarTitle: "Deepgram"
+description: "Streaming STT with DeepgramSTTService and DeepgramFluxSTTService: Nova models, Flux turn detection, and SageMaker variants."
 ---
 ```
+
+Conventions (enforced by `scripts/docs-meta-lint.mjs`, which runs in CI):
+
+- **Titles**: short and readable — the title renders verbatim as the page H1.
+  ≤ 50 chars; no ` - Pipecat` suffix (Mintlify appends it). Duplicate titles
+  are tolerated (they only warn), but every page's **effective unfurl title**
+  — `"og:title"` if set, else `title` — must be globally unique. When two
+  pages legitimately share a short title (e.g. `Daily WebRTC Transport` across
+  SDKs), add a disambiguating `"og:title"`: e.g.
+  `"og:title": "Daily WebRTC Transport - iOS SDK"`. Titles over 30 chars
+  require a `sidebarTitle`.
+- **Descriptions**: 110–140 chars target (50–160 hard band); include the class
+  names the page documents and the literal modality acronym (STT/TTS/LLM/VAD)
+  where relevant; avoid boilerplate openers like "service implementation using".
+- After adding, moving, or retitling a page, run `node scripts/gen-llms-txt.mjs`
+  to regenerate the checked-in `llms.txt` — CI fails if it is stale.
 
 ### Adding pages to navigation
 
