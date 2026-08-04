@@ -103,10 +103,20 @@ function generate() {
     }
   };
 
+  const entry = (p) => {
+    const fm = frontmatter(readFileSync(join(ROOT, `${p}.mdx`), "utf-8"));
+    const desc = fm.description ? `: ${fm.description}` : "";
+    lines.push(`- [${fm.title}](${BASE}${p}.md)${desc}`);
+  };
   for (const tab of docsJson.navigation.tabs) {
     lines.push("", `## ${tab.tab}`, "");
+    if (tab.pages) {
+      for (const p of tab.pages) if (typeof p === "string") entry(p);
+      lines.push("");
+    }
     for (const group of tab.groups) {
       lines.push(`### ${group.group}`, "");
+      if (group.root) entry(group.root);
       walk(group.pages, 4);
       lines.push("");
     }

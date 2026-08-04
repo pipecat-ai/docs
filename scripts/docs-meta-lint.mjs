@@ -110,11 +110,19 @@ function walkNav(docsJson) {
   const walk = (pages, tab, chain) => {
     for (const p of pages) {
       if (typeof p === "string") out.push({ slug: p, tab, chain });
-      else walk(p.pages, tab, [...chain, p.group]);
+      else {
+        if (p.root) out.push({ slug: p.root, tab, chain: [...chain, p.group] });
+        walk(p.pages, tab, [...chain, p.group]);
+      }
     }
   };
   for (const tab of docsJson.navigation.tabs) {
-    for (const group of tab.groups) walk(group.pages, tab.tab, [group.group]);
+    if (tab.pages) walk(tab.pages, tab.tab, []);
+    for (const group of tab.groups) {
+      if (group.root)
+        out.push({ slug: group.root, tab: tab.tab, chain: [group.group] });
+      walk(group.pages, tab.tab, [group.group]);
+    }
   }
   return out;
 }
