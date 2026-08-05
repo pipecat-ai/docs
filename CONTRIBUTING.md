@@ -10,8 +10,7 @@ This project follows the [Contributor Covenant v2.1](https://www.contributor-cov
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) 20+
-- [Mintlify CLI](https://www.npmjs.com/package/mint) (`npm i -g mint`)
+[nvm](https://github.com/nvm-sh/nvm), or another way to install the Node version pinned in `.nvmrc`.
 
 ### Setup
 
@@ -22,17 +21,29 @@ This project follows the [Contributor Covenant v2.1](https://www.contributor-cov
    cd docs
    ```
 
-2. Start the local dev server:
+2. Install and switch to the Node version this repo targets (see `.nvmrc`):
 
    ```bash
-   mint dev
+   nvm install
    ```
 
-3. Open `https://localhost:3000` in your browser to preview changes.
+3. Install dependencies. This also installs the Git hooks that format your changes on commit:
+
+   ```bash
+   npm install
+   ```
+
+4. Start the local dev server:
+
+   ```bash
+   npx mint dev
+   ```
+
+5. Open `https://localhost:3000` in your browser to preview changes.
 
 ### Troubleshooting
 
-- **Mintlify dev isn't running** — Run `mint update` to get the latest version.
+- **Mintlify dev isn't running** — Run `npx mint update` to get the latest version.
 - **Page loads as a 404** — Make sure you are running in a folder with `docs.json`.
 
 ## Making a Contribution
@@ -45,25 +56,20 @@ This project follows the [Contributor Covenant v2.1](https://www.contributor-cov
 
 2. **Make your edits.** See the [Content Guidelines](#content-guidelines) below.
 
-3. **Format with Prettier** to match the repo style:
+3. **Check for broken links:**
 
    ```bash
-   npx prettier --write .
+   npx mint broken-links
    ```
 
-4. **Check for broken links:**
-
-   ```bash
-   mint broken-links
-   ```
-
-5. **Commit your changes** with a meaningful message:
+4. **Commit your changes** with a meaningful message. A pre-commit hook formats
+   the files you staged:
 
    ```bash
    git commit -m "Description of your changes"
    ```
 
-6. **Push your branch** and open a Pull Request against `main`:
+5. **Push your branch** and open a Pull Request against `main`:
 
    ```bash
    git push origin your-branch-name
@@ -89,21 +95,23 @@ description: "Short description for SEO and navigation."
 All pages must be registered in `docs.json` under `navigation.tabs[].groups[].pages`. The path is relative to the repo root without the `.mdx` extension:
 
 ```
-"guides/learn/overview"
+"overview/introduction"
 ```
 
 ### Project Structure
 
+The content directories correspond one-to-one with the navigation tabs in `docs.json`:
+
 ```
 docs.json          # Site config: navigation, tabs, theme, metadata
-getting-started/   # Intro, quickstart, ecosystem overview
-guides/            # Learning guides, feature how-tos
-server/            # Server-side framework reference (pipelines, services, utilities)
-client/            # Client SDK docs (JS, React, React Native, etc.)
-cli/               # Pipecat CLI reference
-deployment/        # Pipecat Cloud deployment docs
+overview/          # Intro and ecosystem overview
+pipecat/           # Pipecat framework docs (fundamentals, learn, features, telephony, deployment)
+client/            # Client SDK docs (concepts, guides)
+pipecat-flows/     # Pipecat Flows docs
+pipecat-cloud/     # Pipecat Cloud docs (fundamentals, guides, security)
+api-reference/     # Reference for server, client, CLI, Flows, and Cloud REST
 snippets/          # Reusable MDX snippets (shared across pages)
-images/            # Static images
+images/ logo/ videos/   # Static assets
 ```
 
 ### Mintlify Components
@@ -128,14 +136,19 @@ Prettier is configured via `.prettierrc`:
 - Double quotes
 - Semicolons enabled
 
-Run `npx prettier --write .` before committing to ensure consistent formatting.
+A pre-commit hook (husky + lint-staged) formats staged files, so formatting is
+usually taken care of for you. To format the whole site by hand:
+
+```bash
+npm run format
+```
 
 ## Continuous Integration
 
 A GitHub Actions workflow runs `mint broken-links` on every PR and push to `main`. If broken links are detected, the workflow will fail and post a comment on your PR. You can run the same check locally:
 
 ```bash
-mint broken-links
+npx mint broken-links
 ```
 
 ## Getting Help
