@@ -397,26 +397,37 @@ function runChecks(root, pages, orphans, missing, gitBase) {
     );
   }
 
-  // 13/14: custom llms.txt staleness + size (skipped until the file ships)
+  // 13/14: custom llms.txt + llms-full.txt staleness, llms.txt size
+  // (skipped until the files ship)
   const customPath = join(root, "llms.txt");
   if (existsSync(customPath)) {
     const genPath = join(root, "scripts", "gen-llms-txt.mjs");
     if (existsSync(genPath)) {
-      try {
-        const generated = execFileSync(
-          process.execPath,
-          [genPath, "--stdout"],
-          { encoding: "utf-8", timeout: 30_000 },
-        );
-        if (generated !== readFileSync(customPath, "utf-8")) {
-          add(
-            13,
-            null,
-            "llms.txt is stale: regenerate with scripts/gen-llms-txt.mjs",
-          );
+      /** @type {Array<[flag: string, file: string]>} */
+      const outputs = [
+        ["--stdout", "llms.txt"],
+        ["--stdout-full", "llms-full.txt"],
+      ];
+      for (const [flag, file] of outputs) {
+        try {
+          const generated = execFileSync(process.execPath, [genPath, flag], {
+            encoding: "utf-8",
+            timeout: 30_000,
+            maxBuffer: 64 * 1024 * 1024, // llms-full.txt is several MB
+          });
+          const onDisk = existsSync(join(root, file))
+            ? readFileSync(join(root, file), "utf-8")
+            : null;
+          if (generated !== onDisk) {
+            add(
+              13,
+              null,
+              `${file} is ${onDisk === null ? "missing" : "stale"}: regenerate with scripts/gen-llms-txt.mjs`,
+            );
+          }
+        } catch (e) {
+          add(13, null, `gen-llms-txt.mjs failed: ${String(e).slice(0, 200)}`);
         }
-      } catch (e) {
-        add(13, null, `gen-llms-txt.mjs failed: ${String(e).slice(0, 200)}`);
       }
     } else {
       add(

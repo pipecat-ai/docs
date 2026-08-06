@@ -19,11 +19,12 @@ mint dev
 mint broken-links
 
 # Lint frontmatter metadata: title/description uniqueness, lengths,
-# llms.txt staleness (also runs in CI)
+# llms.txt + llms-full.txt staleness (also runs in CI)
 node scripts/docs-meta-lint.mjs
 
-# Regenerate llms.txt after adding, moving, or retitling pages
-# (CI fails if the checked-in file is stale)
+# Regenerate llms.txt (tiered index) and llms-full.txt (full content dump)
+# after adding, moving, retitling, or editing pages
+# (CI fails if the checked-in files are stale)
 node scripts/gen-llms-txt.mjs
 
 # Format files with Prettier
@@ -75,8 +76,9 @@ Conventions (enforced by `scripts/docs-meta-lint.mjs`, which runs in CI):
 - **Descriptions**: 110–140 chars target (50–160 hard band); include the class
   names the page documents and the literal modality acronym (STT/TTS/LLM/VAD)
   where relevant; avoid boilerplate openers like "service implementation using".
-- After adding, moving, or retitling a page, run `node scripts/gen-llms-txt.mjs`
-  to regenerate the checked-in `llms.txt` — CI fails if it is stale.
+- After adding, moving, retitling, or editing a page, run
+  `node scripts/gen-llms-txt.mjs` to regenerate the checked-in `llms.txt` and
+  `llms-full.txt` — CI fails if either is stale.
 
 ### Adding pages to navigation
 

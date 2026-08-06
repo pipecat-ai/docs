@@ -1,21 +1,28 @@
 #!/usr/bin/env node
 // @ts-check
 /**
- * Generate the custom llms.txt for docs.pipecat.ai.
+ * Generate the custom llms.txt and llms-full.txt for docs.pipecat.ai.
  *
- * A root-level llms.txt overrides Mintlify's auto-generated file (which
- * truncates at 100,000 characters). This generator emits a structured index:
- * a hand-written orientation section, then navigation-derived sections
- * mirroring the docs.json tab/group hierarchy, with one entry per page built
- * from its frontmatter title and description.
+ * Root-level files override Mintlify's auto-generated ones (which truncate at
+ * 100,000 characters). Two outputs share the same hand-written orientation
+ * preamble:
+ *   - llms.txt       a structured index: navigation-derived sections mirroring
+ *                    the docs.json tab/group hierarchy, one entry per page
+ *                    built from its frontmatter title and description.
+ *   - llms-full.txt  the complete dump: every navigation page's full MDX body
+ *                    in nav order. Snippet imports and their component usages
+ *                    are stripped (we cannot render them outside Mintlify);
+ *                    OpenAPI-backed pages contribute their operation line and
+ *                    description (the schema tables are Mintlify-rendered).
  *
  * Usage:
- *   node scripts/gen-llms-txt.mjs            # rewrite llms.txt in place
- *   node scripts/gen-llms-txt.mjs --stdout   # print to stdout (used by the lint)
+ *   node scripts/gen-llms-txt.mjs                # rewrite both files in place
+ *   node scripts/gen-llms-txt.mjs --stdout       # print llms.txt (used by the lint)
+ *   node scripts/gen-llms-txt.mjs --stdout-full  # print llms-full.txt (used by the lint)
  *
- * CI check 13 in docs-meta-lint.mjs regenerates this file and fails if the
- * checked-in llms.txt differs, so run this after any page add, move, or
- * frontmatter change.
+ * CI check 13 in docs-meta-lint.mjs regenerates both files and fails if the
+ * checked-in copies differ, so run this after any page add, move, retitle, or
+ * content edit.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -84,6 +91,72 @@ function frontmatter(text) {
   return out;
 }
 
+/** Flat list of page slugs in navigation order. @param {any} docsJson */
+function navSlugs(docsJson) {
+  /** @type {string[]} */
+  const slugs = [];
+  /** @param {any[]} pages */
+  const walk = (pages) => {
+    for (const p of pages) {
+      if (typeof p === "string") slugs.push(p);
+      else {
+        if (p.root) slugs.push(p.root);
+        walk(p.pages);
+      }
+    }
+  };
+  for (const tab of docsJson.navigation.tabs) {
+    if (tab.pages) for (const p of tab.pages) if (typeof p === "string") slugs.push(p);
+    for (const group of tab.groups) {
+      if (group.root) slugs.push(group.root);
+      walk(group.pages);
+    }
+  }
+  return slugs;
+}
+
+const SNIPPET_IMPORT_RE =
+  /^import\s+(?:\{([^}]*)\}|(\w+))\s+from\s+["']\/snippets\/[^"']+["'];?[^\S\n]*\n?/gm;
+
+/**
+ * Page body with frontmatter, snippet imports, and self-closing usages of
+ * snippet-imported components stripped. No whitespace collapsing beyond the
+ * stripped spans - code examples may contain intentional blank runs.
+ * @param {string} text
+ */
+function pageBody(text) {
+  let body = text.replace(/^---\n[\s\S]*?\n---\n?/, "");
+  /** @type {string[]} */
+  const snippetNames = [];
+  body = body.replace(SNIPPET_IMPORT_RE, (_, named, dflt) => {
+    const ids = named ? named.split(",") : [dflt];
+    snippetNames.push(...ids.map((s) => s.trim()).filter(Boolean));
+    return "";
+  });
+  for (const name of snippetNames) {
+    body = body.replace(new RegExp(`\\n?<${name}\\b[\\s\\S]*?/>\\n?`, "g"), "");
+  }
+  return body.trim();
+}
+
+function generateFull() {
+  const docsJson = JSON.parse(readFileSync(join(ROOT, "docs.json"), "utf-8"));
+  /** @type {string[]} */
+  const parts = [PREAMBLE];
+  for (const slug of navSlugs(docsJson)) {
+    const raw = readFileSync(join(ROOT, `${slug}.mdx`), "utf-8");
+    const fm = frontmatter(raw);
+    // url-stub pages are external links; point Source at the real target
+    let page = `# ${fm.title}\nSource: ${fm.url ?? `${BASE}${slug}.md`}\n`;
+    if (fm.description) page += `\n${fm.description}\n`;
+    if (fm.openapi) page += `\nOpenAPI operation: \`${fm.openapi}\`\n`;
+    const body = pageBody(raw);
+    if (body) page += `\n${body}\n`;
+    parts.push(page);
+  }
+  return parts.join("\n");
+}
+
 function generate() {
   const docsJson = JSON.parse(readFileSync(join(ROOT, "docs.json"), "utf-8"));
   /** @type {string[]} */
@@ -125,12 +198,18 @@ function generate() {
   return lines.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
-const output = generate();
 if (process.argv.includes("--stdout")) {
-  process.stdout.write(output);
+  process.stdout.write(generate());
+} else if (process.argv.includes("--stdout-full")) {
+  process.stdout.write(generateFull());
 } else {
-  writeFileSync(join(ROOT, "llms.txt"), output);
-  console.log(
-    `llms.txt written: ${[...output].length.toLocaleString("en-US")} chars`,
-  );
+  for (const [file, output] of [
+    ["llms.txt", generate()],
+    ["llms-full.txt", generateFull()],
+  ]) {
+    writeFileSync(join(ROOT, file), output);
+    console.log(
+      `${file} written: ${[...output].length.toLocaleString("en-US")} chars`,
+    );
+  }
 }
