@@ -1,0 +1,65 @@
+name: Docs Metadata Lint
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  # Allow manual trigger
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Lint frontmatter metadata
+        run: |
+          BASE=HEAD
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=$(git merge-base ${{ github.event.pull_request.base.sha }} HEAD)
+          fi
+          node scripts/docs-meta-lint.mjs --format github --git-base "$BASE" | tee metadata-report.txt
+
+      # Baseline is generated from the PR's merge-base on the fly, so the
+      # comparison (metric deltas + changed sidebar labels) is always against
+      # the state this PR actually branched from.
+      - name: Compare against merge-base
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE=$(git merge-base ${{ github.event.pull_request.base.sha }} HEAD)
+          git worktree add /tmp/base "$BASE"
+          node scripts/docs-meta-lint.mjs --root /tmp/base --json > /tmp/base.json || true
+          node scripts/docs-meta-lint.mjs --compare /tmp/base.json | tee metadata-compare.txt
+
+      # Validates the llms.txt size-projection model against production.
+      # Network-dependent, so it must not block a PR on a flake.
+      - name: Calibrate size model against live llms.txt
+        continue-on-error: true
+        run: node scripts/docs-meta-lint.mjs --calibrate
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata-report
+          path: |
+            metadata-report.txt
+            metadata-compare.txt
+          if-no-files-found: ignore
