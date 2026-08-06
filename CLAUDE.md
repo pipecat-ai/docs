@@ -7,16 +7,20 @@ searchable: false
 
 ## Project overview
 
-This is the documentation site for [Pipecat](https://github.com/pipecat-ai/pipecat), hosted at [docs.pipecat.ai](https://docs.pipecat.ai). It's built with [Mintlify](https://mintlify.com/) and contains ~314 MDX files covering guides, API references, and deployment docs.
+This is the documentation site for [Pipecat](https://github.com/pipecat-ai/pipecat), hosted at [docs.pipecat.ai](https://docs.pipecat.ai). It's built with [Mintlify](https://mintlify.com/) and contains several hundred MDX files covering guides, API references, and deployment docs.
 
 ## Development commands
 
 ```bash
+# Install the Node version in .nvmrc, then dependencies and Git hooks
+nvm install
+npm install
+
 # Start local dev server
-mint dev
+npx mint dev
 
 # Check for broken links (also runs in CI)
-mint broken-links
+npx mint broken-links
 
 # Lint frontmatter metadata: title/description uniqueness, lengths,
 # llms.txt + llms-full.txt staleness (also runs in CI)
@@ -27,22 +31,24 @@ node scripts/docs-meta-lint.mjs
 # (CI fails if the checked-in files are stale)
 node scripts/gen-llms-txt.mjs
 
-# Format files with Prettier
-npx prettier --write .
+# Format the whole site with Prettier
+npm run format
 ```
 
 ## Project structure
 
+The content directories correspond one-to-one with the navigation tabs in `docs.json`:
+
 ```
 docs.json          # Site config: navigation, tabs, theme, metadata
-getting-started/   # Intro, quickstart, ecosystem overview
-guides/            # Learning guides, feature how-tos
-server/            # Server-side framework reference (pipelines, services, utilities)
-client/            # Client SDK docs (JS, React, React Native, etc.)
-cli/               # Pipecat CLI reference
-deployment/        # Pipecat Cloud deployment docs
+overview/          # Intro and ecosystem overview
+pipecat/           # Pipecat framework docs (fundamentals, learn, features, telephony, deployment)
+client/            # Client SDK docs (concepts, guides)
+pipecat-flows/     # Pipecat Flows docs
+pipecat-cloud/     # Pipecat Cloud docs (fundamentals, guides, security)
+api-reference/     # Reference for server, client, CLI, Flows, and Cloud REST
 snippets/          # Reusable MDX snippets (shared across pages)
-images/            # Static images
+images/ logo/ videos/   # Static assets
 ```
 
 ## Content conventions
@@ -82,7 +88,7 @@ Conventions (enforced by `scripts/docs-meta-lint.mjs`, which runs in CI):
 
 ### Adding pages to navigation
 
-All pages must be registered in `docs.json` under `navigation.tabs[].groups[].pages`. The path is relative to the repo root without the `.mdx` extension (e.g., `"guides/learn/overview"`).
+All pages must be registered in `docs.json` under `navigation.tabs[].groups[].pages`. The path is relative to the repo root without the `.mdx` extension (e.g., `"overview/introduction"`).
 
 ### Mintlify components
 
@@ -103,6 +109,9 @@ Prettier is configured via `.prettierrc`:
 - 2-space indentation (spaces, not tabs)
 - Double quotes
 - Semicolons enabled
+
+A husky pre-commit hook runs lint-staged, which formats staged files. The whole
+site is Prettier-clean, so `npm run format` should be a no-op on a clean tree.
 
 ## CI/CD
 

@@ -106,7 +106,8 @@ function navSlugs(docsJson) {
     }
   };
   for (const tab of docsJson.navigation.tabs) {
-    if (tab.pages) for (const p of tab.pages) if (typeof p === "string") slugs.push(p);
+    if (tab.pages)
+      for (const p of tab.pages) if (typeof p === "string") slugs.push(p);
     for (const group of tab.groups) {
       if (group.root) slugs.push(group.root);
       walk(group.pages);
