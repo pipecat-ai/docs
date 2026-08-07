@@ -1,0 +1,180 @@
+---
+title: "Gandr Text-to-Speech"
+sidebarTitle: "Gandr"
+description: "GandrTTSService streams speech over a persistent WebSocket, holding one connection warm across turns."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Gandr"
+  maintainerUrl="https://github.com/Gandr-AI"
+  repo="https://github.com/Gandr-AI/gandr-pipecat"
+/>
+
+## Overview
+
+`GandrTTSService` converts text to speech using [Gandr](https://gandr.ai). It
+holds a single WebSocket open and reuses it across turns rather than opening
+one per utterance, which is what keeps steady-state first-audio latency low.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Gandr-AI/gandr-pipecat"
+  >
+    Source code, examples, and issues for the Gandr integration
+  </Card>
+  <Card title="Gandr Website" icon="book" href="https://gandr.ai">
+    Voices, languages, and pricing
+  </Card>
+  <Card title="API Keys" icon="key" href="https://gandr.ai/join/">
+    Create a Gandr API key
+  </Card>
+  <Card title="API Reference" icon="code" href="https://gandr.ai/docs">
+    The full HTTP and WebSocket contract
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from
+`pipecat-ai`:
+
+```bash
+uv pip install git+https://github.com/Gandr-AI/gandr-pipecat.git
+```
+
+## Prerequisites
+
+1. **Gandr account**: sign up at [gandr.ai](https://gandr.ai)
+2. **API key**: a `gnd_…` key from your account page
+
+### Required environment variables
+
+- `GANDR_API_KEY`: your Gandr API key (required)
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  Gandr API key (`gnd_…`). Raises `ValueError` if empty or whitespace.
+</ParamField>
+
+<ParamField path="url" type="str" default="wss://tts-west.gandr.ai/ws">
+  WebSocket endpoint. Leave as the default unless you have been given a
+  different one.
+</ParamField>
+
+<ParamField path="params" type="GandrTTSService.InputParams" default="None">
+  Voice, language and expression configuration. See [Input
+  parameters](#input-parameters).
+</ParamField>
+
+<ParamField path="text_aggregation_mode" type="TextAggregationMode" default="None">
+  How incoming text is aggregated before synthesis.
+</ParamField>
+
+<ParamField path="utterance_timeout_s" type="float" default="30.0">
+  How long to wait for an utterance's closing frame before treating it as
+  failed.
+</ParamField>
+
+<ParamField path="busy_retry_s" type="float" default="0.5">
+  How long to wait before retrying after the server answers `busy`.
+</ParamField>
+
+<ParamField path="max_attempts" type="int" default="3">
+  Total attempts per utterance, including retries for `busy` and for voice
+  registration.
+</ParamField>
+
+<ParamField path="reconnect_on_interruption" type="bool" default="True">
+  On barge-in, drop and reopen the connection so the next turn's audio is not
+  queued behind audio the listener has already interrupted. See
+  [Interruptions](#interruptions).
+</ParamField>
+
+### Input parameters
+
+Passed via `params=GandrTTSService.InputParams(...)`.
+
+| Parameter       | Type    | Default        | Description                                                                   |
+| --------------- | ------- | -------------- | ----------------------------------------------------------------------------- |
+| `voice_id`      | `str`   | `"gandr-mia"`  | A stock voice (see `STOCK_VOICES`) or a `gnd:` cloned-voice identifier.        |
+| `language`      | `str`   | `"en"`         | Bare two-letter code. See [Languages](#languages).                             |
+| `sample_rate`   | `int`   | `None`         | One of 8000, 16000, 22050, 24000. Takes priority over the constructor's value. |
+| `speed`         | `float` | `None`         | 0.6–1.5, pitch preserving.                                                     |
+| `volume`        | `float` | `None`         | 0.5–2.0, soft-ceiling mastered.                                                |
+| `temperature`   | `float` | `None`         | Expression control. Omit to let the service choose.                            |
+| `cfg_weight`    | `float` | `None`         | Expression control. Omit to send nothing at all.                               |
+| `seed`          | `int`   | `None`         | Fixes the render for a reproducible result.                                    |
+| `voice_wav_b64` | `str`   | `None`         | Base64 WAV reference audio for a cloned voice, registered on first utterance.  |
+
+Stock voices: `gandr-mia`, `gandr-ava`, `gandr-jenny`, `gandr-dane`,
+`gandr-leo`, `gandr-lewis`.
+
+### Languages
+
+`language` takes a **bare two-letter code** — `en`, `es`, `fr`, `de`, `pt`,
+`ar`, `zh`, `ja`.
+
+<Warning>
+  A region suffix such as `en-GB` or `zh-CN` is not recognised and the request
+  falls back to English **without raising an error**. If you are populating
+  this from a browser or OS locale, strip the region first.
+</Warning>
+
+## Usage example
+
+```python
+import os
+
+from pipecat_gandr import GandrTTSService
+
+tts = GandrTTSService(
+    api_key=os.getenv("GANDR_API_KEY"),
+    params=GandrTTSService.InputParams(
+        voice_id="gandr-jenny",
+        language="en",
+    ),
+)
+```
+
+A complete runnable pipeline is in
+[`examples/foundational/gandr_tts_basic.py`](https://github.com/Gandr-AI/gandr-pipecat/blob/main/examples/foundational/gandr_tts_basic.py).
+
+## Interruptions
+
+The wire protocol has no cancel frame. On barge-in the service therefore drops
+the connection and reopens it, rather than draining audio nobody is going to
+hear.
+
+Set `reconnect_on_interruption=False` to keep the connection instead and
+discard the interrupted render client-side — at the cost of the next turn
+waiting for that render to finish.
+
+## Notes
+
+<Note>
+  **The first turn on a fresh connection is slower** — roughly 700 ms while the
+  session voice cache fills. Every turn after it is materially quicker, which
+  is why the connection is held warm across turns. A benchmark that measures
+  only turn one is measuring the cache filling rather than the engine.
+</Note>
+
+<Note>
+  Requests are capped at 2,000 characters. Longer text is split losslessly by
+  `split_for_request` before sending; you do not need to pre-chunk.
+</Note>
+
+<Note>
+  Every failure path closes the turn with `TTSStoppedFrame`, so a pipeline
+  cannot hang waiting on a connection that has died.
+</Note>
+
+## Compatibility
+
+**Tested with Pipecat v1.7.0** on Python 3.12.11: clean virtual environment,
+install, import, unit tests, and service construction. Declared support is
+`pipecat-ai>=0.0.108,<2.0.0`.
