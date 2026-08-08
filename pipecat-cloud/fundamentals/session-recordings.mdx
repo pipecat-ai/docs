@@ -1,0 +1,97 @@
+---
+title: Session Recordings
+description: "Where the session audio comes from, how to turn it on, and how to control storage and retention"
+---
+
+The session detail view in the Pipecat Cloud dashboard can play back the audio of a session. That audio is a [Daily cloud recording](https://docs.daily.co/docs/guides/features/recording) of the room your agent ran in. It is not a separate Pipecat Cloud recording feature, and Pipecat Cloud does not turn it on for you.
+
+Knowing that answers most questions about it: what the audio contains, where it is stored, and how long it lasts are all Daily cloud recording behavior.
+
+## What you need for a recording to appear
+
+Two things:
+
+1. **Your agent runs on the Daily transport.** Cloud recording is a feature of the Daily room your agent is in. An agent on a non-Daily transport (a Twilio or generic WebSocket leg, for example) has no room to record, so no recording is made and no player appears on its session page.
+2. **A cloud recording is actually started for that room.** Pipecat Cloud does not start one on your behalf. See the next section.
+
+Nothing else is required. You do not need to enable the dashboard player separately.
+
+## Turning recording on
+
+The [`/start` endpoint](/api-reference/pipecat-cloud/rest-reference/endpoint/start) passes `dailyRoomProperties` and `dailyMeetingTokenProperties` through to Daily unchanged **when Pipecat Cloud is creating the room** (`createDailyRoom: true`). Pipecat Cloud adds no recording defaults of its own, so if you do not ask for a recording, none is made.
+
+### Start automatically when the agent joins
+
+Set `start_cloud_recording` on the meeting token. Daily starts the recording as soon as that token holder joins the room:
+
+```bash
+curl --location --request POST 'https://api.pipecat.daily.co/v1/public/my-agent-name/start' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+    "createDailyRoom": true,
+    "dailyRoomProperties": {
+      "enable_recording": "cloud"
+    },
+    "dailyMeetingTokenProperties": {
+      "start_cloud_recording": true
+    }
+  }'
+```
+
+### Start and stop it from your pipeline
+
+If you want control over when recording runs, call `start_recording()` and `stop_recording()` on the transport instead. See [DailyTransport recording](/api-reference/server/services/transport/daily#recording).
+
+## What the recording contains
+
+A cloud recording is produced on the media server, from what each participant **publishes** into the room.
+
+That has one consequence worth understanding: **user audio in the recording is the raw microphone audio, before any in-pipeline audio filter**. If your agent uses an input audio filter such as [Krisp VIVA](/pipecat-cloud/guides/krisp-viva), that filter runs inside your pipeline on inbound frames, so it only cleans the copy that feeds your STT and VAD. It does not change what the user publishes, so it never affects the recording.
+
+If you need audio that reflects your filtering, [record it in the pipeline instead](/pipecat/fundamentals/recording-audio).
+
+## Storage and retention
+
+By default, cloud recordings are stored by Daily, on the Daily domain that Pipecat Cloud manages for your organization. List them, fetch access links, and delete them with the [Daily recordings REST API](https://docs.daily.co/reference/rest-api/recordings).
+
+<Warning>
+  **Recordings are kept until you delete them.** There is no automatic expiry,
+  so cleanup is yours to run. Recording storage is billed per minute per month
+  stored (see [pricing](https://www.daily.co/pricing/pipecat-cloud/#recording)),
+  so it is worth building deletion into your workflow early rather than letting
+  recordings accumulate.
+</Warning>
+
+### Store recordings in your own S3 bucket
+
+If you have retention or data residency requirements, the cleanest option is to keep recordings out of Daily's storage entirely. Set `recordings_bucket` in `dailyRoomProperties` and Daily writes recordings straight to your bucket:
+
+```bash
+curl --location --request POST 'https://api.pipecat.daily.co/v1/public/my-agent-name/start' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+    "createDailyRoom": true,
+    "dailyRoomProperties": {
+      "enable_recording": "cloud",
+      "recordings_bucket": {
+        "bucket_name": "my-recordings-bucket",
+        "bucket_region": "us-west-2",
+        "assume_role_arn": "arn:aws:iam::123456789012:role/DailyRecordingsRole",
+        "allow_api_access": true
+      }
+    },
+    "dailyMeetingTokenProperties": {
+      "start_cloud_recording": true
+    }
+  }'
+```
+
+Your own S3 lifecycle rules then control retention. Set `allow_api_access` to `true` if you want the dashboard and the Daily access-link API to be able to play recordings back from your bucket.
+
+You can also configure the bucket once at the domain level instead of per room. For IAM role setup and the full property reference, see [Storing recordings in a custom S3 bucket](https://docs.daily.co/docs/guides/features/recording/custom-s3-storage).
+
+### Turn recording off
+
+Leave `start_cloud_recording` out of your `/start` call and no cloud recording is made. Nothing in Pipecat Cloud will add it back. You lose the dashboard player, and no recording storage is billed.
