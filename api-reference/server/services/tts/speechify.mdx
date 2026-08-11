@@ -1,0 +1,162 @@
+---
+title: "Speechify Text-to-Speech"
+sidebarTitle: "Speechify"
+description: "HTTP-based TTS with SpeechifyHttpTTSService: word-level timestamps via Server-Sent Events using simba-3.2 and simba-3.0 models."
+---
+
+## Overview
+
+`SpeechifyHttpTTSService` streams PCM audio and word-level speech marks over Server-Sent Events from Speechify's `/v1/audio/stream/with-timestamps` endpoint. Audio and timestamps arrive together, enabling word-by-word conversation context attribution and accurate interruption handling.
+
+<CardGroup cols={2}>
+  <Card
+    title="Speechify API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.speechify.tts.html"
+  >
+    Pipecat's API methods for Speechify TTS integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-speechify-http.py"
+  >
+    Complete example with Deepgram STT and OpenAI LLM
+  </Card>
+  <Card
+    title="Update Settings Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/update-settings/tts/tts-speechify-http.py"
+  >
+    Changing voice mid-conversation with TTSUpdateSettingsFrame
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[speechify]"
+```
+
+## Prerequisites
+
+Before using `SpeechifyHttpTTSService`, you need:
+
+1. **Speechify Account**: Sign up for API access
+2. **API Key**: Obtain an API key for authentication
+3. **Voice Selection**: Choose from available Speechify voice models
+
+### Required Environment Variables
+
+- `SPEECHIFY_API_KEY`: Your Speechify API key for authentication
+- `SPEECHIFY_VOICE_ID` (optional): Default voice identifier to use
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  Speechify API key for authentication.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession" required>
+  An aiohttp session for HTTP requests. You must create and manage this
+  yourself.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.speechify.ai">
+  Base URL for the Speechify API.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the pipeline's configured sample
+  rate. Must be one of: 8000, 16000, 22050, 24000, 44100, 48000. If the
+  requested rate is not supported, the service synthesizes at 24000 Hz and the
+  output transport will resample.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="SpeechifyHttpTTSService.Settings"
+  default="None"
+>
+  Runtime-configurable settings. See [SpeechifyHttpTTSService
+  Settings](#speechifyhttpttsservice-settings) below.
+</ParamField>
+
+<ParamField
+  path="text_aggregation_mode"
+  type="TextAggregationMode"
+  default="None"
+>
+  How to aggregate incoming text before synthesis. Controls whether text is
+  buffered into sentences or sent immediately.
+</ParamField>
+
+### SpeechifyHttpTTSService Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `SpeechifyHttpTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter                | Type              | Default     | Description                                                                             |
+| ------------------------ | ----------------- | ----------- | --------------------------------------------------------------------------------------- |
+| `voice`                  | `str`             | `geffen_32` | Voice identifier (e.g., `geffen_32`, `beatrice_32`).                                    |
+| `model`                  | `str`             | `simba-3.2` | Model identifier. Use `simba-3.2` for English or `simba-3.0` for multilingual.          |
+| `language`               | `Language \| str` | `None`      | Language for synthesis. Supported: DE, EN, ES, FR, IT, PT. _(Inherited.)_               |
+| `loudness_normalization` | `bool \| None`    | `None`      | Whether to normalize audio loudness to a standard level. Adds latency.                  |
+| `text_normalization`     | `bool \| None`    | `None`      | Whether to spell out numbers, dates, and similar tokens before synthesis. Adds latency. |
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+import aiohttp
+from pipecat.services.speechify.tts import SpeechifyHttpTTSService
+
+async with aiohttp.ClientSession() as session:
+    tts = SpeechifyHttpTTSService(
+        api_key=os.getenv("SPEECHIFY_API_KEY"),
+        aiohttp_session=session,
+        settings=SpeechifyHttpTTSService.Settings(
+            voice="geffen_32",
+            model="simba-3.2",
+        ),
+    )
+```
+
+### Multilingual Setup
+
+For languages other than English, use the `simba-3.0` model:
+
+```python
+from pipecat.transcriptions.language import Language
+
+tts = SpeechifyHttpTTSService(
+    api_key=os.getenv("SPEECHIFY_API_KEY"),
+    aiohttp_session=session,
+    settings=SpeechifyHttpTTSService.Settings(
+        voice="your_voice_id",
+        model="simba-3.0",
+        language=Language.ES,
+    ),
+)
+```
+
+### Changing Voice Mid-Conversation
+
+```python
+from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+# Update to a different voice during the conversation
+await worker.queue_frame(
+    TTSUpdateSettingsFrame(
+        delta=SpeechifyHttpTTSService.Settings(voice="beatrice_32")
+    )
+)
+```
+
+## Notes
+
+- **Speech marks requirement**: Word-level timestamps are only produced by the streaming-native models `simba-3.2` (English) and `simba-3.0` (multilingual). The legacy `simba-english` and `simba-multilingual` models cannot produce speech marks and are rejected by the `/v1/audio/stream/with-timestamps` endpoint.
+- **Sample rate validation**: If the requested sample rate is not one of the supported values (8000, 16000, 22050, 24000, 44100, 48000 Hz), the service synthesizes at 24000 Hz by default and logs a warning. The output transport will handle any necessary resampling.
+- **Supported languages**: The service supports German (DE), English (EN), Spanish (ES), French (FR), Italian (IT), and Portuguese (PT). Languages outside this set fall back to their BCP-47 tag value with a warning.
+- **HTTP-based service**: Unlike WebSocket-based TTS services, `SpeechifyHttpTTSService` processes each synthesis request over HTTP with Server-Sent Events streaming. The service handles interruptions by tracking word-level timestamps.
