@@ -1,0 +1,124 @@
+---
+title: "floe-guard"
+description: "A local budget guardrail for Pipecat voice agents — prices every leg (STT, LLM, TTS, telephony) and hard-stops the next turn before it crosses a spend ceiling. No account, no network."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Floe Labs"
+  maintainerUrl="https://github.com/Floe-Labs"
+  repo="https://github.com/Floe-Labs/floe-guard"
+/>
+
+## Overview
+
+`FloeBudgetGuardProcessor` is a [floe-guard](https://github.com/Floe-Labs/floe-guard)
+budget processor for Pipecat. Drop one processor after your LLM service and it
+enforces a spend ceiling **one turn at a time** — it reserves before a turn,
+settles on the real usage the pipeline reports, and hard-stops a turn that would
+cross your budget (so a runaway agent dies at $0.10, not on the invoice). It
+prices every leg of the call — STT ($/sec), LLM ($/token), TTS ($/1k chars), and
+telephony ($/min) — from a cost map bundled with the package, so you get a
+per-call receipt with **no account, no API key, and no network calls**.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Floe-Labs/floe-guard"
+  >
+    Source code, examples, and issues for floe-guard
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/floe-guard/"
+  >
+    The `floe-guard` package on PyPI
+  </Card>
+  <Card
+    title="Runnable demo"
+    icon="play"
+    href="https://github.com/Floe-Labs/floe-guard/blob/main/examples/voice_call_cost_pipecat.py"
+  >
+    A no-network, no-key example that prints a per-leg call receipt
+  </Card>
+  <Card
+    title="Documentation"
+    icon="book"
+    href="https://github.com/Floe-Labs/floe-guard#pipecat-voice"
+  >
+    floe-guard's Pipecat setup notes
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add "floe-guard[pipecat]"
+```
+
+## Prerequisites
+
+**None.** floe-guard runs entirely in your process — no account, no API key, no
+environment variables, and no network calls. Prices come from a cost map that
+ships with the package.
+
+## Configuration
+
+`FloeBudgetGuardProcessor` takes a `BudgetGuard` (your ceiling) and, optionally,
+the voice-map vendor for each leg so STT / TTS / telephony are priced
+automatically:
+
+| Parameter | Description |
+| --- | --- |
+| `guard` | The `BudgetGuard` instance to enforce, e.g. `BudgetGuard(limit_usd=1.00)`. |
+| `stt_model` | Voice-map vendor key for the STT leg, e.g. `"deepgram-nova-3"` ($/sec). |
+| `tts_model` | Voice-map vendor key for the TTS leg, e.g. `"elevenlabs-flash-v2.5"` ($/1k chars). |
+| `telephony` | Voice-map vendor key for the telephony leg, e.g. `"twilio-us-inbound-local"` ($/min). |
+| `on_budget_exceeded` | Optional async callback to speak a graceful "wrapping up" line before the pipeline stops. Omit for the default hard stop. |
+
+A leg with no vendor and no per-unit override is left un-metered; an unpriceable
+vendor **fails closed** rather than metering at a silent $0. Pass a per-unit
+override for a negotiated rate.
+
+## Usage
+
+Place the processor **directly after the LLM service**, and create the
+`PipelineTask` with usage metrics enabled (Pipecat only emits usage frames when
+they are on):
+
+```python
+from floe_guard import BudgetGuard
+from floe_guard.integrations.pipecat import FloeBudgetGuardProcessor
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+
+guard = BudgetGuard(limit_usd=1.00)                  # your ceiling
+budget = FloeBudgetGuardProcessor(
+    guard,
+    stt_model="deepgram-nova-3",                     # $/sec
+    tts_model="elevenlabs-flash-v2.5",               # $/1k chars
+    telephony="twilio-us-inbound-local",             # $/min
+)
+
+pipeline = Pipeline([transport.input(), stt, llm, budget, tts, transport.output()])
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+)
+```
+
+LLM and TTS auto-meter from the frames Pipecat emits. STT and telephony have no
+native usage frame, so meter them explicitly (e.g. `budget.meter_telephony(1.5)`
+for a 1.5-minute call). A blocked turn pushes a fatal `ErrorFrame` by default, or
+invokes your `on_budget_exceeded` callback. See the
+[runnable example](https://github.com/Floe-Labs/floe-guard/blob/main/examples/voice_call_cost_pipecat.py)
+— it runs with no API key and no network and prints a per-leg receipt.
+
+## Compatibility
+
+Tested with Pipecat 1.x. `floe-guard[pipecat]` requires `pipecat-ai>=1.0`.
