@@ -1,0 +1,67 @@
+---
+title: "Troubleshooting Memory Usage"
+sidebarTitle: "Memory Usage"
+description: "Find and fix memory growth in a Pipecat agent: AudioBufferProcessor buffers, an unbounded LLM context, and state left between sessions."
+---
+
+Memory problems in a Pipecat agent almost always fall into one of two shapes. Work out which one you have first, because the fixes are different.
+
+- **Memory climbs during a single call.** Something in the pipeline is holding on to every second of the conversation.
+- **Memory climbs call after call, and a single call looks fine.** The process is being reused and state from the last session was never released.
+
+A quick way to tell them apart: look at the memory graph for one long session, then compare the first session on a fresh instance to the fifth one. A sawtooth that resets between calls is normal. A staircase that only goes up is a leak.
+
+## Memory climbs during one call
+
+### Audio buffers
+
+`AudioBufferProcessor` is the most common cause. With the default `buffer_size=0` it holds the entire recording in memory until you stop recording, and it pads each track with silence to keep the user and bot audio aligned. That means the buffers grow with the length of the call, not with how much anyone actually said.
+
+At 24 kHz, 16-bit audio, each track is about 2.9 MB per minute. With a user track and a bot track, a 30-minute call is roughly 170 MB before you write anything out. The default `agent-1x` profile on Pipecat Cloud has 1 GB.
+
+Fixes:
+
+- Set a `buffer_size` so the processor flushes in chunks instead of holding everything. See [Chunked recording](/pipecat/fundamentals/recording-audio#chunked-recording).
+- Turn off `enable_turn_audio` unless you use the per-turn handlers. It adds another pair of buffers.
+- Consider recording through your transport provider instead of in the pipeline. See [Recording Conversation Audio](/pipecat/fundamentals/recording-audio).
+
+### An LLM context that never shrinks
+
+Every turn appends to the context, and nothing trims it for you. On a long call that grows memory, cost, and latency together. See [Context Summarization](/pipecat/fundamentals/context-summarization) for how to keep it bounded.
+
+### Lists you append to per turn
+
+Transcript collections, saved frames, custom observers that keep what they see: anything you append to on every turn will grow for as long as the call runs. Cap the size or write the data out and drop it.
+
+## Memory climbs between calls
+
+An instance that finishes a session is not restarted. It can pick up the next session in the same running process, so whatever the last session left behind is still in memory. See [Scaling changes do not replace running instances](/pipecat-cloud/fundamentals/scaling#scaling-changes-do-not-replace-running-instances).
+
+When a session ends, release what belongs to it:
+
+- Set module-level and global references back to `None`. A global that holds the transport, the context, or an audio buffer pins the whole session in memory.
+- Close clients and connections you opened.
+- Cancel tasks and stop threads you started. A task still running keeps everything it references alive.
+- Remove event handlers you registered on objects that outlive the session.
+
+Prefer creating per-session objects inside your bot function over module scope. Anything at module scope is shared by every session the process handles.
+
+## How to measure
+
+<Steps>
+  <Step title="Look at per-session metrics">
+    On Pipecat Cloud, each session has CPU and memory graphs in the dashboard
+    and the CLI. See [CPU and memory
+    metrics](/pipecat-cloud/fundamentals/logging#cpu-and-memory-metrics).
+  </Step>
+  <Step title="Snapshot memory locally">
+    Run one long session locally and take a `tracemalloc` snapshot at the start
+    and end, then compare. The top allocations by size usually name the problem
+    outright.
+  </Step>
+  <Step title="Run several sessions in a row">
+    Against the same local process, run three or four sessions back to back and
+    log memory after each one. If it does not return to roughly the starting
+    level, you are leaking between sessions.
+  </Step>
+</Steps>

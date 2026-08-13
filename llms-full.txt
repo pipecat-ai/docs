@@ -11725,7 +11725,7 @@ Roark connects to Pipecat through a single observer, then layers testing and mon
     ```python
     import os
 
-    from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.pipeline.worker import PipelineWorker
     from pipecat_roark import RoarkObserver
 
     roark = RoarkObserver(
@@ -11742,7 +11742,7 @@ Roark connects to Pipecat through a single observer, then layers testing and mon
         context_aggregator.assistant(),
     ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(observers=[roark]))
+    worker = PipelineWorker(pipeline, observers=[roark])
     ```
 
     <Tip>
@@ -11832,7 +11832,7 @@ Every call — simulated or live — is scored against the same metric library, 
 
 Roark ingests [OpenTelemetry](https://opentelemetry.io/docs/what-is-opentelemetry/) traces from Pipecat's built-in tracing, so each call's full turn tree — STT, LLM, TTS, and tool calls, with latency at every span — shows up on the **Tracing** tab of the call.
 
-Configure the tracer provider **before** constructing `PipelineTask` (Pipecat grabs the provider at task-init time), and pass the **same** call ID to both `RoarkObserver(pipecat_call_id=...)` and `PipelineTask(conversation_id=...)` so Roark can link the trace to the call.
+Configure the tracer provider **before** constructing `PipelineWorker` (Pipecat grabs the provider at task-init time), and pass the **same** call ID to both `RoarkObserver(pipecat_call_id=...)` and `PipelineWorker(conversation_id=...)` so Roark can link the trace to the call.
 
 ```python
 import os
@@ -11843,12 +11843,12 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat_roark import RoarkObserver
 
 
 def setup_roark_tracing() -> None:
-    """Must run BEFORE constructing PipelineTask."""
+    """Must run BEFORE constructing PipelineWorker."""
     resource = Resource.create({
         "deployment.environment": os.getenv("ENVIRONMENT", "production"),
         # Optional: tag spans for the trace explorer.
@@ -11878,9 +11878,9 @@ roark = RoarkObserver(
     pipecat_call_id=call_id,  # appears on the Roark record as pipecatCallId
 )
 
-task = PipelineTask(
+worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(observers=[roark]),
+    observers=[roark],
     enable_tracing=True,
     conversation_id=call_id,  # set as the conversation.id span attribute
 )
@@ -16104,6 +16104,73 @@ Warm and cold transfers (handing a call from the bot to a human agent without dr
 Telephony adds carrier-specific concerns on top of the same dispatch question you'd answer for WebRTC. You still need to decide who actually runs the bot process — the development runner directly, a VM per session, a warm-pool dispatcher, a managed runtime — and the answer is independent of the carrier choice.
 
 A common production shape is: carrier webhook → your dispatcher (validates the webhook signature, decides which bot to run) → your dispatch pattern of choice spawns a bot wired to the carrier's media WebSocket.
+
+# Troubleshooting Memory Usage
+Source: https://docs.pipecat.ai/pipecat/deployment/troubleshooting-memory.md
+
+Find and fix memory growth in a Pipecat agent: AudioBufferProcessor buffers, an unbounded LLM context, and state left between sessions.
+
+Memory problems in a Pipecat agent almost always fall into one of two shapes. Work out which one you have first, because the fixes are different.
+
+- **Memory climbs during a single call.** Something in the pipeline is holding on to every second of the conversation.
+- **Memory climbs call after call, and a single call looks fine.** The process is being reused and state from the last session was never released.
+
+A quick way to tell them apart: look at the memory graph for one long session, then compare the first session on a fresh instance to the fifth one. A sawtooth that resets between calls is normal. A staircase that only goes up is a leak.
+
+## Memory climbs during one call
+
+### Audio buffers
+
+`AudioBufferProcessor` is the most common cause. With the default `buffer_size=0` it holds the entire recording in memory until you stop recording, and it pads each track with silence to keep the user and bot audio aligned. That means the buffers grow with the length of the call, not with how much anyone actually said.
+
+At 24 kHz, 16-bit audio, each track is about 2.9 MB per minute. With a user track and a bot track, a 30-minute call is roughly 170 MB before you write anything out. The default `agent-1x` profile on Pipecat Cloud has 1 GB.
+
+Fixes:
+
+- Set a `buffer_size` so the processor flushes in chunks instead of holding everything. See [Chunked recording](/pipecat/fundamentals/recording-audio#chunked-recording).
+- Turn off `enable_turn_audio` unless you use the per-turn handlers. It adds another pair of buffers.
+- Consider recording through your transport provider instead of in the pipeline. See [Recording Conversation Audio](/pipecat/fundamentals/recording-audio).
+
+### An LLM context that never shrinks
+
+Every turn appends to the context, and nothing trims it for you. On a long call that grows memory, cost, and latency together. See [Context Summarization](/pipecat/fundamentals/context-summarization) for how to keep it bounded.
+
+### Lists you append to per turn
+
+Transcript collections, saved frames, custom observers that keep what they see: anything you append to on every turn will grow for as long as the call runs. Cap the size or write the data out and drop it.
+
+## Memory climbs between calls
+
+An instance that finishes a session is not restarted. It can pick up the next session in the same running process, so whatever the last session left behind is still in memory. See [Scaling changes do not replace running instances](/pipecat-cloud/fundamentals/scaling#scaling-changes-do-not-replace-running-instances).
+
+When a session ends, release what belongs to it:
+
+- Set module-level and global references back to `None`. A global that holds the transport, the context, or an audio buffer pins the whole session in memory.
+- Close clients and connections you opened.
+- Cancel tasks and stop threads you started. A task still running keeps everything it references alive.
+- Remove event handlers you registered on objects that outlive the session.
+
+Prefer creating per-session objects inside your bot function over module scope. Anything at module scope is shared by every session the process handles.
+
+## How to measure
+
+<Steps>
+  <Step title="Look at per-session metrics">
+    On Pipecat Cloud, each session has CPU and memory graphs in the dashboard
+    and the CLI. See [CPU and memory
+    metrics](/pipecat-cloud/fundamentals/logging#cpu-and-memory-metrics).
+  </Step>
+  <Step title="Snapshot memory locally">
+    Run one long session locally and take a `tracemalloc` snapshot at the start
+    and end, then compare. The top allocations by size usually name the
+    problem outright.
+  </Step>
+  <Step title="Run several sessions in a row">
+    Against the same local process, run three or four sessions back to back and
+    log memory after each one. If it does not return to roughly the starting
+    level, you are leaking between sessions.
+  </Step>
+</Steps>
 
 # Fly.io
 Source: https://docs.pipecat.ai/pipecat/deployment/platforms/fly.md
@@ -24167,7 +24234,12 @@ The base image supports multiple Python versions. The default Python version is 
 - `dailyco/pipecat-base:0.1.0-py3.13` (Python 3.13)
 - `dailyco/pipecat-base:0.1.0-py3.14` (Python 3.14)
 
-<Tip>For production use, we recommend pinning to specific versions.</Tip>
+<Tip>
+  For production use, we recommend pinning to specific versions. A `:latest` tag
+  can change without your project changing, so a deploy can leave your warm
+  instances on the old image
+  ([why](/pipecat-cloud/fundamentals/deploy#when-a-deploy-does-not-replace-running-agents)).
+</Tip>
 
 ## Using a custom image
 
@@ -24375,6 +24447,10 @@ To avoid interruption of any active sessions, any running agent instances will c
 Idle agent instances in your agent pool will be replaced with the new configuration according to the Pipecat Cloud auto-scaling strategy.
 New agent requests may, therefore, start with prior deployment configuration if updates are not fully propagated. This ensures on-demand availability
 remains consistent and avoids potential cold starts.
+
+### When a deploy does not replace running agents
+
+A deploy only replaces your running agent instances when it creates a new version of your agent, so a routine deploy can't cut off a session that is already in progress. Some changes look like no change and keep the current version: a scaling-only change (`min-agents` or `max-agents`), an image tag you already deployed (Pipecat Cloud stores the tag, not the image behind it, so re-pushing to a tag like `:latest` looks identical), and a new value for a secret in a set you already use. If you keep warm instances (`min-agents` set to 1 or higher), they can keep serving your old code while the deploy reports success. Run [`pipecat cloud deploy --force`](/api-reference/cli/cloud/deploy) to force a new version.
 
 ### Failed deployments
 
@@ -24825,8 +24901,11 @@ pipecat cloud secrets set my-secrets SECRET_NAME_3 secret-value-3
 ```
 
 <Info>
-  Whenever a secret is added or updated in an existing set, any deployments
-  using that set will need to be redeployed to access the new values.
+  Whenever a secret is added or updated in an existing set, any deployments using
+  that set will need to be redeployed to access the new values. A plain
+  `pipecat cloud deploy` looks like no change here, so use
+  `pipecat cloud deploy --force`
+  ([why](/pipecat-cloud/fundamentals/deploy#when-a-deploy-does-not-replace-running-agents)).
 </Info>
 
 #### Provisioning and readiness
@@ -25295,6 +25374,21 @@ pipecat cloud deploy [agent-name] [image] --min-agents 1 --max-agents 5
 
 Please note that changing your scaling parameters will not disrupt any active sessions.
 If you reduce your max instance count below the number of currently active sessions, you will still be billed for the duration of those sessions.
+
+### Scaling changes do not replace running instances
+
+Changing `min-agents` or `max-agents` only resizes the pool. It does not restart or replace the instances you already have. See [When a deploy does not replace running agents](./deploy#when-a-deploy-does-not-replace-running-agents) for the other changes that behave this way, and for the `--force` flag that does replace them.
+
+An instance that keeps running keeps its process. When it picks up a new session, that session runs in the same process that handled the session before it. Nothing is reset in between, so anything the previous session left in memory is still there.
+
+This matters if your agent holds on to objects per session. Memory can climb call after call on the same instance. Release what a session no longer needs when it ends: drop references held by module-level or global variables (set them back to `None`), close clients and connections, and stop any tasks or threads you started. See [Troubleshooting Memory Usage](/pipecat/deployment/troubleshooting-memory) for the full checklist.
+
+<Note>
+  To take a single instance out of rotation on a condition of your own, override
+  the readiness check. See [Health checks](./health-checks). Reporting not-ready
+  stops new sessions from being routed to that instance, but it does not restart
+  the process.
+</Note>
 
 ## Capacity Planning
 
@@ -27803,7 +27897,8 @@ curl -X GET \
 ## Important Notes
 
 - **Startup latency**: If you call the Session API before your bot finishes initializing, the request may take longer while waiting for the bot to become available.
-- **Session scope**: Each request is routed to the specific bot instance identified by `session_id`. Different sessions are separate pods and don't share state.
+- **Session scope**: Each request is routed to the specific bot instance identified by `session_id`. Two sessions running at the same time are on separate instances, so a request for one session never reaches the other.
+- **Sequential sessions are not isolated**: Being routed separately is not the same as getting a fresh process. After a session ends, its instance can serve the next session in the same running process, so state your agent did not release is still in memory. See [Scaling changes do not replace running instances](../fundamentals/scaling#scaling-changes-do-not-replace-running-instances).
 - **Error handling**: If a session has ended or the session ID is invalid, you'll receive an error response.
 - **Reserved paths**: The base image uses `/bot`, `/ws`, `/api/offer`, `/whatsapp`, `/readyz`, and `/livez`. Don't define endpoints at these paths.
 
@@ -29823,6 +29918,7 @@ Text-to-Speech services receive text input and output audio streams or chunks.
 | [ElevenLabs](/api-reference/server/services/tts/elevenlabs)       | `uv add "pipecat-ai[elevenlabs]"`                                             | Pipecat    |
 | [Fish](/api-reference/server/services/tts/fish)                   | `uv add "pipecat-ai[fish]"`                                                   | Pipecat    |
 | [Floe](/api-reference/server/services/tts/floe)                   | `uv add pipecat-floe`                                                         | Community  |
+| [Gandr](/api-reference/server/services/tts/gandr)                 | `uv add pipecat-gandr`                                                        | Community  |
 | [Gnani](/api-reference/server/services/tts/gnani)                 | `uv add pipecat-gnani`                                                        | Community  |
 | [Google](/api-reference/server/services/tts/google)               | `uv add "pipecat-ai[google]"`                                                 | Pipecat    |
 | [Gradium](/api-reference/server/services/tts/gradium)             | `uv add "pipecat-ai[gradium]"`                                                | Pipecat    |
@@ -29851,7 +29947,9 @@ Text-to-Speech services receive text input and output audio streams or chunks.
 | [Simplismart](/api-reference/server/services/tts/simplismart)     | `uv add pipecat-simplismart`                                                  | Community  |
 | [SLNG](/api-reference/server/services/tts/slng)                   | `uv add pipecat-slng`                                                         | Community  |
 | [Smallest AI](/api-reference/server/services/tts/smallest)        | `uv add "pipecat-ai[smallest]"`                                               | Pipecat    |
+| [SonexLabs](/api-reference/server/services/tts/sonex)             | `uv add pipecat-sonex`                                                        | Community  |
 | [Soniox](/api-reference/server/services/tts/soniox)               | `uv add "pipecat-ai[soniox]"`                                                 | Pipecat    |
+| [Speechify](/api-reference/server/services/tts/speechify)         | `uv add "pipecat-ai[speechify]"`                                              | Pipecat    |
 | [Speechmatics](/api-reference/server/services/tts/speechmatics)   | `uv add "pipecat-ai[speechmatics]"`                                           | Pipecat    |
 | [Supertonic](/api-reference/server/services/tts/supertonic)       | `uv add pipecat-supertonic`                                                   | Community  |
 | [Together AI](/api-reference/server/services/tts/together)        | `uv add "pipecat-ai[together]"`                                               | Pipecat    |
@@ -31286,7 +31384,7 @@ Before using HeyGen video services, you need:
   HeyGen API key for authentication.
 </ParamField>
 
-<ParamField path="params" type="HeyGenParams" default="HeyGenParams()">
+<ParamField path="params" type="HeyGenParams | None" default="None">
   Transport configuration parameters.
 </ParamField>
 
@@ -31495,7 +31593,7 @@ Before using LemonSlice video services, you need:
   [LemonSliceNewSessionRequest](#lemonslicenewsessionrequest) below.
 </ParamField>
 
-<ParamField path="params" type="LemonSliceParams" default="LemonSliceParams()">
+<ParamField path="params" type="LemonSliceParams | None" default="None">
   Transport configuration parameters. See [LemonSliceParams](#lemonsliceparams)
   below.
 </ParamField>
@@ -32440,7 +32538,7 @@ Before using TavusTransport, you need:
   expect audio over the `conversation.echo` app message API.
 </ParamField>
 
-<ParamField path="params" type="TavusParams" default="TavusParams()">
+<ParamField path="params" type="TavusParams | None" default="None">
   Transport configuration parameters.
 </ParamField>
 
@@ -34027,7 +34125,7 @@ Pass the serializer to a `FastAPIWebsocketTransport` through
 ```python
 from fastapi import WebSocket
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineTask
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
     FastAPIWebsocketParams,
@@ -34053,7 +34151,7 @@ async def run_bot(websocket: WebSocket):
         ]
     )
 
-    task = PipelineTask(pipeline)
+    worker = PipelineWorker(pipeline)
     # ... run the pipeline
 ```
 
@@ -39394,7 +39492,7 @@ Before using Moonshine STT service, you need:
 ### Configuration Options
 
 - **Model Size**: Balance between accuracy and performance based on your needs
-- **Language Support**: Moonshine supports English, Spanish, and other languages
+- **Language Support**: Moonshine supports Arabic, Chinese, English, Japanese, Korean, Spanish, Ukrainian, and Vietnamese
 - **No API Key**: Runs entirely locally for complete privacy
 
 <Tip>
@@ -39413,10 +39511,10 @@ Before using Moonshine STT service, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `MoonshineSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter  | Type              | Default                 | Description                                                                                                                                                                           |
-| ---------- | ----------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`    | `str \| Model`    | `Model.SMALL_STREAMING` | Moonshine model architecture. Available models: `TINY`, `BASE`, `TINY_STREAMING`, `BASE_STREAMING`, `SMALL_STREAMING` (default), `MEDIUM_STREAMING`.                                  |
-| `language` | `Language \| str` | `Language.EN`           | Language for transcription. Moonshine supports English, Spanish, and other languages. The base language code is used (e.g., "en" from "en-US"). _(Inherited from base STT settings.)_ |
+| Parameter  | Type              | Default                 | Description                                                                                                                                                                                                                                                                                                                      |
+| ---------- | ----------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`    | `str \| Model`    | `Model.SMALL_STREAMING` | Moonshine model architecture. Available models: `TINY`, `BASE`, `TINY_STREAMING`, `BASE_STREAMING`, `SMALL_STREAMING` (default), `MEDIUM_STREAMING`. Streaming architectures are published for English only; other languages have one or two models. An unavailable architecture falls back to the best model for that language. |
+| `language` | `Language \| str` | `Language.EN`           | Language for transcription. Moonshine publishes models for Arabic, Chinese, English, Japanese, Korean, Spanish, Ukrainian, and Vietnamese; regional variants (e.g., `Language.ES_MX`) resolve to their base code. _(Inherited from base STT settings.)_                                                                          |
 
 ## Usage
 
@@ -39469,11 +39567,12 @@ stt = MoonshineSTTService(
 ## Notes
 
 - **First run downloads**: The selected model downloads from the Moonshine model hub on first use and is cached locally. Later runs load it from the cache.
+- **Runtime model reloading**: Models are language-specific, so a `language` or `model` change reloads the model (including via `set_language()` or `STTUpdateSettingsFrame`). A failed reload keeps the loaded model and pushes an `ErrorFrame`.
 - **Segmented transcription**: `MoonshineSTTService` extends `SegmentedSTTService`, meaning it processes complete audio segments after VAD detects the user has stopped speaking.
 - **CPU-only**: Moonshine runs efficiently on CPU via ONNX Runtime, so no GPU is required. This makes it ideal for resource-constrained environments.
 - **Audio format**: Expects 16-bit mono PCM audio at 16 kHz sample rate.
 - **Model variants**: The streaming-capable models (`TINY_STREAMING`, `SMALL_STREAMING`, `MEDIUM_STREAMING`) can be run in batch mode just like the non-streaming variants. The larger streaming models (`SMALL_STREAMING`, `MEDIUM_STREAMING`) are only available in streaming form.
-- **Language support**: Moonshine supports multiple languages (English, Spanish, and others). The service uses the base language code (e.g., "en" from "en-US").
+- **Language support**: Moonshine supports Arabic, Chinese, English, Japanese, Korean, Spanish, Ukrainian, and Vietnamese. Regional variants (e.g., `Language.ES_MX`) resolve to their base code. The non-English models are released under the non-commercial Moonshine Community License.
 - **No external dependencies**: Unlike API-based STT services, Moonshine requires no API keys or network connectivity after the initial model download.
 
 # NVIDIA Nemotron Speech-to-Text
@@ -43400,7 +43499,7 @@ llm = BasetenLLMService(
 ## Notes
 
 - **Model APIs vs. Dedicated Deployments**: The default `base_url` connects to Baseten's serverless Model APIs. For dedicated deployments on your own GPUs, set `base_url` to your deployment's `/sync/v1` endpoint URL.
-- **Token Usage Reporting**: Baseten reports cumulative token usage on every streamed chunk. The service automatically accumulates these values and reports the final total once at the end of processing.
+- **Token Usage Reporting**: Token usage is reported once per completion at the end of processing.
 - **Message Roles**: Baseten supports `system`, `user`, `assistant`, and `tool` message roles. The `developer` role is not supported.
 - **OpenAI Compatibility**: Baseten fully supports the OpenAI-compatible parameter set inherited from `OpenAILLMService`, including function calling and streaming responses.
 
@@ -43798,7 +43897,9 @@ from pipecat.services.deepseek import DeepSeekLLMService
 
 llm = DeepSeekLLMService(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
-    model="deepseek-chat",
+    settings=DeepSeekLLMService.Settings(
+        model="deepseek-v4-flash",
+    ),
 )
 ```
 
@@ -43810,7 +43911,7 @@ from pipecat.services.deepseek import DeepSeekLLMService
 llm = DeepSeekLLMService(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     settings=DeepSeekLLMService.Settings(
-        model="deepseek-chat",
+        model="deepseek-v4-flash",
         temperature=0.7,
         top_p=0.9,
         max_tokens=2048,
@@ -44138,7 +44239,7 @@ Before using Google Gemini LLM services, you need:
 
 1. **Google Account**: Sign up at [Google AI Studio](https://aistudio.google.com/)
 2. **API Key**: Generate a Gemini API key from AI Studio
-3. **Model Selection**: Choose from available Gemini models (Gemini 2.5 Flash, Gemini 2.5 Pro, etc.)
+3. **Model Selection**: Choose from available Gemini models
 
 ### Required Environment Variables
 
@@ -44151,9 +44252,8 @@ Before using Google Gemini LLM services, you need:
 </ParamField>
 
 <ParamField path="model" type="str" default="None" deprecated>
-  Gemini model name to use (e.g., `"gemini-2.5-flash"`, `"gemini-2.5-pro"`).
-  *Deprecated in v0.0.105. Use `settings=GoogleLLMService.Settings(...)`
-  instead.*
+  Gemini model name to use. *Deprecated in v0.0.105. Use
+  `settings=GoogleLLMService.Settings(...)` instead.*
 </ParamField>
 
 <ParamField path="settings" type="GoogleLLMService.Settings" default="None">
@@ -44184,20 +44284,43 @@ Before using Google Gemini LLM services, you need:
   HTTP options for the Google API client.
 </ParamField>
 
+<ParamField path="stream_idle_timeout_secs" type="float | None" default="20.0">
+  How long to wait for the next chunk of a streamed response before giving up on
+  it. Bounds the wait when the API accepts a request and then stops producing
+  without closing the stream. This is a gap between chunks, not a limit on how
+  long a response may take overall. The first chunk is the slowest, since its
+  wait spans the whole round trip including any thinking the model does before
+  it emits anything; raise this for models configured to think at length. Set to
+  `None` to wait indefinitely.
+</ParamField>
+
+<ParamField path="retry_timeout_secs" type="float | None" default="5.0">
+  How long to wait for the first chunk before giving up on the request and
+  re-issuing it, when `retry_on_timeout` is set. Like the first-chunk wait
+  above, this window spans the whole round trip including any thinking, so it is
+  only a good fit for models that start emitting quickly.
+</ParamField>
+
+<ParamField path="retry_on_timeout" type="bool | None" default="False">
+  Whether to re-issue the request once if the first chunk doesn't arrive within
+  `retry_timeout_secs`. Only the first chunk is retried: once a chunk has been
+  pushed downstream, re-issuing would duplicate the response.
+</ParamField>
+
 ### Settings
 
 Runtime-configurable settings passed via the `settings` constructor argument using `GoogleLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter            | Type                   | Default     | Description                                                                                        |
-| -------------------- | ---------------------- | ----------- | -------------------------------------------------------------------------------------------------- |
-| `model`              | `str`                  | `None`      | Gemini model identifier. _(Inherited from base settings.)_                                         |
-| `system_instruction` | `str`                  | `None`      | System instruction/prompt for the model. _(Inherited from base settings.)_                         |
-| `max_tokens`         | `int`                  | `NOT_GIVEN` | Maximum number of tokens to generate.                                                              |
-| `temperature`        | `float`                | `NOT_GIVEN` | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher values are more creative. |
-| `top_k`              | `int`                  | `NOT_GIVEN` | Top-k sampling parameter. Limits tokens to the top k most likely.                                  |
-| `top_p`              | `float`                | `NOT_GIVEN` | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                               |
-| `thinking`           | `GoogleThinkingConfig` | `NOT_GIVEN` | Thinking configuration. See [GoogleThinkingConfig](#googlethinkingconfig) below.                   |
-| `safety_settings`    | `list[SafetySetting]`  | `NOT_GIVEN` | Content safety filters. Each entry pairs a harm category with a blocking threshold.                |
+| Parameter            | Type                   | Default            | Description                                                                                        |
+| -------------------- | ---------------------- | ------------------ | -------------------------------------------------------------------------------------------------- |
+| `model`              | `str`                  | `gemini-3.6-flash` | Gemini model identifier. _(Inherited from base settings.)_                                         |
+| `system_instruction` | `str`                  | `None`             | System instruction/prompt for the model. _(Inherited from base settings.)_                         |
+| `max_tokens`         | `int`                  | `NOT_GIVEN`        | Maximum number of tokens to generate.                                                              |
+| `temperature`        | `float`                | `NOT_GIVEN`        | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher values are more creative. |
+| `top_k`              | `int`                  | `NOT_GIVEN`        | Top-k sampling parameter. Limits tokens to the top k most likely.                                  |
+| `top_p`              | `float`                | `NOT_GIVEN`        | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                               |
+| `thinking`           | `GoogleThinkingConfig` | `NOT_GIVEN`        | Thinking configuration. See [GoogleThinkingConfig](#googlethinkingconfig) below.                   |
+| `safety_settings`    | `list[SafetySetting]`  | `NOT_GIVEN`        | Content safety filters. Each entry pairs a harm category with a blocking threshold.                |
 
 <Note>
   `NOT_GIVEN` values are omitted from the API request, letting the Gemini API
@@ -44231,7 +44354,7 @@ from pipecat.services.google import GoogleLLMService
 
 llm = GoogleLLMService(
     api_key=os.getenv("GOOGLE_API_KEY"),
-    model="gemini-2.5-flash",
+    model="gemini-3.5-flash",
 )
 ```
 
@@ -44272,7 +44395,7 @@ llm = GoogleLLMService(
 llm = GoogleLLMService(
     api_key=os.getenv("GOOGLE_API_KEY"),
     settings=GoogleLLMService.Settings(
-        model="gemini-3-flash",
+        model="gemini-3.5-flash",
         max_tokens=8192,
         thinking=GoogleLLMService.GoogleThinkingConfig(
             thinking_level="high",
@@ -44290,7 +44413,7 @@ from google.genai.types import HarmBlockThreshold, HarmCategory, SafetySetting
 llm = GoogleLLMService(
     api_key=os.getenv("GOOGLE_API_KEY"),
     settings=GoogleLLMService.Settings(
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         safety_settings=[
             SafetySetting(
                 category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -44356,10 +44479,10 @@ await worker.queue_frame(
 
 `GoogleLLMService` supports the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
-| Event                       | Description                                                                 |
-| --------------------------- | --------------------------------------------------------------------------- |
-| `on_completion_timeout`     | Called when an LLM completion request times out (Google `DeadlineExceeded`) |
-| `on_function_calls_started` | Called when function calls are received and execution is about to start     |
+| Event                       | Description                                                                                                |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `on_completion_timeout`     | Called when an LLM completion request times out (Google `DeadlineExceeded` or stream idle timeout reached) |
+| `on_function_calls_started` | Called when function calls are received and execution is about to start                                    |
 
 ```python
 @llm.event_handler("on_completion_timeout")
@@ -44490,6 +44613,31 @@ Before using Google Vertex AI LLM services, you need:
 
 <ParamField path="http_options" type="HttpOptions" default="None">
   HTTP options for the Google AI client.
+</ParamField>
+
+<ParamField path="stream_idle_timeout_secs" type="float | None" default="20.0">
+  How long to wait for the next chunk of a streamed response before giving up on
+  it. Bounds the wait when the API accepts a request and then stops producing
+  without closing the stream. This is a gap between chunks, not a limit on how
+  long a response may take overall. The first chunk is the slowest, since its
+  wait spans the whole round trip including any thinking the model does before
+  it emits anything; raise this for models configured to think at length. Set to
+  `None` to wait indefinitely. Inherited from `GoogleLLMService`.
+</ParamField>
+
+<ParamField path="retry_timeout_secs" type="float | None" default="5.0">
+  How long to wait for the first chunk before giving up on the request and
+  re-issuing it, when `retry_on_timeout` is set. Like the first-chunk wait
+  above, this window spans the whole round trip including any thinking, so it is
+  only a good fit for models that start emitting quickly. Inherited from
+  `GoogleLLMService`.
+</ParamField>
+
+<ParamField path="retry_on_timeout" type="bool | None" default="False">
+  Whether to re-issue the request once if the first chunk doesn't arrive within
+  `retry_timeout_secs`. Only the first chunk is retried: once a chunk has been
+  pushed downstream, re-issuing would duplicate the response. Inherited from
+  `GoogleLLMService`.
 </ParamField>
 
 ## Usage
@@ -44689,7 +44837,7 @@ llm = GrokLLMService(
 
 ## Notes
 
-- Grok uses incremental token reporting. The service accumulates token usage metrics during processing and reports the final totals at the end of each request.
+- Token usage is reported once per completion at the end of each request.
 - Grok supports prompt caching and reasoning tokens, which are tracked in usage metrics when available.
 
 <Tip>
@@ -45571,7 +45719,7 @@ llm = NvidiaLLMService(
 
 ## Notes
 
-- **Token reporting**: NVIDIA NIM uses incremental token reporting. The service accumulates token usage metrics during processing and reports the final totals at the end of each request.
+- **Token reporting**: Token usage is reported once per completion at the end of each request.
 - **Cloud vs. local deployment**: NIM supports both cloud-hosted and on-premises deployments. For on-premises, override the `base_url` to point to your local NIM endpoint. API keys are only required for the cloud endpoint.
 - **Reasoning content**: The service automatically detects and filters reasoning content from model responses, emitting it as `LLMThought*Frame` objects. This applies to:
   - Models with API-level reasoning separation (e.g., Nemotron Nano models) that include a `reasoning_content` field
@@ -46486,7 +46634,7 @@ llm = PerplexityLLMService(
 ## Notes
 
 - Perplexity does not support function calling or tools. The service only sends messages to the API, without tool definitions.
-- Perplexity uses incremental token reporting. The service accumulates token usage metrics during processing and reports the final totals at the end of each request.
+- Token usage is reported once per completion at the end of each request.
 - Perplexity models have built-in internet search capabilities, providing up-to-date information without requiring additional tool configuration.
 - **Message transformation**: Perplexity's API enforces stricter constraints than OpenAI on conversation history structure (strict role alternation, no non-initial system messages, last message must be user/tool). The service automatically transforms messages to satisfy these constraints before sending them to the API, so you don't need to manually structure your conversation history.
 
@@ -46750,6 +46898,7 @@ llm = SambaNovaLLMService(
 
 - SambaNova does not support `frequency_penalty`, `presence_penalty`, or `seed` parameters.
 - SambaNova has custom handling for tool call indexing. The service includes compatibility logic for processing function calls from the SambaNova API.
+- Token usage reporting includes `cache_read_input_tokens` and `reasoning_tokens` when available from the provider.
 - SambaNova is known for high-throughput inference on large language models.
 
 <Tip>
@@ -47219,7 +47368,7 @@ Before using Async TTS services, you need:
   `settings=AsyncAITTSService.Settings(voice=...)` instead._
 </ParamField>
 
-<ParamField path="model" type="str" default="async_flash_v1.0" deprecated>
+<ParamField path="model" type="str" default="async_flash_v1.5" deprecated>
   TTS model to use. _Deprecated in v0.0.105. Use
   `settings=AsyncAITTSService.Settings(model=...)` instead._
 </ParamField>
@@ -47320,7 +47469,7 @@ tts = AsyncAITTSService(
     api_key=os.getenv("ASYNCAI_API_KEY"),
     settings=AsyncAITTSService.Settings(
         voice="your-voice-uuid",
-        model="async_flash_v1.0",
+        model="async_flash_v1.5",
         language=Language.ES,
     ),
 )
@@ -48020,8 +48169,10 @@ Before using Cartesia TTS services, you need:
   `settings=CartesiaTTSService.Settings(model=...)` instead._
 </ParamField>
 
-<ParamField path="cartesia_version" type="str" default="2026-03-01">
-  API version string for Cartesia service.
+<ParamField path="cartesia_version" type="str" default="None" deprecated>
+  API version string for Cartesia service. _Deprecated in v1.8.0. The service
+  sends the API version it is written against, so this parameter is no longer
+  configurable._
 </ParamField>
 
 <ParamField path="url" type="str" default="wss://api.cartesia.ai/tts/websocket">
@@ -48081,8 +48232,9 @@ The HTTP service accepts similar parameters to the WebSocket service, with these
   HTTP API base URL (instead of `url` for WebSocket).
 </ParamField>
 
-<ParamField path="cartesia_version" type="str" default="2026-03-01">
-  API version for HTTP service.
+<ParamField path="cartesia_version" type="str" default="None" deprecated>
+  API version for HTTP service. _Deprecated in v1.8.0. The service sends the API
+  version it is written against, so this parameter is no longer configurable._
 </ParamField>
 
 <ParamField path="aiohttp_session" type="aiohttp.ClientSession" default="None">
@@ -48583,11 +48735,13 @@ Before using `DeepgramFluxTTSService`, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `DeepgramFluxTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter  | Type              | Default             | Description                                                          |
-| ---------- | ----------------- | ------------------- | -------------------------------------------------------------------- |
-| `voice`    | `str`             | `flux-alexis-en`    | Flux voice identifier (e.g., `flux-alexis-en`, `flux-drew-en`).      |
-| `model`    | `str`             | _(synced to voice)_ | Model identifier. Automatically set to match `voice`. _(Inherited.)_ |
-| `language` | `Language \| str` | `None`              | Language for synthesis. _(Inherited.)_                               |
+| Parameter      | Type                              | Default             | Description                                                                                                                                                                                                               |
+| -------------- | --------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `voice`        | `str`                             | `flux-heather-en`   | Flux voice identifier (e.g., `flux-heather-en`, `flux-alexis-en`, `flux-cole-en`).                                                                                                                                        |
+| `speed`        | `float \| None`                   | `None`              | Speech-rate multiplier, from 0.85 to 1.15 in steps of 0.05. `None` leaves Flux at its default rate. Applied to the open connection via Flux's `Configure` message, so a speed change keeps the cross-turn acoustic state. |
+| `expressivity` | `-2 \| -1 \| 0 \| 1 \| 2 \| None` | `None`              | Expressive range on a calm-to-animated axis. `None` leaves Flux at its default range. Flux fixes expressivity when the connection opens, so a change reconnects.                                                          |
+| `model`        | `str`                             | _(synced to voice)_ | Model identifier. Automatically set to match `voice`. _(Inherited.)_                                                                                                                                                      |
+| `language`     | `Language \| str`                 | `None`              | Language for synthesis. _(Inherited.)_                                                                                                                                                                                    |
 
 <Note>
   The `model` field is automatically kept in sync with `voice` for metrics
@@ -48759,7 +48913,9 @@ from pipecat.services.deepgram.flux.tts import DeepgramFluxTTSService
 tts = DeepgramFluxTTSService(
     api_key=os.getenv("DEEPGRAM_API_KEY"),
     settings=DeepgramFluxTTSService.Settings(
-        voice="flux-alexis-en",
+        voice="flux-heather-en",
+        speed=1.05,
+        expressivity=1,
     ),
 )
 ```
@@ -48773,7 +48929,7 @@ tts = DeepgramFluxTTSService(
     api_key=os.getenv("DEEPGRAM_API_KEY"),
     text_aggregation_mode=TextAggregationMode.SENTENCE,
     settings=DeepgramFluxTTSService.Settings(
-        voice="flux-alexis-en",
+        voice="flux-heather-en",
     ),
 )
 ```
@@ -48823,9 +48979,10 @@ tts = DeepgramSageMakerTTSService(
 ### Flux notes
 
 - **Token Streaming**: By default (`TextAggregationMode.TOKEN`), LLM tokens are sent to Flux immediately without buffering for sentence boundaries. Flux internally determines synthesis boundaries, so aggregating sentences typically only adds latency.
-- **Cross-Turn Prosody**: Flux maintains acoustic state across turns on a single connection, preserving prosody and pacing throughout the conversation. This state resets on reconnection (interruption or server session timeout).
-- **Interruption Handling**: Flux does not yet provide a message to cancel the active turn. Interruptions are handled by reconnecting the websocket, which resets the cross-turn prosody state. Once Deepgram ships the planned `Interrupt` message, interruptions will be handled without reconnection.
-- **Sample Rate Validation**: Only the rates 8000, 16000, 24000, 32000, 44100, and 48000 Hz are supported. An explicit unsupported rate raises a `ValueError` at initialization.
+- **Cross-Turn Prosody**: Flux maintains acoustic state across turns on a single connection, preserving prosody and pacing throughout the conversation. This state survives interruptions and persists for the life of the connection (or until the server's one-hour session timeout).
+- **Interruption Handling**: Interruptions are handled by sending Flux's `Interrupt` message to cancel the active turn without closing the connection, so the cross-turn acoustic state that keeps a voice consistent survives a barge-in. Because an interruption no longer closes the connection, `on_connected` and `on_disconnected` stop firing on every barge-in.
+- **Voice Controls**: `speed` (0.85 to 1.15) is applied to the open connection with Flux's `Configure` message, so a speed change keeps the cross-turn acoustic state. `expressivity` (-2 to 2) is fixed when the connection opens, so a change reconnects.
+- **Sample Rate**: The supported rates are 8000, 16000, 24000, 32000, 44100, and 48000 Hz. An unsupported rate is reported as a warning when connecting but does not raise a `ValueError`.
 - **Audio Format**: Flux audio is always returned as linear PCM (`linear16`), the format used internally by Pipecat pipelines.
 
 ## Event Handlers
@@ -49213,7 +49370,7 @@ Before using Fish Audio TTS services, you need:
   Use `settings=FishAudioTTSService.Settings(voice=...)` instead.
 </ParamField>
 
-<ParamField path="model_id" type="str" default="s2-pro" deprecated>
+<ParamField path="model_id" type="str" default="s2.1-pro" deprecated>
   Fish Audio TTS model to use.
 
 _Deprecated in v0.0.105. Use `settings=FishAudioTTSService.Settings(...)` instead._
@@ -49278,7 +49435,7 @@ tts = FishAudioTTSService(
     api_key=os.getenv("FISH_API_KEY"),
     settings=FishAudioTTSService.Settings(
         voice="your-voice-reference-id",
-        model="s2-pro",
+        model="s2.1-pro",
         prosody_speed=1.2,
         prosody_volume=3,
         latency="balanced",
@@ -49429,6 +49586,178 @@ complete runnable example wiring a WebSocket transport → STT → LLM → TTS.
 Built and verified against Pipecat v1.7.0+. Check the [source
 repository](https://github.com/Floe-Labs/pipecat-floe) for the latest tested
 version and changelog.
+
+# Gandr Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/gandr.md
+
+GandrTTSService streams speech over a persistent WebSocket, holding one connection warm across turns.
+
+## Overview
+
+`GandrTTSService` converts text to speech using [Gandr](https://gandr.ai). It
+holds a single WebSocket open and reuses it across turns rather than opening
+one per utterance, which is what keeps steady-state first-audio latency low.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Gandr-AI/gandr-pipecat"
+  >
+    Source code, examples, and issues for the Gandr integration
+  </Card>
+  <Card title="Gandr Website" icon="book" href="https://gandr.ai">
+    Voices, languages, and pricing
+  </Card>
+  <Card title="API Keys" icon="key" href="https://gandr.ai/join/">
+    Create a Gandr API key
+  </Card>
+  <Card title="API Reference" icon="code" href="https://gandr.ai/docs">
+    The full HTTP and WebSocket contract
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from
+`pipecat-ai`:
+
+```bash
+uv add pipecat-gandr
+```
+
+## Prerequisites
+
+1. **Gandr account**: sign up at [gandr.ai](https://gandr.ai)
+2. **API key**: a `gnd_…` key from your account page
+
+### Required environment variables
+
+- `GANDR_API_KEY`: your Gandr API key (required)
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  Gandr API key (`gnd_…`). Raises `ValueError` if empty or whitespace.
+</ParamField>
+
+<ParamField path="url" type="str" default="wss://tts.gandr.ai/ws">
+  WebSocket endpoint. Leave as the default unless you have been given a
+  different one.
+</ParamField>
+
+<ParamField path="params" type="GandrTTSService.InputParams" default="None">
+  Voice, language and expression configuration. See [Input
+  parameters](#input-parameters).
+</ParamField>
+
+<ParamField path="text_aggregation_mode" type="TextAggregationMode" default="None">
+  How incoming text is aggregated before synthesis.
+</ParamField>
+
+<ParamField path="utterance_timeout_s" type="float" default="30.0">
+  How long to wait for an utterance's closing frame before treating it as
+  failed.
+</ParamField>
+
+<ParamField path="busy_retry_s" type="float" default="0.5">
+  How long to wait before retrying after the server answers `busy`.
+</ParamField>
+
+<ParamField path="max_attempts" type="int" default="3">
+  Total attempts per utterance, including retries for `busy` and for voice
+  registration.
+</ParamField>
+
+<ParamField path="reconnect_on_interruption" type="bool" default="True">
+  On barge-in, drop and reopen the connection so the next turn's audio is not
+  queued behind audio the listener has already interrupted. See
+  [Interruptions](#interruptions).
+</ParamField>
+
+### Input parameters
+
+Passed via `params=GandrTTSService.InputParams(...)`.
+
+| Parameter       | Type    | Default        | Description                                                                   |
+| --------------- | ------- | -------------- | ----------------------------------------------------------------------------- |
+| `voice_id`      | `str`   | `"gandr-mia"`  | A stock voice (see `STOCK_VOICES`) or a `gnd:` cloned-voice identifier.        |
+| `language`      | `str`   | `"en"`         | Bare two-letter code. See [Languages](#languages).                             |
+| `sample_rate`   | `int`   | `None`         | One of 8000, 16000, 22050, 24000. Takes priority over the constructor's value. |
+| `speed`         | `float` | `None`         | 0.6-1.5, pitch preserving.                                                     |
+| `volume`        | `float` | `None`         | 0.5-2.0, soft-ceiling mastered.                                                |
+| `temperature`   | `float` | `None`         | Expression control. Omit to let the service choose.                            |
+| `cfg_weight`    | `float` | `None`         | Expression control. Omit to send nothing at all.                               |
+| `seed`          | `int`   | `None`         | Fixes the render for a reproducible result.                                    |
+| `voice_wav_b64` | `str`   | `None`         | Base64 WAV reference audio for a cloned voice, registered on first utterance.  |
+
+Stock voices: `gandr-mia`, `gandr-ava`, `gandr-jenny`, `gandr-dane`,
+`gandr-leo`, `gandr-lewis`.
+
+### Languages
+
+`language` takes a **bare two-letter code**: 23 languages are supported.
+Examples: `en`, `es`, `fr`, `de`, `pt`, `ar`, `zh`, `ja`.
+
+<Warning>
+  A region suffix such as `en-GB` or `zh-CN` is not recognised and the request
+  falls back to English **without raising an error**. If you are populating
+  this from a browser or OS locale, strip the region first.
+</Warning>
+
+## Usage example
+
+```python
+import os
+
+from pipecat_gandr import GandrTTSService
+
+tts = GandrTTSService(
+    api_key=os.getenv("GANDR_API_KEY"),
+    params=GandrTTSService.InputParams(
+        voice_id="gandr-jenny",
+        language="en",
+    ),
+)
+```
+
+A complete runnable pipeline is in
+[`examples/foundational/gandr_tts_basic.py`](https://github.com/Gandr-AI/gandr-pipecat/blob/main/examples/foundational/gandr_tts_basic.py).
+
+## Interruptions
+
+The wire protocol has no cancel frame. On barge-in the service therefore drops
+the connection and reopens it, rather than draining audio nobody is going to
+hear.
+
+Set `reconnect_on_interruption=False` to keep the connection instead and
+discard the interrupted render client-side, at the cost of the next turn
+waiting for that render to finish.
+
+## Notes
+
+<Note>
+  **The first turn on a fresh connection is slower**, roughly 700 ms while the
+  session voice cache fills. Every turn after it is materially quicker, which
+  is why the connection is held warm across turns. A benchmark that measures
+  only turn one is measuring the cache filling rather than the engine.
+</Note>
+
+<Note>
+  Requests are capped at 2,000 characters. Longer text is split losslessly by
+  `split_for_request` before sending; you do not need to pre-chunk.
+</Note>
+
+<Note>
+  Every failure path closes the turn with `TTSStoppedFrame`, so a pipeline
+  cannot hang waiting on a connection that has died.
+</Note>
+
+## Compatibility
+
+**Tested with Pipecat v1.7.0** on Python 3.12.11: clean virtual environment,
+install, import, unit tests, and service construction. Declared support is
+`pipecat-ai>=0.0.108,<2.0.0`.
 
 # Gnani Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/gnani.md
@@ -51272,7 +51601,7 @@ tts = LmntTTSService(
     api_key=os.getenv("LMNT_API_KEY"),
     settings=LmntTTSService.Settings(
         voice="lily",
-        model="aurora",
+        model="blizzard",
         language=Language.ES,
     ),
 )
@@ -51523,9 +51852,10 @@ _Deprecated in v0.0.105. Use `settings=MiniMaxHttpTTSService.Settings(...)` inst
 
 </ParamField>
 
-<ParamField path="model" type="str" default="speech-02-turbo" deprecated>
-  TTS model name. Options include `speech-2.6-hd`, `speech-2.6-turbo`,
-  `speech-02-hd`, `speech-02-turbo`, `speech-01-hd`, `speech-01-turbo`.
+<ParamField path="model" type="str" default="speech-2.8-turbo" deprecated>
+  TTS model name. Options include `speech-2.8-turbo`, `speech-2.6-hd`,
+  `speech-2.6-turbo`, `speech-02-hd`, `speech-02-turbo`, `speech-01-hd`,
+  `speech-01-turbo`.
 
 _Deprecated in v0.0.105. Use `settings=MiniMaxHttpTTSService.Settings(...)` instead._
 
@@ -54867,6 +55197,96 @@ async def on_connected(service):
     print("Connected to Smallest AI")
 ```
 
+# SonexLabs Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/sonex.md
+
+SonexTTSService converts text to speech with SonexLabs' streaming TTS API.
+
+## Overview
+
+`SonexTTSService` converts text into speech using [SonexLabs'](https://sonexlabs.com)
+streaming text-to-speech API. It streams audio over HTTP with connection
+keep-alive for low time-to-first-audio, and supports multiple voices and
+languages, with automatic language detection when none is specified.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/sonexlabs/pipecat-sonex"
+  >
+    Source code, examples, and issues for the SonexLabs integration
+  </Card>
+  <Card title="SonexLabs" icon="book" href="https://sonexlabs.com">
+    Learn more about SonexLabs' text-to-speech service
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-sonex
+```
+
+## Prerequisites
+
+### SonexLabs Account Setup
+
+Before using the SonexLabs text-to-speech service, you need:
+
+1. **SonexLabs Account**: Sign up at [SonexLabs](https://sonexlabs.com)
+2. **API Key**: Generate an API key from your account dashboard
+3. **Voice Selection**: Pick a voice ID from your account's available voices
+
+### Required Environment Variables
+
+- `SONEX_API_KEY`: Your SonexLabs API key for authentication
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  SonexLabs API key.
+</ParamField>
+
+<ParamField path="voice" type="str" required>
+  Voice ID to use for synthesis.
+</ParamField>
+
+<ParamField path="language" type="str" default="None">
+  Optional language override. Leave unset to auto-detect from the input text.
+</ParamField>
+
+<ParamField path="settings" type="SonexTTSService.Settings" default="None">
+  Runtime-configurable settings, such as `speed`.
+</ParamField>
+
+## Usage
+
+```python
+from pipecat_sonex import SonexTTSService
+
+tts = SonexTTSService(
+    api_key=os.getenv("SONEX_API_KEY"),
+    voice=os.getenv("SONEX_VOICE_ID"),
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+## Compatibility
+
+Tested with Pipecat v1.7.0.
+
 # Soniox Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/soniox.md
 
@@ -54976,8 +55396,8 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 | Parameter  | Type              | Default       | Description                                                                                                                                                                         |
 | ---------- | ----------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`    | `str`             | `tts-rt-v1`   | TTS model identifier. _(Inherited from base settings.)_                                                                                                                             |
-| `voice`    | `str`             | `Adrian`      | Voice name (e.g. `"Adrian"`) or the UUID of a cloned voice in the project owning the API key. _(Inherited from base settings.)_                                                     |
+| `model`    | `str`             | `tts-rt-v2`   | TTS model identifier. _(Inherited from base settings.)_                                                                                                                             |
+| `voice`    | `str`             | `Bryce`       | Voice name (e.g. `"Bryce"`) or the UUID of a cloned voice in the project owning the API key. _(Inherited from base settings.)_                                                      |
 | `language` | `Language \| str` | `Language.EN` | Language for synthesis. _(Inherited from base settings.)_ See [supported languages](https://soniox.com/docs/tts/concepts/languages).                                                |
 | `speed`    | `float \| None`   | `None`        | Speech rate multiplier in the range 0.7-1.3. `None` uses the Soniox server default (1.0). Changing this flushes the current context and starts a new stream with the updated value. |
 
@@ -55003,8 +55423,8 @@ tts = SonioxTTSService(
 tts = SonioxTTSService(
     api_key=os.getenv("SONIOX_API_KEY"),
     settings=SonioxTTSService.Settings(
-        model="tts-rt-v1",
-        voice="Adrian",
+        model="tts-rt-v2",
+        voice="Bryce",
         language="en",
     ),
 )
@@ -55053,7 +55473,7 @@ tts = SonioxTTSService(
 - **Sample rates**: When using raw PCM audio formats, the sample rate must be one of `{8000, 16000, 24000, 44100, 48000}`.
 - **Keepalive**: The service automatically sends keepalive messages every 20 seconds to prevent Soniox's idle timeout (20-30s).
 - **Text aggregation**: Sentence aggregation is enabled by default (`text_aggregation_mode=TextAggregationMode.SENTENCE`). Buffering until sentence boundaries produces more natural speech. Set `text_aggregation_mode=TextAggregationMode.TOKEN` to stream tokens directly for lower latency.
-- **Language support**: Soniox supports 60+ languages. See the [language documentation](https://soniox.com/docs/tts/concepts/languages) for the complete list.
+- **Language support**: Soniox supports 60+ languages, including Icelandic, Sundanese, and Uzbek. See the [language documentation](https://soniox.com/docs/tts/concepts/languages) for the complete list.
 - **Word-aligned text frames**: The service emits `TTSTextFrame`s aligned with word timestamps from Soniox, so the LLM context reflects only what was actually spoken at the moment of interruption. This ensures accurate conversation state when the user interrupts mid-sentence.
 
 ## Event Handlers
@@ -55071,6 +55491,168 @@ Soniox TTS supports the standard [service connection events](/api-reference/serv
 async def on_connected(service):
     print("Connected to Soniox TTS")
 ```
+
+# Speechify Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/speechify.md
+
+HTTP-based TTS with SpeechifyHttpTTSService: word-level timestamps via Server-Sent Events using simba-3.2 and simba-3.0 models.
+
+## Overview
+
+`SpeechifyHttpTTSService` streams PCM audio and word-level speech marks over Server-Sent Events from Speechify's `/v1/audio/stream/with-timestamps` endpoint. Audio and timestamps arrive together, enabling word-by-word conversation context attribution and accurate interruption handling.
+
+<CardGroup cols={2}>
+  <Card
+    title="Speechify API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.speechify.tts.html"
+  >
+    Pipecat's API methods for Speechify TTS integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-speechify-http.py"
+  >
+    Complete example with Deepgram STT and OpenAI LLM
+  </Card>
+  <Card
+    title="Update Settings Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/update-settings/tts/tts-speechify-http.py"
+  >
+    Changing voice mid-conversation with TTSUpdateSettingsFrame
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[speechify]"
+```
+
+## Prerequisites
+
+Before using `SpeechifyHttpTTSService`, you need:
+
+1. **Speechify Account**: Sign up for API access
+2. **API Key**: Obtain an API key for authentication
+3. **Voice Selection**: Choose from available Speechify voice models
+
+### Required Environment Variables
+
+- `SPEECHIFY_API_KEY`: Your Speechify API key for authentication
+- `SPEECHIFY_VOICE_ID` (optional): Default voice identifier to use
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  Speechify API key for authentication.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession" required>
+  An aiohttp session for HTTP requests. You must create and manage this
+  yourself.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.speechify.ai">
+  Base URL for the Speechify API.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the pipeline's configured sample
+  rate. Must be one of: 8000, 16000, 22050, 24000, 44100, 48000. If the
+  requested rate is not supported, the service synthesizes at 24000 Hz and the
+  output transport will resample.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="SpeechifyHttpTTSService.Settings"
+  default="None"
+>
+  Runtime-configurable settings. See [SpeechifyHttpTTSService
+  Settings](#speechifyhttpttsservice-settings) below.
+</ParamField>
+
+<ParamField
+  path="text_aggregation_mode"
+  type="TextAggregationMode"
+  default="None"
+>
+  How to aggregate incoming text before synthesis. Controls whether text is
+  buffered into sentences or sent immediately.
+</ParamField>
+
+### SpeechifyHttpTTSService Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `SpeechifyHttpTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter                | Type              | Default     | Description                                                                             |
+| ------------------------ | ----------------- | ----------- | --------------------------------------------------------------------------------------- |
+| `voice`                  | `str`             | `geffen_32` | Voice identifier (e.g., `geffen_32`, `beatrice_32`).                                    |
+| `model`                  | `str`             | `simba-3.2` | Model identifier. Use `simba-3.2` for English or `simba-3.0` for multilingual.          |
+| `language`               | `Language \| str` | `None`      | Language for synthesis. Supported: DE, EN, ES, FR, IT, PT. _(Inherited.)_               |
+| `loudness_normalization` | `bool \| None`    | `None`      | Whether to normalize audio loudness to a standard level. Adds latency.                  |
+| `text_normalization`     | `bool \| None`    | `None`      | Whether to spell out numbers, dates, and similar tokens before synthesis. Adds latency. |
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+import aiohttp
+from pipecat.services.speechify.tts import SpeechifyHttpTTSService
+
+async with aiohttp.ClientSession() as session:
+    tts = SpeechifyHttpTTSService(
+        api_key=os.getenv("SPEECHIFY_API_KEY"),
+        aiohttp_session=session,
+        settings=SpeechifyHttpTTSService.Settings(
+            voice="geffen_32",
+            model="simba-3.2",
+        ),
+    )
+```
+
+### Multilingual Setup
+
+For languages other than English, use the `simba-3.0` model:
+
+```python
+from pipecat.transcriptions.language import Language
+
+tts = SpeechifyHttpTTSService(
+    api_key=os.getenv("SPEECHIFY_API_KEY"),
+    aiohttp_session=session,
+    settings=SpeechifyHttpTTSService.Settings(
+        voice="your_voice_id",
+        model="simba-3.0",
+        language=Language.ES,
+    ),
+)
+```
+
+### Changing Voice Mid-Conversation
+
+```python
+from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+# Update to a different voice during the conversation
+await worker.queue_frame(
+    TTSUpdateSettingsFrame(
+        delta=SpeechifyHttpTTSService.Settings(voice="beatrice_32")
+    )
+)
+```
+
+## Notes
+
+- **Speech marks requirement**: Word-level timestamps are only produced by the streaming-native models `simba-3.2` (English) and `simba-3.0` (multilingual). The legacy `simba-english` and `simba-multilingual` models cannot produce speech marks and are rejected by the `/v1/audio/stream/with-timestamps` endpoint.
+- **Sample rate validation**: If the requested sample rate is not one of the supported values (8000, 16000, 22050, 24000, 44100, 48000 Hz), the service synthesizes at 24000 Hz by default and logs a warning. The output transport will handle any necessary resampling.
+- **Supported languages**: The service supports German (DE), English (EN), Spanish (ES), French (FR), Italian (IT), and Portuguese (PT). Languages outside this set fall back to their BCP-47 tag value with a warning.
+- **HTTP-based service**: Unlike WebSocket-based TTS services, `SpeechifyHttpTTSService` processes each synthesis request over HTTP with Server-Sent Events streaming. The service handles interruptions by tracking word-level timestamps.
 
 # Speechmatics Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/speechmatics.md
@@ -58075,11 +58657,11 @@ _Deprecated in v0.0.105. Use `settings=GrokRealtimeLLMService.Settings(session_p
 
 Runtime-configurable settings passed via the `settings` constructor argument using `GrokRealtimeLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter            | Type                | Default                       | Description                                                                                          |
-| -------------------- | ------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `model`              | `str`               | `"grok-voice-think-fast-1.0"` | Model identifier. Defaults to xAI's recommended Voice Agent model. _(Inherited from base settings.)_ |
-| `system_instruction` | `str`               | `NOT_GIVEN`                   | System instruction/prompt. _(Inherited from base settings.)_                                         |
-| `session_properties` | `SessionProperties` | `NOT_GIVEN`                   | Session-level configuration (voice, audio config, tools, etc.).                                      |
+| Parameter            | Type                | Default               | Description                                                                                          |
+| -------------------- | ------------------- | --------------------- | ---------------------------------------------------------------------------------------------------- |
+| `model`              | `str`               | `"grok-voice-latest"` | Model identifier. Defaults to xAI's recommended Voice Agent alias. _(Inherited from base settings.)_ |
+| `system_instruction` | `str`               | `NOT_GIVEN`           | System instruction/prompt. _(Inherited from base settings.)_                                         |
+| `session_properties` | `SessionProperties` | `NOT_GIVEN`           | Session-level configuration (voice, audio config, tools, etc.).                                      |
 
 <Note>
   `NOT_GIVEN` values are omitted, letting the service use its own defaults. Only
@@ -58094,7 +58676,22 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `voice`          | `str`                | `"eve"`                            | Voice the model uses to respond. Accepts any built-in voice ID (see [xAI's voice catalogue](https://docs.x.ai/docs/guides/voice/agent)) or a custom voice ID from the Custom Voices API. Case-insensitive. |
 | `turn_detection` | `TurnDetection`      | `TurnDetection(type="server_vad")` | Turn detection configuration. Set to `None` for manual turn detection.                                                                                                                                     |
 | `audio`          | `AudioConfiguration` | `None`                             | Configuration for input and output audio formats.                                                                                                                                                          |
-| `tools`          | `List[GrokTool]`     | `None`                             | Available tools: `web_search`, `x_search`, `file_search`, or custom `function` tools.                                                                                                                      |
+| `tools`          | `List[GrokTool]`     | `None`                             | Available tools: `web_search`, `x_search`, `file_search`, `mcp`, or custom `function` tools.                                                                                                               |
+| `reasoning`      | `Reasoning`          | `None`                             | Reasoning effort controls. Set `effort="high"` to enable reasoning or `effort="none"` to disable.                                                                                                          |
+| `resumption`     | `SessionResumption`  | `None`                             | Session resumption opt-in. Set `enabled=True` to cache conversation history for reconnection.                                                                                                              |
+| `replace`        | `dict[str, str]`     | `None`                             | Pronunciation replacement map applied before TTS (e.g., `{"Acme": "Ack-mee"}`).                                                                                                                            |
+
+### TurnDetection
+
+The `turn_detection` field in `SessionProperties` configures voice activity detection and turn management:
+
+| Parameter             | Type    | Default | Description                                                                        |
+| --------------------- | ------- | ------- | ---------------------------------------------------------------------------------- |
+| `type`                | `str`   | `None`  | Detection type: `"server_vad"` for automatic detection, `None` for manual control. |
+| `threshold`           | `float` | `None`  | VAD activation threshold (0.1–0.9). Higher values require louder audio.            |
+| `silence_duration_ms` | `int`   | `None`  | Milliseconds of silence before the server ends the user turn.                      |
+| `prefix_padding_ms`   | `int`   | `None`  | Audio (ms) included before detected speech start.                                  |
+| `idle_timeout_ms`     | `int`   | `None`  | Milliseconds of silence after assistant response before proactive check-in.        |
 
 ### AudioConfiguration
 
@@ -58102,17 +58699,29 @@ The `audio` field in `SessionProperties` accepts an `AudioConfiguration` with `i
 
 **AudioInput** (`audio.input`):
 
-| Parameter | Type          | Default | Description                                                                                                               |
-| --------- | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `format`  | `AudioFormat` | `None`  | Input audio format. Supports `PCMAudioFormat` (configurable rate), `PCMUAudioFormat` (8kHz), or `PCMAAudioFormat` (8kHz). |
+| Parameter       | Type                        | Default | Description                                                                                                               |
+| --------------- | --------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `format`        | `AudioFormat`               | `None`  | Input audio format. Supports `PCMAudioFormat` (configurable rate), `PCMUAudioFormat` (8kHz), or `PCMAAudioFormat` (8kHz). |
+| `transcription` | `InputAudioTranscription`   | `None`  | Transcription settings. Set `model="grok-transcribe"` for streaming user captions.                                        |
+| `transport`     | `Literal["json", "binary"]` | `None`  | Wire path for input audio.                                                                                                |
 
 **AudioOutput** (`audio.output`):
 
-| Parameter | Type          | Default | Description                                        |
-| --------- | ------------- | ------- | -------------------------------------------------- |
-| `format`  | `AudioFormat` | `None`  | Output audio format. Same format options as input. |
+| Parameter   | Type                        | Default | Description                                        |
+| ----------- | --------------------------- | ------- | -------------------------------------------------- |
+| `format`    | `AudioFormat`               | `None`  | Output audio format. Same format options as input. |
+| `speed`     | `float`                     | `None`  | Playback speed multiplier (0.7–1.5).               |
+| `transport` | `Literal["json", "binary"]` | `None`  | Wire path for assistant audio.                     |
 
 Grok PCM audio supports sample rates: 8000, 16000, 21050, 24000, 32000, 44100, and 48000 Hz.
+
+**InputAudioTranscription** (`audio.input.transcription`):
+
+| Parameter       | Type        | Default | Description                                                               |
+| --------------- | ----------- | ------- | ------------------------------------------------------------------------- |
+| `model`         | `str`       | `None`  | Transcription model. Use `"grok-transcribe"` for streaming user captions. |
+| `language_hint` | `str`       | `None`  | BCP-47 language code to bias ASR (e.g., `"en-US"`).                       |
+| `keyterms`      | `list[str]` | `None`  | Domain terms to bias transcription (max 100 terms, ≤50 chars each).       |
 
 ### Built-in Tools
 
@@ -58123,6 +58732,7 @@ Grok provides several built-in tools in addition to custom function tools:
 | `WebSearchTool`  | `web_search`  | Search the web for current information                             |
 | `XSearchTool`    | `x_search`    | Search X (Twitter) for posts. Supports `allowed_x_handles` filter. |
 | `FileSearchTool` | `file_search` | Search uploaded document collections by `vector_store_ids`         |
+| `McpTool`        | `mcp`         | Remote MCP tool configuration managed by xAI                       |
 
 ## Usage
 
@@ -58227,11 +58837,39 @@ await worker.queue_frame(
   details.
 </Tip>
 
+## Methods
+
+### delete_conversation_item
+
+```python
+await service.delete_conversation_item(item_id: str)
+```
+
+Delete a conversation item by ID. Sends a `conversation.item.delete` event to the server.
+
+**Parameters:**
+
+- `item_id` (`str`): ID of the conversation item to delete
+
+### force_message
+
+```python
+await service.force_message(text: str)
+```
+
+Speak a hard-coded TTS line without involving the LLM. Sends a `force_message` conversation item. The server automatically injects the response lifecycle, so no `response.create` call is needed.
+
+**Parameters:**
+
+- `text` (`str`): Verbatim text to synthesize and play
+
 ## Notes
 
+- **Model versioning**: The default model `"grok-voice-latest"` tracks xAI's recommended Voice Agent. For stability, pin a specific version in settings (e.g., `model="grok-voice-think-fast-1.0"`).
 - **Audio format auto-configuration**: If audio format is not specified in `session_properties`, the service automatically configures PCM input/output using the pipeline's sample rates.
 - **Server-side VAD**: Enabled by default. When VAD is enabled, the server handles speech detection and turn management automatically. Set `turn_detection` to `None` for manual turn detection.
-- **Audio before setup**: Audio is not sent to Grok until the conversation setup is complete, preventing sample rate mismatches.
+- **Audio flow timing**: User audio flows after `session.updated` is received. Audio-only pipelines work without explicitly calling `_create_response`.
+- **Interruption handling**: Interruptions send `response.cancel` to stop in-flight assistant audio on the wire and `conversation.item.truncate` to align server-side history with what the user heard. With server VAD enabled, the input buffer is preserved (not cleared) so interrupting user speech remains intact. Manual turn mode clears the input buffer on interruption.
 - **Voice IDs**: Accepts any built-in voice ID from [xAI's catalogue](https://docs.x.ai/docs/guides/voice/agent) or a custom voice ID from the Custom Voices API. Voice IDs are case-insensitive. Default is `"eve"`.
 - **G.711 support**: PCMU and PCMA formats are supported at a fixed 8000 Hz rate, useful for telephony integrations.
 - **System instruction precedence**: The `system_instruction` from service settings takes precedence over an initial system message in the LLM context. A warning is logged when both are set.
@@ -58239,10 +58877,15 @@ await worker.queue_frame(
 
 ## Event Handlers
 
-| Event                          | Description                                                   |
-| ------------------------------ | ------------------------------------------------------------- |
-| `on_conversation_item_created` | Called when a new conversation item is created in the session |
-| `on_conversation_item_updated` | Called when a conversation item is updated or completed       |
+| Event                            | Parameters                                 | Description                                                   |
+| -------------------------------- | ------------------------------------------ | ------------------------------------------------------------- |
+| `on_conversation_item_created`   | `item_id`, `item`                          | Called when a new conversation item is created in the session |
+| `on_conversation_item_updated`   | `item_id`, `item`                          | Called when a conversation item is updated or completed       |
+| `on_conversation_item_deleted`   | `item_id`                                  | Called when a conversation item is deleted                    |
+| `on_conversation_item_truncated` | `item_id`, `content_index`, `audio_end_ms` | Called when a conversation item is truncated                  |
+| `on_idle_timeout`                | `item_id`                                  | Called when the idle timeout fires (proactive check-in)       |
+| `on_dtmf_received`               | `button`                                   | Called when a DTMF digit is received (SIP sessions)           |
+| `on_mcp_event`                   | `event_type`, `event`                      | Called for MCP discovery and call lifecycle events            |
 
 ```python
 @llm.event_handler("on_conversation_item_created")
@@ -58252,6 +58895,22 @@ async def on_item_created(service, item_id, item):
 @llm.event_handler("on_conversation_item_updated")
 async def on_item_updated(service, item_id, item):
     print(f"Conversation item updated: {item_id}")
+
+@llm.event_handler("on_conversation_item_deleted")
+async def on_item_deleted(service, item_id):
+    print(f"Conversation item deleted: {item_id}")
+
+@llm.event_handler("on_idle_timeout")
+async def on_idle_timeout(service, item_id):
+    print(f"Idle timeout triggered")
+
+@llm.event_handler("on_dtmf_received")
+async def on_dtmf(service, button):
+    print(f"DTMF digit received: {button}")
+
+@llm.event_handler("on_mcp_event")
+async def on_mcp(service, event_type, event):
+    print(f"MCP event: {event_type}")
 ```
 
 # Inworld Realtime
@@ -61424,7 +62083,7 @@ self-hosted option.
 
 Enabling observability in a Pipecat app involves three steps: initialize
 Finchvox, add the `FinchvoxProcessor` to your pipeline, and enable metrics,
-tracing, and turn tracking on your `PipelineTask`.
+tracing, and turn tracking on your `PipelineWorker`.
 
 1. Initialize Finchvox at the top of your bot (e.g., `bot.py`):
 
@@ -61447,11 +62106,11 @@ pipeline = Pipeline([
 ])
 ```
 
-3. Initialize your `PipelineTask` with metrics, tracing, and turn tracking
+3. Initialize your `PipelineWorker` with metrics, tracing, and turn tracking
    enabled:
 
 ```python
-task = PipelineTask(
+worker = PipelineWorker(
     pipeline,
     params=PipelineParams(enable_metrics=True),
     enable_tracing=True,
@@ -61940,7 +62599,7 @@ Before using the Roark observer, you need:
 
 <ParamField path="pipecat_call_id" type="str" default="random UUID">
   Stable call identifier carried on Roark records as `pipecatCallId`. Pass the
-  same value to `PipelineTask(conversation_id=...)` when OpenTelemetry tracing
+  same value to `PipelineWorker(conversation_id=...)` when OpenTelemetry tracing
   is enabled to correlate Roark calls with traces.
 </ParamField>
 
@@ -61952,7 +62611,7 @@ the bot's audio post-TTS:
 
 ```python
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat_roark import RoarkObserver
 
 roark = RoarkObserver(
@@ -61969,7 +62628,7 @@ pipeline = Pipeline([
     context_aggregator.assistant(),
 ])
 
-task = PipelineTask(pipeline, params=PipelineParams(observers=[roark]))
+worker = PipelineWorker(pipeline, observers=[roark])
 ```
 
 That's it — transcripts, tool calls, and the stereo recording flow to Roark
@@ -62353,7 +63012,7 @@ Configuration passed via the `options` constructor argument using
 ```python
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.plugins.pinch import PinchTranslatorService, TranslatorOptions
 
 async def main():
@@ -62375,8 +63034,7 @@ async def main():
         transport.output(),
     ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-    await PipelineRunner().run(task)
+    worker = PipelineWorker(pipeline, params=PipelineParams(allow_interruptions=True))
 ```
 
 ## Compatibility
@@ -66563,9 +67221,7 @@ You can attach multiple observers to a pipeline worker. Each observer will be no
 ```python
 worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(
-        observers=[LLMLogObserver(), TranscriptionLogObserver(), CustomObserver()],
-    ),
+    observers=[LLMLogObserver(), TranscriptionLogObserver(), CustomObserver()],
 )
 ```
 
@@ -66643,9 +67299,7 @@ from pipecat.observers.loggers.debug_log_observer import DebugLogObserver
 
 worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(
-        observers=[DebugLogObserver()],
-    ),
+    observers=[DebugLogObserver()],
 )
 ```
 
@@ -66659,14 +67313,12 @@ from pipecat.observers.loggers.debug_log_observer import DebugLogObserver
 
 worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(
-        observers=[
-            DebugLogObserver(frame_types=(
-                TranscriptionFrame,
-                InterimTranscriptionFrame
-            ))
-        ],
-    ),
+    observers=[
+        DebugLogObserver(frame_types=(
+            TranscriptionFrame,
+            InterimTranscriptionFrame
+        ))
+    ],
 )
 ```
 
@@ -66677,25 +67329,23 @@ Filter frames based on their type and source/destination:
 ```python
 from pipecat.frames.frames import InterruptionFrame, UserStartedSpeakingFrame, LLMTextFrame
 from pipecat.observers.loggers.debug_log_observer import DebugLogObserver, FrameEndpoint
-from pipecat.transports.base_output_transport import BaseOutputTransport
+from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.services.stt_service import STTService
 
 worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(
-        observers=[
-            DebugLogObserver(frame_types={
-                # Only log InterruptionFrame when source is BaseOutputTransport
-                InterruptionFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
+    observers=[
+        DebugLogObserver(frame_types={
+            # Only log InterruptionFrame when source is BaseOutputTransport
+            InterruptionFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
 
-                # Only log UserStartedSpeakingFrame when destination is STTService
-                UserStartedSpeakingFrame: (STTService, FrameEndpoint.DESTINATION),
+            # Only log UserStartedSpeakingFrame when destination is STTService
+            UserStartedSpeakingFrame: (STTService, FrameEndpoint.DESTINATION),
 
-                # Log LLMTextFrame regardless of source or destination
-                LLMTextFrame: None
-            })
-        ],
-    ),
+            # Log LLMTextFrame regardless of source or destination
+            LLMTextFrame: None
+        })
+    ],
 )
 ```
 
@@ -66752,9 +67402,7 @@ from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
 
 worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(
-        observers=[LLMLogObserver()],
-    ),
+    observers=[LLMLogObserver()],
 )
 ```
 
@@ -66791,9 +67439,7 @@ from pipecat.observers.loggers.transcription_log_observer import TranscriptionLo
 
 worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(
-        observers=[TranscriptionLogObserver()],
-    ),
+    observers=[TranscriptionLogObserver()],
 )
 ```
 
@@ -67067,7 +67713,7 @@ async def on_latency_measured(observer, latency):
 
 worker = PipelineWorker(
     pipeline,
-    params=PipelineParams(observers=[latency_observer]),
+    observers=[latency_observer],
 )
 ```
 
@@ -67089,9 +67735,9 @@ async def on_latency_breakdown(observer, breakdown):
 worker = PipelineWorker(
     pipeline,
     params=PipelineParams(
-        observers=[latency_observer],
         enable_metrics=True,  # Required for breakdown metrics
     ),
+    observers=[latency_observer],
 )
 ```
 
