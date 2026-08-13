@@ -71,11 +71,44 @@ To determine the optimal reserved instance count for your deployment, consider:
   apps, consider a waiting UX or message.
 </Tip>
 
+## Changing min-agents at Runtime
+
+You can raise or lower your reserved agent count at any time, with the CLI, the dashboard, or the REST API. The change does not take effect right away.
+
+A `min-agents` change is applied **asynchronously**. A successful response means Pipecat Cloud accepted the change, not that the new reserved instances exist or are ready to take a session. New instances still need roughly 30 seconds to become available, and that can take longer for a large image or an agent that does heavy setup work.
+
+This is a common cause of **unexpected cold starts right after raising `min-agents`**. If you raise the reserved count and then start sessions a second or two later, those sessions race the scale-up. They land on instances that are still starting, so you see long start times even though your configuration looks correct.
+
+### Wait for the New Instances Before Sending Traffic
+
+Rather than waiting a fixed number of seconds, poll the agent and check its real state. `GET /v1/agents/{agentName}` returns everything you need:
+
+```bash
+curl https://api.pipecat.daily.co/v1/agents/my-agent \
+  -H "Authorization: Bearer YOUR_PRIVATE_API_KEY"
+```
+
+Wait until all three of these are true:
+
+1. `reconciledDeploymentId` equals `desiredDeploymentId`. Your change has been picked up.
+2. `ready` is `true`. The agent is in a good state.
+3. `currentRevision.readyReplicas` minus `activeSessionCount` covers the number of sessions you are about to start. There is enough free warm capacity for your traffic.
+
+Poll every few seconds until those conditions hold, then start your sessions.
+
+<Tip>
+  For a known busy period, raise `min-agents` **minutes** before your traffic
+  starts, not seconds. Polling protects you from a race, but giving the pool
+  time to fill is simpler and safer. See
+  [Cold-starts](../fundamentals/scaling#cold-starts) for what makes a scale-up
+  slower.
+</Tip>
+
 ## Cost-Efficient Scaling Strategies
 
 - **Development/Testing**: Use `min-agents: 0` to minimize costs during development
 - **Production Voice AI**: Set `min-agents` to cover your baseline traffic to avoid cold starts
-- **Time-Based Scaling**: Consider modifying your reserved count for known high-traffic periods
+- **Time-Based Scaling**: Consider modifying your reserved count for known high-traffic periods. Make the change ahead of the traffic and confirm the new capacity is ready, as described in [Changing min-agents at Runtime](#changing-min-agents-at-runtime)
 - **Cap session duration**: Use [`--max-session-duration`](/api-reference/cli/cloud/deploy#param-max-session-duration) as a safety net against runaway sessions. If your application's calls are meant to be short, setting a tight cap (e.g. 120s for a 60s use case) prevents a buggy bot from racking up hours of charges.
 - **Monitoring**: Regularly review your warm capacity utilization to optimize your configuration
   <Info>
