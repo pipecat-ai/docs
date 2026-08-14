@@ -1,0 +1,196 @@
+---
+title: "Keenable Web Search"
+sidebarTitle: "Keenable"
+description: "KeenableWebSearch provides low-latency web search and page reading tools via a hosted MCP server powered by Keenable AI."
+---
+
+## Overview
+
+`KeenableWebSearch` exposes web search and page reading capabilities to your Pipecat agents through a hosted MCP server powered by [Keenable AI](https://keenable.ai). It provides two tools that can be registered directly with your LLM context:
+
+- `search_web_pages`: Search the web for current events, news, or facts with optional site and date-range filters
+- `fetch_page_content`: Read the text content of a specific web page
+
+Pass `await search.tools()` to your `LLMContext` and the LLM auto-registers the tool handlers, allowing your agent to answer questions about current events and information beyond the model's training data.
+
+<CardGroup cols={2}>
+  <Card
+    title="Keenable AI"
+    icon="globe"
+    href="https://keenable.ai"
+  >
+    Learn more about Keenable's web search and MCP services
+  </Card>
+  <Card
+    title="Example"
+    icon="code"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/features/features-keenable-web-search.py"
+  >
+    Complete voice agent example with web search
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[keenable]"
+```
+
+## Prerequisites
+
+### API Key (Optional)
+
+No API key is required to use Keenable web search — it works keyless by default using the free tier with `pro` mode. However, you can optionally provide an API key for:
+
+- Higher rate limits
+- Access to `realtime` mode (lower latency, ideal for voice agents)
+
+If you choose to use an API key, set the `KEENABLE_API_KEY` environment variable or pass it directly to the constructor.
+
+## Configuration
+
+<ParamField path="api_key" type="str | None" default="None">
+  API key for higher rate limits and access to `realtime` mode. When unset, the keyless free tier is used.
+</ParamField>
+
+<ParamField path="mode" type="'pro' | 'realtime'" default="'realtime' if keyed, else 'pro'">
+  Search mode:
+  - `"pro"`: Higher quality results
+  - `"realtime"`: Lower latency, optimized for voice (requires an account with realtime mode enabled)
+  
+  When unset, defaults to `"realtime"` if an API key is provided, otherwise `"pro"`.
+</ParamField>
+
+## Available Tools
+
+When you call `await search.tools()`, the following tools are registered:
+
+### search_web_pages
+
+Search the web with optional filters:
+- **site**: Limit results to a specific domain
+- **date_range**: Filter by date range
+- **mode**: Automatically set to the configured mode (`pro` or `realtime`)
+
+### fetch_page_content
+
+Read the full text content of a specific web page by URL.
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+from pipecat.services.keenable.search import KeenableWebSearch
+from pipecat.processors.aggregators.llm_context import LLMContext
+
+# Keyless (free tier, uses "pro" mode)
+search = KeenableWebSearch()
+
+# With API key (uses "realtime" mode by default)
+search = KeenableWebSearch(api_key=os.getenv("KEENABLE_API_KEY"))
+
+# Explicit mode selection
+search = KeenableWebSearch(
+    api_key=os.getenv("KEENABLE_API_KEY"),
+    mode="realtime"
+)
+
+# Register tools with LLM context
+context = LLMContext(tools=await search.tools())
+```
+
+### Complete Voice Agent
+
+```python
+import os
+from datetime import date
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMRunFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.keenable.search import KeenableWebSearch
+from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
+
+# Initialize services
+stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
+tts = CartesiaTTSService(api_key=os.environ["CARTESIA_API_KEY"])
+
+system_prompt = f"""
+You are a helpful assistant with live web access.
+Today's date is {date.today():%A, %B %d, %Y}.
+
+You have two tools:
+- search_web_pages: search the web for current information
+- fetch_page_content: read specific web pages
+
+Use these tools whenever a question needs current information.
+"""
+
+llm = OpenAIResponsesLLMService(
+    api_key=os.environ["OPENAI_API_KEY"],
+    settings=OpenAIResponsesLLMService.Settings(
+        system_instruction=system_prompt,
+    ),
+)
+
+# Initialize web search
+search = KeenableWebSearch(api_key=os.getenv("KEENABLE_API_KEY"))
+
+# Create context with tools
+context = LLMContext(tools=await search.tools())
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+)
+
+# Build pipeline
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    user_aggregator,
+    llm,
+    tts,
+    transport.output(),
+    assistant_aggregator,
+])
+
+worker = PipelineWorker(pipeline)
+```
+
+### Manual Connection Management
+
+The connection to Keenable's server is managed automatically, but you can control it explicitly if needed:
+
+```python
+search = KeenableWebSearch()
+
+# Explicit connection management
+await search.start()
+try:
+    tools = await search.tools()
+    # Use tools...
+finally:
+    await search.close()
+
+# Or use as async context manager
+async with KeenableWebSearch() as search:
+    tools = await search.tools()
+    # Use tools...
+```
+
+## Notes
+
+- The connection to Keenable's server is opened on the first call to `tools()` and closed automatically at pipeline teardown
+- The configured `mode` (`pro` or `realtime`) is pinned per request and hidden from the model
+- `realtime` mode requires an account with realtime mode enabled; keyless access defaults to `pro` mode
+- The `start()` method is idempotent and called automatically by `tools()`
+- The `close()` method is safe to call multiple times and from any task
