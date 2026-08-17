@@ -21,10 +21,11 @@ A bot runner typically creates transport sessions (like Daily WebRTC rooms), gen
 
 ## How the Development Runner Works
 
-The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. By default it starts a **single server that supports all transports simultaneously** — WebRTC, Daily, telephony (Twilio, Telnyx, Plivo, Exotel), and plain WebSocket. Clients choose which transport they want per-request by sending a `"transport"` field in the `POST /start` body; you no longer restart the server to switch transports.
+The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. By default it starts a **single server that supports all transports simultaneously** — WebRTC, Daily, LiveKit, telephony (Twilio, Telnyx, Plivo, Exotel), and plain WebSocket. Clients choose which transport they want per-request by sending a `"transport"` field in the `POST /start` body; you no longer restart the server to switch transports.
 
 - **WebRTC connections**: It serves a built-in web interface where users can connect directly as well as an endpoint to create new WebRTC sessions
 - **Daily integration**: It provides endpoints that create new rooms and tokens and redirect users to join them
+- **LiveKit integration**: It mints room tokens and spawns bots as participants in LiveKit rooms
 - **Telephony providers**: For Twilio, Telnyx, and Plivo, it sets up webhook endpoints that handle incoming calls and establish WebSocket connections for audio streaming
 - **Plain WebSocket**: It exposes a `/ws-client` endpoint for non-telephony WebSocket clients (e.g. browser apps using protobuf framing)
 
@@ -170,6 +171,7 @@ python bot.py -t daily   # Restrict to Daily → DailyRunnerArguments
 Runner arguments are how the runner communicates transport-specific information to your bot. The runner determines which transport to use based on the command-line arguments, then creates the appropriate runner arguments:
 
 - **`DailyRunnerArguments`**: Contains `room_url`, `token` (Optional), `body` (Optional) for joining Daily rooms
+- **`LiveKitRunnerArguments`**: Contains `room_name`, `url`, `token`, `body` (Optional), `session_id` for joining LiveKit rooms
 - **`SmallWebRTCRunnerArguments`**: Contains `webrtc_connection` for local WebRTC sessions, `body` (Optional) for WhatsApp call metadata
 - **`WebSocketRunnerArguments`**: Contains `websocket` for both telephony and plain WebSocket connections. The `transport_type` field distinguishes them — `"websocket"` for plain (non-telephony) clients connecting via `/ws-client`, or a telephony provider value for connections via `/ws`.
 
@@ -241,7 +243,7 @@ This allows you to easily customize behavior between development and production 
 
 ## All Supported Transports
 
-The development runner supports seven transport types, each designed for different use cases. By default all are available from one server; the client selects one per session via the `"transport"` field in the `/start` request. The `-t <transport>` form below is the optional way to **restrict** the server to a single transport.
+The development runner supports eight transport types, each designed for different use cases. By default all are available from one server; the client selects one per session via the `"transport"` field in the `/start` request. The `-t <transport>` form below is the optional way to **restrict** the server to a single transport.
 
 ### WebRTC (`"transport": "webrtc"`)
 
@@ -297,6 +299,37 @@ python bot.py --dialin
   `GET /` redirects to the prebuilt client UI at `/client/` for all transports.
   The Daily browser redirect moved to `GET /daily` in Pipecat 1.3.0.
 </Note>
+
+### LiveKit (`"transport": "livekit"`)
+
+Integration with LiveKit for production WebRTC conferencing with rooms and participant management.
+
+```bash
+python bot.py
+# POST /start with {"transport": "livekit"}
+
+# Restrict to LiveKit only
+python bot.py -t livekit
+```
+
+**Runner Arguments**: `LiveKitRunnerArguments`
+
+- `room_name`: LiveKit room name to join
+- `url`: LiveKit server URL to connect to
+- `token`: Authentication token for the room
+- `body`: Request data from /start endpoint (dict)
+- `session_id`: Unique session identifier
+
+**Available Endpoints**:
+
+- `POST /start`: RTVI-compatible endpoint for programmatic access (send `"transport": "livekit"`)
+
+**Environment Variables**:
+
+- `LIVEKIT_URL`: LiveKit server URL (required)
+- `LIVEKIT_API_KEY`: LiveKit API key (required)
+- `LIVEKIT_API_SECRET`: LiveKit API secret (required)
+- `LIVEKIT_ROOM_NAME`: Room name to use (optional, defaults to `pipecat-{random}`)
 
 ### Telephony (`"transport": "twilio" | "telnyx" | "plivo" | "exotel"`)
 
@@ -355,7 +388,7 @@ Options:
   --host TEXT                Server host address (default: localhost)
   --port INTEGER             Server port (default: 7860)
   -t, --transport            Restrict to a single transport and set it as the default
-                             for /start: daily, webrtc, twilio, telnyx, plivo, exotel.
+                             for /start: daily, livekit, webrtc, twilio, telnyx, plivo, exotel.
                              Omit to support all transports simultaneously (default).
   -x, --proxy TEXT           Public proxy hostname for telephony webhooks (required for telephony)
   --allowed-origins [ORIGIN] Allowed origins for HTTP and WebSocket connections.
@@ -374,6 +407,7 @@ Options:
 
 - `webrtc`: Local WebRTC with browser interface
 - `daily`: Daily.co integration with room management
+- `livekit`: LiveKit integration with room management
 - `twilio`, `telnyx`, `plivo`, `exotel`: Telephony provider integration
 
 **`--proxy` / `-x`**: Required for most telephony transports (Twilio, Telnyx, Plivo). This should be a publicly accessible hostname (like `yourbot.ngrok.io`) that can receive webhooks from telephony providers. The runner automatically strips protocol prefixes (http://, https://) if provided. Not required for Exotel, which uses direct WebSocket connections.
@@ -395,6 +429,13 @@ Different transports require different environment variables:
 - `DAILY_API_KEY`: Daily API key for creating rooms and tokens (required for dial-in)
 - `DAILY_SAMPLE_ROOM_URL` (Optional): Existing room URL to use
 - `DAILY_API_URL` (Optional): Daily API URL (defaults to https://api.daily.co/v1)
+
+**LiveKit**:
+
+- `LIVEKIT_URL`: LiveKit server URL (required)
+- `LIVEKIT_API_KEY`: LiveKit API key (required)
+- `LIVEKIT_API_SECRET`: LiveKit API secret (required)
+- `LIVEKIT_ROOM_NAME` (Optional): Room name to use (defaults to `pipecat-{random}`)
 
 **Telephony**:
 
@@ -720,19 +761,20 @@ This automatic logging applies to all runner endpoints and helps identify issues
 
 All transports are available from `python bot.py`; the `-t` form below restricts the server to one. Access columns assume the default `localhost:7860`.
 
-| Transport     | Command                                     | Access                          | Environment Variables                               |
-| ------------- | ------------------------------------------- | ------------------------------- | --------------------------------------------------- |
-| All (default) | `python bot.py`                             | http://localhost:7860/client    | Per transport (see below)                           |
-| WebRTC        | `python bot.py -t webrtc`                   | http://localhost:7860/client    | None                                                |
-| Daily         | `python bot.py -t daily`                    | `GET /daily`, `POST /start`     | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional) |
-| Daily Direct  | `python bot.py -d`                          | Direct connection               | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional) |
-| Daily Dial-In | `python bot.py --dialin`                    | Phone calls via Daily PSTN      | `DAILY_API_KEY` (Required)                          |
-| Twilio        | `python bot.py -t twilio -x proxy.ngrok.io` | Phone calls                     | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`           |
-| Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io` | Phone calls                     | `TELNYX_API_KEY`                                    |
-| Plivo         | `python bot.py -t plivo -x proxy.ngrok.io`  | Phone calls                     | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                 |
-| Exotel        | `python bot.py -t exotel`                   | Phone calls                     | None                                                |
-| WebSocket     | `python bot.py`                             | `ws://localhost:7860/ws-client` | None                                                |
-| ESP32 WebRTC  | `python bot.py --esp32 --host <ESP32_IP>`   | ESP32 WebRTC connection         | None                                                |
+| Transport     | Command                                     | Access                          | Environment Variables                                                    |
+| ------------- | ------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------ |
+| All (default) | `python bot.py`                             | http://localhost:7860/client    | Per transport (see below)                                                |
+| WebRTC        | `python bot.py -t webrtc`                   | http://localhost:7860/client    | None                                                                     |
+| Daily         | `python bot.py -t daily`                    | `GET /daily`, `POST /start`     | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional)                      |
+| Daily Direct  | `python bot.py -d`                          | Direct connection               | `DAILY_API_KEY`, `DAILY_SAMPLE_ROOM_URL` (Optional)                      |
+| Daily Dial-In | `python bot.py --dialin`                    | Phone calls via Daily PSTN      | `DAILY_API_KEY` (Required)                                               |
+| LiveKit       | `python bot.py -t livekit`                  | `POST /start`                   | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (All required)   |
+| Twilio        | `python bot.py -t twilio -x proxy.ngrok.io` | Phone calls                     | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`                                |
+| Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io` | Phone calls                     | `TELNYX_API_KEY`                                                         |
+| Plivo         | `python bot.py -t plivo -x proxy.ngrok.io`  | Phone calls                     | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                                      |
+| Exotel        | `python bot.py -t exotel`                   | Phone calls                     | None                                                                     |
+| WebSocket     | `python bot.py`                             | `ws://localhost:7860/ws-client` | None                                                                     |
+| ESP32 WebRTC  | `python bot.py --esp32 --host <ESP32_IP>`   | ESP32 WebRTC connection         | None                                                                     |
 
 ## Examples
 
