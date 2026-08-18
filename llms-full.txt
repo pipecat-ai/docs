@@ -24248,6 +24248,19 @@ Source: https://docs.pipecat.ai/pipecat-cloud/fundamentals/deploy.md
 
 Deploy agents with the pipecat cloud deploy CLI command: cloud image builds from your Dockerfile and deployment configuration.
 
+## Choosing a deployment method
+
+Pipecat Cloud gives you four ways to ship an agent. The first three build the image for you from a `Dockerfile` in your project; the fourth deploys an image you built and pushed yourself.
+
+| Method                                        | Best for                                                                                                                                           |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **CLI cloud builds** (`pipecat cloud deploy`) | Deploying from your laptop, or from a script that already has the CLI. See [Cloud Builds](/pipecat-cloud/guides/cloud-builds).                     |
+| **GitHub integration**                        | Push-to-deploy with no CI setup and no API key to manage. See [Deploy from GitHub](/pipecat-cloud/guides/deploy-from-github).                      |
+| **GitHub Actions**                            | Pipelines that need tests, approvals, or custom steps before a deploy. See [CI with GitHub Actions](/pipecat-cloud/guides/ci-with-github-actions). |
+| **Your own container registry**               | Reusing an image your existing build pipeline already produces. See [Container Registries](/pipecat-cloud/guides/container-registries/overview).   |
+
+You can mix them. An agent connected to a GitHub repository can still be deployed with the CLI, though the next push to the connected branch will deploy over it.
+
 ## Deploying an agent
 
 Deploy your agent to Pipecat Cloud with a single command:
@@ -24257,12 +24270,6 @@ pipecat cloud deploy
 ```
 
 The CLI builds your image in the cloud from your project's Dockerfile and deploys it - no container registry setup needed. For more details on how cloud builds work, see the [Cloud Builds guide](/pipecat-cloud/guides/cloud-builds).
-
-<Tip>
-  Prefer not to deploy by hand? Connect a GitHub repository to your agent and
-  every push to the connected branch deploys it. See [Deploy from
-  GitHub](/pipecat-cloud/guides/deploy-from-github).
-</Tip>
 
 ### Deploying to a specific region
 
@@ -25880,17 +25887,12 @@ Connect a GitHub repository to an agent and Pipecat Cloud builds and deploys it 
   needs a `Dockerfile`.
 </Info>
 
-## Choosing a deployment method
-
-Pipecat Cloud gives you three ways to ship an agent. They all end up building the same image:
-
-| Method                                                         | Best for                                                               |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| **GitHub integration** (this guide)                            | Push-to-deploy with no CI setup and no API key to manage.              |
-| [CLI cloud builds](/pipecat-cloud/guides/cloud-builds)         | Deploying from your laptop, or from a script that already has the CLI. |
-| [GitHub Actions](/pipecat-cloud/guides/ci-with-github-actions) | Pipelines that need tests, approvals, or custom steps before a deploy. |
-
-You can mix them. An agent connected to a repository can still be deployed with the CLI, though the next push to the connected branch will deploy over it.
+<Note>
+  Not sure this is the right method? The [deployment
+  overview](/pipecat-cloud/fundamentals/deploy#choosing-a-deployment-method)
+  compares the GitHub integration with CLI cloud builds, GitHub Actions, and
+  your own container registry.
+</Note>
 
 ## Prerequisites
 
@@ -26024,177 +26026,197 @@ The commit that's running and the branch that's connected can legitimately diffe
   </Accordion>
 </AccordionGroup>
 
-# Pipecat Cloud Capacity Planning
-Source: https://docs.pipecat.ai/pipecat-cloud/guides/capacity-planning.md
+# Pipecat Cloud CI with GitHub Actions
+Source: https://docs.pipecat.ai/pipecat-cloud/guides/ci-with-github-actions.md
 
-Plan Pipecat Cloud capacity to minimize cold starts: auto-scaling behavior, the min-agents parameter, and sizing for call volume.
+Automate Pipecat Cloud builds and deploys from CI using the official pipecat-ai GitHub Action in your workflow.
 
-## Overview
+This guide shows you how to automate Pipecat Cloud deployments from GitHub Actions using the official [Deploy to Pipecat Cloud](https://github.com/daily-co/pipecat-cloud-deploy-action) action.
 
-By default, Pipecat Cloud auto-scales your agent to help minimize the likelihood that your agents experience a cold start. For many applications, you can simply set the `--min-agents` parameter to 1 in order to avoid scaling from zero and let Pipecat Cloud handle the rest.
+<Note>
+  If you only need push-to-deploy, the [GitHub
+  integration](/pipecat-cloud/guides/deploy-from-github) does that with no
+  workflow file and no API key to manage. Reach for a GitHub Actions workflow
+  when a deploy has to run tests, wait on an approval, or do custom steps.
+</Note>
 
-However, for applications where traffic can fluctuate, you may need to plan for additional warm capacity to ensure your agents are always ready to respond immediately. For those cases, this guide will help you understand how warm capacity works in Pipecat Cloud, when you need to plan to use reserves, and how you can optimize your plan for both performance and cost.
+## Prerequisites
 
-## Agent Types
+Before setting up your workflow, ensure you have:
 
-Before discussing capacity planning, it's important to understand the different types of agent instances in Pipecat Cloud:
+- A Pipecat Cloud account with a **Private** API key
+- A secret set configured for your agent
 
-- **Active Agents**: Agent instances currently running and handling user sessions.
-- **Idle Agents**: When you start an active agent, Pipecat Cloud automatically provisions an additional idle agent to help with scaling. These take approximately 30 seconds to become available, though this time may vary based on system load and image size. You are not charged for these idle agents.
-- **Reserved Agents**: Agent instances maintained according to your `--min-agents` deployment setting, ensuring immediate availability regardless of current traffic.
+## Configure GitHub Secrets
 
-## Understanding Warm Capacity
+Add the following secret to your repository (Settings → Secrets and variables → Actions):
 
-Your "warm capacity" represents agent instances that are immediately available to handle new sessions without a cold start. Pipecat Cloud automatically manages this based on:
+- `PCC_API_KEY`: Your Pipecat Cloud **Private** API key
 
-1. Your configured **reserved agents** (`min-agents`)
-2. Your current **active sessions**
-3. Automatically provisioned **idle agents**
+## Basic Workflow — Cloud Build
 
-The system ensures you always have the following warm capacity available:
+The simplest setup uses [cloud builds](./cloud-builds) to build your image server-side. No Docker, no container registry, no extra infrastructure.
 
-- When **Reserved > Active**: Your warm capacity equals the number of **Reserved Agents**
-- When **Active ≥ Reserved**: Your warm capacity equals the number of **Active Agents** (through automatically provisioned idle agents)
+Create `.github/workflows/deploy.yml` in your repository:
 
-To illustrate the point, here are a few scenarios showing how warm capacity works:
+```yml
+name: Deploy to Pipecat Cloud
 
-| Reserved | Active | Warm Capacity |
-| -------- | ------ | ------------- |
-| 10       | 1      | 10            |
-| 10       | 10     | 10            |
-| 1        | 10     | 10            |
+on:
+  push:
+    branches: ["main"]
 
-This shows how:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-- Reserved agents provide a guaranteed minimum warm capacity
-- As active sessions increase beyond your reserved count, your warm capacity grows to match through automatically provisioned idle agents
+      - name: Build and Deploy to Pipecat Cloud
+        uses: daily-co/pipecat-cloud-deploy-action@v2
+        with:
+          api-key: ${{ secrets.PCC_API_KEY }}
+          agent-name: ${{ github.event.repository.name }}
+          cloud-build: true
+          secret-set: my-secret-set
+          region: us-east
+```
 
-## Agent Cooldown
+This workflow will:
 
-When an active session ends, the agent instance behavior is governed by a cooldown period:
-
-- The agent instance remains available in your warm capacity pool for a 5-minute cooldown period
-- During this time, it can immediately serve another request without any cold start
-- After the 5-minute cooldown expires, if the agent instance hasn't been used, it will be terminated
-- This cooldown provides a buffer in your warm capacity pool, helping to smooth transitions between traffic peaks
-
-## Planning for Traffic Patterns
-
-To determine the optimal reserved instance count for your deployment, consider:
-
-1. **Peak Concurrent Sessions**: How many simultaneous sessions do you expect during peak periods?
-
-2. **Growth Rate**: How quickly do new sessions start during peak periods?
-   - If new sessions start faster than the ~30 second warm-up time for auto-scaled agent instances, you'll need more reserved capacity
-
-3. **Cold Start Tolerance**: How important is immediate response for your use case?
+1. Trigger on every push to the `main` branch
+2. Create a build context from your repository
+3. Upload it to Pipecat Cloud and build the image server-side
+4. Deploy the new image and wait for readiness
 
 <Tip>
-  Completely avoiding cold starts may not be practical for all applications. We
-  strongly recommend considering longer or variable start up times when building
-  your application. For phone use cases, consider a hold message or for web
-  apps, consider a waiting UX or message.
+  Cloud builds automatically detect and reuse identical build contexts, so
+  re-deploying unchanged code is nearly instant.
 </Tip>
 
-## Cost-Efficient Scaling Strategies
+## Build Caching
 
-- **Development/Testing**: Use `min-agents: 0` to minimize costs during development
-- **Production Voice AI**: Set `min-agents` to cover your baseline traffic to avoid cold starts
-- **Time-Based Scaling**: Consider modifying your reserved count for known high-traffic periods
-- **Cap session duration**: Use [`--max-session-duration`](/api-reference/cli/cloud/deploy#param-max-session-duration) as a safety net against runaway sessions. If your application's calls are meant to be short, setting a tight cap (e.g. 120s for a 60s use case) prevents a buggy bot from racking up hours of charges.
-- **Monitoring**: Regularly review your warm capacity utilization to optimize your configuration
-  <Info>
-    Cold start times vary widely. See
-    [Cold-starts](../fundamentals/scaling#cold-starts) for best-case timing and
-    what can push it to a minute or more.
-  </Info>
+Cloud builds use a content hash of your build context to detect cache hits. If the files haven't changed since the last successful build, the action skips the upload and build entirely and reuses the previous image.
 
-## Calculating Optimal Reserved Agents
+You can also reuse a specific build across workflows with the `build-id` input:
 
-For production deployments where immediate response is essential, you can calculate your optimal reserved agent count using a growth rate approach:
-
-```
-Optimal Reserved = MAX(Baseline Sessions, CPS × Idle Creation Delay)
+```yml
+- name: Deploy to Pipecat Cloud
+  uses: daily-co/pipecat-cloud-deploy-action@v2
+  with:
+    api-key: ${{ secrets.PCC_API_KEY }}
+    agent-name: ${{ github.event.repository.name }}
+    build-id: 14f5a062-7ecd-407a-b5f0-3ebba82e790b
+    secret-set: my-secret-set
 ```
 
-Where:
+## Monorepo Configuration
 
-- **Baseline Sessions**: Minimum concurrent sessions you typically maintain
-- **CPS (Calls Per Second)**: Your expected session growth rate during peak periods
-- **Idle Creation Delay**: Time for new idle agents to become available (~30 seconds)
+If your agent lives in a subdirectory (e.g. `server/`), set the build context and optionally restrict the workflow to that path:
 
-This formula addresses the fundamental challenge: "Can our warm capacity creation keep pace with our call growth rate?" By reserving capacity based on your growth rate and the idle creation delay, you ensure sufficient capacity is available during the critical period before auto-scaling can catch up.
+```yml
+name: Deploy to Pipecat Cloud
 
-### Growth Rate Examples
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "server/**"
 
-Here's how the formula works with different growth rates:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-| Scenario      | Baseline | CPS                | Idle Creation Delay | Calculation       | Optimal Reserved |
-| ------------- | -------- | ------------------ | ------------------- | ----------------- | ---------------- |
-| High volume   | 10       | 1.0 (1 call/sec)   | 30s                 | MAX(10, 1.0 × 30) | 30               |
-| Medium volume | 10       | 0.5 (1 call/2sec)  | 30s                 | MAX(10, 0.5 × 30) | 15               |
-| Low volume    | 10       | 0.1 (1 call/10sec) | 30s                 | MAX(10, 0.1 × 30) | 10               |
-
-### Call Center Example
-
-Consider a voice AI call center that:
-
-- Normally handles 10 concurrent calls (baseline)
-- During promotions, receives new calls at a rate of 1 call per second
-- Has a 30-second idle creation delay
-
-Applying our formula:
-
-```
-Optimal Reserved = MAX(10, 1 × 30)
-                 = MAX(10, 30)
-                 = 30
+      - name: Build and Deploy to Pipecat Cloud
+        uses: daily-co/pipecat-cloud-deploy-action@v2
+        with:
+          api-key: ${{ secrets.PCC_API_KEY }}
+          agent-name: ${{ github.event.repository.name }}
+          cloud-build: true
+          build-context: ./server
+          dockerfile: Dockerfile
+          secret-set: my-secret-set
 ```
 
-With 30 reserved agents:
+The `paths` filter ensures the workflow runs only when files under `server/` change.
 
-- You can handle the growth rate of 1 call per second for the full 30 seconds until new idle agents start becoming available
-- This prevents any cold starts during the critical catch-up period
-- Auto-scaling will create additional idle agents to handle continued growth
+## Customizing Deployment
 
-### Understanding the Growth Rate Approach
+Configure the deployment via action inputs:
 
-This approach works because:
-
-1. When your call volume starts increasing, you immediately begin consuming your warm capacity
-2. At the same time, each new active call triggers the creation of a new idle agent
-3. However, these new idle agents take ~30 seconds to become available
-4. Your reserved capacity must be sufficient to handle all calls during this 30-second "catch-up period"
-
-### Trading Cost for Performance
-
-The formula provides a starting point, which you can adjust based on your specific needs:
-
-- **Cost-sensitive**: Use a lower reserved count and accept some cold starts during traffic spikes
-- **Performance-sensitive**: Use the calculated reserved count to ensure zero cold starts
-- **Hybrid approach**: Monitor your actual traffic patterns and adjust based on real-world performance
+- **secret-set**: Name of the secret set used for runtime environment variables
+- **region**: Deployment region (uses your organization default if omitted)
+- **min-agents**: Minimum agents to keep warm (0–50)
+- **max-agents**: Maximum concurrent agents (1–50)
+- **agent-profile**: Agent profile name, if used
+- **wait-for-ready**: Whether to poll until the deployment is ready (default: true)
+- **wait-timeout**: Max seconds to wait for readiness (default: 90)
 
 <Tip>
-  For most production voice AI applications, we recommend using at least the
-  calculated optimal reserved agent count during business hours or peak usage
-  periods, and then scaling down during off-hours to optimize costs.
+  Tune `min-agents` and `max-agents` based on your traffic. See the [Capacity
+  Planning guide](./capacity-planning) for guidance.
 </Tip>
 
-## Summary and Next Steps
+## Deploying from Your Own Container Registry
 
-Proper capacity planning ensures your agents are always ready to respond immediately, providing the best possible user experience while optimizing costs:
+If you host images in your own container registry (e.g. Docker Hub, AWS ECR, GHCR), you can skip the cloud build and deploy a fully tagged image directly:
 
-1. **Understand your traffic patterns**: Baseline sessions, peak sessions, and growth rate
-2. **Calculate your optimal reserved agents**: Use the formula to determine the right level of warm capacity
-3. **Monitor and adjust**: Refine your capacity planning based on real-world performance and costs
+```yml
+- name: Deploy to Pipecat Cloud
+  uses: daily-co/pipecat-cloud-deploy-action@v2
+  with:
+    api-key: ${{ secrets.PCC_API_KEY }}
+    agent-name: ${{ github.event.repository.name }}
+    image: my-registry.example.com/my-agent:v1.2.3
+    image-credentials: my-image-pull-secret
+    secret-set: my-secret-set
+```
+
+<Note>
+  When deploying a pre-built image, you must provide an `image-credentials`
+  reference if the image is in a private registry. Pipecat Cloud requires images
+  built for `linux/arm64`.
+</Note>
+
+## Using v1 with Docker Build
+
+<Note>
+  **v1 is still available** for users who need the action to run `docker build`
+  and push to their own container registry. However, we recommend upgrading to
+  v2 with cloud builds for a simpler setup.
+</Note>
+
+The v1 action can build, tag, and push Docker images as part of the workflow. This requires registry credentials and the `packages: write` permission (for GHCR):
+
+```yml
+- name: Build and Deploy to Pipecat Cloud
+  uses: daily-co/pipecat-cloud-deploy-action@v1
+  with:
+    api-key: ${{ secrets.PCC_API_KEY }}
+    agent-name: ${{ github.event.repository.name }}
+    build: true
+    image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+    registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
+    registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
+    secret-set: my-secret-set
+    image-credentials: my-image-pull-secret
+```
+
+See the [v1 README](https://github.com/daily-co/pipecat-cloud-deploy-action/tree/v1#readme) for full documentation of v1 inputs.
+
+## Next Steps
 
 <CardGroup cols={2}>
-  <Card title="Explore Scaling Options" icon="server" href="../fundamentals/scaling">
-    Learn more about scaling configuration options and deployment strategies.
+  <Card title="Secrets Management" icon="key" href="../fundamentals/secrets">
+    Learn how to securely manage image pull secrets and environment variables.
   </Card>
 
-  <Card title="Deploy Your Agent" icon="rocket" href="../fundamentals/deploy">
-    Apply your capacity planning knowledge to your agent deployment.
+  <Card title="Scaling Configuration" icon="chart-line" href="../fundamentals/scaling">
+    Configure auto-scaling to handle varying traffic loads.
   </Card>
 </CardGroup>
 
@@ -26576,197 +26598,177 @@ Replace the following placeholders with your actual values:
   private repository.
 </Note>
 
-# Pipecat Cloud CI with GitHub Actions
-Source: https://docs.pipecat.ai/pipecat-cloud/guides/ci-with-github-actions.md
+# Pipecat Cloud Capacity Planning
+Source: https://docs.pipecat.ai/pipecat-cloud/guides/capacity-planning.md
 
-Automate Pipecat Cloud builds and deploys from CI using the official pipecat-ai GitHub Action in your workflow.
+Plan Pipecat Cloud capacity to minimize cold starts: auto-scaling behavior, the min-agents parameter, and sizing for call volume.
 
-This guide shows you how to automate Pipecat Cloud deployments from GitHub Actions using the official [Deploy to Pipecat Cloud](https://github.com/daily-co/pipecat-cloud-deploy-action) action.
+## Overview
 
-<Note>
-  If you only need push-to-deploy, the [GitHub
-  integration](/pipecat-cloud/guides/deploy-from-github) does that with no
-  workflow file and no API key to manage. Reach for a GitHub Actions workflow
-  when a deploy has to run tests, wait on an approval, or do custom steps.
-</Note>
+By default, Pipecat Cloud auto-scales your agent to help minimize the likelihood that your agents experience a cold start. For many applications, you can simply set the `--min-agents` parameter to 1 in order to avoid scaling from zero and let Pipecat Cloud handle the rest.
 
-## Prerequisites
+However, for applications where traffic can fluctuate, you may need to plan for additional warm capacity to ensure your agents are always ready to respond immediately. For those cases, this guide will help you understand how warm capacity works in Pipecat Cloud, when you need to plan to use reserves, and how you can optimize your plan for both performance and cost.
 
-Before setting up your workflow, ensure you have:
+## Agent Types
 
-- A Pipecat Cloud account with a **Private** API key
-- A secret set configured for your agent
+Before discussing capacity planning, it's important to understand the different types of agent instances in Pipecat Cloud:
 
-## Configure GitHub Secrets
+- **Active Agents**: Agent instances currently running and handling user sessions.
+- **Idle Agents**: When you start an active agent, Pipecat Cloud automatically provisions an additional idle agent to help with scaling. These take approximately 30 seconds to become available, though this time may vary based on system load and image size. You are not charged for these idle agents.
+- **Reserved Agents**: Agent instances maintained according to your `--min-agents` deployment setting, ensuring immediate availability regardless of current traffic.
 
-Add the following secret to your repository (Settings → Secrets and variables → Actions):
+## Understanding Warm Capacity
 
-- `PCC_API_KEY`: Your Pipecat Cloud **Private** API key
+Your "warm capacity" represents agent instances that are immediately available to handle new sessions without a cold start. Pipecat Cloud automatically manages this based on:
 
-## Basic Workflow — Cloud Build
+1. Your configured **reserved agents** (`min-agents`)
+2. Your current **active sessions**
+3. Automatically provisioned **idle agents**
 
-The simplest setup uses [cloud builds](./cloud-builds) to build your image server-side. No Docker, no container registry, no extra infrastructure.
+The system ensures you always have the following warm capacity available:
 
-Create `.github/workflows/deploy.yml` in your repository:
+- When **Reserved > Active**: Your warm capacity equals the number of **Reserved Agents**
+- When **Active ≥ Reserved**: Your warm capacity equals the number of **Active Agents** (through automatically provisioned idle agents)
 
-```yml
-name: Deploy to Pipecat Cloud
+To illustrate the point, here are a few scenarios showing how warm capacity works:
 
-on:
-  push:
-    branches: ["main"]
+| Reserved | Active | Warm Capacity |
+| -------- | ------ | ------------- |
+| 10       | 1      | 10            |
+| 10       | 10     | 10            |
+| 1        | 10     | 10            |
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+This shows how:
 
-      - name: Build and Deploy to Pipecat Cloud
-        uses: daily-co/pipecat-cloud-deploy-action@v2
-        with:
-          api-key: ${{ secrets.PCC_API_KEY }}
-          agent-name: ${{ github.event.repository.name }}
-          cloud-build: true
-          secret-set: my-secret-set
-          region: us-east
-```
+- Reserved agents provide a guaranteed minimum warm capacity
+- As active sessions increase beyond your reserved count, your warm capacity grows to match through automatically provisioned idle agents
 
-This workflow will:
+## Agent Cooldown
 
-1. Trigger on every push to the `main` branch
-2. Create a build context from your repository
-3. Upload it to Pipecat Cloud and build the image server-side
-4. Deploy the new image and wait for readiness
+When an active session ends, the agent instance behavior is governed by a cooldown period:
 
-<Tip>
-  Cloud builds automatically detect and reuse identical build contexts, so
-  re-deploying unchanged code is nearly instant.
-</Tip>
+- The agent instance remains available in your warm capacity pool for a 5-minute cooldown period
+- During this time, it can immediately serve another request without any cold start
+- After the 5-minute cooldown expires, if the agent instance hasn't been used, it will be terminated
+- This cooldown provides a buffer in your warm capacity pool, helping to smooth transitions between traffic peaks
 
-## Build Caching
+## Planning for Traffic Patterns
 
-Cloud builds use a content hash of your build context to detect cache hits. If the files haven't changed since the last successful build, the action skips the upload and build entirely and reuses the previous image.
+To determine the optimal reserved instance count for your deployment, consider:
 
-You can also reuse a specific build across workflows with the `build-id` input:
+1. **Peak Concurrent Sessions**: How many simultaneous sessions do you expect during peak periods?
 
-```yml
-- name: Deploy to Pipecat Cloud
-  uses: daily-co/pipecat-cloud-deploy-action@v2
-  with:
-    api-key: ${{ secrets.PCC_API_KEY }}
-    agent-name: ${{ github.event.repository.name }}
-    build-id: 14f5a062-7ecd-407a-b5f0-3ebba82e790b
-    secret-set: my-secret-set
-```
+2. **Growth Rate**: How quickly do new sessions start during peak periods?
+   - If new sessions start faster than the ~30 second warm-up time for auto-scaled agent instances, you'll need more reserved capacity
 
-## Monorepo Configuration
-
-If your agent lives in a subdirectory (e.g. `server/`), set the build context and optionally restrict the workflow to that path:
-
-```yml
-name: Deploy to Pipecat Cloud
-
-on:
-  push:
-    branches: ["main"]
-    paths:
-      - "server/**"
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build and Deploy to Pipecat Cloud
-        uses: daily-co/pipecat-cloud-deploy-action@v2
-        with:
-          api-key: ${{ secrets.PCC_API_KEY }}
-          agent-name: ${{ github.event.repository.name }}
-          cloud-build: true
-          build-context: ./server
-          dockerfile: Dockerfile
-          secret-set: my-secret-set
-```
-
-The `paths` filter ensures the workflow runs only when files under `server/` change.
-
-## Customizing Deployment
-
-Configure the deployment via action inputs:
-
-- **secret-set**: Name of the secret set used for runtime environment variables
-- **region**: Deployment region (uses your organization default if omitted)
-- **min-agents**: Minimum agents to keep warm (0–50)
-- **max-agents**: Maximum concurrent agents (1–50)
-- **agent-profile**: Agent profile name, if used
-- **wait-for-ready**: Whether to poll until the deployment is ready (default: true)
-- **wait-timeout**: Max seconds to wait for readiness (default: 90)
+3. **Cold Start Tolerance**: How important is immediate response for your use case?
 
 <Tip>
-  Tune `min-agents` and `max-agents` based on your traffic. See the [Capacity
-  Planning guide](./capacity-planning) for guidance.
+  Completely avoiding cold starts may not be practical for all applications. We
+  strongly recommend considering longer or variable start up times when building
+  your application. For phone use cases, consider a hold message or for web
+  apps, consider a waiting UX or message.
 </Tip>
 
-## Deploying from Your Own Container Registry
+## Cost-Efficient Scaling Strategies
 
-If you host images in your own container registry (e.g. Docker Hub, AWS ECR, GHCR), you can skip the cloud build and deploy a fully tagged image directly:
+- **Development/Testing**: Use `min-agents: 0` to minimize costs during development
+- **Production Voice AI**: Set `min-agents` to cover your baseline traffic to avoid cold starts
+- **Time-Based Scaling**: Consider modifying your reserved count for known high-traffic periods
+- **Cap session duration**: Use [`--max-session-duration`](/api-reference/cli/cloud/deploy#param-max-session-duration) as a safety net against runaway sessions. If your application's calls are meant to be short, setting a tight cap (e.g. 120s for a 60s use case) prevents a buggy bot from racking up hours of charges.
+- **Monitoring**: Regularly review your warm capacity utilization to optimize your configuration
+  <Info>
+    Cold start times vary widely. See
+    [Cold-starts](../fundamentals/scaling#cold-starts) for best-case timing and
+    what can push it to a minute or more.
+  </Info>
 
-```yml
-- name: Deploy to Pipecat Cloud
-  uses: daily-co/pipecat-cloud-deploy-action@v2
-  with:
-    api-key: ${{ secrets.PCC_API_KEY }}
-    agent-name: ${{ github.event.repository.name }}
-    image: my-registry.example.com/my-agent:v1.2.3
-    image-credentials: my-image-pull-secret
-    secret-set: my-secret-set
+## Calculating Optimal Reserved Agents
+
+For production deployments where immediate response is essential, you can calculate your optimal reserved agent count using a growth rate approach:
+
+```
+Optimal Reserved = MAX(Baseline Sessions, CPS × Idle Creation Delay)
 ```
 
-<Note>
-  When deploying a pre-built image, you must provide an `image-credentials`
-  reference if the image is in a private registry. Pipecat Cloud requires images
-  built for `linux/arm64`.
-</Note>
+Where:
 
-## Using v1 with Docker Build
+- **Baseline Sessions**: Minimum concurrent sessions you typically maintain
+- **CPS (Calls Per Second)**: Your expected session growth rate during peak periods
+- **Idle Creation Delay**: Time for new idle agents to become available (~30 seconds)
 
-<Note>
-  **v1 is still available** for users who need the action to run `docker build`
-  and push to their own container registry. However, we recommend upgrading to
-  v2 with cloud builds for a simpler setup.
-</Note>
+This formula addresses the fundamental challenge: "Can our warm capacity creation keep pace with our call growth rate?" By reserving capacity based on your growth rate and the idle creation delay, you ensure sufficient capacity is available during the critical period before auto-scaling can catch up.
 
-The v1 action can build, tag, and push Docker images as part of the workflow. This requires registry credentials and the `packages: write` permission (for GHCR):
+### Growth Rate Examples
 
-```yml
-- name: Build and Deploy to Pipecat Cloud
-  uses: daily-co/pipecat-cloud-deploy-action@v1
-  with:
-    api-key: ${{ secrets.PCC_API_KEY }}
-    agent-name: ${{ github.event.repository.name }}
-    build: true
-    image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
-    registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
-    registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
-    secret-set: my-secret-set
-    image-credentials: my-image-pull-secret
+Here's how the formula works with different growth rates:
+
+| Scenario      | Baseline | CPS                | Idle Creation Delay | Calculation       | Optimal Reserved |
+| ------------- | -------- | ------------------ | ------------------- | ----------------- | ---------------- |
+| High volume   | 10       | 1.0 (1 call/sec)   | 30s                 | MAX(10, 1.0 × 30) | 30               |
+| Medium volume | 10       | 0.5 (1 call/2sec)  | 30s                 | MAX(10, 0.5 × 30) | 15               |
+| Low volume    | 10       | 0.1 (1 call/10sec) | 30s                 | MAX(10, 0.1 × 30) | 10               |
+
+### Call Center Example
+
+Consider a voice AI call center that:
+
+- Normally handles 10 concurrent calls (baseline)
+- During promotions, receives new calls at a rate of 1 call per second
+- Has a 30-second idle creation delay
+
+Applying our formula:
+
+```
+Optimal Reserved = MAX(10, 1 × 30)
+                 = MAX(10, 30)
+                 = 30
 ```
 
-See the [v1 README](https://github.com/daily-co/pipecat-cloud-deploy-action/tree/v1#readme) for full documentation of v1 inputs.
+With 30 reserved agents:
 
-## Next Steps
+- You can handle the growth rate of 1 call per second for the full 30 seconds until new idle agents start becoming available
+- This prevents any cold starts during the critical catch-up period
+- Auto-scaling will create additional idle agents to handle continued growth
+
+### Understanding the Growth Rate Approach
+
+This approach works because:
+
+1. When your call volume starts increasing, you immediately begin consuming your warm capacity
+2. At the same time, each new active call triggers the creation of a new idle agent
+3. However, these new idle agents take ~30 seconds to become available
+4. Your reserved capacity must be sufficient to handle all calls during this 30-second "catch-up period"
+
+### Trading Cost for Performance
+
+The formula provides a starting point, which you can adjust based on your specific needs:
+
+- **Cost-sensitive**: Use a lower reserved count and accept some cold starts during traffic spikes
+- **Performance-sensitive**: Use the calculated reserved count to ensure zero cold starts
+- **Hybrid approach**: Monitor your actual traffic patterns and adjust based on real-world performance
+
+<Tip>
+  For most production voice AI applications, we recommend using at least the
+  calculated optimal reserved agent count during business hours or peak usage
+  periods, and then scaling down during off-hours to optimize costs.
+</Tip>
+
+## Summary and Next Steps
+
+Proper capacity planning ensures your agents are always ready to respond immediately, providing the best possible user experience while optimizing costs:
+
+1. **Understand your traffic patterns**: Baseline sessions, peak sessions, and growth rate
+2. **Calculate your optimal reserved agents**: Use the formula to determine the right level of warm capacity
+3. **Monitor and adjust**: Refine your capacity planning based on real-world performance and costs
 
 <CardGroup cols={2}>
-  <Card title="Secrets Management" icon="key" href="../fundamentals/secrets">
-    Learn how to securely manage image pull secrets and environment variables.
+  <Card title="Explore Scaling Options" icon="server" href="../fundamentals/scaling">
+    Learn more about scaling configuration options and deployment strategies.
   </Card>
 
-  <Card title="Scaling Configuration" icon="chart-line" href="../fundamentals/scaling">
-    Configure auto-scaling to handle varying traffic loads.
+  <Card title="Deploy Your Agent" icon="rocket" href="../fundamentals/deploy">
+    Apply your capacity planning knowledge to your agent deployment.
   </Card>
 </CardGroup>
 
