@@ -24,6 +24,7 @@ You can customize this behavior by providing your own strategies for more sophis
 ## How It Works
 
 1. **Turn Start Detection**: When any start strategy triggers, the user aggregator:
+
    - Marks the start of a user turn
    - Optionally emits `UserStartedSpeakingFrame`
    - Optionally emits an interruption frame (if the bot is speaking)
@@ -31,6 +32,7 @@ You can customize this behavior by providing your own strategies for more sophis
 2. **During User Turn**: The aggregator collects transcriptions and audio frames.
 
 3. **Turn Stop Detection**: When a stop strategy triggers, the user aggregator:
+
    - Marks the end of the user turn
    - Emits `UserStoppedSpeakingFrame`
    - Pushes the aggregated user message to the LLM context
@@ -145,10 +147,18 @@ All start strategies inherit these parameters:
   turn starts, allowing the user to interrupt the bot.
 </ParamField>
 
-<ParamField path="enable_user_speaking_frames" type="bool" default="True">
+<ParamField
+  path="enable_user_speaking_frames"
+  type="bool"
+  default="True"
+  deprecated
+>
   If True, the user aggregator will emit frames indicating when the user starts
   speaking. Disable this if another component (e.g., an STT service) already
-  generates these frames.
+  generates these frames. *Deprecated in v1.8.0. Whether a turn is announced is
+  a per-turn decision: pass `enable_user_speaking_frames` to
+  `trigger_user_turn_started()` where the strategy decides the turn. Will be
+  removed in v2.0.0.*
 </ParamField>
 
 ### VADUserTurnStartStrategy
@@ -315,19 +325,23 @@ strategies = UserTurnStrategies(
 
 ### ExternalUserTurnStartStrategy
 
-Delegates turn start detection to an external processor. This strategy listens for `UserStartedSpeakingFrame` frames emitted by other components in the pipeline (such as speech-to-speech services).
+Delegates turn start detection to another component in the pipeline. It handles two signals, which differ in how much the emitter has already done:
+
+- `ProposedUserStartedSpeakingFrame`: a service with its own turn detection proposing a turn boundary. This strategy makes the decision, emitting the `UserStartedSpeakingFrame` and broadcasting the interruption itself. Subclass it to adjust when, or whether, a proposal opens a turn.
+- `UserStartedSpeakingFrame`: the turn was already decided and announced elsewhere, typically by a shared [`UserTurnProcessor`](/api-reference/server/utilities/turn-management/external-turn-management#userturnprocessor) fanning turns out to several aggregators. This strategy adopts that decision and emits nothing, so the turn isn't announced twice.
+
+<ParamField path="enable_interruptions" type="bool" default="True">
+  Whether to broadcast an interruption when a proposal opens a turn.
+  Turn-detecting services route their `should_interrupt` setting here. Ignored
+  when a `UserStartedSpeakingFrame` drives the turn, since the emitter has
+  already broadcast one.
+</ParamField>
 
 ```python
 from pipecat.turns.user_start import ExternalUserTurnStartStrategy
 
 strategy = ExternalUserTurnStartStrategy()
 ```
-
-<Note>
-  This strategy automatically sets `enable_interruptions=False` and
-  `enable_user_speaking_frames=False` since these are expected to be handled by
-  the external processor.
-</Note>
 
 ## Stop Strategies
 
@@ -337,9 +351,17 @@ Stop strategies determine when a user's turn ends and the bot should respond.
 
 All stop strategies inherit these parameters:
 
-<ParamField path="enable_user_speaking_frames" type="bool" default="True">
+<ParamField
+  path="enable_user_speaking_frames"
+  type="bool"
+  default="True"
+  deprecated
+>
   If True, the aggregator will emit frames indicating when the user stops
   speaking. Disable this if another component already generates these frames.
+  *Deprecated in v1.8.0. Whether a turn is announced is a per-turn decision:
+  pass `enable_user_speaking_frames` to `trigger_user_turn_stopped()` where the
+  strategy decides the turn. Will be removed in v2.0.0.*
 </ParamField>
 
 ### SpeechTimeoutUserTurnStopStrategy
@@ -428,7 +450,12 @@ strategy = TurnAnalyzerUserTurnStopStrategy(
 
 ### ExternalUserTurnStopStrategy
 
-Delegates turn stop detection to an external processor. This strategy listens for `UserStoppedSpeakingFrame` frames emitted by other components in the pipeline.
+Delegates turn stop detection to another component in the pipeline. The end-of-turn counterpart to [`ExternalUserTurnStartStrategy`](#externaluserturnstartstrategy), taking the same two signals:
+
+- `ProposedUserStoppedSpeakingFrame`: a service proposing that the turn has ended. This strategy decides, and emits the `UserStoppedSpeakingFrame` itself. It may also hold the turn open past the proposal, which is what `wait_for_transcript` does.
+- `UserStoppedSpeakingFrame`: the turn end was already decided and announced elsewhere, typically by a shared [`UserTurnProcessor`](/api-reference/server/utilities/turn-management/external-turn-management#userturnprocessor). This strategy adopts that decision and emits nothing.
+
+To shift the timing further, subclass it and override `trigger_user_turn_stopped()`, which both paths reach once they decide the turn is over.
 
 <ParamField path="timeout" type="float" default="0.5">
   A short delay in seconds used to handle consecutive or slightly delayed
@@ -437,9 +464,9 @@ Delegates turn stop detection to an external processor. This strategy listens fo
 
 <ParamField path="wait_for_transcript" type="bool" default="True">
   When `True` (default), turn-stop signaling waits for a transcript to arrive
-  after the external `UserStoppedSpeakingFrame`. When `False`, the strategy
-  signals turn-stop as soon as that frame arrives, independent of transcripts —
-  useful when local turn detection drives a realtime (speech-to-speech) service.
+  after the external stop signal. When `False`, the strategy signals turn-stop
+  as soon as that signal arrives, independent of transcripts — useful when local
+  turn detection drives a realtime (speech-to-speech) service.
   [`LLMContextAggregatorPair`](/api-reference/server/utilities/turn-management/external-turn-management#realtime-speech-to-speech-services)
   flips this to `False` for you when `realtime_service_mode=True`.
 </ParamField>
@@ -575,6 +602,11 @@ Container for configuring user turn start and stop strategies.
 
 A convenience class that preconfigures `UserTurnStrategies` with external strategies for both start and stop detection. Use this when an external processor (such as a speech-to-speech service) controls turn management.
 
+What these strategies emit depends on which frame drives the turn:
+
+- **A proposal** (`ProposedUserStartedSpeakingFrame` / `ProposedUserStoppedSpeakingFrame`, sent by a turn-detecting STT service): the decision is left to these strategies, so they push `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and broadcast the interruption themselves.
+- **A real turn frame** (`UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame`, sent by a shared `UserTurnProcessor` or a third-party service): the turn was already announced, so these strategies emit nothing and `enable_interruptions` does not apply.
+
 ```python
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 
@@ -586,12 +618,32 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 )
 ```
 
+### Constructor Parameters
+
+<ParamField path="enable_interruptions" type="bool" default="True">
+  Whether to broadcast an interruption when a proposal starts a turn. This is
+  where a turn-detecting STT service sends its `should_interrupt` setting, so
+  the two are the same knob. Set it to `False` to stop the bot being interrupted
+  when the user starts speaking. Ignored when a real turn frame drives the turn.
+</ParamField>
+
 <Note>
   When an STT service acts as the turn controller, you can optionally include a
   VAD (such as `SileroVADAnalyzer`) in your transport. The VAD is not required
   for core turn management functionality, but it does enable useful STT metrics.
   Omit it if you don't need those metrics.
 </Note>
+
+<Warning>
+  Passing `user_turn_strategies` by hand replaces whatever the service
+  recommended, and `should_interrupt` is part of that recommendation. If you set
+  `should_interrupt=False` on the service **and** pin
+  `user_turn_strategies=ExternalUserTurnStrategies()` yourself, interruptions
+  come back on. Either drop the manual `user_turn_strategies` (the service
+  recommends the right ones on its own) or pass
+  `ExternalUserTurnStrategies(enable_interruptions=False)`. The aggregator logs
+  a warning naming both fixes when it spots this.
+</Warning>
 
 ## FilterIncompleteUserTurnStrategies
 
