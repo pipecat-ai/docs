@@ -29846,8 +29846,9 @@ Analytics services help you better understand how your service operates.
 | Service                                                                 | Setup                                          | Maintainer |
 | ----------------------------------------------------------------------- | ---------------------------------------------- | ---------- |
 | [Finchvox](/api-reference/server/services/analytics/finchvox)           | `uv add finchvox`                              | Community  |
-| [floe-guard](/api-reference/server/services/analytics/floe)       | `uv add "floe-guard[pipecat]"`                 | Community  |
+| [floe-guard](/api-reference/server/services/analytics/floe)             | `uv add "floe-guard[pipecat]"`                 | Community  |
 | [Future AGI](/api-reference/server/services/analytics/future-agi)       | `uv add traceAI-pipecat`                       | Community  |
+| [MLflow](/api-reference/server/services/analytics/mlflow)               | `uv add "pipecat-ai[tracing]" mlflow`          | Community  |
 | [Noveum Trace](/api-reference/server/services/analytics/noveum-trace)   | `uv add "noveum-trace[pipecat]"`               | Community  |
 | [OpenInference](/api-reference/server/services/analytics/openinference) | `uv add openinference-instrumentation-pipecat` | Community  |
 | [Roark](/api-reference/server/services/analytics/roark)                 | `uv add pipecat-roark`                         | Community  |
@@ -62883,11 +62884,7 @@ Since Pipecat's built-in tracing uses [OpenTelemetry](/api-reference/server/util
   >
     Browse the MLflow open-source repository
   </Card>
-  <Card
-    title="MLflow Platform"
-    icon="chart-line"
-    href="https://mlflow.org/"
-  >
+  <Card title="MLflow Platform" icon="chart-line" href="https://mlflow.org/">
     Explore the MLflow platform
   </Card>
 </CardGroup>
@@ -62897,7 +62894,7 @@ Since Pipecat's built-in tracing uses [OpenTelemetry](/api-reference/server/util
 Install Pipecat with tracing support and the OTLP HTTP exporter:
 
 ```bash
-pip install "pipecat-ai[tracing]" mlflow opentelemetry-exporter-otlp-proto-http
+uv add "pipecat-ai[tracing]" mlflow opentelemetry-exporter-otlp-proto-http
 ```
 
 ## Prerequisites
@@ -62916,6 +62913,7 @@ The MLflow UI will be available at [http://localhost:5000](http://localhost:5000
 For other setup options including Docker and pip, see the [MLflow environment setup guide](https://mlflow.org/docs/latest/genai/getting-started/connect-environment/).
 
 If you prefer a managed solution, [Managed MLflow](https://mlflow.org/docs/latest/genai/getting-started/databricks-trial/) on AWS SageMaker or Databricks provides a fully hosted MLflow experience with no infrastructure to manage.
+
 </Tip>
 
 ### Key Features
@@ -62968,19 +62966,27 @@ mlflow experiments create --experiment-name "pipecat-traces"
 
 ```python
 import os
+
 from dotenv import load_dotenv
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.utils.tracing.setup import setup_tracing
+from pipecat.workers.runner import WorkerRunner
 
 load_dotenv()
 
-# Initialize tracing with MLflow exporter
+# Initialize tracing with the MLflow exporter
 exporter = OTLPSpanExporter(
     endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:5000/v1/traces"),
 )
@@ -62991,26 +62997,37 @@ setup_tracing(
 )
 
 # Create your services
-stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
+
+llm = OpenAILLMService(api_key=os.environ["OPENAI_API_KEY"])
+
 tts = CartesiaTTSService(
-    api_key=os.getenv("CARTESIA_API_KEY"),
-    voice_id="your-voice-id",
+    api_key=os.environ["CARTESIA_API_KEY"],
+    settings=CartesiaTTSService.Settings(voice="your-voice-id"),
+)
+
+# Create the context and its user/assistant aggregators
+context = LLMContext()
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
 )
 
 # Build pipeline
-pipeline = Pipeline([
-    transport.input(),
-    stt,
-    context_aggregator.user(),
-    llm,
-    tts,
-    transport.output(),
-    context_aggregator.assistant(),
-])
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
 
-# Create pipeline task with tracing enabled
-task = PipelineTask(
+# Create the pipeline worker with tracing enabled
+worker = PipelineWorker(
     pipeline,
     params=PipelineParams(
         enable_metrics=True,
@@ -63021,8 +63038,9 @@ task = PipelineTask(
 )
 
 # Run the pipeline
-runner = PipelineRunner()
-await runner.run(task)
+runner = WorkerRunner()
+await runner.add_workers(worker)
+await runner.run()
 ```
 
 After running your Pipecat application, open the MLflow UI at [http://localhost:5000](http://localhost:5000) and navigate to the **Traces** tab to see detailed traces of your voice agent conversations, including STT, LLM, and TTS spans with latency and token usage.
