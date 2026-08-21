@@ -20,6 +20,11 @@ background noise from incoming user audio before the audio reaches VAD and your
 STT service. Several enhancement models are available, and you can blend the
 enhanced output with the original audio.
 
+The package also provides `HecttorAudioProcessor`, a two-stage frame processor
+that enhances the audio with two different blend factors at once — one tuned
+for STT and one for VAD and turn-taking models. See
+[HecttorAudioProcessor](#hecttoraudioprocessor-per-consumer-blends) below.
+
 <CardGroup cols={2}>
   <Card
     title="Source Repository"
@@ -131,10 +136,74 @@ audio_filter = HecttorFilter(
 )
 ```
 
+## HecttorAudioProcessor: per-consumer blends
+
+The optimal enhancer weight for transcription is not always the optimal weight
+for endpointing: STT usually wants fully enhanced audio, while VAD and
+turn-taking models can perform better with some of the original signal blended
+back in. `HecttorAudioProcessor` (requires `pipecat-hecttor` >= 0.2.0) produces
+both blends from the same input.
+
+Instead of a transport filter, it is a pair of pipeline stages built around
+Pipecat's processing order — STT consumes audio before the user context
+aggregator, which hosts the VAD and turn analyzers:
+
+```python
+from pipecat_hecttor import HecttorAudioProcessor
+
+hecttor = HecttorAudioProcessor(
+    asr_weight=1.0,     # blend for the STT/agent path
+    vad_tt_weight=0.3,  # blend for VAD and turn-taking models
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),       # no audio_in_filter
+        hecttor,                 # stage 1: frames now carry the ASR blend
+        stt,                     # hears the ASR blend
+        hecttor.vad_tt_stage(),  # stage 2: swaps in the VAD/TT blend
+        user_aggregator,         # VAD + turn analyzers hear the VAD/TT blend
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+### Configuration
+
+The processor accepts the same `api_key`, `model_name`, and `chunk_size_ms`
+parameters as `HecttorFilter`, plus the two blend weights:
+
+<ParamField path="asr_weight" type="float | None" default="None">
+  Blend factor in `[0.0, 1.0]` for the audio delivered to the STT/agent path.
+  `1.0` = fully enhanced, `0.0` = original audio. If not set, the model's
+  default weight is used.
+</ParamField>
+
+<ParamField path="vad_tt_weight" type="float | None" default="None">
+  Blend factor in `[0.0, 1.0]` for the audio delivered to VAD and turn-taking
+  models via `vad_tt_stage()`. If not set, the model's default weight is used.
+</ParamField>
+
+<Warning>
+  Use `HecttorAudioProcessor` **instead of** `audio_in_filter` — combining
+  them enhances the audio twice.
+</Warning>
+
+Notes:
+
+- The current implementation runs two enhancer sessions, one per weight, which
+  doubles enhancement compute.
+- Any processor placed downstream of `vad_tt_stage()` (e.g. audio recorders)
+  receives the VAD/TT blend.
+
 ## Input Frames
 
 <ParamField path="FilterEnableFrame" type="Frame">
-  Control frame to toggle enhancement on and off at runtime
+  Control frame to toggle enhancement on and off at runtime (`HecttorFilter`
+  only)
 
 ```python
 from pipecat.frames.frames import FilterEnableFrame
