@@ -20,7 +20,7 @@
  *                       model reproduces it within +/-2 chars
  *   --format github     add ::warning/::error annotations for GitHub Actions
  *   --root PATH         repo root (default: parent of this script's directory)
- *   --git-base REF      ref for rename/delete + redirect-change checks (default HEAD)
+ *   --git-base REF      ref for the page-move + redirect checks (default HEAD)
  *
  * Checks are numbered 1-19. ENFORCED holds the numbers that fail CI;
  * everything else reports as WARN. Duplicate raw titles are tolerated (short
@@ -54,6 +54,11 @@ const CUSTOM_LLMS_WARN = 120_000; // usability ceiling for a custom llms.txt (ch
 // description uniqueness (8) and effective unfurl-title uniqueness (19,
 // og:title falling back to title) - together they keep every page's RAG
 // identity (title + description) and social/AI citation label unique.
+// 16 and 17 guard URLs rather than metadata: a page may move, but its old
+// URL must keep resolving (17) and the redirect table must not regress in
+// the process (16). Moving a page breaks inbound links, Google results, and
+// the citations Kapa and the Context Hub hand back, so the redirect is the
+// thing being enforced - not the move.
 const ENFORCED = new Set([1, 8, 13, 15, 16, 17, 18, 19]);
 
 const EXPECTED_OPENAPI_PAGES = 24;
@@ -480,29 +485,86 @@ function runChecks(root, pages, orphans, missing, gitBase) {
     add(15, slug, `unexpected new url stub: '${val}'`);
   }
 
-  // 16: redirects unchanged vs git base
-  const headDocs = git(root, "show", `${gitBase}:docs.json`);
-  if (headDocs !== null) {
-    const oldR = JSON.parse(headDocs).redirects ?? [];
-    const newR =
-      JSON.parse(readFileSync(join(root, "docs.json"), "utf-8")).redirects ??
-      [];
-    if (JSON.stringify(oldR) !== JSON.stringify(newR)) {
+  // --- 16 + 17: page moves and the redirect table -------------------------
+  // Moving or deleting a page is legitimate as long as its old URL still
+  // resolves, so neither check bans the move itself. 17 requires every
+  // renamed/deleted page to leave a redirect behind; 16 guards the table
+  // against the regressions a move can cause: an entry dropped, an entry left
+  // pointing at a page this diff moved away, or a new entry pointing nowhere.
+  // Additions and destination rewrites are expected on a move and pass.
+  const redirects = /** @type {{source: string, destination: string}[]} */ (
+    JSON.parse(readFileSync(join(root, "docs.json"), "utf-8")).redirects ?? []
+  );
+
+  /** every URL form a page file is served at @param {string} p */
+  const urlsFor = (p) => {
+    const base = p.replace(/\.mdx$/, "");
+    return base.endsWith("/index")
+      ? [`/${base}`, `/${base.slice(0, -"/index".length)}`]
+      : [`/${base}`];
+  };
+  /** does an internal destination land on a real page? @param {string} dest */
+  const destResolves = (dest) => {
+    if (!dest.startsWith("/")) return true; // external or templated
+    const slug = dest.split(/[#?]/)[0].replace(/\/+$/, "").slice(1);
+    if (!slug) return true; // site root
+    return (
+      existsSync(join(root, `${slug}.mdx`)) ||
+      existsSync(join(root, slug, "index.mdx"))
+    );
+  };
+
+  // renamed/deleted .mdx paths vs the base
+  /** @type {{old: string, now: string | null, line: string}[]} */
+  const moved = [];
+  const status = git(root, "diff", "--name-status", gitBase, "--", "*.mdx");
+  for (const line of (status ?? "").trim().split("\n").filter(Boolean)) {
+    const f = line.split("\t");
+    if (f[0][0] === "R") moved.push({ old: f[1], now: f[2], line });
+    else if (f[0][0] === "D") moved.push({ old: f[1], now: null, line });
+  }
+
+  // 17: a renamed or deleted page must leave a redirect from its old URL
+  const sources = new Set(redirects.map((r) => r.source));
+  for (const m of moved) {
+    const urls = urlsFor(m.old);
+    if (!urls.some((u) => sources.has(u))) {
       add(
-        16,
+        17,
         null,
-        `docs.json redirects changed vs ${gitBase} ` +
-          `(${oldR.length} -> ${newR.length} entries); split redirect edits into their own PR`,
+        `.mdx rename/delete vs ${gitBase} with no redirect from '${urls[0]}': ${m.line}`,
       );
     }
   }
 
-  // 17: no .mdx renames or deletes vs git base
-  const status = git(root, "diff", "--name-status", gitBase, "--", "*.mdx");
-  if (status) {
-    for (const line of status.trim().split("\n")) {
-      if (line && "RD".includes(line[0])) {
-        add(17, null, `.mdx rename/delete vs ${gitBase}: ${line}`);
+  // 16: the redirect table must not regress
+  const headDocs = git(root, "show", `${gitBase}:docs.json`);
+  if (headDocs !== null) {
+    const oldR = /** @type {{source: string, destination: string}[]} */ (
+      JSON.parse(headDocs).redirects ?? []
+    );
+    const oldBySource = new Map(oldR.map((r) => [r.source, r.destination]));
+    const movedUrls = new Set(moved.flatMap((m) => urlsFor(m.old)));
+
+    for (const src of oldBySource.keys()) {
+      if (!sources.has(src)) {
+        add(16, null, `redirect removed vs ${gitBase}: '${src}'`);
+      }
+    }
+    for (const r of redirects) {
+      const before = oldBySource.get(r.source);
+      const touched = before === undefined || before !== r.destination;
+      // a new/rewritten entry must land somewhere real; an untouched entry
+      // must not be left dangling by a page this diff moved away
+      if (
+        (touched || movedUrls.has(r.destination)) &&
+        !destResolves(r.destination)
+      ) {
+        add(
+          16,
+          null,
+          `redirect '${r.source}' -> '${r.destination}' does not resolve to a page`,
+        );
       }
     }
   }
