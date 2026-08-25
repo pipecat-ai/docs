@@ -1,0 +1,232 @@
+---
+title: "Hecttor"
+description: "Real-time speech enhancement and audio denoising using the Hecttor SDK"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Saima AI"
+  maintainerUrl="https://github.com/Saima-AI"
+  repo="https://github.com/Saima-AI/pipecat-hecttor"
+/>
+
+## Overview
+
+`HecttorFilter` is a `BaseAudioFilter` implementation backed by
+[Hecttor](https://hecttor.ai), a real-time speech enhancer tuned for ASR/STT
+accuracy. You attach it to a transport's `audio_in_filter`, and it removes
+background noise from incoming user audio before the audio reaches VAD and your
+STT service. Several enhancement models are available, and you can blend the
+enhanced output with the original audio.
+
+The package also provides `HecttorAudioProcessor`, a two-stage frame processor
+that enhances the audio with two different blend factors at once — one tuned
+for STT and one for VAD and turn-taking models. See
+[HecttorAudioProcessor](#hecttoraudioprocessor-per-consumer-blends) below.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Saima-AI/pipecat-hecttor"
+  >
+    Source code, examples, and issues for the Hecttor integration
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-hecttor/"
+  >
+    The `pipecat-hecttor` package on PyPI
+  </Card>
+  <Card title="Hecttor" icon="globe" href="https://hecttor.ai">
+    Learn more about Hecttor
+  </Card>
+  <Card title="Request Access" icon="key" href="https://hecttor.ai">
+    Contact Hecttor for SDK access and an API key
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-hecttor
+```
+
+The filter also requires the `hecttor_sdk` package, which is **not published to
+PyPI**. Contact [Hecttor](https://hecttor.ai) for SDK access and an API key —
+you'll receive a wheel for your platform and Python version:
+
+```bash
+pip install hecttor_sdk-<version>-<python>-<platform>.whl
+```
+
+Requires Python >= 3.11.
+
+## Prerequisites
+
+- **API key**: contact [Hecttor](https://hecttor.ai) for SDK access and an API
+  key.
+- **Network access**: the agent process must be able to reach Hecttor's servers
+  to validate the API key on initialization.
+
+### Required Environment Variables
+
+- `HECTTOR_API_KEY`: your Hecttor API key
+
+```bash
+export HECTTOR_API_KEY="your_api_key_here"
+```
+
+<Warning>Don't commit API keys or `.env` files to source control.</Warning>
+
+## Configuration
+
+<ParamField path="api_key" type="str | None" default="None">
+  Hecttor API key. Falls back to the `HECTTOR_API_KEY` environment variable if
+  not provided.
+</ParamField>
+
+<ParamField path="model_name" type="str" default='"coda-vi-1.0"'>
+  ASR enhancement model to use. One of `"crest-1.0"`, `"crest-2.0"`,
+  `"mist-1.0"`, `"coda-1.0"`, or `"coda-vi-1.0"`.
+</ParamField>
+
+<ParamField path="chunk_size_ms" type="int" default="20">
+  Chunk size in milliseconds, either `16` or `20`. The `"crest-2.0"`,
+  `"coda-1.0"`, and `"coda-vi-1.0"` models require `20`.
+</ParamField>
+
+<ParamField path="enhancer_weight" type="float | None" default="None">
+  Blend factor between original and enhanced audio in the range `[0.0, 1.0]`.
+  `1.0` = fully enhanced, `0.0` = original audio. If not set, the model's
+  default weight is used.
+</ParamField>
+
+## Usage
+
+Create one filter instance and pass it to your transport as `audio_in_filter`:
+
+```python
+from pipecat_hecttor import HecttorFilter
+from pipecat.transports.base_transport import TransportParams
+
+audio_filter = HecttorFilter()
+
+transport_params = TransportParams(
+    audio_in_enabled=True,
+    audio_out_enabled=True,
+    audio_in_filter=audio_filter,
+)
+```
+
+The transport drives the filter lifecycle — `start(sample_rate)`,
+`filter(audio)`, `process_frame(frame)`, and `stop()` — so no additional wiring
+is needed.
+
+### Fine-tuning enhancement
+
+```python
+audio_filter = HecttorFilter(
+    model_name="coda-vi-1.0",
+    enhancer_weight=0.8,  # 80% enhanced, 20% original
+)
+```
+
+## HecttorAudioProcessor: per-consumer blends
+
+The optimal enhancer weight for transcription is not always the optimal weight
+for endpointing: STT usually wants fully enhanced audio, while VAD and
+turn-taking models can perform better with some of the original signal blended
+back in. `HecttorAudioProcessor` (requires `pipecat-hecttor` >= 0.2.0) produces
+both blends from the same input.
+
+Instead of a transport filter, it is a pair of pipeline stages built around
+Pipecat's processing order — STT consumes audio before the user context
+aggregator, which hosts the VAD and turn analyzers:
+
+```python
+from pipecat_hecttor import HecttorAudioProcessor
+
+hecttor = HecttorAudioProcessor(
+    asr_weight=1.0,     # blend for the STT/agent path
+    vad_tt_weight=0.3,  # blend for VAD and turn-taking models
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),       # no audio_in_filter
+        hecttor,                 # stage 1: frames now carry the ASR blend
+        stt,                     # hears the ASR blend
+        hecttor.vad_tt_stage(),  # stage 2: swaps in the VAD/TT blend
+        user_aggregator,         # VAD + turn analyzers hear the VAD/TT blend
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+### Configuration
+
+The processor accepts the same `api_key`, `model_name`, and `chunk_size_ms`
+parameters as `HecttorFilter`, plus the two blend weights:
+
+<ParamField path="asr_weight" type="float | None" default="None">
+  Blend factor in `[0.0, 1.0]` for the audio delivered to the STT/agent path.
+  `1.0` = fully enhanced, `0.0` = original audio. If not set, the model's
+  default weight is used.
+</ParamField>
+
+<ParamField path="vad_tt_weight" type="float | None" default="None">
+  Blend factor in `[0.0, 1.0]` for the audio delivered to VAD and turn-taking
+  models via `vad_tt_stage()`. If not set, the model's default weight is used.
+</ParamField>
+
+<Warning>
+  Use `HecttorAudioProcessor` **instead of** `audio_in_filter` — combining
+  them enhances the audio twice.
+</Warning>
+
+Notes:
+
+- The current implementation runs two enhancer sessions, one per weight, which
+  doubles enhancement compute.
+- Any processor placed downstream of `vad_tt_stage()` (e.g. audio recorders)
+  receives the VAD/TT blend.
+
+## Input Frames
+
+<ParamField path="FilterEnableFrame" type="Frame">
+  Control frame to toggle enhancement on and off at runtime (`HecttorFilter`
+  only)
+
+```python
+from pipecat.frames.frames import FilterEnableFrame
+
+# Bypass enhancement — audio passes through unchanged
+await worker.queue_frame(FilterEnableFrame(enable=False))
+
+# Resume enhancement
+await worker.queue_frame(FilterEnableFrame(enable=True))
+```
+
+</ParamField>
+
+## Audio Requirements
+
+- Input must be signed 16-bit PCM (int16) bytes.
+- Supported sample rates: 4000, 8000, 16000, 24000, 32000, 44100, and 48000 Hz
+  (the SDK resamples internally).
+- Any chunk size is accepted — the filter buffers partial data internally and
+  emits audio once complete chunks are available.
+
+## Compatibility
+
+Tested with Pipecat v1.7.0. Check the [source
+repository](https://github.com/Saima-AI/pipecat-hecttor) for the latest tested
+version and changelog.
