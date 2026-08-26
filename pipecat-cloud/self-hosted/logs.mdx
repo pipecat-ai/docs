@@ -7,28 +7,75 @@ description: "Agent logs and session metrics in self-hosted regions: enabling th
 import {
   productName,
   productNameSingular,
-  ProductName,
   hostedName,
-  cliMinVersion,
-  packageMinVersion,
-  packageRef,
-  registryHost,
 } from "/snippets/self-hosted-vars.mdx";
 
-Agent logs in a {productNameSingular} are stored in your region and are never sent to Pipecat Cloud for storage. The log store is optional and off by default; when you enable it, `pipecat cloud agent logs`, the dashboard, and the API query it on demand.
+Agent logs in a {productNameSingular} are stored in your region and are never sent to Pipecat Cloud for storage. Log collection is **optional and off by default**; when you enable it, `pipecat cloud agent logs`, the dashboard, and the [logs API](/api-reference/pipecat-cloud/rest-reference/endpoint/agent-get-logs) query your store on demand, through your region, and return only what you asked for.
+
+Session records and CPU and memory metrics are separate from logs and are always available — see [Session metrics](#session-metrics) below.
 
 ## Enabling the log store
 
-{/* logging.enabled + external store (bundled = dev only); schema bootstrap */}
+With log collection off, `pipecat cloud agent logs` for an agent in the region returns "Log retrieval is not available for this region." Your agents still write to standard output, which you can collect with your own tooling.
+
+To enable the platform's log lane, provide an OpenSearch-compatible store and set the values described in [Configuration → Log store](/pipecat-cloud/self-hosted/configuration#log-store). The install then:
+
+- applies the log index template and a retention policy (`logging.retentionDays`, default 7) to your store — there is no manual schema step;
+- adds a log shipper alongside every agent, which reads the agent's own output and writes it to your store; and
+- enables the log query route through your region.
+
+Changing `retentionDays` after the first install requires updating the retention policy in your store directly; the package applies it once.
+
+<Note>
+  The package can also bundle a single-node store for evaluation
+  (`logging.bundled.enabled`). It has no authentication, no TLS, and keeps its
+  data on ephemeral storage by default — log history dies with the pod. Use it
+  on a laptop, not in production.
+</Note>
 
 ## What is captured
 
-{/* base image >= 0.1.23 for session-stamped runner lines; crash tail */}
+Each agent's log lines are captured per session and interleaved with the platform's own per-session lines (activation, lifecycle), so one session-filtered query returns everything that happened in that session:
+
+- lines your agent writes with `loguru` (the recommended logger — see [Session logging](/pipecat-cloud/fundamentals/logging#session-logging));
+- anything your code prints to standard output or standard error; and
+- the last lines of an agent that exits mid-session, so a crash's final output is queryable after the fact.
+
+Session-stamped capture of your agent's own output requires an image built on **`dailyco/pipecat-base` 0.1.23 or later**. Agents on older base images still run, and the platform's own lines are still captured, but the agent's output is not associated with sessions.
+
+All the usual filters apply — `--level`, session ID, deployment, text search, and time range — and log lines are returned only to members of your organization who query them.
 
 ## Session metrics
 
-{/* cgroup v2 requirement and degradation */}
+Per-session CPU and memory metrics, shown in the dashboard's session detail and `pipecat cloud agent sessions --id <session>`, are sampled inside each agent's pod and reported to Pipecat Cloud with the session record. They do not depend on the log store.
+
+Sampling requires **cgroup v2** on the node. On a cgroup v1 node, sessions run normally but the session detail reports that resource metrics are not available. To confirm which case you are in, look for a `metrics_discovery_ok` or `metrics_discovery_failed` line in the sidecar container's log of any agent pod; the failure line states exactly what was detected.
 
 ## Platform metrics
 
-{/* /metrics on region agent, ServiceMonitor optional */}
+Every platform component exposes Prometheus metrics, and the package can render the scrape configuration for a [Prometheus Operator](https://prometheus-operator.dev/) stack:
+
+```yaml
+pipecat-cloud-operator:
+  serviceMonitor:
+    enabled: true
+region-agent:
+  podMonitor:
+    enabled: true
+keda:
+  prometheus:
+    operator:
+      serviceMonitor:
+        enabled: true
+```
+
+The activation service renders its `ServiceMonitor` automatically when the Prometheus Operator CRDs exist at install time (run `helm upgrade` again if you install the operator later). Without a Prometheus stack, none of this renders and the install is unaffected; the region agent still serves `/metrics` on port `9090` for any scraper you point at it.
+
+What to watch:
+
+- **Region connectivity** — the region agent's connection state and its TLS certificate expiry (`region_agent_tls_cert_expiry_timestamp_seconds`). Certificates rotate automatically; a gauge that stops advancing is the thing to alert on.
+- **Telemetry backlog** — `region_agent_telemetry_buffer_pending` and `region_agent_telemetry_oldest_pending_age_seconds`. Session records are buffered in the region and delivered when connected, so a growing backlog means the region has been disconnected for a while, not that data is lost.
+- **Activation service CPU** — it relays every WebSocket frame in line, so it is the first platform component to need more replicas as WebSocket session volume grows.
+- **Autoscaler and node provisioning latency**, if you scale agent nodes on demand: cold starts are dominated by node launch and image pull, not by Pipecat Cloud.
+
+The [EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks#monitoring) includes an optional Prometheus and Grafana stack wired to all of the above.
