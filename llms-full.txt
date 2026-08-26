@@ -6166,27 +6166,26 @@ class AcmeAgent(LLMWorker):
             agent (str): The agent to transfer to (e.g. 'support').
             reason (str): Why the user is being transferred.
         """
+        await params.result_callback(None)
         await self.activate_worker(
             agent,
             args=LLMWorkerActivationArgs(
                 messages=[{"role": "developer", "content": reason}],
             ),
             deactivate_self=True,
-            result_callback=params.result_callback,
         )
 ```
 
-For `LLMWorker`, `activate_worker()` also accepts a `messages` parameter. These messages are injected and spoken by the current agent _before_ the transfer happens -- useful for announcing the handoff:
+To announce the transfer to the user, deliver a message via `params.result_callback()` before calling `activate_worker()`. The LLM processes the result and speaks the announcement before the handoff completes:
 
 ```python
+await params.result_callback(f"Transferring you to the {agent} agent.")
 await self.activate_worker(
     agent,
-    messages=[{"role": "developer", "content": f"Tell the user about the transfer ({reason})."}],
     args=LLMWorkerActivationArgs(
         messages=[{"role": "developer", "content": reason}],
     ),
     deactivate_self=True,
-    result_callback=params.result_callback,
 )
 ```
 
@@ -6781,13 +6780,13 @@ class AcmeLLMAgent(LLMWorker):
             agent (str): The target agent.
             reason (str): Transfer reason.
         """
+        await params.result_callback(None)
         await self.activate_worker(
             agent,
             args=LLMWorkerActivationArgs(
                 messages=[{"role": "developer", "content": reason}]
             ),
             deactivate_self=True,
-            result_callback=params.result_callback,
         )
 
 
@@ -78646,15 +78645,15 @@ async def activate_worker(
 ) -> None
 ```
 
-Activate another agent, optionally finishing an in-progress tool call. When called from a `@tool` handler, pass `params.result_callback` to ensure any pending LLM output is fully delivered before the target is activated. To hand off (deactivate this agent and activate the target), pass `deactivate_self=True`.
+Activate another worker, draining this worker's pipeline to hand over. When called from a `@tool` handler, deliver the function call result first with `await params.result_callback(result)`: the output it triggers is delivered before the target is activated. The handover itself waits until the tool call asking for it has finished.
 
-| Parameter         | Type                                 | Default | Description                                                   |
-| ----------------- | ------------------------------------ | ------- | ------------------------------------------------------------- |
-| `worker_name`     | `str`                                |         | Name of the agent to activate                                 |
-| `args`            | `WorkerActivationArgs \| None`       | `None`  | Arguments forwarded to `on_activated`                         |
-| `deactivate_self` | `bool`                               | `False` | Whether to deactivate this agent before activating the target |
-| `messages`        | `list \| None`                       | `None`  | LLM messages to inject and speak before activating            |
-| `result_callback` | `FunctionCallResultCallback \| None` | `None`  | The `result_callback` from `FunctionCallParams`               |
+| Parameter         | Type                                 | Default | Description                                                                                                                                                                                                                                |
+| ----------------- | ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `worker_name`     | `str`                                |         | Name of the worker to activate                                                                                                                                                                                                             |
+| `args`            | `WorkerActivationArgs \| None`       | `None`  | Arguments forwarded to `on_activated`                                                                                                                                                                                                      |
+| `deactivate_self` | `bool`                               | `False` | Whether to deactivate this worker before activating the target. Deactivating this worker drains its pipeline first; staying active does not. A worker that stays active and wants to drain anyway can call `flush_pipeline()` before this. |
+| `messages`        | `list \| None`                       | `None`  | **Deprecated.** LLM messages to inject and deliver before activating the target. Call `params.result_callback(result)` before `activate_worker()` instead. Will be removed in 2.0.0.                                                       |
+| `result_callback` | `FunctionCallResultCallback \| None` | `None`  | **Deprecated.** The `result_callback` from `FunctionCallParams`. Call `params.result_callback(result)` before `activate_worker()` instead. Will be removed in 2.0.0.                                                                       |
 
 ### end
 
@@ -78668,13 +78667,13 @@ async def end(
 ) -> None
 ```
 
-Request a graceful end of the session. When called from a `@tool` handler, pass `params.result_callback` to ensure any pending LLM output is fully delivered before ending.
+Request a graceful end of the session. When called from a `@tool` handler, deliver the function call result first with `await params.result_callback(result)`: the LLM output it triggers is delivered before the session ends.
 
-| Parameter         | Type                                 | Default | Description                                     |
-| ----------------- | ------------------------------------ | ------- | ----------------------------------------------- |
-| `reason`          | `str \| None`                        | `None`  | Human-readable reason for ending                |
-| `messages`        | `list \| None`                       | `None`  | LLM messages to inject and speak before ending  |
-| `result_callback` | `FunctionCallResultCallback \| None` | `None`  | The `result_callback` from `FunctionCallParams` |
+| Parameter         | Type                                 | Default | Description                                                                                                                                               |
+| ----------------- | ------------------------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reason`          | `str \| None`                        | `None`  | Human-readable reason for ending                                                                                                                          |
+| `messages`        | `list \| None`                       | `None`  | **Deprecated.** LLM messages to inject and deliver before ending. Call `params.result_callback(result)` before `end()` instead. Will be removed in 2.0.0. |
+| `result_callback` | `FunctionCallResultCallback \| None` | `None`  | **Deprecated.** The `result_callback` from `FunctionCallParams`. Call `params.result_callback(result)` before `end()` instead. Will be removed in 2.0.0.  |
 
 ### queue_frame
 
@@ -80739,11 +80738,21 @@ pipeline = Pipeline([transport.input(), bridge, transport.output()])
 </ParamField>
 
 <ParamField path="worker_name" type="str" required>
-  Name of the owning agent, used as message source.
+  Name of the owning worker, used as message source.
+</ParamField>
+
+<ParamField path="target_worker" type="str | None" default="None">
+  When set, only exchange frames with this worker.
 </ParamField>
 
 <ParamField path="target_task" type="str | None" default="None">
-  When set, only exchange frames with this agent.
+  **Deprecated.** Use `target_worker` instead. When set, only exchange frames
+  with this worker.
+
+  <Warning>
+    Deprecated since 1.8.0. Use `target_worker` instead. Will be removed in
+    2.0.0.
+  </Warning>
 </ParamField>
 
 <ParamField path="bridge" type="str | None" default="None">
