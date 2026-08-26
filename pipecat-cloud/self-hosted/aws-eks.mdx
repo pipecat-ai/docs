@@ -4,35 +4,80 @@ sidebarTitle: "AWS EKS reference"
 description: "A reference architecture for a self-hosted region on Amazon EKS: VPC, node pools, managed broker and log store, WebSocket front door, monitoring."
 ---
 
-import {
-  productName,
-  productNameSingular,
-  ProductName,
-  hostedName,
-  cliMinVersion,
-  packageMinVersion,
-  packageRef,
-  registryHost,
-} from "/snippets/self-hosted-vars.mdx";
+import { productNameSingular } from "/snippets/self-hosted-vars.mdx";
 
-This reference architecture describes a production-shaped {productNameSingular} on Amazon EKS. It is one proven layout, not a requirement — any conforming Kubernetes cluster works.
+This page describes a production-shaped {productNameSingular} on Amazon EKS as Daily runs it for validation. It is one proven layout, not a requirement — any cluster that meets the [requirements](/pipecat-cloud/self-hosted/requirements) works — but it answers the questions every region has to answer somewhere: where agents run, where the broker and log store live, how WebSocket traffic gets in, and what to watch.
 
 ## Layout
 
-{/* VPC, system node group, bots pool (Karpenter), managed Valkey + OpenSearch */}
+<Frame caption="One VPC, one cluster, two kinds of nodes, two managed stores, and an optional WebSocket front door.">
+
+```
+                 Internet
+                    │  wss:// (telephony / WebSocket clients)
+            ┌───────▼────────┐
+            │  ALB  +  ACM   │  external-dns writes the hostname
+            └───────┬────────┘
+   VPC  ────────────┼──────────────────────────────────────────────
+                    │                              NAT → api / registry /
+   ┌────────────────▼─────────────────────┐        region-gateway (outbound only)
+   │ EKS                                  │
+   │  system node group (amd64, fixed)    │   ┌────────────────────────┐
+   │   platform components, cert-manager, │──▶│ ElastiCache Valkey     │ TLS + auth
+   │   Karpenter, ALB controller,         │   └────────────────────────┘
+   │   external-dns, monitoring           │   ┌────────────────────────┐
+   │  agents node pool (Karpenter)        │──▶│ OpenSearch (optional)  │ TLS + auth
+   │   amd64 or arm64 per pod, tainted,   │   └────────────────────────┘
+   │   scales from zero on session demand │
+   └──────────────────────────────────────┘
+```
+
+</Frame>
+
+- **VPC and EKS** with private nodes behind a NAT gateway — the region needs outbound access only. The VPC CNI runs in prefix-delegation mode so each node can host 110 pods rather than the ENI-limited 29, which is the ceiling session-shaped workloads hit first.
+- **A fixed system node group** (amd64) for the platform components and cluster add-ons.
+- **An agents node pool managed by [Karpenter](https://karpenter.sh/)**: tainted so only agent pods land on it, scaling from zero on session demand, and launching amd64 or arm64 instances per pod — so per-deployment [architecture targeting](/pipecat-cloud/self-hosted/sizing#architecture) works without a node group per architecture. Agent pods are steered to it with a scheduling overlay that matches the pool's taint.
+- **ElastiCache for Valkey** as the broker (TLS and password authentication), and **Amazon OpenSearch Service** as the log store if log collection is enabled. Both are reachable only from inside the VPC; the platform applies the log schema from inside the cluster.
+- **In-cluster platform**, installed in order: cert-manager and trust-manager (the region prerequisites), Karpenter, the AWS Load Balancer Controller, external-dns, and managed add-ons for CoreDNS autoscaling and metrics-server.
 
 ## WebSocket front door
 
-{/* ALB + ACM + external-dns; idle timeout */}
+Only needed for WebSocket and telephony transports; a region running Daily WebRTC agents alone skips all of it.
+
+- An **ACM certificate** for the WebSocket hostname, DNS-validated against a Route 53 zone in the account (delegate a subdomain into the account if your domain is hosted elsewhere).
+- An **Application Load Balancer** created by the AWS Load Balancer Controller from the region package's `Ingress` (`wsExposure.mode: ingress`, `className: alb`), internet-facing, IP targets, HTTPS on 443 with the ACM certificate, and the **idle timeout raised** from the 60-second default — voice sessions are long-lived.
+- **external-dns** publishes the hostname from the `Ingress`, and the same hostname is registered as the region's WebSocket endpoint.
+
+A `curl -I` of the hostname returning `404` over valid TLS confirms the path end to end.
 
 ## Values
 
-{/* what the values file carries */}
+The region's values file contains only the cluster-specific facts the package cannot know: the broker endpoint and its password Secret, the log store URL and credentials Secret (if enabled), the WebSocket hostname and certificate ARN, and the scheduling overlay that places agents on the Karpenter pool. In Daily's reference stack it is generated from the infrastructure's own outputs so nothing is copied by hand; whatever tooling you use, keep image references and versions out of it so that [upgrades stay version-only](/pipecat-cloud/self-hosted/operations#upgrading-the-region-package).
+
+Two agent-pod settings worth carrying from this layout regardless of provider: `ndots: 2` in the [agent pod DNS configuration](/pipecat-cloud/self-hosted/configuration#agent-pod-settings), which stops every external lookup from walking the cluster search list and is what keeps CoreDNS healthy at high pod counts, and CoreDNS autoscaling.
 
 ## Monitoring
 
-{/* optional kube-prometheus-stack; what to watch */}
+Optionally, a kube-prometheus-stack (Prometheus, Grafana, kube-state-metrics, node-exporter) with the [platform components' scrape configuration](/pipecat-cloud/self-hosted/logs#platform-metrics) switched on. At session scale, the signals that matter are Karpenter's node launch and pod startup durations, CoreDNS request rate against session count, the region agent's telemetry backlog, the activation service's CPU (it relays every WebSocket frame), and autoscaler latency.
 
-## Cost and sizing presets
+## Capacity and cold starts
 
-{/* dev/small/load/production shapes */}
+Measured on this layout, a new session attaches to an already-running agent pod in well under a second; starting a pod from zero on a warm node takes roughly 10–15 seconds; and a session that also has to wait for a **new node** adds about a minute of instance launch and image pull. Two levers, in order:
+
+1. **Warm pods** — set `min_agents` on services that need instant answer, and rely on the autoscaler's spare capacity for growth headroom. This is the same control as in Daily-hosted regions.
+2. **Warm nodes** — keep a small amount of agent-pool capacity provisioned but empty, so scale-ups do not wait for an instance. Karpenter's capacity buffers do this without running placeholder pods.
+
+Disruption settings on the agents pool should be voice-shaped: nodes leave only when empty, with a termination grace period at least as long as your maximum session duration, so a consolidation or a node refresh never cuts a call.
+
+## Sizing presets
+
+Approximate idle cost (us-west-2, on-demand list prices, before agent nodes and the load balancer) for four shapes of this stack:
+
+| Shape        | System nodes        | Stores                                                                         | Idle cost  | For                                    |
+| ------------ | ------------------- | ------------------------------------------------------------------------------ | ---------- | -------------------------------------- |
+| `dev`        | 1 × 4 vCPU          | The package's bundled broker and log store (evaluation only)                   | ~$275/mo   | A bot or two                           |
+| `small`      | 2 × 4 vCPU          | `cache.t4g.micro`, `t3.small.search`                                           | ~$480/mo   | Seeing a region work on managed stores |
+| `load`       | 3–6 × 4 vCPU        | `cache.m7g.large`, `m7g.large.search` with 100 GB                              | ~$825/mo   | Real session load                      |
+| `production` | 3–8 × 4 vCPU, 3 AZs | `cache.m7g.large` with failover, 3 × `m7g.large.search` zone-aware with 200 GB | ~$1,250/mo | Production, before measured tuning     |
+
+The `production` shape is the right structure; its instance sizes should be adjusted from your own measured load.
