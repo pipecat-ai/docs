@@ -30197,85 +30197,253 @@ Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/operations.md
 
 Day-two operations for a self-hosted region: package upgrades, certificate lifecycle, high availability, rebuilding a cluster, and retiring a region.
 
-Once a {productNameSingular} is active, most of its lifecycle is hands-free. This page covers the operations you will perform and the ones that happen automatically.
+Once a {productNameSingular} is active, most of its lifecycle is hands-free. This page covers the operations you perform and the ones that happen on their own.
 
 ## Upgrading the region package
 
-{/* --version only; never image refs; --reset-then-reuse-values */}
+Upgrading is the version alone. Your values file carries no image references, so a new version moves every platform component together:
+
+```bash
+helm upgrade pipecat oci://registry.pipecat.daily.co/pcc/pcc-region \
+  --version <new version> \
+  --namespace pipecat-system \
+  -f values-acme-us-east.yaml \
+  --set global.regionKey=acme-us-east \
+  --wait --timeout 10m
+```
+
+Schema updates for the platform's custom resources are applied as part of the upgrade, before the new components start, so there is no separate step. If you use `--reuse-values`, switch to `--reset-then-reuse-values`: plain `--reuse-values` carries the previous package's defaults forward and pins every image to the old version.
+
+Running agents are not restarted by an upgrade. Platform changes that affect how agent pods are built (such as [agent pod settings](/pipecat-cloud/self-hosted/configuration#agent-pod-settings)) reach each agent on its next deploy.
+
+Pipecat Cloud records the package version each region runs and can tell you when a region falls behind the supported range. Upgrade at least when Daily asks you to; there is otherwise no requirement to track every release.
 
 ## Certificate lifecycle
 
-{/* automatic; expiry visible in regions show; expired = re-enroll */}
+Your region authenticates to Pipecat Cloud with certificates issued during enrollment. Two levels exist, and both renew without intervention:
+
+- **The region's certificate authority** is valid for about a year and is renewed automatically once two-thirds of its lifetime has elapsed. Renewal is authenticated by the current certificate, so no new enrollment token is needed. Its expiry is visible in `pipecat cloud regions show` and on the region's dashboard page.
+- **The region agent's own certificate** is valid for 90 days and is re-issued in the cluster 15 days before expiry. The agent picks the new certificate up without a restart, and existing connections are unaffected.
+
+The one case that needs you: if the region's certificate authority is allowed to **expire** — for example, the cluster was powered off for months — it cannot renew itself, and the region stops connecting. Recovery is a fresh enrollment: mint a new enrollment token, stage it in the cluster, delete the `pipecat-region-ca` Secret in `pipecat-system`, and run `helm upgrade` with your usual values. The enrollment job runs again and the region reconnects. Nothing about the region record, your agents, or your referenced secrets changes.
 
 ## High availability
 
-{/* agent replicas 2, bot-starter 2, PDBs */}
+By default the package runs two replicas of the region agent and two of the session activation service, each with a `PodDisruptionBudget`. Every region agent replica holds its own connection to Pipecat Cloud, and the control plane spreads requests across them, so one replica can be drained or fail without interrupting deploys or session starts. Session records are buffered in the region and delivered when a connection is available, so a full disconnection delays them rather than losing them.
+
+Scale the activation service (`pipecat-bot-starter.replicaCount`) as WebSocket session volume grows — it relays every frame of every WebSocket session in line.
 
 ## Rebuilding a cluster
 
-{/* same key, new token, recreate referenced secrets */}
+The region record lives in Pipecat Cloud and survives your cluster. To rebuild:
+
+1. Delete the old cluster (or uninstall the release).
+2. On the new cluster, install the platform prerequisites, mint a **new** enrollment token, and stage it.
+3. Install the package with the **same region key** and values. Do not re-register the region — the record is unchanged.
+4. Re-create every [referenced secret](/pipecat-cloud/self-hosted/secrets#after-rebuilding-a-cluster) in the workloads namespace; Pipecat Cloud still lists them, but they report `pending` until they exist again.
+5. Redeploy your agents, or wait for the next deploy — deployments are re-created in the new cluster when their services are next deployed.
+
+Reuse the same region key for the life of the region. Registering a new key for a rebuilt cluster counts as an additional region against your organization's allowance.
 
 ## Retiring a region
 
-{/* delete agents first; regions delete; refused while agents/sessions exist */}
+Deleting a region is deliberate and refused while anything still depends on it:
 
-## GitOps
+1. Delete or move every agent deployed to the region (`pipecat cloud agent delete <name>`), and let any active sessions end.
+2. Delete the region:
 
-{/* workloadsNamespace.create false; foreign label */}
+   ```bash
+   pipecat cloud regions delete acme-us-east
+   ```
+
+   The request is refused while the region still has deployed agents or active sessions; the response says which. In the dashboard, use **Revoke Region** on the region's page.
+
+3. Uninstall the release from the cluster (`helm uninstall pipecat -n pipecat-system`). The workloads namespace and everything you put in it — including your Secrets — are left in place on purpose.
+
+Once deleted, the region's connection is cut off within moments and it disappears from region pickers. Its key stays reserved for your organization.
+
+## GitOps-managed clusters
+
+The package works under Argo CD, Flux, and similar tools with two adjustments:
+
+- Set `workloadsNamespace.create: false` and manage the workloads namespace yourself, with the Pod Security label described in [Requirements](/pipecat-cloud/self-hosted/requirements#kubernetes-cluster). The platform adds one management label to it; do not prune that label.
+- The enrollment token is consumed once, at first install. Keep it out of your repository: stage it with `kubectl` (or your secrets tooling) before the first sync, exactly as in the [setup guide](/pipecat-cloud/self-hosted/setup).
+
+<Note>
+  `externalBroker.passwordSecret` is read from the cluster when the chart is
+  rendered. Tools that render with `helm template` and no cluster access will
+  see an empty value; render with a live connection to the cluster, or supply
+  the broker password through your own secrets tooling.
+</Note>
 
 # Self-Hosted Region Diagnostics
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/diagnostics.md
 
 Diagnose a self-hosted region with the doctor, region status and event feed, and the support bundle, and what to collect before contacting support.
 
-A {productNameSingular} ships with its own diagnostics, and the control plane keeps a record of what happened to it. Start here when something is off.
+A {productNameSingular} ships with its own diagnostics, and Pipecat Cloud keeps a record of what happened to it. Start here when something is off.
 
 ## Region status
 
-{/* regions show: status, connected agents, versions, cert expiry; dashboard */}
+From your workstation:
 
-## Region events
+```bash
+pipecat cloud regions show acme-us-east
+```
 
-{/* event feed: enrolled, renewal.signed/rejected/overdue, revoked */}
+The record shows the region's enrollment status, certificate expiry, declared architectures, workloads namespace, and WebSocket endpoint. The dashboard's **Settings → Regions** page shows the same, plus whether the region is currently connected and which platform version each region agent is running.
+
+In the cluster, the platform components live in `pipecat-system`:
+
+```bash
+kubectl -n pipecat-system get pods
+kubectl -n pipecat-system logs deploy/pipecat-region-agent
+```
+
+A healthy region has every pod `Running`, the `pipecat-region-enroll` job `Completed`, and the region agent's log reporting an established channel.
 
 ## The doctor
 
-{/* two forms from helm get notes; what it checks; nothing leaves the cluster */}
+The package includes a self-diagnosis command that runs tiered pass/fail checks over the region's configuration, enrollment material, certificate chain, platform pods, and — most usefully — its ability to reach Pipecat Cloud, distinguishing "egress is blocked" from "the certificate is wrong", the two failures that look identical from the outside. Nothing leaves the cluster; the report is yours, and it is the first thing to include when you contact support.
+
+The install prints two ready-to-run forms; re-read them any time with:
+
+```bash
+helm get notes pipecat -n pipecat-system
+```
+
+- **While the region agent is running** — the richest view, since it tests the real connection:
+
+  ```bash
+  kubectl -n pipecat-system exec deploy/pipecat-region-agent -- /app doctor
+  ```
+
+- **When the agent cannot run** — never enrolled, image pulls failing, egress blocked — the second form runs the doctor from the enrollment image, which is pullable without credentials, under a read-only service account the package creates for exactly this purpose. Use the command from `helm get notes`; it carries the right image tag for your installed version.
+
+## Region events
+
+Pipecat Cloud records a timeline for every region: registration, enrollment, each certificate renewal and its outcome, agent connections and disconnections, deployment failures reported by the region, support bundle pulls, and revocation. Daily support reads this feed when you contact them, so a report needs only your region key and roughly when the problem started.
 
 ## Support bundle
 
-{/* what it is, on by default, audited, how to disable */}
+When you ask for help, Daily support can pull a read-only snapshot of your region's platform state through the region's own connection — pods and events in the system and workloads namespaces, the status of each deployment, autoscaler state, the platform components' recent log lines, and reachability checks. It never includes your agents' logs, secret values, or environment variables; [What Pipecat Cloud Can See](/pipecat-cloud/self-hosted/what-daily-can-see) lists its contents exactly. Every pull is recorded on the region's event feed, and you can disable the capability with `region-agent.supportBundle.enabled: false`.
 
 ## Common failures
 
-{/* 403 on register; enroll Job failed; ImageResolutionFailed vs CreateContainerConfigError; --wait timeout; architecture not supported; wsUrl stale */}
+<AccordionGroup>
+  <Accordion title="Registering the region fails with 403">
+    Either your organization does not have self-hosted regions enabled, or it
+    has used all of its region allowance. If you are rebuilding a cluster, reuse
+    the existing region key rather than registering a new one. Otherwise,
+    [contact Daily](/enterprise-support).
+  </Accordion>
+  <Accordion title="helm install --wait times out">
+    Look at the pods in `pipecat-system`. Pods stuck in `Pending` on a fresh
+    cluster usually mean nodes too small for the platform components' requests —
+    see [Sizing the platform
+    components](/pipecat-cloud/self-hosted/requirements#sizing-the-platform-components).
+    An enrollment job that failed usually means the token expired (mint a new
+    one and run the install again), the cluster cannot reach
+    `api.pipecat.daily.co`, or cert-manager is not ready. The enrollment job's
+    log states the cause.
+  </Accordion>
+  <Accordion title="The region shows as active but is not connected">
+    Run the doctor. It separates a blocked egress path to
+    `region-gateway.pipecat.daily.co:8443` from a certificate problem. If the
+    region's certificate authority has expired, see [Certificate
+    lifecycle](/pipecat-cloud/self-hosted/operations#certificate-lifecycle).
+  </Accordion>
+  <Accordion title="A deploy fails with ImageResolutionFailed">
+    The platform resolves the agent image to a digest before creating any pod,
+    so a private image whose pull secret is missing or wrong fails here, not
+    with `ImagePullBackOff`. Check that the referenced image pull secret exists
+    in the workloads namespace and is `ready`. On a rebuilt cluster, referenced
+    secrets must be re-created.
+  </Accordion>
+  <Accordion title="An agent pod fails with CreateContainerConfigError">
+    A referenced secret set the agent uses does not exist in the workloads
+    namespace. Re-create it; the reference recovers on its own.
+  </Accordion>
+  <Accordion title="A deploy is rejected: architecture not supported">
+    The deployment declares an architecture the region was not registered with.
+    Either build the image for a supported architecture, or update the region's
+    declared architectures with `pipecat cloud regions register …
+    --architectures …` — only if your nodes can actually run it.
+  </Accordion>
+  <Accordion title="WebSocket sessions stop connecting">
+    If the region is healthy, check the registered WebSocket endpoint with
+    `pipecat cloud regions show`: `/start` hands clients whatever hostname is
+    stored, so a changed hostname that was not re-registered fails every session
+    while every in-cluster diagnostic passes. Also confirm your load balancer's
+    idle timeout exceeds your longest session.
+  </Accordion>
+  <Accordion title="pipecat cloud agent logs says logs are not available">
+    Log collection is off by default in self-hosted regions. See [Enabling the
+    log store](/pipecat-cloud/self-hosted/logs#enabling-the-log-store).
+  </Accordion>
+  <Accordion title="Session metrics are missing">
+    The node runs cgroup v1. Sessions are unaffected; see [Session
+    metrics](/pipecat-cloud/self-hosted/logs#session-metrics).
+  </Accordion>
+</AccordionGroup>
 
 ## Contacting support
 
-{/* what to collect: region key, request id, doctor output; logs posture */}
+Include:
+
+- your organization and **region key**;
+- the **doctor report**;
+- the approximate time of the problem and, for a failed API call, the `X-Request-Id` from the response, which lets support find the request on both sides;
+- what you observed in the cluster (`kubectl -n pipecat-system get pods`, and the relevant pod's log if a platform component is failing).
+
+Daily does not read your agents' logs. If a problem is inside your agent and you want support to look at its output, include the relevant lines yourself.
 
 # What Pipecat Cloud Can See
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/what-daily-can-see.md
 
 Exactly what data the Pipecat Cloud control plane reads from a self-hosted region, what it never reads, and how to turn each channel off.
 
-Running a {productNameSingular} means Pipecat Cloud manages your region without holding your data. This page lists exactly what the control plane can read, what it structurally cannot, and how to turn each channel off.
+Running a {productNameSingular} means Pipecat Cloud manages your region without holding your data. This page lists exactly what the control plane receives or can read, what it structurally cannot, and how to turn each channel off. The access described here is enforced by the region package's own Kubernetes roles, which you can inspect with `helm get manifest pipecat -n pipecat-system`.
 
-## Always: session records and metrics
+## Always: session records and region health
 
-{/* telemetry events */}
+Sent by the region as sessions run, and the basis of everything you see in the dashboard:
 
-## By default: platform diagnostics
+- **Session records** — session ID, agent and deployment, start and end times, outcome, and per-session CPU and memory samples. No session content.
+- **Deployment state** — whether each deployment is ready, and failure verdicts (as category codes, not free text) when an agent cannot be deployed.
+- **Region health** — connected region agents, the platform version and capabilities each one runs, and certificate expiry.
 
-{/* support bundle contents verbatim from the two Roles; how to disable */}
+Turning session records off (`region-agent.telemetry.enabled: false`) makes sessions invisible to Pipecat Cloud — the sessions list, metrics, and billing records all stop — so it is not recommended.
+
+## By default, on request: platform diagnostics
+
+The **support bundle** is a read-only snapshot Daily support can pull through the region's connection when you ask for help. Its access is exactly two namespaced roles:
+
+| Namespace           | May read                                                                                                                                                                                                                                                                                         |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pipecat-system`    | Pod listings and status; recent log lines of the platform components (region agent, operator, activation service); cluster events; and the existence, type, and age of four platform Secrets (`pipecat-region-ca`, `pipecat-region-enroll-token`, `pipecat-bot-starter-ws-auth`, `pipecat-pull`) |
+| Workloads namespace | Pod listings and status for agent pods; cluster events; autoscaler state; each deployment's status and a fixed subset of its spec (image, resources, scaling)                                                                                                                                    |
+
+It does **not** read agent pod logs, the contents of any Secret, environment variable values, or ConfigMap contents. Every pull is recorded on the region's event feed.
+
+Disable it with `region-agent.supportBundle.enabled: false`, which removes both the capability and the roles.
 
 ## Only when you enable it: agent logs
 
-{/* log query lane; off by default; never pulled by Daily */}
+With the [log store](/pipecat-cloud/self-hosted/logs) enabled, agent log lines are stored in your region and read **only** when a member of your organization queries them through the CLI, dashboard, or API. Each query returns the lines that match its filters and nothing else; no log data is collected or stored by Pipecat Cloud, and Daily does not pull agent logs on its own. Log collection is off by default.
 
 ## Never
 
-{/* Secret data, env values, ConfigMap bodies, media */}
+Independent of any setting:
+
+- **Session audio, video, or messages.** WebSocket and telephony sessions connect directly to your region; Daily WebRTC sessions connect to Daily's media infrastructure as they do for every region. In neither case does session media pass through the Pipecat Cloud control plane.
+- **Secret values.** [Referenced secrets](/pipecat-cloud/self-hosted/secrets) are checked for existence and type only, and the status response cannot carry keys or values.
+- **Environment variables or configuration contents** of your agents or the platform components.
+- **Anything in namespaces other than the system and workloads namespaces.** The platform's roles are scoped to those two.
+
+## Inbound access
+
+Nothing connects inbound to your cluster. The region agent opens an outbound, mutually authenticated connection to Pipecat Cloud, and every control-plane operation — deploying, starting sessions, querying logs, pulling a support bundle — travels over it and is limited to the operations above. Revoking the region cuts that connection off.
 
 # Self-Hosted Region on AWS EKS
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/aws-eks.md
