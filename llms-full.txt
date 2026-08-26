@@ -29502,68 +29502,338 @@ Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/setup.md
 
 Register a self-hosted region, mint an enrollment token and registry key, install the region package with Helm, and verify the region is active.
 
-This guide takes a cluster that meets the [requirements](/pipecat-cloud/self-hosted/requirements) to an active {productNameSingular} your organization can deploy agents to.
+This guide takes a cluster that meets the [requirements](/pipecat-cloud/self-hosted/requirements) to an active {productNameSingular} your organization can deploy agents to. Every step has a CLI form and a dashboard form; the cluster-side commands are the same either way.
+
+<Info>
+  The region commands require `pipecatcloud` {cliMinVersion} or later. Check
+  with `pipecat cloud --version` and upgrade with `uv tool upgrade pipecat-ai
+  --with pipecatcloud` if needed.
+</Info>
+
+## Before you begin
+
+Pick a **region key**: a short, DNS-safe identifier such as `acme-us-east`. Region keys are unique across all of Pipecat Cloud, so include your organization or company name. You will use the same key for the life of the region, including across cluster rebuilds.
+
+Decide on the **workloads namespace** where your agents will run. The default, `pipecat-agents`, is fine unless you have a naming convention to follow. The namespace is created by the install and is yours: it survives uninstalls, and you can pre-create it yourself if a GitOps pipeline owns your namespaces.
 
 <Steps>
   <Step title="Mint a registry key">
-    {/* organizations registry-keys mint; helm registry login */}
+    A registry key is a pull-only credential that lets `helm` on your workstation fetch the region package. It is shown exactly once.
+
+    ```bash
+    pipecat cloud organizations registry-keys mint --name acme-us-east-workstation
+    ```
+
+    The command prints the key and the matching `helm registry login` command. Run it, supplying the key on stdin rather than the command line:
+
+    ```bash
+    echo "$REGISTRY_KEY" | helm registry login registry.pipecat.daily.co -u pcc --password-stdin
+    ```
+
+    In the dashboard, mint registry keys from the **Keys** page under your organization's settings.
+
+    <Note>
+      This is a workstation credential only. Your cluster's own credential for
+      pulling platform images is delivered automatically during enrollment —
+      you never create an image pull secret for the platform components.
+    </Note>
+
   </Step>
+
   <Step title="Register the region">
-    {/* regions register: key, display name, workloads namespace, architectures, WS endpoint; dashboard equivalent */}
+    Registration creates the region record in your organization: its key, a display name, the workloads namespace, the CPU architectures its nodes provide, and — if you plan to run WebSocket or telephony agents — the public WebSocket endpoint you will expose.
+
+    ```bash
+    pipecat cloud regions register acme-us-east \
+      --display-name "Acme US East" \
+      --workloads-namespace pipecat-agents \
+      --architectures amd64,arm64 \
+      --default-architecture amd64 \
+      --ws-public-endpoint wss://ws.acme-us-east.example.com
+    ```
+
+    Only declare architectures your cluster can actually schedule; deploys are validated against this list. Omit `--ws-public-endpoint` if the region will not expose a WebSocket endpoint — you can add it later.
+
+    Registering is an upsert: re-running the command with different options updates the record, and options you leave out keep their stored values. Use it whenever something about the region changes, such as a new WebSocket hostname.
+
+    In the dashboard, open **Settings → Regions** and choose **Register Region**.
+
   </Step>
-  <Step title="Mint an enrollment token">
-    {/* regions enroll-token; kubectl create secret; one-time, 1h */}
+
+  <Step title="Mint an enrollment token and stage it in the cluster">
+    Enrollment is how your cluster proves it is the region you registered and receives its certificates. It is bootstrapped by a one-time token that must be present in the cluster before you install the package.
+
+    ```bash
+    pipecat cloud regions enroll-token acme-us-east
+    ```
+
+    The command prints the token together with the `kubectl` command that stages it. Create the system namespace first, then run the printed command:
+
+    ```bash
+    kubectl create namespace pipecat-system
+    kubectl -n pipecat-system create secret generic pipecat-region-enroll-token \
+      --from-literal=token=<token>
+    ```
+
+    In the dashboard, open the region on **Settings → Regions** and choose **Mint Enrollment Token**.
+
+    <Warning>
+      The token is single-use, expires after one hour, and cannot be retrieved
+      again. If it expires before you install, mint a new one — nothing else
+      needs to change.
+    </Warning>
+
   </Step>
+
+  <Step title="Write your values file">
+    Create a values file for the region. It should contain only what the package cannot know about your cluster — your broker, your log store if you use one, your WebSocket exposure — and never image references or versions. See [Configuration](/pipecat-cloud/self-hosted/configuration) for the reference; a minimal production file looks like this:
+
+    ```yaml
+    valkey:
+      enabled: false
+    externalBroker:
+      host: my-broker.internal
+      port: 6379
+      tls: true
+      username: default
+      passwordSecret: broker-auth # a Secret in pipecat-system with key `password`
+
+    wsExposure:
+      mode: ingress
+      ingress:
+        host: ws.acme-us-east.example.com
+        className: alb
+        annotations:
+          alb.ingress.kubernetes.io/scheme: internet-facing
+          alb.ingress.kubernetes.io/target-type: ip
+          alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=4000
+    ```
+
+    Any Secrets your values reference (such as `broker-auth` above) must exist in `pipecat-system` before you install.
+
+  </Step>
+
   <Step title="Install the region package">
-    {/* helm upgrade --install ... --set global.regionKey ... --wait */}
+    ```bash
+    helm upgrade --install pipecat oci://registry.pipecat.daily.co/pcc/pcc-region \
+      --version <version> \
+      --namespace pipecat-system --create-namespace \
+      -f values-acme-us-east.yaml \
+      --set global.regionKey=acme-us-east \
+      --wait --timeout 10m
+    ```
+
+    Use the latest published version ({packageMinVersion} or later). The package carries its own control-plane configuration and every platform image at that version, so `--set global.regionKey` and your values file are the entire configuration.
+
+    During the install, an enrollment job runs first: it exchanges your one-time token for the region's certificates, receives the cluster's image pull credential, and writes both into the cluster. The remaining components then start and the region agent opens its connection to Pipecat Cloud.
+
+    `--wait` returning cleanly is the acceptance test: enrollment completed and every component is ready. If it times out, see [Diagnostics](/pipecat-cloud/self-hosted/diagnostics#common-failures) — the most common cause on a fresh cluster is nodes too small for the platform components' requests.
+
   </Step>
+
   <Step title="Verify">
-    {/* regions show → active; pods Running; enrollment Job Completed */}
+    From your workstation:
+
+    ```bash
+    pipecat cloud regions show acme-us-east
+    ```
+
+    The enrollment status should read `active`, with an intermediate certificate expiry about a year out. In the dashboard, the region appears on **Settings → Regions** with its status and certificate expiry, and in every region picker.
+
+    In the cluster, all pods in `pipecat-system` should be `Running` and the enrollment job `Completed`:
+
+    ```bash
+    kubectl -n pipecat-system get pods
+    ```
+
+    The install also prints two ready-to-run diagnostic commands; re-read them any time with `helm get notes pipecat -n pipecat-system`.
+
   </Step>
 </Steps>
 
 ## Next steps
 
-{/* secrets, deploy an agent, WebSockets */}
+<CardGroup cols={2}>
+  <Card
+    title="Reference your secrets"
+    icon="key"
+    href="/pipecat-cloud/self-hosted/secrets"
+  >
+    Create Secrets in your workloads namespace and reference them as secret
+    sets.
+  </Card>
+  <Card
+    title="Deploy an agent"
+    icon="rocket"
+    href="/pipecat-cloud/fundamentals/deploy"
+  >
+    `pipecat cloud deploy --region acme-us-east`, exactly as for any other
+    region.
+  </Card>
+  <Card
+    title="Size your agents"
+    icon="sliders"
+    href="/pipecat-cloud/self-hosted/sizing"
+  >
+    Explicit CPU and memory, your own profiles, and architecture targeting.
+  </Card>
+  <Card
+    title="Expose WebSockets"
+    icon="phone"
+    href="/pipecat-cloud/self-hosted/websockets"
+  >
+    Telephony and WebSocket sessions connect directly to your region.
+  </Card>
+</CardGroup>
 
 # Self-Hosted Region Configuration
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/configuration.md
 
 Region package Helm values reference: workloads namespace, external broker and log store, WebSocket exposure, replica counts, and pull secrets.
 
-The region package installs with sensible defaults; the values below are the ones a production region typically sets. Your values file should contain only what the package cannot know about your cluster — never image references or versions.
+The region package installs with working defaults for evaluation. The values below are the ones a production {productNameSingular} typically sets. Two rules keep upgrades painless:
+
+- **Your values file carries only what the package cannot know about your cluster** — endpoints, hostnames, sizing. Never add image references or versions: an image reference in your values is a pin that survives every upgrade.
+- **Upgrading is the version alone.** `helm upgrade … --version <new>` with the same values file moves every platform component together. If you rely on `--reuse-values`, use `--reset-then-reuse-values` instead, so the new package's defaults are not overridden by the previous one's.
 
 ## Region identity
 
-{/* global.regionKey, workloadsNamespace.{create,name} */}
+```yaml
+global:
+  regionKey: acme-us-east # usually passed as --set global.regionKey=…
+  workloadsNamespace: pipecat-agents # must match the registered region
+workloadsNamespace:
+  create: true # false if a GitOps pipeline owns the namespace
+```
+
+`global.regionKey` is the one value every install must supply. `global.workloadsNamespace` must match the namespace you registered the region with; every component derives its copy from this single value.
+
+Set `workloadsNamespace.create: false` when your own tooling creates namespaces. The namespace must exist before the install and carry the label `pod-security.kubernetes.io/enforce: privileged` (see [Requirements](/pipecat-cloud/self-hosted/requirements#kubernetes-cluster)). The platform adopts it by adding one management label; Argo CD and Flux tolerate foreign labels by default, so avoid prune or self-heal rules that would remove it.
 
 ## Broker
 
-{/* valkey.enabled false + externalBroker.* */}
+The platform uses a Valkey- or Redis-compatible broker for session activation and autoscaling signals. The bundled broker is single-replica and intended for evaluation; a production region brings its own:
+
+```yaml
+valkey:
+  enabled: false
+externalBroker:
+  host: my-broker.internal
+  port: 6379
+  tls: true
+  username: default
+  passwordSecret: broker-auth # Secret in pipecat-system, key `password`; empty = no auth
+```
+
+The broker must be reachable from both the system namespace and the workloads namespace, since agent pods connect to it too. Create `broker-auth` before installing. Its value is read at install time, so rotating the broker password is: update the Secret, run `helm upgrade`, then restart the platform components.
 
 ## Log store
 
-{/* logging.enabled (default off), logging.external.* and the operator/agent mirrors */}
+Agent log collection is **off by default** and stays in your region when enabled. Enabling it means three settings, because the components that write logs, query them, and bootstrap the store are configured separately:
+
+```yaml
+logging:
+  enabled: true
+  bundled:
+    enabled: false # the bundled store is single-node and for evaluation only
+  external:
+    url: https://my-opensearch.internal:9200
+    credsSecret: pipecat-log-store-creds # Secret in pipecat-system: username, password (+ ca.crt for a private CA)
+  retentionDays: 7
+
+pipecat-cloud-operator:
+  logShipper:
+    enabled: true # do not set an image — the package provides it
+    opensearchUrl: https://my-opensearch.internal:9200
+    credsSecret: pipecat-log-store-creds
+  operatorConfig:
+    systemCopySecrets:
+      - pipecat-log-store-creds # mirrored into the workloads namespace for agent pods
+
+region-agent:
+  logs:
+    opensearch:
+      url: https://my-opensearch.internal:9200
+      index: pcc-logs
+      credsSecretName: pipecat-log-store-creds
+      caInSecret: false # true if the Secret carries ca.crt
+```
+
+The install applies the log schema to your store automatically; there is no manual step. See [Logs and observability](/pipecat-cloud/self-hosted/logs) for what is captured and how retention works.
 
 ## WebSocket exposure
 
-{/* wsExposure.mode none|ingress|httpRoute */}
+How the region's WebSocket routes are exposed outside the cluster. The default, `none`, renders nothing — you route to the activation service yourself. The other modes render a standard `Ingress` or a Gateway API `HTTPRoute`:
+
+```yaml
+wsExposure:
+  mode: ingress # none | ingress | httpRoute
+  ingress:
+    host: ws.acme-us-east.example.com
+    className: alb
+    annotations: {}
+    tls: []
+  httpRoute:
+    parentRefs: [] # your Gateway, for mode: httpRoute
+    hostnames: []
+    requestTimeout: "0s" # disabled — WebSocket sessions outlive request deadlines
+```
+
+Whatever public URL results is what you register as the region's WebSocket endpoint. Details, including controller-specific timeout settings, are on [WebSockets and telephony](/pipecat-cloud/self-hosted/websockets).
 
 ## Replicas and availability
 
-{/* region-agent.replicaCount, pipecat-bot-starter.replicaCount */}
+```yaml
+region-agent:
+  replicaCount: 2 # default; each replica holds its own connection to Pipecat Cloud
+pipecat-bot-starter:
+  replicaCount: 2 # default; scale up as session-start volume grows
+```
+
+Both components are highly available at two replicas and render a `PodDisruptionBudget`. The activation service's horizontal autoscaler is off by default; `replicaCount` owns its scale unless you enable it (which requires a metrics server in the cluster).
 
 ## Agent pod settings
 
-{/* botPodDnsConfig ndots; scheduling overlay */}
+Two operator settings shape every agent pod. Both apply to a service on its next deploy, never to running pods:
+
+```yaml
+pipecat-cloud-operator:
+  # Resolver settings for agent pods. ndots:2 stops every external lookup
+  # from walking the cluster search list first — recommended at scale.
+  botPodDnsConfig:
+    options:
+      - name: ndots
+        value: "2"
+  # Spare-capacity policy for autoscaled services. Empty keeps the default
+  # (two pods per active or pending session).
+  botScalingPolicy: {}
+```
+
+Scheduling constraints for agent pods (node selectors, tolerations, affinity) are set through the operator's scheduling overlay; the [EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks) shows a dedicated, tainted agent node pool wired this way.
 
 ## Image pull credentials
 
-{/* registry.pullSecret.managed */}
+```yaml
+registry:
+  pullSecret:
+    managed: true
+```
+
+With the default, enrollment delivers the cluster's pull credential for platform images as the `pipecat-pull` Secret and rotates it automatically; nothing sensitive appears in your values. Set `managed: false` only if you provide `pipecat-pull` yourself end to end (a private mirror, node-level registry authentication, or your own secrets tooling).
+
+## Network policies
+
+Per-agent egress network policies are **off by default** in a {productNameSingular}: it is your cluster, and agents calling services on your network is often the point. Attach your own `NetworkPolicy` resources to the workloads namespace, or enable the platform's per-agent egress policy under `pipecat-cloud-operator.networkPolicy` if you want agents restricted to public destinations plus the platform services. Either requires a CNI that enforces network policies.
 
 ## Diagnostics
 
-{/* region-agent.supportBundle.enabled */}
+```yaml
+region-agent:
+  supportBundle:
+    enabled: true # default
+```
+
+The support bundle lets Daily support pull a read-only snapshot of the platform components' state when you ask for help. It is limited to what the two read-only roles the package renders can see, never includes secret values or agent logs, and every pull is recorded on the region's event feed. Set `enabled: false` to remove both the route and the roles. See [What Pipecat Cloud Can See](/pipecat-cloud/self-hosted/what-daily-can-see).
 
 # Secrets in Self-Hosted Regions
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/secrets.md
