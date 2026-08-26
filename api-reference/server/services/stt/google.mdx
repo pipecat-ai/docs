@@ -1,14 +1,26 @@
 ---
 title: "Google Speech-to-Text"
 sidebarTitle: "Google"
-description: "GoogleSTTService provides real-time STT on Google Cloud Speech-to-Text V2, with 125+ languages, model selection, and VAD."
+description: "Streaming STT with GeminiSTTService on the Gemini Live API and GoogleSTTService on Cloud Speech-to-Text V2: hints and 125+ languages."
 ---
 
 ## Overview
 
-`GoogleSTTService` provides real-time speech recognition using Google Cloud's Speech-to-Text V2 API with support for 125+ languages, multiple models, voice activity detection, and advanced features like automatic punctuation and word-level confidence scores.
+Google provides two STT service implementations:
+
+- `GeminiSTTService` for streaming transcription with a Gemini Live transcription model (e.g. `gemini-3.5-transcribe-live`) over the Gemini Live API, with automatic language detection, language hints, and adaptation phrases
+- `GoogleSTTService` for real-time speech recognition using Google Cloud's Speech-to-Text V2 API with support for 125+ languages, multiple models, voice activity detection, and advanced features like automatic punctuation and word-level confidence scores
+
+The two services authenticate differently: `GeminiSTTService` uses a Google AI (Gemini) API key, while `GoogleSTTService` uses Google Cloud service account credentials.
 
 <CardGroup cols={2}>
+  <Card
+    title="Gemini STT API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.google.gemini_live.stt.html"
+  >
+    Pipecat's API methods for Gemini STT integration
+  </Card>
   <Card
     title="Google STT API Reference"
     icon="code"
@@ -17,11 +29,32 @@ description: "GoogleSTTService provides real-time STT on Google Cloud Speech-to-
     Pipecat's API methods for Google Cloud STT integration
   </Card>
   <Card
-    title="Example Implementation"
+    title="Gemini Voice Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-google-gemini.py"
+  >
+    Complete voice bot example with Gemini services
+  </Card>
+  <Card
+    title="Gemini Transcription Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/transcription/transcription-google-gemini.py"
+  >
+    Transcription example with GeminiSTTService
+  </Card>
+  <Card
+    title="Google Cloud STT Example"
     icon="play"
     href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-google.py"
   >
     Complete example with Google Cloud services
+  </Card>
+  <Card
+    title="Google AI Documentation"
+    icon="book"
+    href="https://ai.google.dev/gemini-api/docs"
+  >
+    Official Google Gemini API documentation
   </Card>
   <Card
     title="Google Cloud Documentation"
@@ -41,31 +74,160 @@ description: "GoogleSTTService provides real-time STT on Google Cloud Speech-to-
 
 ## Installation
 
-To use Google Cloud Speech services, install the required dependency:
+To use either Google STT service, install the required dependency:
 
 ```bash
 uv add "pipecat-ai[google]"
 ```
 
+<Note>
+  `GeminiSTTService` additionally requires `google-genai >= 2.9.0` for
+  transcription support. Upgrade with `uv add "google-genai>=2.9.0"` if you have
+  an older version installed.
+</Note>
+
 ## Prerequisites
+
+### Google AI Setup
+
+Before using `GeminiSTTService`, you need:
+
+1. **Google AI Account**: Sign up at [Google AI Studio](https://aistudio.google.com/)
+2. **API Key**: Generate an API key from the AI Studio console
+3. **Model Access**: Ensure you have access to the `gemini-3.5-transcribe-live` model
+
+Required environment variables:
+
+- `GOOGLE_API_KEY`: Your Google AI (Gemini) API key
 
 ### Google Cloud Setup
 
-Before using Google Cloud STT services, you need:
+Before using `GoogleSTTService`, you need:
 
 1. **Google Cloud Account**: Sign up at [Google Cloud Console](https://console.cloud.google.com/)
 2. **Project Setup**: Create a project and enable the Speech-to-Text API
 3. **Service Account**: Create a service account with Speech-to-Text permissions
 4. **Authentication**: Set up credentials via service account key or Application Default Credentials
 
-### Required Environment Variables
+Required environment variables:
 
 - `GOOGLE_APPLICATION_CREDENTIALS`: Path to your service account key file (recommended)
 - Or use Application Default Credentials for cloud deployments
 
-## Configuration
+## GeminiSTTService
 
-### GoogleSTTService
+`GeminiSTTService` streams raw PCM audio to a Gemini Live transcription model (e.g. `gemini-3.5-transcribe-live`) over the Gemini Live API, delivering interim and final transcription frames as results arrive.
+
+The model detects utterance boundaries itself, and when the pipeline's VAD signals end of speech the service sends an audio-stream-end signal to flush the utterance, so the final transcript is produced promptly instead of waiting for the model to decide the utterance ended. Without an upstream VAD the model finalizes on its own schedule.
+
+Audio is sent at the pipeline's input sample rate; the model performs best with 16 kHz mono PCM.
+
+<ParamField path="api_key" type="str" required>
+  Google AI (Gemini) API key for authentication.
+</ParamField>
+
+<ParamField path="http_options" type="HttpOptions" default="None">
+  Optional HTTP options passed to the google-genai client.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the pipeline's configured sample
+  rate. The model performs best with 16 kHz mono PCM.
+</ParamField>
+
+<ParamField path="settings" type="GeminiSTTService.Settings" default="None">
+  Runtime-configurable settings for the STT service. Defaults to the
+  `gemini-3.5-transcribe-live` model with automatic language detection. See
+  [Settings](#settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="GEMINI_TTFS_P99">
+  P99 latency from speech end to final transcript in seconds. Override for your
+  deployment. See https://github.com/pipecat-ai/stt-benchmark
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `GeminiSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+Language configuration maps to the Live API's `AudioTranscriptionConfig`: when `language` or `languages` are set they are sent as language hints; otherwise the model detects the language automatically. Language hints and automatic detection are mutually exclusive — if both are configured, hints take precedence.
+
+| Parameter            | Type              | Default                        | Description                                                                                                       |
+| -------------------- | ----------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `model`              | `str`             | `"gemini-3.5-transcribe-live"` | Gemini transcription model to use. _(Inherited from base STT settings.)_                                          |
+| `language`           | `Language \| str` | `None`                         | Single language hint. _(Inherited from base STT settings.)_                                                       |
+| `languages`          | `list[Language]`  | `[]`                           | List of `Language` enums used as language hints (e.g. `[Language.ES_ES]`).                                        |
+| `language_auto`      | `bool \| None`    | `None`                         | Enable automatic language detection. `None` auto-detects unless hints are given. Set to `False` to disable.       |
+| `adaptation_phrases` | `list[str]`       | `None`                         | Phrases to bias recognition toward, improving accuracy for domain-specific terms (e.g. `["Pipecat", "oatmilk"]`). |
+
+### Usage
+
+```python
+import os
+from pipecat.services.google.gemini_live.stt import GeminiSTTService
+
+stt = GeminiSTTService(
+    api_key=os.getenv("GOOGLE_API_KEY")
+)
+```
+
+#### With Language Hints
+
+```python
+from pipecat.services.google.gemini_live.stt import GeminiSTTService
+from pipecat.transcriptions.language import Language
+
+stt = GeminiSTTService(
+    api_key=os.getenv("GOOGLE_API_KEY"),
+    settings=GeminiSTTService.Settings(
+        languages=[Language.EN_US, Language.ES_ES]
+    )
+)
+```
+
+#### With Adaptation Phrases
+
+Use adaptation phrases to improve recognition accuracy for domain-specific terms:
+
+```python
+stt = GeminiSTTService(
+    api_key=os.getenv("GOOGLE_API_KEY"),
+    settings=GeminiSTTService.Settings(
+        adaptation_phrases=["Pipecat", "oatmilk", "WebRTC"]
+    )
+)
+```
+
+### Notes
+
+- **Requires google-genai >= 2.9.0**: The service will raise an `ImportError` if an older version is installed. Upgrade with `uv add "google-genai>=2.9.0"`.
+- **VAD Integration**: When the pipeline's VAD signals end of speech (via `VADUserStoppedSpeakingFrame`), the service flushes the utterance to receive the final transcript promptly. Without a VAD, the model finalizes on its own schedule.
+- **Language configuration**: Language hints (`languages`) and automatic detection (`language_auto`) are mutually exclusive. If both are configured, language hints take precedence.
+- **Audio requirements**: The model performs best with 16 kHz mono PCM audio. Audio is sent at the pipeline's input sample rate.
+- **Connection management**: Settings changes (model, languages, adaptation phrases) require a reconnection. The service automatically handles reconnection on transient errors.
+- **Authentication**: Uses Google AI (Gemini) API keys, not Google Cloud service accounts. This is a different authentication method from `GoogleSTTService`.
+
+### Event Handlers
+
+Supports the standard [service connection events](/api-reference/server/events/service-events):
+
+| Event                 | Description                                               |
+| --------------------- | --------------------------------------------------------- |
+| `on_connected`        | Called when successfully connected to the Gemini Live API |
+| `on_disconnected`     | Called when disconnected from the Gemini Live API         |
+| `on_connection_error` | Called when a fatal connection error occurs               |
+
+```python
+@stt.event_handler("on_connected")
+async def on_connected(service):
+    print("Connected to Gemini Live API")
+
+@stt.event_handler("on_disconnected")
+async def on_disconnected(service):
+    print("Disconnected from Gemini Live API")
+```
+
+## GoogleSTTService
 
 <ParamField path="credentials" type="str" default="None">
   JSON string containing Google Cloud service account credentials.
@@ -96,7 +258,7 @@ Before using Google Cloud STT services, you need:
 </ParamField>
 
 <ParamField path="settings" type="GoogleSTTService.Settings" default="None">
-  Runtime-configurable settings for the STT service. See [Settings](#settings)
+  Runtime-configurable settings for the STT service. See [Settings](#settings-2)
   below.
 </ParamField>
 
@@ -131,9 +293,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `enable_voice_activity_events`         | `bool`                       | `False`            | Detect voice activity in audio.                                                                                                                                                                                                      |
 | `adaptation`                           | `dict \| SpeechAdaptation`   | `None`             | Phrase sets biasing recognition toward domain-specific terms. Each `phrase_sets` entry is either a resource name or an inline phrase set. See [Speech Adaptation](#speech-adaptation) for details. Support varies by model/language. |
 
-## Usage
-
-### Basic Setup
+### Usage
 
 ```python
 from pipecat.services.google.stt import GoogleSTTService
@@ -143,7 +303,7 @@ stt = GoogleSTTService(
 )
 ```
 
-### With Credentials JSON String
+#### With Credentials JSON String
 
 ```python
 import json
@@ -155,7 +315,7 @@ stt = GoogleSTTService(
 )
 ```
 
-### With Custom Parameters
+#### With Custom Parameters
 
 ```python
 from pipecat.services.google.stt import GoogleSTTService
@@ -173,7 +333,7 @@ stt = GoogleSTTService(
 )
 ```
 
-### Speech Adaptation
+#### Speech Adaptation
 
 Bias recognition toward domain-specific terms using inline phrase sets or references to pre-created phrase sets:
 
@@ -200,9 +360,9 @@ stt = GoogleSTTService(
 )
 ```
 
-### Updating Settings at Runtime
+#### Updating Settings at Runtime
 
-Google STT supports dynamic settings updates via `STTUpdateSettingsFrame`:
+Google Cloud STT supports dynamic settings updates via `STTUpdateSettingsFrame`:
 
 ```python
 from pipecat.frames.frames import STTUpdateSettingsFrame
@@ -219,7 +379,7 @@ await worker.queue_frame(
 )
 ```
 
-## Notes
+### Notes
 
 - **Streaming time limit**: Google Cloud STT has a 5-minute streaming limit per connection. The service automatically handles stream reconnection at 4 minutes to provide seamless transcription without interruption.
 - **Multi-language support**: Pass a list of `Language` values to `languages` for multi-language recognition. The first language is the primary language.
@@ -234,9 +394,9 @@ await worker.queue_frame(
   guide](/pipecat/fundamentals/service-settings) for migration details.
 </Tip>
 
-## Event Handlers
+### Event Handlers
 
-Google STT supports the standard [service connection events](/api-reference/server/events/service-events):
+Supports the standard [service connection events](/api-reference/server/events/service-events):
 
 | Event             | Description                                   |
 | ----------------- | --------------------------------------------- |
