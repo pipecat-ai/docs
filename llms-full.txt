@@ -30016,50 +30016,181 @@ Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/websockets.md
 
 Expose a self-hosted region's WebSocket endpoint for telephony and client sessions: Ingress or Gateway API, the public endpoint, token auth.
 
-WebSocket sessions connect directly to your region — media never passes through Pipecat Cloud. To use the WebSocket transport or telephony providers with a {productNameSingular}, you expose the region's WebSocket endpoint and register its public URL.
+WebSocket sessions connect **directly to your region** — audio never passes through Pipecat Cloud. To use the [WebSocket transport](/pipecat-cloud/guides/generic-websocket) or [telephony providers](/pipecat-cloud/guides/telephony/overview) with a {productNameSingular}, you expose the region's WebSocket routes on a public `wss://` hostname and register that hostname as the region's WebSocket endpoint. Agents that use only the Daily WebRTC transport need none of this.
 
 ## How sessions reach your region
 
-{/* /start returns wsUrl under the registered endpoint + token */}
+In {hostedName}, WebSocket clients connect to `wss://{region}.api.pipecat.daily.co/ws/…`. In a {productNameSingular}, the equivalent is the **WebSocket endpoint you registered**:
+
+1. Your application (or a telephony provider's function) calls [`/start`](/api-reference/pipecat-cloud/rest-reference/endpoint/start) with `"transport": "websocket"`, exactly as for any region.
+2. Pipecat Cloud returns a `wsUrl` under your registered endpoint — `wss://ws.acme-us-east.example.com/ws/generic/<agent>.<org>` — together with a session token signed for your region.
+3. The client connects to that URL. Your ingress routes it to the region's activation service, which starts or reuses an agent and relays the stream.
+
+Always use the `wsUrl` from the `/start` response rather than constructing one; only its hostname is yours.
 
 ## Exposing the endpoint
 
-{/* mode ingress (ALB example, idle timeout) / httpRoute / none */}
+The region package can render the routing for you, or leave it entirely to your own infrastructure. Whichever mode you choose, the path set is fixed — `/ws/twilio`, `/ws/telnyx`, `/ws/plivo`, `/ws/exotel`, and `/ws/generic/…` — and everything infrastructure-shaped (controller, hostname, DNS, TLS, timeouts) is yours.
+
+<Tabs>
+  <Tab title="Ingress">
+    Renders a standard `Ingress` for the WebSocket paths. WebSocket behavior — idle timeouts in particular — is controller-specific and set through annotations. This example uses the AWS Load Balancer Controller with an ACM certificate:
+
+    ```yaml
+    wsExposure:
+      mode: ingress
+      ingress:
+        host: ws.acme-us-east.example.com
+        className: alb
+        annotations:
+          alb.ingress.kubernetes.io/scheme: internet-facing
+          alb.ingress.kubernetes.io/target-type: ip
+          alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+          alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:…
+          # WebSocket sessions are long-lived: the default 60 s idle timeout ends calls.
+          alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=4000
+    ```
+
+    Use `wsExposure.ingress.tls` for controllers that terminate TLS from a Secret (for example, one issued by cert-manager).
+
+  </Tab>
+  <Tab title="Gateway API">
+    Renders an `HTTPRoute` bound to a `Gateway` you operate. TLS terminates on the Gateway's listener. Gateway API has first-class WebSocket support and per-route timeouts; the route disables its request timeout by default because WebSocket sessions outlive any request deadline.
+
+    ```yaml
+    wsExposure:
+      mode: httpRoute
+      httpRoute:
+        parentRefs:
+          - name: my-gateway
+            namespace: gateway-system
+            sectionName: wss
+        hostnames:
+          - ws.acme-us-east.example.com
+    ```
+
+    The install checks that the Gateway API CRDs are present.
+
+  </Tab>
+  <Tab title="Bring your own">
+    Leave `wsExposure.mode: none` (the default) and route to the activation service yourself — a load balancer, a service mesh, or routing managed by your GitOps pipeline. Target the Service `pipecat-bot-starter` on port `8080` in the system namespace, for the path set above. Raise any idle or request timeouts well above your longest expected session.
+  </Tab>
+</Tabs>
+
+<Warning>
+  Whatever sits in front of the region must allow long-lived connections. A
+  60-second idle timeout — the default on many load balancers — cuts voice
+  sessions off mid-call.
+</Warning>
+
+To confirm the route works before you have an agent, request the hostname over HTTPS: `curl -I https://ws.acme-us-east.example.com` should return **404 over valid TLS**. There is nothing at `/`; the 404 is the healthy signature.
 
 ## Registering the public endpoint
 
-{/* regions register --ws-public-endpoint; changing it later */}
+The hostname is stored on the region record and is the only thing `/start` uses to build a `wsUrl`:
+
+```bash
+pipecat cloud regions register acme-us-east --ws-public-endpoint wss://ws.acme-us-east.example.com
+```
+
+Registration is an upsert, so this updates just the endpoint on an existing region. Changing it later needs no reinstall and no new enrollment: re-run the command and new sessions use the new hostname immediately. Use the `wss://` scheme (not `https://`) and no trailing slash — the value is used verbatim.
+
+In the dashboard, edit the region on **Settings → Regions** and set **WebSocket public endpoint**.
+
+<Note>
+  A stale endpoint is the one WebSocket failure your own diagnostics cannot see:
+  the region is healthy and connected, but `/start` hands clients a URL that no
+  longer resolves. If sessions stop connecting after a hostname change, check
+  the registered endpoint first with `pipecat cloud regions show`.
+</Note>
 
 ## Token authentication
 
-{/* per-region signing; websocket_auth token; provider paths require none */}
+[WebSocket authentication](/pipecat-cloud/guides/websocket-authentication) works the same way in {productName}: deploy the agent with `websocket_auth = "token"`, and the token returned by `/start` must accompany the connection. The signing key is specific to your region — it is issued during enrollment and rotated with the region's certificates — so a token minted for one region is not valid in another. A bad or missing token is rejected before the WebSocket upgrade.
 
 ## Telephony providers
 
-{/* /v1/public/.../start pattern vs provider paths; serviceHost same as cloud */}
+Both dial-in patterns from the [telephony guides](/pipecat-cloud/guides/telephony/overview) work, with your registered hostname in place of `api.pipecat.daily.co`:
+
+- **A provider function that calls `/start`** and streams to the returned `wsUrl` (with the token appended) — works with `websocket_auth` set to `token` or `none`, and is the recommended, fully authenticated path.
+- **Pointing the provider directly at a provider path**, such as `wss://ws.acme-us-east.example.com/ws/twilio` with the `_pipecatCloudServiceHost` parameter, or `/ws/telnyx?serviceHost=…` — available only for agents deployed with `websocket_auth = "none"`, since nothing in that flow can mint a token.
+
+The service host is `<agent>.<organization>`, exactly as in {hostedName}. It does not change when you move an agent between regions, so provider configuration that embeds it keeps working.
 
 # Self-Hosted Region Logs
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/logs.md
 
 Agent logs and session metrics in self-hosted regions: enabling the optional log store, base image requirements, cgroup v2, and platform metrics.
 
-Agent logs in a {productNameSingular} are stored in your region and are never sent to Pipecat Cloud for storage. The log store is optional and off by default; when you enable it, `pipecat cloud agent logs`, the dashboard, and the API query it on demand.
+Agent logs in a {productNameSingular} are stored in your region and are never sent to Pipecat Cloud for storage. Log collection is **optional and off by default**; when you enable it, `pipecat cloud agent logs`, the dashboard, and the [logs API](/api-reference/pipecat-cloud/rest-reference/endpoint/agent-get-logs) query your store on demand, through your region, and return only what you asked for.
+
+Session records and CPU and memory metrics are separate from logs and are always available — see [Session metrics](#session-metrics) below.
 
 ## Enabling the log store
 
-{/* logging.enabled + external store (bundled = dev only); schema bootstrap */}
+With log collection off, `pipecat cloud agent logs` for an agent in the region returns "Log retrieval is not available for this region." Your agents still write to standard output, which you can collect with your own tooling.
+
+To enable the platform's log lane, provide an OpenSearch-compatible store and set the values described in [Configuration → Log store](/pipecat-cloud/self-hosted/configuration#log-store). The install then:
+
+- applies the log index template and a retention policy (`logging.retentionDays`, default 7) to your store — there is no manual schema step;
+- adds a log shipper alongside every agent, which reads the agent's own output and writes it to your store; and
+- enables the log query route through your region.
+
+Changing `retentionDays` after the first install requires updating the retention policy in your store directly; the package applies it once.
+
+<Note>
+  The package can also bundle a single-node store for evaluation
+  (`logging.bundled.enabled`). It has no authentication, no TLS, and keeps its
+  data on ephemeral storage by default — log history dies with the pod. Use it
+  on a laptop, not in production.
+</Note>
 
 ## What is captured
 
-{/* base image >= 0.1.23 for session-stamped runner lines; crash tail */}
+Each agent's log lines are captured per session and interleaved with the platform's own per-session lines (activation, lifecycle), so one session-filtered query returns everything that happened in that session:
+
+- lines your agent writes with `loguru` (the recommended logger — see [Session logging](/pipecat-cloud/fundamentals/logging#session-logging));
+- anything your code prints to standard output or standard error; and
+- the last lines of an agent that exits mid-session, so a crash's final output is queryable after the fact.
+
+Session-stamped capture of your agent's own output requires an image built on **`dailyco/pipecat-base` 0.1.23 or later**. Agents on older base images still run, and the platform's own lines are still captured, but the agent's output is not associated with sessions.
+
+All the usual filters apply — `--level`, session ID, deployment, text search, and time range — and log lines are returned only to members of your organization who query them.
 
 ## Session metrics
 
-{/* cgroup v2 requirement and degradation */}
+Per-session CPU and memory metrics, shown in the dashboard's session detail and `pipecat cloud agent sessions --id <session>`, are sampled inside each agent's pod and reported to Pipecat Cloud with the session record. They do not depend on the log store.
+
+Sampling requires **cgroup v2** on the node. On a cgroup v1 node, sessions run normally but the session detail reports that resource metrics are not available. To confirm which case you are in, look for a `metrics_discovery_ok` or `metrics_discovery_failed` line in the sidecar container's log of any agent pod; the failure line states exactly what was detected.
 
 ## Platform metrics
 
-{/* /metrics on region agent, ServiceMonitor optional */}
+Every platform component exposes Prometheus metrics, and the package can render the scrape configuration for a [Prometheus Operator](https://prometheus-operator.dev/) stack:
+
+```yaml
+pipecat-cloud-operator:
+  serviceMonitor:
+    enabled: true
+region-agent:
+  podMonitor:
+    enabled: true
+keda:
+  prometheus:
+    operator:
+      serviceMonitor:
+        enabled: true
+```
+
+The activation service renders its `ServiceMonitor` automatically when the Prometheus Operator CRDs exist at install time (run `helm upgrade` again if you install the operator later). Without a Prometheus stack, none of this renders and the install is unaffected; the region agent still serves `/metrics` on port `9090` for any scraper you point at it.
+
+What to watch:
+
+- **Region connectivity** — the region agent's connection state and its TLS certificate expiry (`region_agent_tls_cert_expiry_timestamp_seconds`). Certificates rotate automatically; a gauge that stops advancing is the thing to alert on.
+- **Telemetry backlog** — `region_agent_telemetry_buffer_pending` and `region_agent_telemetry_oldest_pending_age_seconds`. Session records are buffered in the region and delivered when connected, so a growing backlog means the region has been disconnected for a while, not that data is lost.
+- **Activation service CPU** — it relays every WebSocket frame in line, so it is the first platform component to need more replicas as WebSocket session volume grows.
+- **Autoscaler and node provisioning latency**, if you scale agent nodes on demand: cold starts are dominated by node launch and image pull, not by Pipecat Cloud.
+
+The [EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks#monitoring) includes an optional Prometheus and Grafana stack wired to all of the above.
 
 # Operating a Self-Hosted Region
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/operations.md
