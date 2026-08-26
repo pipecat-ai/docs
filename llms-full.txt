@@ -29364,50 +29364,138 @@ Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/overview.md
 
 Run Pipecat Cloud agents in your own Kubernetes cluster as a self-hosted region: what stays managed, what you operate, what leaves your cluster.
 
-A {productNameSingular} is a Pipecat Cloud region that runs in a Kubernetes cluster you operate. Pipecat Cloud remains the control plane: you deploy, start sessions, and read logs and session records exactly as you do for {hostedName}, while your agents execute on your infrastructure.
+A {productNameSingular} is a Pipecat Cloud region that runs in a Kubernetes cluster you operate. Pipecat Cloud remains the control plane: you deploy agents, start sessions, and read logs and session records exactly as you do for {hostedName}, while your agents execute on your infrastructure — in your network, next to your data.
+
+<Note>
+  {ProductName} are an enterprise feature. To enable them for your organization,
+  [contact Daily](/enterprise-support).
+</Note>
 
 ## What stays the same
 
-{/* deploy / start / sessions / logs / dashboard / CLI parity */}
+A {productNameSingular} appears in your organization's region list and is used like any other region:
+
+- **Deploy** with `pipecat cloud deploy --region <your-region>` or the dashboard, from any container registry.
+- **Start sessions** with the [REST API](/api-reference/pipecat-cloud/rest-reference/endpoint/start) or [Python SDK](/api-reference/pipecat-cloud/sdk-reference/overview), on any transport — Daily WebRTC, WebSocket, or telephony providers.
+- **Observe** sessions, CPU and memory metrics, and agent logs in the dashboard, the CLI, and the API.
+- **Reference secrets** by set name, and scale with the same `min_agents` / `max_agents` controls.
 
 ## What changes
 
-{/* secrets are referenced, you size explicitly, you own ingress + stores, architecture is yours */}
+| Area                | {hostedName}                             | Self-hosted regions                                                                                                           |
+| ------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Where agents run    | Daily's infrastructure                   | Your Kubernetes cluster                                                                                                       |
+| Secrets             | Uploaded to Pipecat Cloud as secret sets | Created by you in your cluster and [referenced](/pipecat-cloud/self-hosted/secrets) by name — values never leave your cluster |
+| Agent sizing        | Fixed agent profiles                     | [Explicit CPU and memory, or your own profiles](/pipecat-cloud/self-hosted/sizing)                                            |
+| CPU architecture    | `arm64`                                  | Whatever your nodes provide; you [declare](/pipecat-cloud/self-hosted/sizing#architecture) `amd64`, `arm64`, or both          |
+| WebSocket endpoint  | `wss://api.pipecat.daily.co/ws/…`        | A public endpoint [you expose](/pipecat-cloud/self-hosted/websockets) and register                                            |
+| Agent logs          | Stored by Pipecat Cloud                  | Stored in [your own log store](/pipecat-cloud/self-hosted/logs), optional and off by default                                  |
+| Supporting services | Managed                                  | You provide a broker and, optionally, a log store; the package bundles development-grade versions of both                     |
+| Scaling ceiling     | Your organization's replica limit        | No platform-imposed ceiling — your cluster's capacity                                                                         |
+| Billing             | Per agent-minute by profile              | Per your enterprise agreement; agent-minutes in self-hosted regions are not metered by profile                                |
+
+## How your region connects
+
+The region package installs a small set of platform components into your cluster alongside your agents. One of them, the **region agent**, opens an outbound, mutually authenticated TLS connection to Pipecat Cloud and keeps it open. Everything the control plane does in your region — creating deployments, starting sessions, querying logs — travels over that connection. Nothing connects inbound to your cluster, and the certificates involved are issued during enrollment and renewed automatically.
 
 ## What leaves your cluster
 
-{/* session metadata + metrics events; log lines only when you enable the lane and query; never media, never secret values */}
+Running a {productNameSingular} keeps your data in your region while giving Pipecat Cloud enough to manage it:
 
-## How to get started
+- **Always:** session records and per-session metrics (start and end times, outcome, CPU and memory usage), and the region's own health — connected agents, component versions, certificate expiry.
+- **By default, on request:** a read-only diagnostic snapshot of the platform components, which Daily support can pull when you ask for help. It never includes secret values or your agents' logs.
+- **Only when you enable it:** agent log lines, and only when someone in your organization queries them.
+- **Never:** session audio or media, secret values, environment variables, or the contents of your configuration.
 
-{/* entitlement: enterprise feature, contact Daily; then Requirements → Set up */}
+The full breakdown is on [What Pipecat Cloud Can See](/pipecat-cloud/self-hosted/what-daily-can-see).
+
+## Getting started
+
+<Steps>
+  <Step title="Get enabled">
+    Self-hosted regions are enabled per organization by Daily. [Contact
+    us](/enterprise-support) to get started.
+  </Step>
+  <Step title="Prepare a cluster">
+    Check the [requirements](/pipecat-cloud/self-hosted/requirements) — a
+    conforming Kubernetes cluster, two platform prerequisites, and outbound
+    network access.
+  </Step>
+  <Step title="Register and install">
+    Follow [Set up a region](/pipecat-cloud/self-hosted/setup): register the
+    region, mint an enrollment token, and install the region package with Helm.
+    You'll need `pipecatcloud` {cliMinVersion} or later.
+  </Step>
+  <Step title="Deploy an agent">
+    Deploy to the new region exactly as you would to any other, and start a
+    session.
+  </Step>
+</Steps>
 
 # Self-Hosted Region Requirements
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/requirements.md
 
 Cluster, platform, network egress, and node requirements for a Pipecat Cloud self-hosted region, with sizing guidance for platform components.
 
-Before registering a {productNameSingular}, make sure your cluster and network meet the requirements below.
+Before registering a {productNameSingular}, make sure your cluster, network, and workstation meet the requirements below.
 
 ## Kubernetes cluster
 
-{/* version floor, cgroup v2, node architectures, PSA note for the workloads namespace */}
+- **A conforming Kubernetes cluster, version 1.29 or later.** Any distribution works — managed (EKS, GKE, AKS, OKE) or self-managed. The [AWS EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks) is one proven layout.
+- **cgroup v2 on the nodes that run agents.** Per-session CPU and memory metrics are sampled from the node's cgroup filesystem, which must be the unified (v2) hierarchy — the default on recent distributions (Amazon Linux 2023, Ubuntu 22.04+, RHEL 9+). On cgroup v1 nodes, sessions run normally but resource metrics are unavailable and the dashboard says so; see [Session metrics](/pipecat-cloud/self-hosted/logs#session-metrics).
+- **Nodes for the architectures you intend to run.** Agents are scheduled on `amd64` or `arm64` nodes according to the architecture each deployment declares. Provide nodes for one or both, and [declare what the region supports](/pipecat-cloud/self-hosted/sizing#architecture) when you register it.
+- **A namespace for agents that permits privileged pods.** The package creates a workloads namespace (`pipecat-agents` by default) labeled `pod-security.kubernetes.io/enforce: privileged`, because agent pods currently mount a host path to read cgroup metrics. If you create the namespace yourself (for example, from a GitOps pipeline), apply that label; the install refuses to proceed without a usable namespace.
 
 ## Platform prerequisites
 
-{/* cert-manager + trust-manager; Helm 3.8+ for OCI; kubectl */}
+Two cluster-scoped components must be installed before the region package, because the package's own resources depend on their APIs being present:
+
+- **[cert-manager](https://cert-manager.io/)** (tested with v1.18) — issues and renews the region's certificates.
+- **[trust-manager](https://cert-manager.io/docs/trust/trust-manager/)** (tested with v0.24) — distributes the Pipecat Cloud trust anchor into the region.
+
+Install both with their CRDs (`crds.enabled=true` for cert-manager) and wait for them to be ready before installing the region package. The package checks for their CRDs at install time and fails with a clear message if either is missing.
 
 ## Network
 
-{/* outbound only: api, registry, region endpoint :8443; inbound only your own WS ingress */}
+A {productNameSingular} needs **outbound** access only. Nothing connects inbound to your cluster unless you choose to expose a WebSocket endpoint.
+
+| Destination                                   | Port | Purpose                                                                                 |
+| --------------------------------------------- | ---- | --------------------------------------------------------------------------------------- |
+| `api.pipecat.daily.co`                        | 443  | Region registration, enrollment, and automatic certificate renewal                      |
+| `region-gateway.pipecat.daily.co`             | 8443 | The persistent, mutually authenticated connection between your region and Pipecat Cloud |
+| {registryHost}                                | 443  | Pulling the region package and the platform component images                            |
+| Your AI service providers                     | 443  | Whatever your agents call (STT, LLM, TTS, and so on)                                    |
+| Your telephony or WebSocket clients (inbound) | 443  | Only if you [expose a WebSocket endpoint](/pipecat-cloud/self-hosted/websockets)        |
+
+Egress through NAT is fine; no static IP addresses are required. Agent pods also need to reach the broker and, if enabled, the log store you configure.
 
 ## Sizing the platform components
 
-{/* platform component requests; the undersized-node lesson; bots pool separate */}
+The platform components run in a system namespace (`pipecat-system` by default) with these defaults:
 
-## Tools on your workstation
+| Component                    | Replicas | Request per replica |
+| ---------------------------- | -------- | ------------------- |
+| Session activation service   | 2        | 1 vCPU, 1 GiB       |
+| Deployment operator          | 2        | 1 vCPU, 2 GiB       |
+| Region agent                 | 2        | small               |
+| Autoscaler                   | 1        | small               |
+| Bundled broker and log store | 1 each   | development-grade   |
 
-{/* pipecat CLI >= cliMinVersion, helm, kubectl */}
+Plan roughly **6 vCPU and 8 GiB** for the platform at default replica counts, on nodes with at least 4 allocatable vCPU. Several components request a full vCPU each, so nodes with 2 vCPU fit at most one of them and a `helm install --wait` will time out with pods left pending.
+
+Capacity for the agents themselves comes on top of this. Size it from your expected concurrency and the [resources you assign per agent](/pipecat-cloud/self-hosted/sizing) — a voice agent typically needs 0.5 vCPU and 1 GiB. A dedicated, autoscaled node pool for agent pods, as in the [EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks), keeps platform and agent capacity independent.
+
+## Supporting services
+
+The package bundles a single-replica broker and, optionally, a single-node log store. Both are intended for evaluation only. A production region provides:
+
+- **A Valkey- or Redis-compatible broker** with TLS and password authentication, reachable from the cluster. The platform uses it for session activation and autoscaling signals.
+- **An OpenSearch cluster** for agent logs — only if you [enable the log store](/pipecat-cloud/self-hosted/logs).
+
+## Your workstation
+
+- The Pipecat CLI with the `pipecatcloud` plugin, version {cliMinVersion} or later, [logged in](/api-reference/cli/cloud/auth) to an organization that has self-hosted regions enabled.
+- `helm` 3.8 or later (for OCI registry support) and `kubectl`, configured for the target cluster.
 
 # Set Up a Self-Hosted Region
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/setup.md
