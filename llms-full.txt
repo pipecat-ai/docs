@@ -29753,10 +29753,63 @@ externalBroker:
   port: 6379
   tls: true
   username: default
-  passwordSecret: broker-auth # Secret in pipecat-system, key `password`; empty = no auth
+  passwordSecret: broker-auth # Secret in pipecat-system, key `password`
+  # password: "…"            # alternatively, the value itself (see below)
 ```
 
-The broker must be reachable from both the system namespace and the workloads namespace, since agent pods connect to it too. Create `broker-auth` before installing. Its value is read at install time, so rotating the broker password is: update the Secret, run `helm upgrade`, then restart the platform components.
+The broker must be reachable from both the system namespace and the workloads namespace, since agent pods connect to it too. The password can be supplied two ways; leave both empty for a broker without authentication:
+
+- **`passwordSecret`** — the name of a Secret in `pipecat-system` carrying the password under the key `password`. Create it before installing. The chart reads it from the cluster while rendering, so this works with `helm install` and `helm upgrade` run against the cluster; a render that cannot read the Secret (for example `helm template` with no cluster) fails with a message naming the alternative rather than installing an empty password.
+- **`password`** — the value itself, for pipelines that already inject secrets into values (SOPS-encrypted values files, secrets materialized by an operator, a vault plugin). This is the path for Argo CD, Flux, and CI renders. It wins over `passwordSecret` when both are set.
+
+Either way the value is read when the chart is rendered, so rotating the broker password is: change the value or Secret, run `helm upgrade` (or sync), then restart the platform components.
+
+## Activation secret
+
+The region agent and the session activation service share one secret that authenticates session starts inside your cluster. It lives in a Secret named `pipecat-bot-starter-secret` in `pipecat-system`, with the same value under two keys (`secret` and `BOT_STARTER_SECRET`), and must exist before the platform components start — they reference it as required, so a missing Secret blocks startup rather than running unauthenticated. Three ways to supply it, mutually exclusive:
+
+```yaml
+botStarter:
+  generateSecret: true # default: a pre-install/pre-upgrade job creates it if absent
+# botStarterSecret: "…" # or: render it from this value (deterministic; GitOps-safe)
+```
+
+- **Generated (default).** A pre-install/pre-upgrade job creates the Secret if it is absent and never rotates an existing value. It runs the same way under `helm install` and under Argo CD's pre-sync phase, and the Secret appears in no rendered manifest, so nothing drifts. It carries no Helm or Argo ownership labels and survives `helm uninstall`.
+- **From a value.** Set `botStarterSecret` and the chart renders the Secret from it; the job does not run. For shops that inject secrets into values.
+- **Supplied by you.** Set `botStarter.generateSecret: false` and create the Secret yourself before installing — two keys, one value. With External Secrets Operator, use its `Password` generator with `refreshPolicy: CreatedOnce` and an immutable target so a later reconcile never rewrites it:
+
+  ```yaml
+  apiVersion: generators.external-secrets.io/v1alpha1
+  kind: Password
+  metadata:
+    name: pipecat-bot-starter-secret
+    namespace: pipecat-system
+  spec:
+    length: 43
+  ---
+  apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: pipecat-bot-starter-secret
+    namespace: pipecat-system
+  spec:
+    refreshPolicy: CreatedOnce
+    target:
+      name: pipecat-bot-starter-secret
+      immutable: true
+      template:
+        data:
+          secret: "{{ .password }}"
+          BOT_STARTER_SECRET: "{{ .password }}"
+    dataFrom:
+      - sourceRef:
+          generatorRef:
+            apiVersion: generators.external-secrets.io/v1alpha1
+            kind: Password
+            name: pipecat-bot-starter-secret
+  ```
+
+Rotation is deliberate, never a side effect of an upgrade or sync: delete the Secret and re-run the hook (or set a new value under both keys), then restart the activation service first and the region agent second.
 
 ## Log store
 
@@ -30300,12 +30353,10 @@ The package works under Argo CD, Flux, and similar tools with two adjustments:
 - Set `workloadsNamespace.create: false` and manage the workloads namespace yourself, with the Pod Security label described in [Requirements](/pipecat-cloud/self-hosted/requirements#kubernetes-cluster). The platform adds one management label to it; do not prune that label.
 - The enrollment token is consumed once, at first install. Keep it out of your repository: stage it with `kubectl` (or your secrets tooling) before the first sync, exactly as in the [setup guide](/pipecat-cloud/self-hosted/setup).
 
-<Note>
-  `externalBroker.passwordSecret` is read from the cluster when the chart is
-  rendered. Tools that render with `helm template` and no cluster access will
-  see an empty value; render with a live connection to the cluster, or supply
-  the broker password through your own secrets tooling.
-</Note>
+- Supply the broker password as a value (`externalBroker.password`) from your secrets tooling rather than by Secret name: tools that render with `helm template` have no cluster to read a Secret from, and the chart refuses to render in that case. See [Broker](/pipecat-cloud/self-hosted/configuration#broker).
+- The activation secret needs nothing extra: the default pre-install job runs in Argo CD's pre-sync phase and creates it once. If your pipeline owns all Secrets, see the [supply-it-yourself option](/pipecat-cloud/self-hosted/configuration#activation-secret).
+
+Two consecutive renders of the chart with the same values are byte-identical, so a repeated sync changes nothing.
 
 # Self-Hosted Region Diagnostics
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/diagnostics.md
