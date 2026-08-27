@@ -28,6 +28,14 @@ npx mint broken-links --check-anchors --check-redirects
 # llms.txt + llms-full.txt staleness (also runs in CI)
 node scripts/docs-meta-lint.mjs
 
+# Verify every `from pipecat... import ...` in a code sample resolves against
+# the framework source. This is a CI check: CI clones pipecat itself, so the
+# result is reproducible. Running it locally is optional and only meaningful
+# when ../pipecat is on the revision the docs describe — against a stale or
+# feature-branch checkout it can pass an import CI will reject, or reject one
+# CI accepts. --fix rewrites unambiguous renames.
+node scripts/check-imports.mjs [--pipecat PATH]
+
 # Regenerate llms.txt (tiered index) and llms-full.txt (full content dump)
 # after adding, moving, retitling, or editing pages
 # (CI fails if the checked-in files are stale)
