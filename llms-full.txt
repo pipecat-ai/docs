@@ -4652,10 +4652,21 @@ class FunctionCallParams:
     tool_call_id: str                           # Unique identifier for this call
     arguments: Mapping[str, Any]                # Arguments from the LLM
     llm: LLMService                             # Reference to the LLM service
+    pipeline_worker: PipelineWorker             # The worker running this pipeline
     context: LLMContext                         # Current conversation context
     result_callback: FunctionCallResultCallback # Return results here
     app_resources: Any                          # Application-defined resources shared across tool calls
+    worker_runner: WorkerRunner | None          # Reach a peer worker by name
 ```
+
+`worker_runner` finds another worker on the same runner without the application threading the object through `app_resources`:
+
+```python
+async def research(params: FunctionCallParams, query: str):
+    ui_jobs = params.worker_runner.get_worker("ui-jobs")
+```
+
+It is set for any call from a running pipeline, and `None` only when the params were built by hand.
 
 **Using the parameters:**
 
@@ -5953,13 +5964,15 @@ The standard client handlers ship in `@pipecat-ai/client-react`; apps can overri
 - `respond_to_job(text)` — return `{"answer": text}` for the requester's voice LLM to phrase.
 - `respond_to_job()` — complete the turn silently (the worker acted, but said nothing).
 
-**Surfaces long work.** When a turn kicks off background work, `ui_job_group` / `start_ui_job_group` fan it out to peer workers _and_ surface it to the client as a cancellable progress card, streaming each worker's updates as they arrive:
+**Surfaces long work.** When a turn kicks off background work, `job_group()` / `request_job_group()` fan it out to peer workers _and_ surface it to the client as a cancellable progress card, streaming each worker's updates as they arrive:
 
 ```python
-await self.start_ui_job_group(
+await self.request_job_group(
     "wikipedia", "news", "scholar",
-    payload={"query": research_query},
-    label=f"Research: {research_query}",
+    params=JobGroupParams(
+        payload={"query": research_query},
+        label=f"Research: {research_query}",
+    ),
 )
 ```
 
@@ -5994,7 +6007,7 @@ The voice agent exposes a tool that dispatches a `respond` job to the worker and
 async def answer_about_screen(params, query: str):
     """Ask the screen-aware UI layer to answer about the current page."""
     async with params.pipeline_worker.job(
-        "hello", name="respond", payload={"query": query}, timeout=30
+        "hello", params=JobParams(name="respond", payload={"query": query}, timeout=30)
     ) as t:
         pass
     await params.result_callback(t.response)
@@ -6047,17 +6060,19 @@ class FormWorker(ReplyToolMixin, UIWorker):
 
 The LLM uses whichever fields fit the turn — `select_text` to point at "this paragraph", `fills` + `click` to complete a form — and unused fields stay `null`.
 
-Delegation also scales to background work. A `@tool` can fan out to peer workers with `start_ui_job_group`, which surfaces a cancellable progress card on the client and returns immediately so the voice agent isn't blocked:
+Delegation also scales to background work. A `@tool` can fan out to peer workers with `request_job_group()`, which surfaces a cancellable progress card on the client and returns immediately so the voice agent isn't blocked:
 
 ```python
 class ResearchWorker(UIWorker):
     @tool
     async def reply(self, params, answer: str, research_query: str | None = None):
         if research_query:
-            await self.start_ui_job_group(
+            await self.request_job_group(
                 "wikipedia", "news", "scholar",
-                payload={"query": research_query},
-                label=f"Research: {research_query}",
+                params=JobGroupParams(
+                    payload={"query": research_query},
+                    label=f"Research: {research_query}",
+                ),
             )
         await self.respond_to_job(answer)
         await params.result_callback(None)
@@ -6075,7 +6090,9 @@ async def on_user_turn_stopped(aggregator, strategy, message):
     transcript = (message.content or "").strip()
     if not transcript:
         return
-    async with worker.job("ui", name="respond", payload={"query": transcript}, timeout=15):
+    async with worker.job(
+        "ui", params=JobParams(name="respond", payload={"query": transcript}, timeout=15)
+    ):
         pass  # fire-and-forget; the worker acts on its own
 ```
 
@@ -6366,10 +6383,15 @@ Use cases for jobs:
 
 ## Single job
 
-The simplest form is `self.job()`, which sends a job to one agent and waits for the response:
+The simplest form is `self.job()`, which sends a job to one agent and waits for the response. What the job carries — its payload, its timeout, the name of the handler it routes to — goes in a [`JobParams`](/api-reference/server/workers/types#jobparams):
 
 ```python
-async with self.job("worker", payload={"question": "What is Pipecat?"}, timeout=30) as j:
+from pipecat.pipeline.job_context import JobParams
+
+async with self.job(
+    "worker",
+    params=JobParams(payload={"question": "What is Pipecat?"}, timeout=30),
+) as j:
     pass
 
 print(j.response)
@@ -6379,10 +6401,15 @@ print(j.response)
 
 ## Job group
 
-When you need to dispatch work to multiple agents in parallel, use `self.job_group()`:
+When you need to dispatch work to multiple agents in parallel, use `self.job_group()` with a [`JobGroupParams`](/api-reference/server/workers/types#jobgroupparams), which adds `cancel_on_error` to the same fields:
 
 ```python
-async with self.job_group("worker1", "worker2", "worker3", payload={"topic": "AI safety"}, timeout=30) as jg:
+from pipecat.pipeline.job_context import JobGroupParams
+
+async with self.job_group(
+    "worker1", "worker2", "worker3",
+    params=JobGroupParams(payload={"topic": "AI safety"}, timeout=30),
+) as jg:
     pass
 
 for worker_name, response in jg.responses.items():
@@ -6394,10 +6421,16 @@ for worker_name, response in jg.responses.items():
 The same payload is sent to every agent. If you need different arguments per agent, you can structure the payload so each one reads its own key:
 
 ```python
-async with self.job_group("researcher", "fact_checker", payload={
-    "researcher": {"topic": "AI safety", "depth": "detailed"},
-    "fact_checker": {"claims": ["AI can self-improve", "AGI is near"]},
-}, timeout=30) as jg:
+async with self.job_group(
+    "researcher", "fact_checker",
+    params=JobGroupParams(
+        payload={
+            "researcher": {"topic": "AI safety", "depth": "detailed"},
+            "fact_checker": {"claims": ["AI can self-improve", "AGI is near"]},
+        },
+        timeout=30,
+    ),
+) as jg:
     pass
 ```
 
@@ -6435,7 +6468,9 @@ class MyWorker(BaseWorker):
 The requester specifies the job name when dispatching:
 
 ```python
-async with self.job("worker", name="research", payload={"topic": "AI"}) as j:
+async with self.job(
+    "worker", params=JobParams(name="research", payload={"topic": "AI"})
+) as j:
     pass
 ```
 
@@ -6533,7 +6568,10 @@ class ModeratorAgent(LLMWorker):
         Args:
             topic (str): The topic to debate.
         """
-        async with self.job_group("advocate", "critic", "analyst", payload={"topic": topic}, timeout=30) as jg:
+        async with self.job_group(
+            "advocate", "critic", "analyst",
+            params=JobGroupParams(payload={"topic": topic}, timeout=30),
+        ) as jg:
             pass
 
         result = "\n\n".join(
@@ -6584,7 +6622,7 @@ When using `job()` or `job_group()`, cancellation happens automatically if the c
 ```python
 # If an exception or CancelledError is raised inside the block,
 # all agents are cancelled automatically
-async with self.job_group("w1", "w2", payload=data) as jg:
+async with self.job_group("w1", "w2", params=JobGroupParams(payload=data)) as jg:
     # ... if this raises, the agents get cancelled
     pass
 ```
@@ -6595,7 +6633,7 @@ By default (`cancel_on_error=True`), if any agent responds with an error status,
 
 ```python
 try:
-    async with self.job_group("w1", "w2", payload=data) as jg:
+    async with self.job_group("w1", "w2", params=JobGroupParams(payload=data)) as jg:
         pass
 except JobGroupError as e:
     # An agent errored -- remaining agents were cancelled
@@ -6609,8 +6647,8 @@ For fire-and-forget jobs (using `request_job()`), you manage cancellation yourse
 ```python
 job_ids = []
 try:
-    job_ids.append(await self.request_job("w1", payload={"job": 1}))
-    job_ids.append(await self.request_job("w2", payload={"job": 2}))
+    job_ids.append(await self.request_job("w1", params=JobParams(payload={"job": 1})))
+    job_ids.append(await self.request_job("w2", params=JobParams(payload={"job": 2})))
     # ...
 except asyncio.CancelledError:
     for jid in job_ids:
@@ -78092,6 +78130,20 @@ agent.bus -> WorkerBus
 
 The bus this agent is attached to. Raises `RuntimeError` if accessed before `attach()` has been called.
 
+### worker_runner
+
+```python
+agent.worker_runner -> WorkerRunner
+```
+
+The runner this agent is attached to. Use it to reach another worker on the same runner by name, rather than having the application pass the object in through `app_resources`:
+
+```python
+ui_jobs = self.worker_runner.get_worker("ui-jobs")
+```
+
+Raises `RuntimeError` if accessed before `attach()` has been called. The same accessor is on [`FrameProcessor`](/api-reference/server/events/frame-processor-events) and on [`FunctionCallParams`](/pipecat/learn/function-calling), so a processor or a tool handler can reach the runner too.
+
 ### active
 
 ```python
@@ -78316,20 +78368,16 @@ async def request_job(
     self,
     worker_name: str,
     *,
-    name: str | None = None,
-    payload: dict | None = None,
-    timeout: float | None = None,
+    params: JobParams | None = None,
 ) -> str
 ```
 
 Send a job request to a single agent (fire-and-forget). Waits for the agent to be ready before sending the request. Does not wait for the job to complete; use callbacks (`on_job_response`, `on_job_completed`) or `job()` for that.
 
-| Parameter     | Type            | Default | Description                                          |
-| ------------- | --------------- | ------- | ---------------------------------------------------- |
-| `worker_name` | `str`           |         | Name of the agent to send the job to                 |
-| `name`        | `str \| None`   | `None`  | Job name for routing to a named `@job` handler       |
-| `payload`     | `dict \| None`  | `None`  | Structured data describing the work                  |
-| `timeout`     | `float \| None` | `None`  | Timeout in seconds; auto-cancels after this duration |
+| Parameter     | Type                | Default | Description                                                            |
+| ------------- | ------------------- | ------- | ---------------------------------------------------------------------- |
+| `worker_name` | `str`               |         | Name of the agent to send the job to                                   |
+| `params`      | `JobParams \| None` | `None`  | The job's [`JobParams`](/api-reference/server/workers/types#jobparams) |
 
 **Returns:** The generated `job_id`.
 
@@ -78340,25 +78388,21 @@ def job(
     self,
     worker_name: str,
     *,
-    name: str | None = None,
-    payload: dict | None = None,
-    timeout: float | None = None,
+    params: JobParams | None = None,
 ) -> JobContext
 ```
 
 Create a single-agent job context manager. Waits for the agent to be ready, sends a job request, and waits for the response on exit. Supports `async for` inside the block to receive intermediate events.
 
-| Parameter     | Type            | Default | Description                                    |
-| ------------- | --------------- | ------- | ---------------------------------------------- |
-| `worker_name` | `str`           |         | Name of the agent to send the job to           |
-| `name`        | `str \| None`   | `None`  | Job name for routing to a named `@job` handler |
-| `payload`     | `dict \| None`  | `None`  | Structured data describing the work            |
-| `timeout`     | `float \| None` | `None`  | Timeout in seconds                             |
+| Parameter     | Type                | Default | Description                                                            |
+| ------------- | ------------------- | ------- | ---------------------------------------------------------------------- |
+| `worker_name` | `str`               |         | Name of the agent to send the job to                                   |
+| `params`      | `JobParams \| None` | `None`  | The job's [`JobParams`](/api-reference/server/workers/types#jobparams) |
 
 **Returns:** A [`JobContext`](/api-reference/server/workers/types#jobcontext) to use with `async with`.
 
 ```python
-async with self.job("worker", payload=data) as j:
+async with self.job("worker", params=JobParams(payload=data)) as j:
     async for event in j:
         if event.type == JobEvent.UPDATE:
             print(event.data)
@@ -78372,22 +78416,16 @@ print(j.response)
 async def request_job_group(
     self,
     *worker_names: str,
-    name: str | None = None,
-    payload: dict | None = None,
-    timeout: float | None = None,
-    cancel_on_error: bool = True,
+    params: JobGroupParams | None = None,
 ) -> str
 ```
 
 Send a job request to multiple agents (fire-and-forget). Waits for all agents to be ready before sending requests.
 
-| Parameter         | Type            | Default | Description                                    |
-| ----------------- | --------------- | ------- | ---------------------------------------------- |
-| `*worker_names`   | `str`           |         | Names of the agents to send the job to         |
-| `name`            | `str \| None`   | `None`  | Job name for routing to named `@job` handlers  |
-| `payload`         | `dict \| None`  | `None`  | Structured data describing the work            |
-| `timeout`         | `float \| None` | `None`  | Timeout in seconds                             |
-| `cancel_on_error` | `bool`          | `True`  | Whether to cancel the group if a worker errors |
+| Parameter       | Type                     | Default | Description                                                                        |
+| --------------- | ------------------------ | ------- | ---------------------------------------------------------------------------------- |
+| `*worker_names` | `str`                    |         | Names of the agents to send the job to                                             |
+| `params`        | `JobGroupParams \| None` | `None`  | The group's [`JobGroupParams`](/api-reference/server/workers/types#jobgroupparams) |
 
 **Returns:** The generated `job_id` shared by all agents in the group.
 
@@ -78397,27 +78435,21 @@ Send a job request to multiple agents (fire-and-forget). Waits for all agents to
 def job_group(
     self,
     *worker_names: str,
-    name: str | None = None,
-    payload: dict | None = None,
-    timeout: float | None = None,
-    cancel_on_error: bool = True,
+    params: JobGroupParams | None = None,
 ) -> JobGroupContext
 ```
 
 Create a job group context manager. Waits for agents to be ready, sends job requests, and waits for all responses on exit. Supports `async for` inside the block to receive intermediate events.
 
-| Parameter         | Type            | Default | Description                                    |
-| ----------------- | --------------- | ------- | ---------------------------------------------- |
-| `*worker_names`   | `str`           |         | Names of the agents to send the job to         |
-| `name`            | `str \| None`   | `None`  | Job name for routing to named `@job` handlers  |
-| `payload`         | `dict \| None`  | `None`  | Structured data describing the work            |
-| `timeout`         | `float \| None` | `None`  | Timeout in seconds                             |
-| `cancel_on_error` | `bool`          | `True`  | Whether to cancel the group if a worker errors |
+| Parameter       | Type                     | Default | Description                                                                        |
+| --------------- | ------------------------ | ------- | ---------------------------------------------------------------------------------- |
+| `*worker_names` | `str`                    |         | Names of the agents to send the job to                                             |
+| `params`        | `JobGroupParams \| None` | `None`  | The group's [`JobGroupParams`](/api-reference/server/workers/types#jobgroupparams) |
 
 **Returns:** A [`JobGroupContext`](/api-reference/server/workers/types#jobgroupcontext) to use with `async with`.
 
 ```python
-async with self.job_group("w1", "w2", payload=data) as jg:
+async with self.job_group("w1", "w2", params=JobGroupParams(payload=data)) as jg:
     async for event in jg:
         if event.type == JobGroupEvent.UPDATE:
             print(f"{event.worker_name}: {event.data}")
@@ -78438,6 +78470,23 @@ Cancel a running job group.
 | --------- | ------------- | ------- | -------------------------------------- |
 | `job_id`  | `str`         |         | The job identifier to cancel           |
 | `reason`  | `str \| None` | `None`  | Human-readable reason for cancellation |
+
+Cancellation the worker decides on itself — on shutdown, on a timeout, or through `cancel_on_error` — goes through this method and is never refused. For a request from outside the worker, use `request_cancel_job_group`.
+
+### request_cancel_job_group
+
+```python
+async def request_cancel_job_group(self, job_id: str, *, reason: str | None = None) -> bool
+```
+
+Cancel a running job group on behalf of something outside the worker — a client UI, an operator endpoint, anything reaching in. The request is honored only for a group dispatched with `JobGroupParams(cancellable=True)`.
+
+| Parameter | Type          | Default | Description                            |
+| --------- | ------------- | ------- | -------------------------------------- |
+| `job_id`  | `str`         |         | The job identifier to cancel           |
+| `reason`  | `str \| None` | `None`  | Human-readable reason for cancellation |
+
+**Returns:** Whether the group was cancelled.
 
 ### request_job_update
 
@@ -78540,10 +78589,7 @@ async def create_job_group_and_request_job(
     self,
     worker_names: list[str],
     *,
-    name: str | None = None,
-    payload: dict | None = None,
-    timeout: float | None = None,
-    cancel_on_error: bool = True,
+    params: JobGroupParams | None = None,
 ) -> JobGroup
 ```
 
@@ -78743,6 +78789,74 @@ async def on_greeter_ready(self, data: WorkerReadyData) -> None:
 </ParamField>
 
 The handler receives a [`WorkerReadyData`](/api-reference/server/workers/types#workerreadydata) instance.
+
+# BaseUIWorker
+Source: https://docs.pipecat.ai/api-reference/server/workers/base-ui-worker.md
+
+Worker that surfaces its jobs and job groups on the client UI as progress cards, without involving an LLM.
+
+`BaseUIWorker` extends [`BaseWorker`](/api-reference/server/workers/base-worker) with client visibility. Every job group it dispatches streams its lifecycle to the client as `ui-job-group` envelopes, so background work appears as a progress card the user can watch and cancel.
+
+It involves no LLM. Instantiate one directly and register it on the runner as a dispatcher when a pipeline app wants client-visible background work driven by its own tools:
+
+```python
+from pipecat.pipeline.job_context import JobGroupParams
+from pipecat.workers.base_ui_worker import BaseUIWorker
+
+ui_jobs = BaseUIWorker("ui-jobs")
+
+async def research(params: FunctionCallParams, query: str):
+    job_id = await params.worker_runner.get_worker("ui-jobs").request_job_group(
+        "wikipedia", "news",
+        params=JobGroupParams(payload={"query": query}, label=f"Research: {query}"),
+    )
+    await params.result_callback({"status": "started", "job_id": job_id})
+```
+
+## Choosing a worker
+
+|                                                                 | Class                                                     |
+| --------------------------------------------------------------- | --------------------------------------------------------- |
+| Work the client shouldn't see                                   | [`BaseWorker`](/api-reference/server/workers/base-worker) |
+| Client-visible work, dispatched by the main pipeline's LLM      | `BaseUIWorker`                                            |
+| Client-visible work, plus an LLM that reads and drives the page | [`UIWorker`](/api-reference/server/workers/ui-worker)     |
+
+[`UIWorker`](/api-reference/server/workers/ui-worker) inherits from `BaseUIWorker`, so it keeps this behavior and adds an LLM with the screen in context. Reach for it when the work depends on what the user is looking at; a `BaseUIWorker` dispatcher is enough when the main pipeline's LLM already decides what to run.
+
+## What reaches the client
+
+A group dispatched by a `BaseUIWorker` publishes:
+
+| Envelope          | When                                                                  |
+| ----------------- | --------------------------------------------------------------------- |
+| `group_started`   | At dispatch, carrying the group's workers, `label`, and `cancellable` |
+| `job_update`      | As each worker sends an intermediate update                           |
+| `job_completed`   | As each worker responds                                               |
+| `group_completed` | At group teardown — normal completion, cancellation, or timeout       |
+
+The client's reserved `__cancel_job_group` event is translated into a cancellation for any group dispatched with `JobGroupParams(cancellable=True)`. A group dispatched without it is still reported to the client, but the client cannot stop it.
+
+## Dispatching
+
+`BaseUIWorker` uses the same job API as `BaseWorker` — [`job_group()`](/api-reference/server/workers/base-worker#job_group), [`request_job_group()`](/api-reference/server/workers/base-worker#request_job_group), and [`create_job_group_and_request_job()`](/api-reference/server/workers/base-worker#create_job_group_and_request_job). There is no separate UI-specific dispatch method: every group this worker dispatches is client-visible by virtue of the class.
+
+Give the group a `label`. It titles the card the user sees, and without one the card has nothing to name the work:
+
+```python
+async with self.job_group(
+    "wikipedia", "news", "scholar",
+    params=JobGroupParams(
+        payload={"query": query},
+        label=f"Research: {query}",
+        cancellable=True,
+    ),
+) as jg:
+    results = await jg.wait()
+```
+
+## Job hooks
+
+The same hooks as [`BaseWorker`](/api-reference/server/workers/base-worker#job-hooks) — `on_job_update`, `on_job_response`, `on_job_stream_end`, and `on_job_completed` — with the client forwarding layered on top. Always call `super()` when overriding, or the client stops receiving the group's lifecycle.
 
 # LLMWorker
 Source: https://docs.pipecat.ai/api-reference/server/workers/llm-worker.md
@@ -79182,7 +79296,7 @@ Fill a text input or textarea. With `replace=True` (the default) the field is ov
 
 ## Responding to jobs
 
-A `UIWorker` answers via a built-in single-flight `respond` job. When a requester dispatches `self.job("ui", name="respond", payload={"query": "..."})`, the worker clears its context (unless `keep_history=True`), injects the current `<ui_state>`, appends the query as a user message, and runs one LLM turn. A `@tool` ends the turn by calling `respond_to_job()`.
+A `UIWorker` answers via a built-in single-flight `respond` job. When a requester dispatches `self.job("ui", params=JobParams(name="respond", payload={"query": "..."}))`, the worker clears its context (unless `keep_history=True`), injects the current `<ui_state>`, appends the query as a user message, and runs one LLM turn. A `@tool` ends the turn by calling `respond_to_job()`.
 
 ### respond_to_job
 
@@ -79243,66 +79357,48 @@ Render a UI event as a string for context injection. The default wraps the event
 
 ## Job groups
 
-A `UIWorker` can fan work out to peer workers and surface the work to the client as a cancellable progress card. These are distinct from the inherited worker-to-worker [`job_group`](/api-reference/server/workers/base-worker) (which is invisible to the client).
+A `UIWorker` fans work out to peer workers with the ordinary [`job_group()`](/api-reference/server/workers/base-worker#job_group) and [`request_job_group()`](/api-reference/server/workers/base-worker#request_job_group). Because it inherits from [`BaseUIWorker`](/api-reference/server/workers/base-ui-worker), every group it dispatches is surfaced to the client as a progress card — there is no separate UI-specific call.
 
-### ui_job_group
-
-```python
-def ui_job_group(
-    self,
-    *worker_names: str,
-    name: str | None = None,
-    payload: dict | None = None,
-    timeout: float | None = None,
-    cancel_on_error: bool = True,
-    label: str | None = None,
-    cancellable: bool = True,
-) -> UIJobGroupContext
-```
-
-Dispatch a job group whose lifecycle is forwarded to the client as `ui-job-group` envelopes (`group_started` → `job_update*` → `job_completed` × N → `group_completed`). Use as an `async with` context manager to consume worker events inline.
-
-| Parameter         | Type            | Default | Description                                                            |
-| ----------------- | --------------- | ------- | ---------------------------------------------------------------------- |
-| `*worker_names`   | `str`           |         | Names of the workers to send the job to.                               |
-| `name`            | `str \| None`   | `None`  | Optional job name for routing to named `@job` handlers.                |
-| `payload`         | `dict \| None`  | `None`  | Optional structured data describing the work.                          |
-| `timeout`         | `float \| None` | `None`  | Optional timeout (seconds) covering both the ready-wait and execution. |
-| `cancel_on_error` | `bool`          | `True`  | Whether to cancel the group if a worker errors.                        |
-| `label`           | `str \| None`   | `None`  | Human-readable label the client uses to title the in-flight card.      |
-| `cancellable`     | `bool`          | `True`  | Whether the client may cancel the group via `ui-cancel-job-group`.     |
+Give the group a `label` to title the card, and `cancellable` to say whether the client may stop it:
 
 ```python
-async with self.ui_job_group(
+async with self.job_group(
     "researcher_a", "researcher_b",
-    payload={"query": query},
-    label=f"Research: {query}",
-) as tg:
-    async for event in tg:
+    params=JobGroupParams(
+        payload={"query": query},
+        label=f"Research: {query}",
+    ),
+) as jg:
+    async for event in jg:
         ...
-    results = tg.responses
+    results = jg.responses
 ```
 
-### start_ui_job_group
-
-```python
-async def start_ui_job_group(self, *worker_names: str, ...) -> str
-```
-
-Fire-and-forget version of `ui_job_group` with the same parameters. Dispatches the group in the background and returns the `job_id` immediately (the lifecycle still forwards to the client). Use it when a `@tool` wants to kick off work and unblock the voice worker.
+Use `request_job_group()` when a `@tool` wants to kick off work and unblock the voice worker. It dispatches in the background and returns the `job_id` immediately, and the lifecycle still reaches the client:
 
 ```python
 @tool
 async def reply(self, params, answer, research_query=None):
     if research_query:
-        await self.start_ui_job_group(
+        await self.request_job_group(
             "wikipedia", "news", "scholar",
-            payload={"query": research_query},
-            label=f"Research: {research_query}",
+            params=JobGroupParams(
+                payload={"query": research_query},
+                label=f"Research: {research_query}",
+            ),
         )
     await self.respond_to_job(answer)
     await params.result_callback(None)
 ```
+
+<Warning>
+  `ui_job_group()`, `start_ui_job_group()`, and `UIJobGroupContext` are
+  deprecated and will be removed in 2.0.0. Use `job_group()`,
+  `request_job_group()`, and
+  [`JobGroupContext`](/api-reference/server/workers/types#jobgroupcontext)
+  instead — every group a `BaseUIWorker` dispatches reaches the client, so the
+  separate UI spelling no longer distinguishes anything.
+</Warning>
 
 ## Handling UI events
 
@@ -79476,6 +79572,27 @@ Add one or more agents to this runner. Each agent is attached to the runner's bu
 | ---------- | --------------------------------------------------------- | ------------------------- |
 | `*workers` | [`BaseWorker`](/api-reference/server/workers/base-worker) | One or more agents to add |
 
+### get_worker
+
+```python
+def get_worker(self, name: str) -> BaseWorker | None
+```
+
+Return an agent added to this runner, by name.
+
+| Parameter | Type  | Description               |
+| --------- | ----- | ------------------------- |
+| `name`    | `str` | Name of the agent to find |
+
+**Returns:** The agent, or `None` if this runner has none by that name.
+
+Only agents on the same runner have a local instance to return. One on another runner is addressable over the bus but has no object to hand back, so this returns `None` for it.
+
+```python
+async def research(params: FunctionCallParams, query: str):
+    ui_jobs = params.worker_runner.get_worker("ui-jobs")
+```
+
 ### run
 
 ```python
@@ -79534,6 +79651,57 @@ async def on_error(runner, error):
 Source: https://docs.pipecat.ai/api-reference/server/workers/types.md
 
 Shared types for Pipecat workers and job coordination: JobStatus, job context enums, and data classes.
+
+## JobParams
+
+```python
+from pipecat.pipeline.job_context import JobParams
+```
+
+Everything a job dispatch needs, in one object. Pass it as `params=` to [`job()`](/api-reference/server/workers/base-worker#job) or [`request_job()`](/api-reference/server/workers/base-worker#request_job).
+
+| Field         | Type            | Default | Description                                                                                                                                                          |
+| ------------- | --------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`        | `str \| None`   | `None`  | Routes the request to the matching `@job(name=...)` handler on the worker                                                                                            |
+| `payload`     | `dict \| None`  | `None`  | Structured data describing the work                                                                                                                                  |
+| `timeout`     | `float \| None` | `None`  | Seconds, covering both the wait for the worker to become ready and the job itself                                                                                    |
+| `label`       | `str \| None`   | `None`  | Human-readable description, e.g. `"Research: Radiohead"`. A [`BaseUIWorker`](/api-reference/server/workers/base-ui-worker) titles the client's progress card with it |
+| `cancellable` | `bool`          | `True`  | Whether an external requester, such as the client UI, may ask for the job to be cancelled                                                                            |
+
+```python
+from pipecat.pipeline.job_context import JobParams
+
+async with self.job("researcher", params=JobParams(payload={"topic": topic})) as j:
+    result = await j.wait()
+```
+
+<Note>
+  `cancellable` governs requests from outside the worker. Cancellation the
+  worker initiates itself — on shutdown, on a timeout, or through
+  `cancel_on_error` — proceeds either way.
+</Note>
+
+## JobGroupParams
+
+```python
+from pipecat.pipeline.job_context import JobGroupParams
+```
+
+Carries every `JobParams` field, which apply to the group as a whole, plus one of its own. Pass it as `params=` to [`job_group()`](/api-reference/server/workers/base-worker#job_group), [`request_job_group()`](/api-reference/server/workers/base-worker#request_job_group), or [`create_job_group_and_request_job()`](/api-reference/server/workers/base-worker#create_job_group_and_request_job).
+
+| Field             | Type   | Default | Description                                                             |
+| ----------------- | ------ | ------- | ----------------------------------------------------------------------- |
+| `cancel_on_error` | `bool` | `True`  | Whether a worker responding with an error cancels the rest of the group |
+
+```python
+from pipecat.pipeline.job_context import JobGroupParams
+
+async with self.job_group(
+    "wikipedia", "news",
+    params=JobGroupParams(payload={"query": query}, label=f"Research: {query}"),
+) as jg:
+    results = await jg.wait()
+```
 
 ## JobStatus
 
@@ -79606,7 +79774,7 @@ On normal completion, the result is available via `response`. On worker error or
 ### Usage
 
 ```python
-async with self.job("worker", payload=data) as j:
+async with self.job("worker", params=JobParams(payload=data)) as j:
     async for event in j:
         print(f"[{event.type}]: {event.data}")
 
@@ -79633,7 +79801,7 @@ On normal completion, results are available via `responses`. On worker error (wi
 ### Usage
 
 ```python
-async with self.job_group("w1", "w2", payload=data) as jg:
+async with self.job_group("w1", "w2", params=JobGroupParams(payload=data)) as jg:
     async for event in jg:
         print(f"{event.worker_name} [{event.type}]: {event.data}")
 
@@ -79684,13 +79852,16 @@ from pipecat.pipeline.job_context import JobGroup
 
 Tracks a group of agents launched together by a job request. Exposed via [`BaseWorker.job_groups`](/api-reference/server/workers/base-worker#job_groups) and returned by `create_job_group_and_request_job`.
 
-| Field             | Type                   | Default | Description                                     |
-| ----------------- | ---------------------- | ------- | ----------------------------------------------- |
-| `job_id`          | `str`                  |         | Shared identifier for all agents in this group  |
-| `worker_names`    | `set[str]`             |         | Names of the agents in the group                |
-| `responses`       | `dict[str, dict]`      | `{}`    | Collected responses keyed by worker name        |
-| `timeout_task`    | `asyncio.Task \| None` | `None`  | Optional task that cancels the group on timeout |
-| `cancel_on_error` | `bool`                 | `True`  | Whether to cancel the group if a worker errors  |
+| Field             | Type                   | Default | Description                                                         |
+| ----------------- | ---------------------- | ------- | ------------------------------------------------------------------- |
+| `job_id`          | `str`                  |         | Shared identifier for all agents in this group                      |
+| `worker_names`    | `list[str]`            |         | Names of the agents in the group, in the order they were dispatched |
+| `responses`       | `dict[str, dict]`      | `{}`    | Collected responses keyed by worker name                            |
+| `timeout_task`    | `asyncio.Task \| None` | `None`  | Optional task that cancels the group on timeout                     |
+| `cancel_on_error` | `bool`                 | `True`  | Whether to cancel the group if a worker errors                      |
+| `label`           | `str \| None`          | `None`  | Human-readable description of the work, shown on the client's card  |
+| `cancellable`     | `bool`                 | `True`  | Whether an external requester may ask for the group to be cancelled |
+| `terminated`      | `set[str]`             | `set()` | Names of the workers that have finished                             |
 
 ### Properties
 
@@ -79832,7 +80003,7 @@ Raised when a single-agent job (via [`JobContext`](/api-reference/server/workers
 
 ```python
 try:
-    async with self.job("worker", payload=data, timeout=30) as j:
+    async with self.job("worker", params=JobParams(payload=data, timeout=30)) as j:
         async for event in j:
             ...
     print(j.response)
@@ -79850,7 +80021,7 @@ Raised when a job group (via [`JobGroupContext`](/api-reference/server/workers/t
 
 ```python
 try:
-    async with self.job_group("w1", "w2", payload=data, timeout=30) as jg:
+    async with self.job_group("w1", "w2", params=JobGroupParams(payload=data, timeout=30)) as jg:
         async for event in jg:
             ...
     print(jg.responses)

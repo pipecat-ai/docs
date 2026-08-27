@@ -155,7 +155,7 @@ Fill a text input or textarea. With `replace=True` (the default) the field is ov
 
 ## Responding to jobs
 
-A `UIWorker` answers via a built-in single-flight `respond` job. When a requester dispatches `self.job("ui", name="respond", payload={"query": "..."})`, the worker clears its context (unless `keep_history=True`), injects the current `<ui_state>`, appends the query as a user message, and runs one LLM turn. A `@tool` ends the turn by calling `respond_to_job()`.
+A `UIWorker` answers via a built-in single-flight `respond` job. When a requester dispatches `self.job("ui", params=JobParams(name="respond", payload={"query": "..."}))`, the worker clears its context (unless `keep_history=True`), injects the current `<ui_state>`, appends the query as a user message, and runs one LLM turn. A `@tool` ends the turn by calling `respond_to_job()`.
 
 ### respond_to_job
 
@@ -216,66 +216,48 @@ Render a UI event as a string for context injection. The default wraps the event
 
 ## Job groups
 
-A `UIWorker` can fan work out to peer workers and surface the work to the client as a cancellable progress card. These are distinct from the inherited worker-to-worker [`job_group`](/api-reference/server/workers/base-worker) (which is invisible to the client).
+A `UIWorker` fans work out to peer workers with the ordinary [`job_group()`](/api-reference/server/workers/base-worker#job_group) and [`request_job_group()`](/api-reference/server/workers/base-worker#request_job_group). Because it inherits from [`BaseUIWorker`](/api-reference/server/workers/base-ui-worker), every group it dispatches is surfaced to the client as a progress card — there is no separate UI-specific call.
 
-### ui_job_group
-
-```python
-def ui_job_group(
-    self,
-    *worker_names: str,
-    name: str | None = None,
-    payload: dict | None = None,
-    timeout: float | None = None,
-    cancel_on_error: bool = True,
-    label: str | None = None,
-    cancellable: bool = True,
-) -> UIJobGroupContext
-```
-
-Dispatch a job group whose lifecycle is forwarded to the client as `ui-job-group` envelopes (`group_started` → `job_update*` → `job_completed` × N → `group_completed`). Use as an `async with` context manager to consume worker events inline.
-
-| Parameter         | Type            | Default | Description                                                            |
-| ----------------- | --------------- | ------- | ---------------------------------------------------------------------- |
-| `*worker_names`   | `str`           |         | Names of the workers to send the job to.                               |
-| `name`            | `str \| None`   | `None`  | Optional job name for routing to named `@job` handlers.                |
-| `payload`         | `dict \| None`  | `None`  | Optional structured data describing the work.                          |
-| `timeout`         | `float \| None` | `None`  | Optional timeout (seconds) covering both the ready-wait and execution. |
-| `cancel_on_error` | `bool`          | `True`  | Whether to cancel the group if a worker errors.                        |
-| `label`           | `str \| None`   | `None`  | Human-readable label the client uses to title the in-flight card.      |
-| `cancellable`     | `bool`          | `True`  | Whether the client may cancel the group via `ui-cancel-job-group`.     |
+Give the group a `label` to title the card, and `cancellable` to say whether the client may stop it:
 
 ```python
-async with self.ui_job_group(
+async with self.job_group(
     "researcher_a", "researcher_b",
-    payload={"query": query},
-    label=f"Research: {query}",
-) as tg:
-    async for event in tg:
+    params=JobGroupParams(
+        payload={"query": query},
+        label=f"Research: {query}",
+    ),
+) as jg:
+    async for event in jg:
         ...
-    results = tg.responses
+    results = jg.responses
 ```
 
-### start_ui_job_group
-
-```python
-async def start_ui_job_group(self, *worker_names: str, ...) -> str
-```
-
-Fire-and-forget version of `ui_job_group` with the same parameters. Dispatches the group in the background and returns the `job_id` immediately (the lifecycle still forwards to the client). Use it when a `@tool` wants to kick off work and unblock the voice worker.
+Use `request_job_group()` when a `@tool` wants to kick off work and unblock the voice worker. It dispatches in the background and returns the `job_id` immediately, and the lifecycle still reaches the client:
 
 ```python
 @tool
 async def reply(self, params, answer, research_query=None):
     if research_query:
-        await self.start_ui_job_group(
+        await self.request_job_group(
             "wikipedia", "news", "scholar",
-            payload={"query": research_query},
-            label=f"Research: {research_query}",
+            params=JobGroupParams(
+                payload={"query": research_query},
+                label=f"Research: {research_query}",
+            ),
         )
     await self.respond_to_job(answer)
     await params.result_callback(None)
 ```
+
+<Warning>
+  `ui_job_group()`, `start_ui_job_group()`, and `UIJobGroupContext` are
+  deprecated and will be removed in 2.0.0. Use `job_group()`,
+  `request_job_group()`, and
+  [`JobGroupContext`](/api-reference/server/workers/types#jobgroupcontext)
+  instead — every group a `BaseUIWorker` dispatches reaches the client, so the
+  separate UI spelling no longer distinguishes anything.
+</Warning>
 
 ## Handling UI events
 
