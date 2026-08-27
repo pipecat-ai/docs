@@ -11687,6 +11687,25 @@ user:
   default, and `cartesia` (HTTP) when you want a cloud voice.
 </Note>
 
+Both the `speech:` and `judge.transcription:` blocks take an optional `language`, so a non-English agent can be driven and judged in the language it speaks:
+
+```yaml
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: zf_xiaobei # voices are language-specific — match the language
+    language: zh
+```
+
+It accepts a code like `zh` or a `Language`, and an unrecognized code raises a `ValueError` naming it. Omitting it leaves the service's own default, which is English. Voices are not selected for you: `af_heart` speaks US English whatever `language` says.
+
+<Tip>
+  Prefer `whisper` over `moonshine` for transcribing a non-English agent.
+  Moonshine's non-English models return empty or truncated transcripts, and an
+  empty transcript is indistinguishable from a bot that said nothing.
+</Tip>
+
 ### Judging with `judge:`
 
 **Text (the default).** The agent's TTS is skipped automatically, including any on-connect greeting, and the judge evaluates the LLM's text output. Fast and silent; equivalent to:
@@ -11816,6 +11835,31 @@ The trade-off is that anything the bot accumulated in one scenario is still ther
 
 - **Conversation context**: seed or clear it per scenario with [`context:`](#seeding-the-context-with-context). The harness replaces the bot's LLM context with the messages you provide (via an `LLMMessagesUpdateFrame`); without it, the previous conversation carries forward, which is rarely what you want across independent scenarios.
 - **Application state**: counters, flags, cached data, anything your bot holds outside the LLM context. The harness can't see this, so resetting it is your bot's job. A common place is the bot's connect handler, which runs again for each scenario's connection.
+
+### Scoring every turn
+
+By default the first turn with a failed assertion ends the scenario, since a conversation that has gone wrong rarely tells you much about the turns after it. Set `stop_on_failure: false` when the turns are independent and you want a score across all of them — benchmarking intent classification over a list of utterances, say:
+
+```yaml
+name: intent_benchmark
+stop_on_failure: false
+
+turns:
+  - user: "Book me a flight to Tokyo."
+    expect:
+      - event: function_call
+        within_ms: 15000
+        calls: [{ name: book_flight }]
+```
+
+<Warning>
+  Give those turns an explicit `within_ms`. With the 60-second default, a bot
+  that has stopped answering costs a full budget on every remaining turn.
+</Warning>
+
+This governs progression from one turn to the next. Within a turn, an
+expectation that times out still ends that turn's matching, because a turn's
+expectations share one deadline anchored at the moment its input was sent.
 
 ### Exercising the disconnect path
 
@@ -11962,6 +12006,7 @@ Scenarios assert on a small set of semantic events, mapped from the RTVI message
 | `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                                   |
 | `llm_started`           | The LLM began generating a response.                                                                                                                                                         |
 | `function_call`         | The LLM called a function.                                                                                                                                                                   |
+| `function_call_stopped` | A function call ended. Its `args` carry `tool_call_id` and `cancelled`, so a scenario can tell work that was stopped from work that finished on its own.                                     |
 | `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-keypresses-with-dtmf), where the aggregated keys become a transcription in either mode. |
 | `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                  |
 | `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                    |
@@ -12039,6 +12084,19 @@ A `function_call` expectation asserts that the turn invoked one or more tools. L
 
 `args` is a subset check: every listed key/value must be present in the call's arguments, and extra arguments are ignored. A single expected call can use the `name:`/`args:` shorthand directly on the expectation, and a bare `function_call` with neither just asserts that some call happened.
 
+Arguments take part in the matching, so the turn is satisfied by any call matching both the name and the arguments — a call the model gets wrong and immediately repeats correctly still passes. When nothing matches, the failure names the arguments that did arrive.
+
+`function_call_stopped` takes the same `calls:` shape and reports a call ending, which is how a scenario asserts that a [cancellable tool](/pipecat/learn/function-calling#async-function-call-cancellation) was actually stopped:
+
+```yaml
+- user: "Actually, cancel that report."
+  expect:
+    - event: function_call_stopped
+      calls:
+        - name: write_report
+          args: { cancelled: true }
+```
+
 ## Next steps
 
 <CardGroup cols={2}>
@@ -12110,6 +12168,7 @@ pipecat eval suite manifest.yaml -c 8             # 8 runs at a time
 pipecat eval suite manifest.yaml -n nightly       # output to eval-runs/nightly/
 pipecat eval suite manifest.yaml -a               # record conversation audio
 pipecat eval suite manifest.yaml -d               # save full per-pipeline debug logs
+pipecat eval suite manifest.yaml -r 5             # run each pair 5 times
 ```
 
 Everything except the `suite:` list can live in the manifest or be passed on the command line (the command line wins), so a manifest can be as minimal as a `suite:` list.
@@ -12121,12 +12180,21 @@ Each invocation writes to `<runs_dir>/<name>/` (a timestamp when `-n` is omitted
 ```
 eval-runs/20260610_142200/
   logs/
+  results.jsonl                                # one line per run
+  logs/
     bots_support-agent.py__greeting.log        # the agent process output
     bots_support-agent.py__greeting.eval.log   # the harness's decision trace
     bots_support-agent.py__greeting.debug.log  # per-pipeline harness logs (-d only)
   recordings/
     bots_support-agent.py__greeting.wav        # conversation audio (record: true or -a)
 ```
+
+`results.jsonl` carries one line per run — its bot, scenario, attempt, outcome, duration, failures, per-turn results, and paths to its artifacts. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+
+<Note>
+  `results.jsonl` is written by `pipecat eval suite`. `pipecat eval run` doesn't
+  produce one.
+</Note>
 
 When a run fails, start with the `.eval.log` decision trace: it's a timestamped record of every event the harness saw, what it matched, what the judge said, and why an assertion failed. The agent's own log sits next to it.
 
@@ -12136,9 +12204,32 @@ If you just want to run a batch of scenarios against an agent you already have r
 
 ```bash
 pipecat eval run scenarios/*.yaml --bot-url ws://localhost:7860
+pipecat eval run scenarios/ --bot-url ws://localhost:7860       # the whole directory
 ```
 
+A directory expands to its `*.yaml` files in filename order, non-recursively, and files and directories can be mixed in one invocation. A directory holding no `.yaml` files is an error rather than an empty run.
+
 By default the agent is left running afterward so it can serve more evals; pass `--stop-bot` to shut it down when the batch finishes.
+
+## Repeating a run
+
+A behavior with a race in it passes sometimes. `repeat:` in the manifest, or `--repeat` / `-r` on the command line, runs every (bot, scenario) pair N times and reports a pass rate per pair instead of a single verdict:
+
+```yaml
+# manifest.yaml
+repeat: 5
+suite:
+  - bot: bots/support-agent.py
+    scenarios: [interruption]
+```
+
+Attempts interleave across bots rather than running back to back, and artifact filenames gain an attempt suffix (`__001`) only when `repeat` is above 1, so a single pass keeps the filenames it always had.
+
+<Warning>
+  A repeated sweep always exits `0`. A pass rate isn't a pass or a fail, so the
+  threshold is yours to choose — read `results.jsonl` and decide. Leave `repeat`
+  unset for the CI gate below.
+</Warning>
 
 ## Suites in CI
 
@@ -12191,15 +12282,29 @@ The agent must already be running with its eval transport (`python bot.py -t eva
 
 `run()` returns an `EvalResult`:
 
-| Field           | Description                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------------- |
-| `scenario_name` | Name of the scenario that ran.                                                              |
-| `passed`        | Whether every assertion passed.                                                             |
-| `failures`      | The failed assertions, each with the turn index, expectation index, event name, and reason. |
-| `duration_ms`   | Wall-clock time the run took.                                                               |
-| `events_seen`   | Every semantic event observed, for diagnostics.                                             |
-| `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).    |
-| `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.  |
+| Field           | Description                                                                                         |
+| --------------- | --------------------------------------------------------------------------------------------------- |
+| `scenario_name` | Name of the scenario that ran.                                                                      |
+| `passed`        | Whether every assertion passed.                                                                     |
+| `failures`      | The failed assertions, each with the turn index, expectation index, event name, reason, and `kind`. |
+| `turns`         | One `EvalTurnResult` per scenario turn, in order. See below.                                        |
+| `duration_ms`   | Wall-clock time the run took.                                                                       |
+| `events_seen`   | Every semantic event observed, for diagnostics.                                                     |
+| `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).            |
+| `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.          |
+
+Each `EvalTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, and its `duration_ms`. `EvalResult.failures` is these turns' failures flattened, plus any that belong to no turn — a failed connect, say.
+
+`not_run` is deliberately distinct from a pass, so a turn the scenario never reached doesn't inflate a rate:
+
+```python
+result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
+
+scored = [t for t in result.turns if t.status != "not_run"]
+print(f"{sum(1 for t in scored if t.status == 'passed')}/{len(scored)} turns")
+```
+
+`failures` carry a `kind` alongside the reason — `timeout`, `judge_no`, `text_mismatch`, `missing_function_call`, and so on — which is the stable key to group by when scoring a sweep rather than reading one run.
 
 This maps cleanly onto a pytest test:
 
@@ -89579,7 +89684,8 @@ pipecat eval run [OPTIONS] SCENARIOS...
 **Arguments:**
 
 <ParamField path="SCENARIOS..." type="path" required>
-  One or more scenario YAML files.
+  One or more scenario YAML files, or directories of them. A directory expands
+  to its `*.yaml` files in filename order, non-recursively.
 </ParamField>
 
 **Options:**
@@ -89679,6 +89785,12 @@ pipecat eval suite [OPTIONS] MANIFEST_PATH
 
 <ParamField path="--concurrency / -c" type="integer">
   Override the manifest's `concurrency` (how many runs execute at once).
+</ParamField>
+
+<ParamField path="--repeat / -r" type="integer">
+  Override the manifest's `repeat` — how many times to run each (bot, scenario)
+  pair. Must be at least 1. Above 1, the suite reports a pass rate per pair and
+  always exits `0`, since a rate is neither a pass nor a fail.
 </ParamField>
 
 <ParamField path="--base-port" type="integer">
