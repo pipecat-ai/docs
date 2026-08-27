@@ -29,9 +29,12 @@ npx mint broken-links --check-anchors --check-redirects
 node scripts/docs-meta-lint.mjs
 
 # Verify every `from pipecat... import ...` in a code sample resolves against
-# the framework source (also runs in CI, which checks pipecat out itself).
-# Defaults to ../pipecat; --fix rewrites unambiguous renames.
-node scripts/check-imports.mjs
+# the framework source. This is a CI check: CI clones pipecat itself, so the
+# result is reproducible. Running it locally is optional and only meaningful
+# when ../pipecat is on the revision the docs describe — against a stale or
+# feature-branch checkout it can pass an import CI will reject, or reject one
+# CI accepts. --fix rewrites unambiguous renames.
+node scripts/check-imports.mjs [--pipecat PATH]
 
 # Regenerate llms.txt (tiered index) and llms-full.txt (full content dump)
 # after adding, moving, retitling, or editing pages
@@ -119,12 +122,6 @@ Prettier is configured via `.prettierrc`:
 
 A husky pre-commit hook runs lint-staged, which formats staged files. The whole
 site is Prettier-clean, so `npm run format` should be a no-op on a clean tree.
-
-The hook also runs `check-imports.mjs`, which needs a pipecat checkout at
-`../pipecat`. Without one it prints a note and skips rather than failing, so a
-contributor who only has this repo can still commit — the check does not run
-locally in that case, and CI is what catches the problem, against a checkout it
-makes itself.
 
 ## CI/CD
 
