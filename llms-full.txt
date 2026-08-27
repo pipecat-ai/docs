@@ -83335,6 +83335,14 @@ Initializes the media device selection machinery, based on `enableCam`/`enableMi
 await pcClient.initDevices();
 ```
 
+It drives [`mediaState`](#mediastate): both devices move to `initializing` on entry, then to `granted` for each device the transport reports as acquired. A device that isn't acquired falls back to `uninitialized`. On failure the underlying error classifies the affected devices and is re-thrown, so callers still see it.
+
+<Note>
+  Calling `initDevices()` again after a failure is the recovery path — a second
+  call re-enters `initializing` and reclassifies. There is no separate retry
+  method.
+</Note>
+
 ### getAllMics()
 
 `async getAllMics(): Promise<MediaDeviceInfo[]>`
@@ -83509,6 +83517,63 @@ An accessor to determine if the client is sharing their screen.
 ```typescript
 screen_sharing = pcClient.isSharingScreen;
 ```
+
+### mediaState
+
+`get mediaState(): MediaState`
+
+Per-device state for the mic and cam, independent of the transport's connection state. Use it to render permission UI — whether to show a "grant access" prompt, an error, or the device picker.
+
+```typescript
+const { mic, cam } = pcClient.mediaState;
+
+if (mic.state === "error" && mic.reason === "blocked") {
+  // the user denied microphone permission
+}
+```
+
+Returns a snapshot. To track changes, subscribe to `RTVIEvent.MediaStateUpdated` or pass an [`onMediaStateChanged`](/api-reference/client/js/callbacks) callback to the constructor. In React, use [`useMediaState`](/api-reference/client/react/hooks#usemediastate).
+
+<Expandable title="MediaState" defaultOpen="true">
+  <ParamField path="mic" type="DeviceStatus">
+    Status of the microphone.
+  </ParamField>
+  <ParamField path="cam" type="DeviceStatus">
+    Status of the camera.
+  </ParamField>
+</Expandable>
+
+A `DeviceStatus` is `{ state }`, plus `reason` and optional `details` when `state` is `"error"`:
+
+| `state`         | Meaning                                          |
+| --------------- | ------------------------------------------------ |
+| `uninitialized` | `initDevices()` hasn't run for this device       |
+| `initializing`  | Enumeration or a permission request is in flight |
+| `granted`       | Enumerated and ready to use                      |
+| `error`         | Could not be acquired; see `reason`              |
+
+| `reason`              | Meaning                                                            |
+| --------------------- | ------------------------------------------------------------------ |
+| `blocked`             | The user denied permission                                         |
+| `already-in-use`      | The hardware is busy in another application                        |
+| `not-found`           | No matching hardware                                               |
+| `invalid-constraints` | The requested constraints couldn't be satisfied                    |
+| `not-supported`       | Browser API unavailable — a legacy browser, or an insecure context |
+| `unknown`             | Couldn't be classified                                             |
+
+<Note>
+  Speakers aren't tracked here. Output devices have no permission or in-use
+  failure mode, only enumeration, so `getAllSpeakers()` and `updateSpeaker()`
+  are the whole story for them.
+</Note>
+
+### needsInit()
+
+`needsInit(): boolean`
+
+Whether `initDevices()` still has work to do — true while any device you opted into with `enableMic` / `enableCam` is still `uninitialized`. Devices you opted out of stay `uninitialized` by design and don't count.
+
+`connect()` and `startBot()` use this internally to decide whether to run an implicit `initDevices()`; it's public so your own code can branch on the same rule.
 
 ## Tracks (audio and video)
 
@@ -83858,6 +83923,13 @@ pcClient.on(RTVIEvent.BotReady, () => console.log("Bot ready via event"));
 
 <ParamField path="onCamUpdated" type="cam:MediaDeviceInfo">
   User selected a new camera as their selected/active device.
+</ParamField>
+
+<ParamField path="onMediaStateChanged" type="mediaState:MediaState">
+  Per-device mic/cam state changed — a permission granted or denied, a device
+  that couldn't be acquired. See
+  [`mediaState`](/api-reference/client/js/client-methods#mediastate) for the
+  shape and what each state means.
 </ParamField>
 
 <ParamField path="onSpeakerUpdated" type="speaker:MediaDeviceInfo">
@@ -84212,6 +84284,7 @@ Here's the complete reference mapping events to their corresponding callbacks:
 | `MicUpdated`           | `onMicUpdated`           | `MediaDeviceInfo`               |
 | `CamUpdated`           | `onCamUpdated`           | `MediaDeviceInfo`               |
 | `SpeakerUpdated`       | `onSpeakerUpdated`       | `MediaDeviceInfo`               |
+| `MediaStateUpdated`    | `onMediaStateChanged`    | `MediaState`                    |
 | `DeviceError`          | `onDeviceError`          | `DeviceError`                   |
 
 ### Audio Activity Events
@@ -85750,6 +85823,25 @@ function DeviceSelector() {
   );
 }
 ```
+
+## useMediaState
+
+Subscribes to the per-device mic and cam state, re-rendering when either transitions. Use it to drive permission UI.
+
+```jsx
+import { useMediaState } from "@pipecat-ai/client-react";
+
+function MicStatus() {
+  const { mic } = useMediaState();
+
+  if (mic.state === "error") {
+    return <p>Microphone unavailable: {mic.reason}</p>;
+  }
+  return <p>Microphone {mic.state}</p>;
+}
+```
+
+Returns a [`MediaState`](/api-reference/client/js/client-methods#mediastate) snapshot. Safe to call from any component inside `PipecatClientProvider` — the subscription is mounted for you.
 
 ## usePipecatClientMediaTrack
 
