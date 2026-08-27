@@ -114,6 +114,71 @@ class MyCustomProcessor(FrameProcessor):
         await self.push_frame(frame, direction)  # ✅ Required - pass frame through
 ```
 
+## Setup and cleanup
+
+A processor is set up before any frame reaches it, and cleaned up when the pipeline tears down. This is where a processor that needs a connection, a client, or the pipeline's audio configuration gets it:
+
+```python
+from pipecat.processors.frame_processor import FrameProcessor, FrameProcessorSetup
+
+class MyCustomProcessor(FrameProcessor):
+    async def setup(self, setup: FrameProcessorSetup):
+        await super().setup(setup)          # ✅ Required
+        self._sample_rate = setup.audio_out_sample_rate
+        self._client = await connect()
+
+    async def cleanup(self):
+        await super().cleanup()             # ✅ Required
+        await self._client.close()
+```
+
+### FrameProcessorSetup
+
+| Field                      | Type                     | Default | Description                                       |
+| -------------------------- | ------------------------ | ------- | ------------------------------------------------- |
+| `clock`                    | `BaseClock`              |         | The pipeline clock                                |
+| `task_manager`             | `BaseTaskManager`        |         | Creates and tracks the processor's asyncio tasks  |
+| `pipeline_worker`          | `PipelineWorker`         |         | The worker running this pipeline                  |
+| `audio_in_sample_rate`     | `int`                    | `16000` | Input audio sample rate in Hz                     |
+| `audio_out_sample_rate`    | `int`                    | `24000` | Output audio sample rate in Hz                    |
+| `enable_metrics`           | `bool`                   | `False` | Whether to collect performance metrics            |
+| `enable_tracing`           | `bool`                   | `False` | Whether tracing is enabled                        |
+| `enable_usage_metrics`     | `bool`                   | `False` | Whether to collect usage metrics                  |
+| `observer`                 | `BaseObserver \| None`   | `None`  | The pipeline observer, if one is attached         |
+| `report_only_initial_ttfb` | `bool`                   | `False` | Whether to report only the first TTFB per service |
+| `tracing_context`          | `TracingContext \| None` | `None`  | Tracing context for distributed tracing           |
+
+`metrics_enabled`, `usage_metrics_enabled`, and `report_only_initial_ttfb` are also available as properties on the processor itself, and `processor_setup` returns the whole object once setup has run.
+
+<Warning>
+  Don't read this configuration off the `StartFrame` in `process_frame()`.
+  `StartFrame.audio_in_sample_rate` and its siblings are deprecated since v1.8.0
+  and removed in 2.0.0.
+</Warning>
+
+<Note>
+  Processors are set up **concurrently**, so a resource two of them share — the
+  client an input and output transport hold between them — needs guarding.
+  `acquires` and `releases` from `pipecat.utils.shared` do that: the first owner
+  to acquire runs the decorated method while the rest wait for it, and
+  `releases` runs only for the last owner to let go.
+</Note>
+
+A processor that raises while setting up pushes an `ErrorFrame` upstream, so the application learns its pipeline came up degraded. A processor that raises while being cleaned up no longer costs the rest of the pipeline its teardown — the failure is logged and every other processor is still released.
+
+## Holding frames until a condition is met
+
+A processor that establishes a connection during setup may receive frames before it is ready for them. `pause_processing_all_frames_until()` holds everything arriving at the processor until a condition resolves, then delivers it in order:
+
+```python
+async def setup(self, setup: FrameProcessorSetup):
+    await super().setup(setup)
+    self._ready = asyncio.Event()
+    await self.pause_processing_all_frames_until(self._ready.wait, timeout=10)
+```
+
+The pause takes effect from the frame _after_ the one being processed, so a `StartFrame` that triggers it still travels downstream. Both queues are held while it is in force, so give it a `timeout`; the pause is always lifted at cleanup.
+
 ## Critical Responsibility: Frame Forwarding
 
 FrameProcessors receive **all** frames that are pushed through the pipeline. This gives them a lot of power, but also a great responsibility. Critically, they must push all frames through the pipeline; if they don't, they block frames from moving through the Pipeline, which will cause issues in how your application functions.

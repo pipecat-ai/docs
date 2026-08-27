@@ -9790,6 +9790,71 @@ class MyCustomProcessor(FrameProcessor):
         await self.push_frame(frame, direction)  # ✅ Required - pass frame through
 ```
 
+## Setup and cleanup
+
+A processor is set up before any frame reaches it, and cleaned up when the pipeline tears down. This is where a processor that needs a connection, a client, or the pipeline's audio configuration gets it:
+
+```python
+from pipecat.processors.frame_processor import FrameProcessor, FrameProcessorSetup
+
+class MyCustomProcessor(FrameProcessor):
+    async def setup(self, setup: FrameProcessorSetup):
+        await super().setup(setup)          # ✅ Required
+        self._sample_rate = setup.audio_out_sample_rate
+        self._client = await connect()
+
+    async def cleanup(self):
+        await super().cleanup()             # ✅ Required
+        await self._client.close()
+```
+
+### FrameProcessorSetup
+
+| Field                      | Type                     | Default | Description                                       |
+| -------------------------- | ------------------------ | ------- | ------------------------------------------------- |
+| `clock`                    | `BaseClock`              |         | The pipeline clock                                |
+| `task_manager`             | `BaseTaskManager`        |         | Creates and tracks the processor's asyncio tasks  |
+| `pipeline_worker`          | `PipelineWorker`         |         | The worker running this pipeline                  |
+| `audio_in_sample_rate`     | `int`                    | `16000` | Input audio sample rate in Hz                     |
+| `audio_out_sample_rate`    | `int`                    | `24000` | Output audio sample rate in Hz                    |
+| `enable_metrics`           | `bool`                   | `False` | Whether to collect performance metrics            |
+| `enable_tracing`           | `bool`                   | `False` | Whether tracing is enabled                        |
+| `enable_usage_metrics`     | `bool`                   | `False` | Whether to collect usage metrics                  |
+| `observer`                 | `BaseObserver \| None`   | `None`  | The pipeline observer, if one is attached         |
+| `report_only_initial_ttfb` | `bool`                   | `False` | Whether to report only the first TTFB per service |
+| `tracing_context`          | `TracingContext \| None` | `None`  | Tracing context for distributed tracing           |
+
+`metrics_enabled`, `usage_metrics_enabled`, and `report_only_initial_ttfb` are also available as properties on the processor itself, and `processor_setup` returns the whole object once setup has run.
+
+<Warning>
+  Don't read this configuration off the `StartFrame` in `process_frame()`.
+  `StartFrame.audio_in_sample_rate` and its siblings are deprecated since v1.8.0
+  and removed in 2.0.0.
+</Warning>
+
+<Note>
+  Processors are set up **concurrently**, so a resource two of them share — the
+  client an input and output transport hold between them — needs guarding.
+  `acquires` and `releases` from `pipecat.utils.shared` do that: the first owner
+  to acquire runs the decorated method while the rest wait for it, and
+  `releases` runs only for the last owner to let go.
+</Note>
+
+A processor that raises while setting up pushes an `ErrorFrame` upstream, so the application learns its pipeline came up degraded. A processor that raises while being cleaned up no longer costs the rest of the pipeline its teardown — the failure is logged and every other processor is still released.
+
+## Holding frames until a condition is met
+
+A processor that establishes a connection during setup may receive frames before it is ready for them. `pause_processing_all_frames_until()` holds everything arriving at the processor until a condition resolves, then delivers it in order:
+
+```python
+async def setup(self, setup: FrameProcessorSetup):
+    await super().setup(setup)
+    self._ready = asyncio.Event()
+    await self.pause_processing_all_frames_until(self._ready.wait, timeout=10)
+```
+
+The pause takes effect from the frame _after_ the one being processed, so a `StartFrame` that triggers it still travels downstream. Both queues are held while it is in force, so give it a `timeout`; the pause is always lifted at cleanup.
+
 ## Critical Responsibility: Frame Forwarding
 
 FrameProcessors receive **all** frames that are pushed through the pipeline. This gives them a lot of power, but also a great responsibility. Critically, they must push all frames through the pipeline; if they don't, they block frames from moving through the Pipeline, which will cause issues in how your application functions.
@@ -38924,7 +38989,7 @@ Before using the Gnani STT services, you need:
 
 <ParamField path="sample_rate" type="int" default="None">
   Audio sample rate in Hz. One of `8000`, `16000`, `44100`, or `48000`. When
-  omitted, the rate is negotiated from `StartFrame`.
+  omitted, the rate is negotiated from the pipeline configuration.
 </ParamField>
 
 <ParamField path="keepalive_timeout" type="float" default="None">
@@ -41065,7 +41130,7 @@ Before using the Ringg AI STT service, you need:
 
 <ParamField path="sample_rate" type="int" default="None">
   Sample rate (Hz) of the audio to be streamed. If not provided, the value is
-  taken from the `StartFrame`.
+  taken from the pipeline configuration.
 </ParamField>
 
 <ParamField path="params" type="RinggSTTParams" default="None">
@@ -41584,7 +41649,7 @@ API key. See [Simplismart](https://simplismart.ai) to get started.
 </ParamField>
 
 <ParamField path="sample_rate" type="int" default="None">
-  Input audio sample rate. Usually supplied by the pipeline `StartFrame`.
+  Input audio sample rate. Usually supplied by the pipeline configuration.
 </ParamField>
 
 <ParamField
@@ -50933,8 +50998,8 @@ Before using the Floe TTS service, you need:
   **BYOK.** Your upstream vendor key, sent as the `X-Floe-Provider-Key` header.
   Floe routes the call on your key and bills only its service fee, while still
   metering the call and enforcing your spend caps. Omit for the keyless path.
-  Like `task_id`, it's attached via a custom `httpx` client; if you pass your own
-  `http_client`, add the header to it yourself.
+  Like `task_id`, it's attached via a custom `httpx` client; if you pass your
+  own `http_client`, add the header to it yourself.
 </ParamField>
 
 <ParamField path="kwargs">
@@ -51034,7 +51099,11 @@ uv add pipecat-gandr
   parameters](#input-parameters).
 </ParamField>
 
-<ParamField path="text_aggregation_mode" type="TextAggregationMode" default="None">
+<ParamField
+  path="text_aggregation_mode"
+  type="TextAggregationMode"
+  default="None"
+>
   How incoming text is aggregated before synthesis.
 </ParamField>
 
@@ -51062,18 +51131,18 @@ uv add pipecat-gandr
 
 Passed via `params=GandrTTSService.InputParams(...)`.
 
-| Parameter       | Type    | Default        | Description                                                                   |
-| --------------- | ------- | -------------- | ----------------------------------------------------------------------------- |
-| `voice_id`      | `str`   | `"gandr-mia"`  | A stock voice (see `STOCK_VOICES`) or a `gnd:` cloned-voice identifier.        |
-| `language`      | `str`   | `"en"`         | Bare two-letter code. See [Languages](#languages).                             |
-| `sample_rate`   | `int`   | `None`         | One of 8000, 16000, 22050, 24000. Takes priority over the constructor's value. |
-| `speed`         | `float` | `None`         | 0.6-1.5, pitch preserving.                                                     |
-| `volume`        | `float` | `None`         | 0.5-2.0, soft-ceiling mastered.                                                |
-| `temperature`   | `float` | `None`         | Expression control. Omit to let the service choose.                            |
-| `cfg_weight`    | `float` | `None`         | Expression control. Omit to send nothing at all.                               |
-| `seed`          | `int`   | `None`         | Accepted and forwarded to the engine; results are currently non-deterministic regardless of the value. |
-| `voice_wav_b64` | `str`   | `None`         | Base64 WAV reference audio for a cloned voice, registered on first utterance.  |
-| `word_timestamps` | `bool`  | `None`         | Ask for word-level timing: the closing frame then carries per-word offsets, fed into Pipecat's word-timestamp machinery. Requires `pipecat-gandr>=0.1.3`. |
+| Parameter         | Type    | Default       | Description                                                                                                                                               |
+| ----------------- | ------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `voice_id`        | `str`   | `"gandr-mia"` | A stock voice (see `STOCK_VOICES`) or a `gnd:` cloned-voice identifier.                                                                                   |
+| `language`        | `str`   | `"en"`        | Bare two-letter code. See [Languages](#languages).                                                                                                        |
+| `sample_rate`     | `int`   | `None`        | One of 8000, 16000, 22050, 24000. Takes priority over the constructor's value.                                                                            |
+| `speed`           | `float` | `None`        | 0.6-1.5, pitch preserving.                                                                                                                                |
+| `volume`          | `float` | `None`        | 0.5-2.0, soft-ceiling mastered.                                                                                                                           |
+| `temperature`     | `float` | `None`        | Expression control. Omit to let the service choose.                                                                                                       |
+| `cfg_weight`      | `float` | `None`        | Expression control. Omit to send nothing at all.                                                                                                          |
+| `seed`            | `int`   | `None`        | Accepted and forwarded to the engine; results are currently non-deterministic regardless of the value.                                                    |
+| `voice_wav_b64`   | `str`   | `None`        | Base64 WAV reference audio for a cloned voice, registered on first utterance.                                                                             |
+| `word_timestamps` | `bool`  | `None`        | Ask for word-level timing: the closing frame then carries per-word offsets, fed into Pipecat's word-timestamp machinery. Requires `pipecat-gandr>=0.1.3`. |
 
 Stock voices: `gandr-mia`, `gandr-ava`, `gandr-jenny`, `gandr-dane`,
 `gandr-leo`, `gandr-lewis`.
@@ -51085,8 +51154,8 @@ Examples: `en`, `es`, `fr`, `de`, `pt`, `ar`, `zh`, `ja`.
 
 <Warning>
   A region suffix such as `en-GB` or `zh-CN` is not recognised and the request
-  falls back to English **without raising an error**. If you are populating
-  this from a browser or OS locale, strip the region first.
+  falls back to English **without raising an error**. If you are populating this
+  from a browser or OS locale, strip the region first.
 </Warning>
 
 ## Usage example
@@ -51121,14 +51190,13 @@ waiting for that render to finish.
 ## Notes
 
 <Note>
-  **The first turn on a fresh connection is slower** while the
-  session voice cache fills. Every turn after it is materially quicker, which
-  is why the connection is held warm across turns. A benchmark that measures
-  only turn one is measuring the cache filling rather than the engine.
-  Gandr's published steady-state numbers: first audio byte in 146 ms over the
-  open internet, and 116 ms p50 first audio, server side warm. Both are
-  byte-arrival metrics rather than heard-sound timing: the engine's first
-  rendered chunk can be silence.
+  **The first turn on a fresh connection is slower** while the session voice
+  cache fills. Every turn after it is materially quicker, which is why the
+  connection is held warm across turns. A benchmark that measures only turn one
+  is measuring the cache filling rather than the engine. Gandr's published
+  steady-state numbers: first audio byte in 146 ms over the open internet, and
+  116 ms p50 first audio, server side warm. Both are byte-arrival metrics rather
+  than heard-sound timing: the engine's first rendered chunk can be silence.
 </Note>
 
 <Note>
@@ -51247,7 +51315,7 @@ SSE for chunked streaming, and WebSocket for interruptible real-time synthesis.
 
 <ParamField path="sample_rate" type="int" default="None">
   Output sample rate in Hz. One of `8000`, `16000`, `22050`, `24000`, `44100`,
-  or `48000`. When omitted, negotiated from `StartFrame`.
+  or `48000`. When omitted, negotiated from the pipeline configuration.
 </ParamField>
 
 <ParamField path="settings" type="Settings" default="None">
@@ -63807,12 +63875,12 @@ ships with the package.
 the voice-map vendor for each leg so STT / TTS / telephony are priced
 automatically:
 
-| Parameter | Description |
-| --- | --- |
-| `guard` | The `BudgetGuard` instance to enforce, e.g. `BudgetGuard(limit_usd=1.00)`. |
-| `stt_model` | Voice-map vendor key for the STT leg, e.g. `"deepgram-nova-3"` ($/sec). |
-| `tts_model` | Voice-map vendor key for the TTS leg, e.g. `"elevenlabs-flash-v2.5"` ($/1k chars). |
-| `telephony` | Voice-map vendor key for the telephony leg, e.g. `"twilio-us-inbound-local"` ($/min). |
+| Parameter            | Description                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `guard`              | The `BudgetGuard` instance to enforce, e.g. `BudgetGuard(limit_usd=1.00)`.                                                |
+| `stt_model`          | Voice-map vendor key for the STT leg, e.g. `"deepgram-nova-3"` ($/sec).                                                   |
+| `tts_model`          | Voice-map vendor key for the TTS leg, e.g. `"elevenlabs-flash-v2.5"` ($/1k chars).                                        |
+| `telephony`          | Voice-map vendor key for the telephony leg, e.g. `"twilio-us-inbound-local"` ($/min).                                     |
 | `on_budget_exceeded` | Optional async callback to speak a graceful "wrapping up" line before the pipeline stops. Omit for the default hard stop. |
 
 A leg with no vendor and no per-unit override is left un-metered; an unpriceable
@@ -64489,7 +64557,7 @@ Before using the Roark observer, you need:
 >
   Bring-your-own `AudioBufferProcessor` to control sample rate, channels, or
   buffer size. If omitted, the observer creates a default (stereo, ~256 KB
-  chunks; sample rate adopted from the pipeline's `StartFrame`) accessible via
+  chunks; sample rate adopted from the pipeline configuration) accessible via
   `observer.audio_processor`.
 </ParamField>
 
@@ -65772,8 +65840,8 @@ parameters as `HecttorFilter`, plus the two blend weights:
 </ParamField>
 
 <Warning>
-  Use `HecttorAudioProcessor` **instead of** `audio_in_filter` — combining
-  them enhances the audio twice.
+  Use `HecttorAudioProcessor` **instead of** `audio_in_filter` — combining them
+  enhances the audio twice.
 </Warning>
 
 Notes:
@@ -67560,7 +67628,7 @@ AudioBufferProcessor(
 
 <ParamField path="sample_rate" type="int | None" default="None">
   The desired output sample rate in Hz. If `None`, uses the transport's sample
-  rate from the `StartFrame`.
+  rate from the pipeline configuration.
 </ParamField>
 
 <ParamField path="num_channels" type="int" default="1">
@@ -69554,6 +69622,9 @@ All observers must inherit from `BaseObserver` and can implement these methods:
 - `on_push_frame(data: FramePushed)`: Called when a frame is pushed from one processor to another
 - `on_process_frame(data: FrameProcessed)`: Called when a frame is being processed by a processor
 - `on_pipeline_started()`: Called after the `StartFrame` has been processed by all processors in the pipeline
+- `on_processor_setup(data: ProcessorSetUp)`: Called once each processor has been set up
+
+`ProcessorSetUp` carries the `processor` and the `started_at_ns` / `finished_at_ns` bracketing its `setup()`. Services connect during setup, so this is where that cost can be measured. Processors are set up concurrently, so these arrive in completion order rather than pipeline order, and the times come from `time.monotonic_ns()` because the pipeline clock isn't running yet.
 
 ```python
 from pipecat.observers.base_observer import BaseObserver, FramePushed, FrameProcessed
@@ -69857,11 +69928,11 @@ Source: https://docs.pipecat.ai/api-reference/server/utilities/observers/startup
 
 Measure processor startup times and transport readiness during pipeline initialization
 
-The `StartupTimingObserver` measures how long each processor's `start()` method takes during pipeline startup, and tracks transport connection timing. This is useful for diagnosing startup slowness and identifying initialization bottlenecks such as WebSocket connections, API authentication, or model loading.
+The `StartupTimingObserver` measures what each processor costs to get ready — its `setup()` and its `start()` together — and tracks transport connection timing. This is useful for diagnosing startup slowness and identifying initialization bottlenecks such as WebSocket connections, API authentication, or model loading.
 
 ## Features
 
-- Measures per-processor `start()` duration by tracking `StartFrame` propagation
+- Measures per-processor readiness cost, from `setup()` through `StartFrame` propagation
 - Reports total pipeline startup time and per-processor breakdown
 - Tracks transport connection milestones (bot connected, client connected)
 - Emits `on_startup_timing_report` with processor timing data
@@ -69940,23 +70011,24 @@ async def on_startup_timing_report(observer, report):
 
 **Report fields (`StartupTimingReport`):**
 
-| Field                 | Type                           | Description                                            |
-| --------------------- | ------------------------------ | ------------------------------------------------------ |
-| `start_time`          | `float`                        | Unix timestamp when the first processor began starting |
-| `total_duration_secs` | `float`                        | Sum of all measured processor `start()` durations      |
-| `processor_timings`   | `List[ProcessorStartupTiming]` | Per-processor timing data, in pipeline order           |
+| Field                 | Type                           | Description                                                                                                                                                   |
+| --------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `start_time`          | `float`                        | Unix timestamp when the pipeline began setting up                                                                                                             |
+| `total_duration_secs` | `float`                        | Wall-clock span from the pipeline starting to set up until it had started. Processors set up concurrently, so this is the span, not the sum of what each cost |
+| `processor_timings`   | `List[ProcessorStartupTiming]` | Per-processor timing data, in pipeline order                                                                                                                  |
 
 **Processor timing fields (`ProcessorStartupTiming`):**
 
-| Field               | Type    | Description                                                     |
-| ------------------- | ------- | --------------------------------------------------------------- |
-| `processor_name`    | `str`   | The name of the processor                                       |
-| `start_offset_secs` | `float` | Offset from the StartFrame to when this processor's start began |
-| `duration_secs`     | `float` | How long the processor's `start()` took                         |
+| Field                 | Type    | Description                                                                    |
+| --------------------- | ------- | ------------------------------------------------------------------------------ |
+| `processor_name`      | `str`   | The name of the processor                                                      |
+| `start_offset_secs`   | `float` | Offset from the `StartFrame` to when this processor's `start()` began          |
+| `duration_secs`       | `float` | What the processor cost to get ready: its `setup()` and its `start()` together |
+| `setup_duration_secs` | `float` | How long `setup()` took — the part of `duration_secs` spent connecting         |
 
 ### on_transport_timing_report
 
-Called once when the first client connects, with transport connection timing relative to the `StartFrame`.
+Called once when the first client connects, with transport connection timing measured from the moment the pipeline began setting up.
 
 ```python
 @observer.event_handler("on_transport_timing_report")
@@ -69969,11 +70041,11 @@ async def on_transport_timing_report(observer, report):
 
 **Report fields (`TransportTimingReport`):**
 
-| Field                   | Type              | Description                                                          |
-| ----------------------- | ----------------- | -------------------------------------------------------------------- |
-| `start_time`            | `float`           | Unix timestamp of the StartFrame (pipeline start)                    |
-| `bot_connected_secs`    | `Optional[float]` | Seconds from StartFrame to `BotConnectedFrame` (SFU transports only) |
-| `client_connected_secs` | `Optional[float]` | Seconds from StartFrame to first `ClientConnectedFrame`              |
+| Field                   | Type              | Description                                                              |
+| ----------------------- | ----------------- | ------------------------------------------------------------------------ |
+| `start_time`            | `float`           | Unix timestamp when the pipeline began setting up                        |
+| `bot_connected_secs`    | `Optional[float]` | Seconds from start of setup to `BotConnectedFrame` (SFU transports only) |
+| `client_connected_secs` | `Optional[float]` | Seconds from start of setup to first `ClientConnectedFrame`              |
 
 <Note>
   `bot_connected_secs` is only set for SFU transports (Daily, LiveKit, HeyGen,
@@ -77754,36 +77826,24 @@ SystemFrames have higher priority than DataFrames and ControlFrames and are neve
 
 ### StartFrame
 
-The first frame pushed into a pipeline, initializing all processors. Every processor receives this before any DataFrames or ControlFrames arrive.
+The first frame pushed into a pipeline, marking the point at which frames start flowing. Every processor receives this before any DataFrames or ControlFrames arrive; a processor holds anything that reaches it earlier and delivers it, in arrival order, once the `StartFrame` has passed.
 
-<ParamField path="audio_in_sample_rate" type="int" default="16000">
-  Input audio sample rate in Hz.
-</ParamField>
+Pipeline configuration reaches processors through [`FrameProcessorSetup`](/pipecat/fundamentals/custom-frame-processor#frameprocessorsetup) in `setup()`, which runs before this frame.
 
-<ParamField path="audio_out_sample_rate" type="int" default="24000">
-  Output audio sample rate in Hz.
-</ParamField>
+<Warning>
+  Reading `audio_in_sample_rate`, `audio_out_sample_rate`, `enable_metrics`,
+  `enable_tracing`, `enable_usage_metrics`, `report_only_initial_ttfb`, or
+  `tracing_context` off a `StartFrame` is deprecated since v1.8.0 and warns.
+  These fields are removed in 2.0.0 — read them from the `FrameProcessorSetup`
+  passed to `setup()` instead:
 
-<ParamField path="enable_metrics" type="bool" default="False">
-  Enable performance metrics collection from processors.
-</ParamField>
+```python
+async def setup(self, setup: FrameProcessorSetup):
+    await super().setup(setup)
+    self._sample_rate = setup.audio_out_sample_rate
+```
 
-<ParamField path="enable_tracing" type="bool" default="False">
-  Enable tracing for pipeline execution.
-</ParamField>
-
-<ParamField path="enable_usage_metrics" type="bool" default="False">
-  Enable usage metrics (token counts, API calls) from services.
-</ParamField>
-
-<ParamField path="report_only_initial_ttfb" type="bool" default="False">
-  When `True`, only report time-to-first-byte for the initial response rather
-  than every response.
-</ParamField>
-
-<ParamField path="tracing_context" type="TracingContext | None" default="None">
-  Optional tracing context for distributed tracing integration.
-</ParamField>
+</Warning>
 
 ### CancelFrame
 
@@ -78132,7 +78192,7 @@ Updates the user idle timeout at runtime. Setting the timeout to `0` disables id
 
 ### MetricsFrame
 
-Performance metrics collected from processors. Emitted when metrics reporting is enabled via `StartFrame`.
+Performance metrics collected from processors. Emitted when metrics reporting is enabled in the pipeline configuration.
 
 <ParamField path="data" type="List[MetricsData]" required>
   List of metrics data entries.
@@ -80383,7 +80443,7 @@ params = PipelineParams(
 
 The parameters you set in `PipelineParams` are passed to various components of the pipeline:
 
-1. **StartFrame**: Many parameters are included in the StartFrame that initializes the pipeline
+1. **Processor setup**: Many parameters reach processors through the `FrameProcessorSetup` passed to `setup()`
 2. **Metrics Collection**: Metrics settings configure what performance data is gathered
 3. **Heartbeat Monitoring**: Controls the pipeline's health monitoring system
 4. **Audio Processing**: Sample rates affect how audio is processed throughout the pipeline
@@ -80559,6 +80619,17 @@ await runner.run(worker)
   for details.
 </ParamField>
 
+<ParamField path="setup_timeout_secs" type="float" default="20.0">
+  How long to wait for every processor to finish setting up. A processor that
+  blocks while connecting would otherwise leave `run()` waiting on it forever;
+  when the wait runs out the pipeline reports `on_setup_timeout` and tears down.
+</ParamField>
+
+<ParamField path="start_timeout_secs" type="float" default="20.0">
+  How long to wait for the `StartFrame` to reach the end of the pipeline. When
+  the wait runs out the pipeline reports `on_pipeline_timeout`.
+</ParamField>
+
 <ParamField
   path="processor_unusable_policy"
   type="ProcessorUnusablePolicy"
@@ -80722,6 +80793,8 @@ PipelineWorker provides event handlers for monitoring pipeline lifecycle and fra
 | `on_pipeline_started`         | Pipeline has started processing                                       |
 | `on_pipeline_finished`        | Pipeline reached a terminal state                                     |
 | `on_pipeline_error`           | An error frame reached the pipeline worker                            |
+| `on_setup_timeout`            | Processors never finished setting up                                  |
+| `on_pipeline_timeout`         | A frame the worker was waiting on never arrived                       |
 | `on_frame_reached_upstream`   | A filtered frame type reached the pipeline source                     |
 | `on_frame_reached_downstream` | A filtered frame type reached the pipeline sink                       |
 | `on_heartbeat_timeout`        | No heartbeat received within the monitor timeout (pipeline may stall) |
@@ -80765,6 +80838,39 @@ async def on_pipeline_finished(worker, frame):
 | --------- | ---------------- | -------------------------------------------------------------- |
 | `worker`  | `PipelineWorker` | The pipeline worker instance                                   |
 | `frame`   | `Frame`          | The terminal frame (`EndFrame`, `StopFrame`, or `CancelFrame`) |
+
+### on_setup_timeout
+
+Fired when the processors never finish setting up within `setup_timeout_secs`. The pipeline is torn down afterwards. Takes no frame — nothing has flowed yet.
+
+```python
+@worker.event_handler("on_setup_timeout")
+async def on_setup_timeout(worker):
+    print("A processor never finished connecting")
+```
+
+**Parameters:**
+
+| Parameter | Type             | Description                  |
+| --------- | ---------------- | ---------------------------- |
+| `worker`  | `PipelineWorker` | The pipeline worker instance |
+
+### on_pipeline_timeout
+
+Fired when a frame the worker was waiting on never arrived — a `StartFrame` that never reached the end of the pipeline within `start_timeout_secs`, or a `CancelFrame` that never drained. Inspect `frame` to tell the two apart.
+
+```python
+@worker.event_handler("on_pipeline_timeout")
+async def on_pipeline_timeout(worker, frame):
+    print(f"Timed out waiting for {frame}")
+```
+
+**Parameters:**
+
+| Parameter | Type             | Description                    |
+| --------- | ---------------- | ------------------------------ |
+| `worker`  | `PipelineWorker` | The pipeline worker instance   |
+| `frame`   | `Frame`          | The frame the worker waited on |
 
 ### on_pipeline_error
 
