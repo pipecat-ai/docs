@@ -789,7 +789,7 @@ stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 tts = CartesiaTTSService(
     api_key=os.getenv("CARTESIA_API_KEY"),
     settings=CartesiaTTSService.Settings(
-        voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
+        voice=os.getenv("CARTESIA_VOICE_ID", "86e30c1d-714b-4074-a1f2-1cb6b552fb49"),
     ),
 )
 llm = OpenAIResponsesLLMService(
@@ -2186,7 +2186,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     tts = CartesiaTTSService(
         api_key=os.environ["CARTESIA_API_KEY"],
         settings=CartesiaTTSService.Settings(
-            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+            voice="86e30c1d-714b-4074-a1f2-1cb6b552fb49",
         ),
     )
 
@@ -4203,12 +4203,6 @@ llm = YourLLMService(
 
 Runtime settings are covered in [Service Settings](/pipecat/fundamentals/service-settings).
 
-<Warning>
-  `enable_async_tool_cancellation` is deprecated and will be removed in 2.0.0.
-  Set `cancellable_by_llm=True` on the tools that should be cancellable instead
-  — see [Function Calling](/pipecat/learn/function-calling).
-</Warning>
-
 ## Event Handlers
 
 LLM services provide event handlers for monitoring completion lifecycle:
@@ -4410,7 +4404,8 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
 **Options:**
 
 - **`cancel_on_interruption`** (default `True`): When `True`, the call is cancelled if the user interrupts. When `False`, the call is treated as **asynchronous** — see below.
-- **`timeout_secs`** (default `None`): Per-tool timeout in seconds. Overrides the global `function_call_timeout_secs` for this function. Use a longer timeout for slow operations (e.g. database queries) or a shorter one for quick lookups.
+- **`timeout_secs`** (default `None`): Per-tool timeout in seconds. Overrides the global `function_call_timeout_secs` for this function. Use a longer timeout for slow operations (e.g. database queries) or a shorter one for quick lookups. A call that runs past its deadline is cancelled: the handler is thrown an `asyncio.CancelledError` so it can clean up, the call settles as cancelled, and inference runs so the bot can say it didn't complete. The deadline covers the handler's own execution — work it spawns into a task of its own isn't cancelled with it.
+- **`cancellable_by_llm`** (default `False`): Lets the model stop this call while it runs. Only meaningful with `cancel_on_interruption=False` — see below.
 
 <Note>
   `@tool_options` also sets call options on the handler of a
@@ -4432,16 +4427,27 @@ With `cancel_on_interruption=False`, the call is **asynchronous**: the LLM conti
 
 #### Async function call cancellation
 
-For async functions (`cancel_on_interruption=False`), you can also enable model-directed cancellation:
+An async function (`cancel_on_interruption=False`) can also be made cancellable by the model, for the case where the user changes their request before a long-running lookup completes:
 
 ```python
-llm = OpenAILLMService(
-    api_key="your-api-key",
-    enable_async_tool_cancellation=True,
-)
+@tool_options(cancel_on_interruption=False, cancellable_by_llm=True, timeout_secs=120)
+async def write_report(params: FunctionCallParams, topic: str):
+    ...
 ```
 
-When `enable_async_tool_cancellation=True` and at least one async function is available, Pipecat automatically adds the built-in `cancel_async_tool_call` tool and supporting system instructions. The LLM can call that tool to cancel a stale in-progress async function call — for example, when the user changes their request before a long-running lookup completes.
+For each cancellable tool, Pipecat advertises a matching `cancel_<name>` tool — `cancel_write_report` here — alongside supporting system instructions. Calling it with no arguments stops the running call; a `tool_call_id` is only needed to pick one out when several calls of the same tool are in flight.
+
+`cancellable_by_llm` only does something in combination with `cancel_on_interruption=False`. A synchronous call blocks the LLM, so there is no moment at which it could ask for the cancellation, and the work has to outlast the model's round trip to the cancel tool to be worth stopping.
+
+<Warning>
+  Setting `cancellable_by_llm` per tool replaces the LLM service's
+  `enable_async_tool_cancellation` flag, which treated every async tool as
+  cancellable. The flag is deprecated and will be removed in 2.0.0. Whether a
+  tool runs long enough to be worth stopping, and whether the model can be
+  trusted to judge that its result is no longer wanted, are per-tool questions —
+  a model that cancels too readily discards a result the user was waiting on
+  without mentioning it.
+</Warning>
 
 ## Parallel and Multiple Tool Calls
 
@@ -4896,7 +4902,7 @@ Intermediate results are injected into the LLM context as async-tool developer m
 - **Function calling extends LLM capabilities** beyond training data to real-time information
 - **Context integration is automatic** - function calls and results are stored in conversation history
 - **Direct functions are the preferred approach** - one async function is both schema and handler; list it in `LLMContext(tools=[...])` or add it via `LLMSetToolsFrame` to make it available. When you need explicit schema control, use a `FunctionSchema` with its `handler` bundled in
-- **Async function calls are opt-in** - set `cancel_on_interruption=False` for deferred results, intermediate updates, and optional async-tool cancellation
+- **Async function calls are opt-in** - set `cancel_on_interruption=False` for deferred results and intermediate updates, and add `cancellable_by_llm=True` to let the model stop a call
 - **Pipeline integration is seamless** - functions work within your existing voice AI architecture
 - **Advanced control available** - fine-tune LLM execution and monitor function call lifecycle
 
@@ -5065,28 +5071,10 @@ tts = YourTTSService(
   audio is playing or still on its way.
 - **`transport_destination`**: Destination for the generated audio frames.
 
-<Note>
-  A provider can accept every request and answer with silence — an unknown voice
-  ID, say — without reporting an error, leaving the bot mute with nothing in the
-  logs. Each silent context reports an error the service can carry on from; on
-  reaching `max_consecutive_zero_audio_contexts` it reports a permanent error
-  instead, stops being given work, and the pipeline worker applies its
-  [`ProcessorUnusablePolicy`](/api-reference/server/pipeline/pipeline-worker). A
-  [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher)
-  fails over at that point.
-</Note>
-
 Text handling — `text_aggregation_mode`, `text_transforms`, `text_filters`, and
 `skip_aggregator_types` — is covered in
 [Text Processing and Filtering](#text-processing-and-filtering) below. Runtime
 settings are covered in [Service Settings](/pipecat/fundamentals/service-settings).
-
-<Warning>
-  `aggregate_sentences` and `pause_watchdog_timeout_s` are deprecated and will
-  be removed in 2.0.0. Use `text_aggregation_mode` in place of
-  `aggregate_sentences`; `pause_watchdog_timeout_s` has no replacement and does
-  nothing when passed.
-</Warning>
 
 ### Pipeline-Level Audio Configuration
 
@@ -6759,7 +6747,7 @@ async def run_bot(transport, runner_args):
     tts = CartesiaTTSService(
         api_key=os.environ["CARTESIA_API_KEY"],
         settings=CartesiaTTSService.Settings(
-            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+            voice="86e30c1d-714b-4074-a1f2-1cb6b552fb49",
         ),
     )
 
@@ -7205,7 +7193,7 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 tts = CartesiaTTSService(
     api_key=os.getenv("CARTESIA_API_KEY"),
     settings=CartesiaTTSService.Settings(
-        voice="71a7ad14-091c-4e8e-a314-022ece01c121",
+        voice="86e30c1d-714b-4074-a1f2-1cb6b552fb49",
     ),
 )
 ```
@@ -7336,7 +7324,7 @@ from pipecat.services.cartesia.tts import CartesiaTTSService, GenerationConfig
 tts = CartesiaTTSService(
     api_key=os.getenv("CARTESIA_API_KEY"),
     settings=CartesiaTTSService.Settings(
-        voice="71a7ad14-091c-4e8e-a314-022ece01c121",
+        voice="86e30c1d-714b-4074-a1f2-1cb6b552fb49",
         generation_config=GenerationConfig(speed=1.2, emotion="excited"),
     ),
 )
@@ -10790,7 +10778,7 @@ Scenarios are YAML files, so they're easy to write, review, and share. Everythin
 ## Requirements
 
 - **Pipecat CLI**: the `pipecat eval` commands ship with the CLI extra: `uv tool install "pipecat-ai[cli]"`. If you've added `pipecat-ai[cli]` to your project instead, run them with `uv run pipecat eval` (just like `uv run bot.py`). The same commands are also available as `python -m pipecat.evals`.
-- **A judge LLM** (for `eval:` assertions): Ollama by default (`ollama pull gemma2:9b`), or point the scenario's `judge:` block at OpenAI or any OpenAI-compatible endpoint.
+- **A judge LLM** (for `eval:` assertions): Ollama by default (`ollama pull gemma4:12b`), or point the scenario's `judge:` block at OpenAI or any OpenAI-compatible endpoint.
 - **Audio services** (audio mode only): the harness needs a TTS to synthesize the user's voice and an STT to transcribe the agent's speech. Both can be local models or HTTP-based services; the defaults are local (Kokoro and Moonshine or Whisper, installed with `uv add "pipecat-ai[kokoro,moonshine]"` or `uv add "pipecat-ai[kokoro,whisper]"`), which download once on first use and run with no keys and no per-run cost. WebSocket-streaming services aren't supported here, which keeps the harness simple.
 - **Your agent's own credentials**: the agent under test is your real agent, so it needs the same service API keys it normally would.
 
@@ -11160,7 +11148,7 @@ This guide takes an existing agent, starts it with the eval transport, and runs 
 - A working Pipecat agent that uses `create_transport()` and the development runner (the standard pattern from the [quickstart](/pipecat/get-started/quickstart) and all Pipecat examples), with its usual service API keys in `.env`.
 - The Pipecat CLI: `uv tool install "pipecat-ai[cli]"` (or add `pipecat-ai[cli]` to your project and run the commands below with `uv run pipecat eval`).
 - A judge LLM. Either:
-  - **Ollama** (local, the default): install [Ollama](https://ollama.com) and run `ollama pull gemma2:9b`, or
+  - **Ollama** (local, the default): install [Ollama](https://ollama.com) and run `ollama pull gemma4:12b`, or
   - **OpenAI**: set `OPENAI_API_KEY` and point the scenario's `judge:` block at it (shown below).
 
 <Steps>
@@ -11248,7 +11236,7 @@ This guide takes an existing agent, starts it with the eval transport, and runs 
     This scenario runs in **text mode** (the default): the user turn is sent as text and the agent's TTS is skipped automatically, so the whole conversation costs nothing in audio services and finishes in seconds.
 
     <Note>
-      Ollama with `gemma2:9b` is the default judge, which is why the first tab
+      Ollama with `gemma4:12b` is the default judge, which is why the first tab
       has no `judge:` block. To use a different judge LLM, add a `judge.eval:`
       block as in the OpenAI tab.
     </Note>
@@ -11318,7 +11306,8 @@ name: multi_turn # required: the eval's name
 judge: # optional: judge modality and LLM (defaults shown below)
   eval:
     service: ollama
-    model: gemma2:9b
+    model: gemma4:12b
+    extra: { reasoning_effort: none }
 
 turns: # required: the conversation, in order
   - user: "My name is Alex, and I'm planning a trip to Italy."
@@ -11364,7 +11353,7 @@ Two top-level blocks control a scenario's modalities, and each has its own `moda
 
 When `modality:` isn't specified, or a block is omitted entirely, it defaults to `text`. The two sides are also independent: you can drive the agent with text while judging its real speech, or speak to it and judge the LLM text.
 
-A scenario with neither block runs entirely in text mode. No audio flows on either side, so this is the fastest and cheapest way to test prompts, conversational logic, and function calling: no audio service cost, and a multi-turn scenario finishes in seconds. The judge LLM is the only service the harness itself needs (Ollama with `gemma2:9b` by default).
+A scenario with neither block runs entirely in text mode. No audio flows on either side, so this is the fastest and cheapest way to test prompts, conversational logic, and function calling: no audio service cost, and a multi-turn scenario finishes in seconds. The judge LLM is the only service the harness itself needs (Ollama with `gemma4:12b` by default).
 
 <Note>
   The top-level `user:` block here only configures delivery. Each turn's `user:`
@@ -11416,7 +11405,7 @@ judge:
     model: small-streaming
   eval:
     service: ollama # the judge LLM
-    model: gemma2:9b
+    model: gemma4:12b
 ```
 
 <Note>
@@ -11424,7 +11413,23 @@ judge:
   When `transcription.service:` is omitted, it defaults to `moonshine`.
 </Note>
 
-In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma2:9b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`. This is the LLM that decides [`eval:`](#semantic-judging-with-eval) assertions.
+In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma4:12b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`. This is the LLM that decides [`eval:`](#semantic-judging-with-eval) assertions.
+
+An `extra:` mapping is forwarded to the judge as top-level request parameters, which is how provider-specific options reach it. The default judge is thinking-capable and only its JSON verdict is ever read, so the default `extra:` turns reasoning off — it buys nothing while costing latency and eating into the token budget the verdict needs.
+
+<Note>
+  Naming a `model:` without an `extra:` drops the defaults rather than merging
+  with them, since they are chosen for the default model. To pin an older judge,
+  set only what it needs:
+
+```yaml
+judge:
+  eval:
+    service: ollama
+    model: gemma2:9b # no extra: — gemma2 isn't thinking-capable
+```
+
+</Note>
 
 ### Custom services with `factory:`
 
@@ -32627,9 +32632,17 @@ webrtc_connection = SmallWebRTCConnection(
 
 ### Using ICE servers with the development runner
 
-If you start your bot with the [development runner](/api-reference/server/utilities/runner/guide) (`from pipecat.runner.run import main`), the runner builds the `SmallWebRTCConnection` for you, so you cannot pass `ice_servers` from your `bot()` function. The only ICE option the runner exposes is the `enableDefaultIceServers` flag in the client's `/start` request, which adds Google's public STUN server (`stun:stun.l.google.com:19302`) and nothing else. There is no built-in way to inject a custom STUN or TURN server through the default runner.
+If you start your bot with the [development runner](/api-reference/server/utilities/runner/guide) (`from pipecat.runner.run import main`), the runner builds the `SmallWebRTCConnection` for you. Name the servers when you start the bot instead of passing `ice_servers` from your `bot()` function:
 
-To use a custom TURN server, run your own signaling server that creates the `SmallWebRTCConnection` directly with `ice_servers=[...]`, as shown in [Server-side configuration](#server-side-configuration) above.
+```bash
+python bot.py -t webrtc \
+  --ice-servers stun:stun.l.google.com:19302 \
+  '{"urls": "turn:turn.example.com:3478", "username": "user", "credential": "pass"}'
+```
+
+Each entry is a bare STUN or TURN URL, or a JSON object with `urls` and, for a TURN server that needs them, `username` and `credential`. The same values can come from the `PIPECAT_ICE_SERVERS` environment variable, which takes them comma-separated or as a JSON array.
+
+The runner uses these for its own candidate gathering and hands them to the client in the `/start` response, so both ends of the connection use the same servers. They take precedence over the `enableDefaultIceServers` flag in the client's `/start` request, which adds Google's public STUN server and nothing else. Without either, the bot gathers host candidates only.
 
 <Note>
   In production, WebRTC applications must run over HTTPS. Browsers block WebRTC
@@ -34111,15 +34124,16 @@ You can create custom serializers by implementing the `FrameSerializer` base cla
 
 ```python
 from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
-from pipecat.frames.frames import Frame, StartFrame
+from pipecat.frames.frames import Frame
+from pipecat.processors.frame_processor import FrameProcessorSetup
 
 class MyCustomSerializer(FrameSerializer):
     @property
     def type(self) -> FrameSerializerType:
         return FrameSerializerType.TEXT  # or BINARY
 
-    async def setup(self, frame: StartFrame):
-        # Initialize with pipeline configuration
+    async def setup(self, setup: FrameProcessorSetup):
+        # Read pipeline configuration, e.g. setup.audio_out_sample_rate
         pass
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
@@ -34223,7 +34237,7 @@ Passed via the `params` constructor argument using
 | --------------------- | -------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `media_format`        | `AcefoneMediaFormat` | `ULAW`  | Wire audio format. `ULAW` = 8kHz G.711 μ-law; `PCM` = 16-bit linear PCM (`slin16`).                                            |
 | `acefone_sample_rate` | `int`                | `8000`  | Sample rate of the Acefone/Smartflo media stream (Hz).                                                                         |
-| `sample_rate`         | `int`                | `0`     | Pipeline input sample rate override. When `0`, the rate is taken from the `StartFrame` during setup.                           |
+| `sample_rate`         | `int`                | `0`     | Pipeline input sample rate override. When `0`, the rate comes from the pipeline configuration during setup.                    |
 | `stream_sid`          | `str`                | `None`  | The Media Stream SID for the call. Typically parsed from the initial `start` message; captured automatically from it if unset. |
 | `call_sid`            | `str`                | `None`  | The associated Call SID. Required when `auto_hang_up` is enabled.                                                              |
 | `auto_hang_up`        | `bool`               | `False` | Terminate the call via a websocket `end` event on the first `EndFrame`/`CancelFrame`.                                          |
@@ -50128,9 +50142,9 @@ export ELEVENLABS_API_KEY=your_api_key
 </ParamField>
 
 <ParamField path="model" type="str" default="eleven_flash_v2_5" deprecated>
-  ElevenLabs model ID. Use a `multilingual` model variant (e.g.
-  `eleven_multilingual_v2`) if you need non-English language support.
-  _Deprecated in v0.0.105. Use
+  ElevenLabs model ID. To set `language` explicitly, use one of the models that
+  accept a language code — `eleven_flash_v2_5`, `eleven_turbo_v2_5`,
+  `eleven_v3`, or `eleven_v3_conversational`. _Deprecated in v0.0.105. Use
   `settings=ElevenLabsTTSService.Settings(model=...)` instead._
 </ParamField>
 
@@ -50275,17 +50289,17 @@ The HTTP service uses `ElevenLabsHttpTTSSettings` which also includes:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `ElevenLabsTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter                  | Type              | Default     | Description                                                                                       |
-| -------------------------- | ----------------- | ----------- | ------------------------------------------------------------------------------------------------- |
-| `model`                    | `str`             | `None`      | ElevenLabs model identifier. _(Inherited from base settings.)_                                    |
-| `voice`                    | `str`             | `None`      | Voice identifier. _(Inherited from base settings.)_                                               |
-| `language`                 | `Language \| str` | `None`      | Language code. Only effective with multilingual models. _(Inherited from base settings.)_         |
-| `stability`                | `float`           | `NOT_GIVEN` | Voice consistency (0.0–1.0). Lower values are more expressive, higher values are more consistent. |
-| `similarity_boost`         | `float`           | `NOT_GIVEN` | Voice clarity and similarity to the original (0.0–1.0).                                           |
-| `style`                    | `float`           | `NOT_GIVEN` | Style exaggeration (0.0–1.0). Higher values amplify the voice's style.                            |
-| `use_speaker_boost`        | `bool`            | `NOT_GIVEN` | Enhance clarity and target speaker similarity.                                                    |
-| `speed`                    | `float`           | `NOT_GIVEN` | Speech rate. WebSocket: 0.7–1.2. HTTP: 0.25–4.0.                                                  |
-| `apply_text_normalization` | `Literal`         | `NOT_GIVEN` | Text normalization: `"auto"`, `"on"`, or `"off"`.                                                 |
+| Parameter                  | Type              | Default     | Description                                                                                             |
+| -------------------------- | ----------------- | ----------- | ------------------------------------------------------------------------------------------------------- |
+| `model`                    | `str`             | `None`      | ElevenLabs model identifier. _(Inherited from base settings.)_                                          |
+| `voice`                    | `str`             | `None`      | Voice identifier. _(Inherited from base settings.)_                                                     |
+| `language`                 | `Language \| str` | `None`      | Language code. Applies to the four models that accept one; see Notes. _(Inherited from base settings.)_ |
+| `stability`                | `float`           | `NOT_GIVEN` | Voice consistency (0.0–1.0). Lower values are more expressive, higher values are more consistent.       |
+| `similarity_boost`         | `float`           | `NOT_GIVEN` | Voice clarity and similarity to the original (0.0–1.0).                                                 |
+| `style`                    | `float`           | `NOT_GIVEN` | Style exaggeration (0.0–1.0). Higher values amplify the voice's style.                                  |
+| `use_speaker_boost`        | `bool`            | `NOT_GIVEN` | Enhance clarity and target speaker similarity.                                                          |
+| `speed`                    | `float`           | `NOT_GIVEN` | Speech rate. WebSocket: 0.7–1.2. HTTP: 0.25–4.0.                                                        |
+| `apply_text_normalization` | `Literal`         | `NOT_GIVEN` | Text normalization: `"auto"`, `"on"`, or `"off"`.                                                       |
 
 <Note>
   `NOT_GIVEN` values use the ElevenLabs API defaults. See [ElevenLabs voice
@@ -50301,7 +50315,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | ----------- | ----------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`     | `str`             | `"eleven_v3_conversational"` | Must be an Eleven v3 model (`eleven_v3` or `eleven_v3_conversational`); anything else logs a warning.                                                                                     |
 | `voice`     | `str`             | `None`                       | Voice identifier.                                                                                                                                                                         |
-| `language`  | `Language \| str` | `None`                       | Language code. Eleven v3 covers a broader language set than the v2.5 models.                                                                                                              |
+| `language`  | `Language \| str` | `None`                       | Language code. Eleven v3 covers 74 languages; the v2.5 models cover 32.                                                                                                                   |
 | `stability` | `float`           | `NOT_GIVEN`                  | Voice stability (0.0–1.0). `0.0` is most expressive but can hallucinate, `0.5` stays closest to the reference recording, and `1.0` is most consistent but least responsive to audio tags. |
 
 ## Usage
@@ -50326,7 +50340,7 @@ tts = ElevenLabsTTSService(
     api_key=os.getenv("ELEVENLABS_API_KEY"),
     settings=ElevenLabsTTSService.Settings(
         voice="21m00Tcm4TlvDq8ikWAM",
-        model="eleven_multilingual_v2",
+        model="eleven_flash_v2_5",
         language=Language.ES,
         stability=0.7,
         similarity_boost=0.8,
@@ -50392,7 +50406,7 @@ tts = ElevenLabsDialogueTTSService(
 
 ## Notes
 
-- **Multilingual models required for `language`**: Setting `language` with a non-multilingual model (e.g. `eleven_flash_v2_5`) has no effect. Use `eleven_multilingual_v2` or similar.
+- **Models that accept `language`**: Four models take a language code — `eleven_flash_v2_5` and `eleven_turbo_v2_5` cover 32 languages, and `eleven_v3` and `eleven_v3_conversational` cover 74, a superset that adds Farsi, Pashto, and Sindhi among others. Any other model, `eleven_multilingual_v2` included, detects the language from the text itself; setting `language` there logs a warning and the code is dropped. A code the model doesn't cover is dropped the same way.
 - **WebSocket vs HTTP**: The WebSocket service supports word-level timestamps and interruption handling, making it significantly better for interactive conversations. The HTTP service is simpler but lacks these features.
 - **Text aggregation**: Sentence aggregation is enabled by default (`text_aggregation_mode=TextAggregationMode.SENTENCE`). Buffering until sentence boundaries produces more natural speech. Set `text_aggregation_mode=TextAggregationMode.TOKEN` to stream tokens directly for lower latency. The `auto_mode` parameter is automatically configured based on the aggregation mode for optimal quality.
 - **Word timestamp accuracy**: Word timestamps reflect the original input text by default, preserving non-Latin scripts in transcripts and LLM context. Text normalization (`apply_text_normalization`) does not affect which alignment field is used.
@@ -70375,6 +70389,12 @@ Options:
   --allowed-origins [ORIGIN] Allowed origins for HTTP and WebSocket connections.
                              Can be specified multiple times. Omit or leave empty to allow
                              all origins. Defaults to PIPECAT_ALLOWED_ORIGINS env var.
+  --ice-servers [SERVER]     STUN and TURN servers for the WebRTC transport, as bare URLs
+                             (stun:stun.l.google.com:19302) or, when TURN needs credentials,
+                             JSON objects ('{"urls": "turn:...", "username": "u",
+                             "credential": "p"}'). Defaults to PIPECAT_ICE_SERVERS, which takes
+                             the same entries comma-separated or as a JSON array. Without this
+                             the bot gathers host candidates only.
   --esp32                    Enable SDP munging for ESP32 WebRTC compatibility
   -d, --direct               Connect directly to Daily room for testing (automatically sets transport to daily)
   --dialin                   Enable Daily PSTN dial-in webhook handling
@@ -70505,15 +70525,14 @@ If you started the runner with `-t <transport>`, a `/start` request for any othe
 }
 ```
 
-Returns a `sessionId` (and an `iceConfig` when `enableDefaultIceServers` is set). The bot starts when the WebRTC offer arrives.
+Returns a `sessionId`, plus an `iceConfig` when the runner was started with `--ice-servers` or the client set `enableDefaultIceServers`. The bot starts when the WebRTC offer arrives.
 
 <Note>
-  `enableDefaultIceServers` is the only ICE option the runner exposes, and it
-  adds Google's public STUN server (`stun:stun.l.google.com:19302`) and nothing
-  else. The runner builds the `SmallWebRTCConnection` for you, so you cannot
-  pass a custom STUN or TURN server from your `bot()` function. To use a custom
-  TURN server, run your own signaling server that creates the
-  `SmallWebRTCConnection` directly: see [Using ICE servers with the development
+  `--ice-servers` names the STUN and TURN servers for both ends of the
+  connection: the runner gathers candidates with them and returns them to the
+  client as `iceConfig`. They take precedence over `enableDefaultIceServers`,
+  which adds Google's public STUN server (`stun:stun.l.google.com:19302`) and
+  nothing else. See [Using ICE servers with the development
   runner](/api-reference/server/services/transport/small-webrtc#using-ice-servers-with-the-development-runner).
 </Note>
 
@@ -71588,13 +71607,13 @@ The manual strategy allows explicit control over which service is active by push
 
 ### ServiceSwitcherStrategyFailover
 
-The failover strategy automatically switches to the next available service when the active service reports a non-fatal error. This enables automatic recovery from service failures without manual intervention.
+The failover strategy automatically switches away from the active service once it can no longer do its job. This enables automatic recovery from service failures without manual intervention.
 
 **Initial State**: The first service in the list is active by default.
 
-**Automatic Failover**: When the active service pushes a non-fatal `ErrorFrame`, the strategy automatically switches to the next service in the list (wrapping around to the first service if needed).
+**Automatic Failover**: An error the active service can carry on from is ignored. When one leaves it unable to work at all — a rejected API key, an unknown model or voice — the strategy switches to the next service in the list that can still do its job, wrapping around from the end. A service that failed to connect during setup is already unusable, so the switch happens before the pipeline starts and every frame reaches a service that connected.
 
-**Recovery**: The failed service remains in the list and can be switched back to manually or via application logic in the `on_service_switched` event handler. This allows implementing custom recovery policies.
+**Recovery**: The failed service remains in the list. Bring it back with [`set_usable(True)`](/api-reference/server/events/frame-processor-events), then switch to it manually or from application logic in the `on_service_switched` event handler.
 
 ```python
 from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
@@ -71615,7 +71634,7 @@ async def on_switched(strategy, service):
 You can create your own switching strategy by subclassing `ServiceSwitcherStrategy` and implementing the `handle_frame` and/or `handle_error` methods.
 
 - **`handle_frame(frame, direction)`**: Called for control frames (like `ManuallySwitchServiceFrame`). Should return the newly active service if a switch occurred, or `None` otherwise.
-- **`handle_error(error)`**: Called when the active service reports a non-fatal error. Override this to implement custom error-handling logic. Should return the newly active service if a switch occurred, or `None` otherwise.
+- **`handle_error(error)`**: Called for every error the active service reports, whether or not it can carry on from it. Override this to decide which errors are worth switching away from — `error.processor.is_usable` separates a service that is finished from one having a bad moment, and a strategy is free to switch on either. Should return the newly active service if a switch occurred, or `None` otherwise.
 
 Additionally, if you want to maintain either manual switching or automatic failover as an option when writing a custom strategy, your new strategy should inherit from `ServiceSwitcherStrategyManual` or `ServiceSwitcherStrategyFailover`, respectively.
 
@@ -77123,16 +77142,6 @@ For example, the TTS service pauses itself while synthesizing a `TTSSpeakFrame`.
 
 Internally, each processor has two queues: a high-priority input queue for SystemFrames and a process queue for everything else. Pausing blocks the process queue, but SystemFrames continue to flow through the input queue. This is why the typical pattern is for a processor to pause itself and then resume in response to a `SystemFrame`.
 
-<Note>
-  `FrameProcessorResumeFrame` is a `ControlFrame`, which means it enters the
-  same process queue that pausing blocks. If DataFrames have already queued up
-  ahead of it, the resume frame will be stuck behind them and the processor will
-  stay paused. To resume a paused processor from outside, use the `SystemFrame`
-  variant `FrameProcessorResumeUrgentFrame` instead — it bypasses the process
-  queue entirely. See [System
-  Frames](/api-reference/server/frames/system-frames#processor-pause/resume-urgent).
-</Note>
-
 ### FrameProcessorPauseFrame
 
 Pauses a specific processor. Queued in order, so the processor finishes handling any frames ahead of it before pausing.
@@ -77141,19 +77150,21 @@ Pauses a specific processor. Queued in order, so the processor finishes handling
   The processor to pause.
 </ParamField>
 
-### FrameProcessorResumeFrame
-
-Resumes a previously paused processor, releasing all buffered frames for processing.
-
-<ParamField path="processor" type="FrameProcessor">
-  The processor to resume.
-</ParamField>
-
 <Note>
-  Because this is a `ControlFrame`, it will be blocked behind any DataFrames
-  that queued up while the processor was paused. Use
-  `FrameProcessorResumeUrgentFrame` if the processor may have buffered frames.
+  Resuming is handled by
+  [`FrameProcessorResumeFrame`](/api-reference/server/frames/system-frames#frameprocessorresumeframe),
+  a `SystemFrame`. It travels the high-priority input queue, so it reaches a
+  paused processor regardless of what has piled up in the process queue behind
+  it.
 </Note>
+
+## User Turn Proposals
+
+### ProposedUserStoppedSpeakingFrame
+
+Proposes that a user turn has ended. Emitted by a component with its own turn detection, typically an STT or realtime LLM service whose provider reports speech boundaries, and resolved into a `UserStoppedSpeakingFrame` by an [`ExternalUserTurnStopStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstopstrategy).
+
+This is a `ControlFrame` so it stays ordered against the final `TranscriptionFrame`. A service pushes that transcript and then proposes the stop, and the turn strategy needs the text in hand to close the turn on. Its start-of-turn counterpart, [`ProposedUserStartedSpeakingFrame`](/api-reference/server/frames/system-frames#proposeduserstartedspeakingframe), is a `SystemFrame` because resolving it broadcasts an interruption.
 
 ## LLM Response Boundaries
 
@@ -77550,9 +77561,17 @@ An unrecoverable error requiring the bot to shut down. The `fatal` field is alwa
 
 Inherits from `ErrorFrame`.
 
-## Processor Pause/Resume (Urgent)
+## Processor Pause/Resume
 
-These are the `SystemFrame` variants of `FrameProcessorPauseFrame` and `FrameProcessorResumeFrame`. As SystemFrames, they flow through the high-priority input queue rather than the process queue, so they are not blocked by paused state or buffered frames. This makes `FrameProcessorResumeUrgentFrame` the correct way to resume a processor externally — the `ControlFrame` variant (`FrameProcessorResumeFrame`) would get stuck behind any DataFrames that queued up during the pause. See [Control Frames](/api-reference/server/frames/control-frames#processor-pause/resume) for the full explanation.
+Resuming always travels the high-priority input queue, so a paused processor is reached regardless of what has queued up behind the pause. Pausing comes in two forms: [`FrameProcessorPauseFrame`](/api-reference/server/frames/control-frames#frameprocessorpauseframe) is a `ControlFrame` that takes effect in order, after the frames ahead of it, while `FrameProcessorPauseUrgentFrame` takes effect immediately.
+
+### FrameProcessorResumeFrame
+
+Resumes a previously paused processor, releasing all buffered frames for processing in the order they arrived.
+
+<ParamField path="processor" type="FrameProcessor">
+  The processor to resume.
+</ParamField>
 
 ### FrameProcessorPauseUrgentFrame
 
@@ -77564,7 +77583,7 @@ Pauses a processor immediately, without waiting for queued frames to drain first
 
 ### FrameProcessorResumeUrgentFrame
 
-Resumes a paused processor immediately, releasing buffered frames. Use this instead of `FrameProcessorResumeFrame` when the processor may have frames queued up.
+Equivalent to `FrameProcessorResumeFrame`. Either resumes a paused processor and releases its buffered frames.
 
 <ParamField path="processor" type="FrameProcessor">
   The processor to resume.
@@ -77590,9 +77609,7 @@ Marks the end of a user turn. The bot's response is triggered separately by the 
 
 Proposes that a user turn has started. Emitted by a component with its own turn detection, typically an STT or realtime LLM service whose provider reports speech boundaries. It is a proposal rather than a decision: an [`ExternalUserTurnStartStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstartstrategy) resolves it into a `UserStartedSpeakingFrame` and broadcasts the interruption.
 
-### ProposedUserStoppedSpeakingFrame
-
-Proposes that a user turn has ended. The end-of-turn counterpart to `ProposedUserStartedSpeakingFrame`, resolved into a `UserStoppedSpeakingFrame` by an [`ExternalUserTurnStopStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstopstrategy).
+Its end-of-turn counterpart, [`ProposedUserStoppedSpeakingFrame`](/api-reference/server/frames/control-frames#proposeduserstoppedspeakingframe), is a `ControlFrame`. Resolving a start proposal broadcasts an interruption, which has to reach the pipeline ahead of whatever is queued; resolving a stop proposal has to stay ordered against the final `TranscriptionFrame`, since the strategy needs that text in hand to close the turn on.
 
 ### UserSpeakingFrame
 

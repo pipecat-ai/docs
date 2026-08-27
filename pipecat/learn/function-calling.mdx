@@ -140,7 +140,8 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
 **Options:**
 
 - **`cancel_on_interruption`** (default `True`): When `True`, the call is cancelled if the user interrupts. When `False`, the call is treated as **asynchronous** — see below.
-- **`timeout_secs`** (default `None`): Per-tool timeout in seconds. Overrides the global `function_call_timeout_secs` for this function. Use a longer timeout for slow operations (e.g. database queries) or a shorter one for quick lookups.
+- **`timeout_secs`** (default `None`): Per-tool timeout in seconds. Overrides the global `function_call_timeout_secs` for this function. Use a longer timeout for slow operations (e.g. database queries) or a shorter one for quick lookups. A call that runs past its deadline is cancelled: the handler is thrown an `asyncio.CancelledError` so it can clean up, the call settles as cancelled, and inference runs so the bot can say it didn't complete. The deadline covers the handler's own execution — work it spawns into a task of its own isn't cancelled with it.
+- **`cancellable_by_llm`** (default `False`): Lets the model stop this call while it runs. Only meaningful with `cancel_on_interruption=False` — see below.
 
 <Note>
   `@tool_options` also sets call options on the handler of a
@@ -162,16 +163,27 @@ With `cancel_on_interruption=False`, the call is **asynchronous**: the LLM conti
 
 #### Async function call cancellation
 
-For async functions (`cancel_on_interruption=False`), you can also enable model-directed cancellation:
+An async function (`cancel_on_interruption=False`) can also be made cancellable by the model, for the case where the user changes their request before a long-running lookup completes:
 
 ```python
-llm = OpenAILLMService(
-    api_key="your-api-key",
-    enable_async_tool_cancellation=True,
-)
+@tool_options(cancel_on_interruption=False, cancellable_by_llm=True, timeout_secs=120)
+async def write_report(params: FunctionCallParams, topic: str):
+    ...
 ```
 
-When `enable_async_tool_cancellation=True` and at least one async function is available, Pipecat automatically adds the built-in `cancel_async_tool_call` tool and supporting system instructions. The LLM can call that tool to cancel a stale in-progress async function call — for example, when the user changes their request before a long-running lookup completes.
+For each cancellable tool, Pipecat advertises a matching `cancel_<name>` tool — `cancel_write_report` here — alongside supporting system instructions. Calling it with no arguments stops the running call; a `tool_call_id` is only needed to pick one out when several calls of the same tool are in flight.
+
+`cancellable_by_llm` only does something in combination with `cancel_on_interruption=False`. A synchronous call blocks the LLM, so there is no moment at which it could ask for the cancellation, and the work has to outlast the model's round trip to the cancel tool to be worth stopping.
+
+<Warning>
+  Setting `cancellable_by_llm` per tool replaces the LLM service's
+  `enable_async_tool_cancellation` flag, which treated every async tool as
+  cancellable. The flag is deprecated and will be removed in 2.0.0. Whether a
+  tool runs long enough to be worth stopping, and whether the model can be
+  trusted to judge that its result is no longer wanted, are per-tool questions —
+  a model that cancels too readily discards a result the user was waiting on
+  without mentioning it.
+</Warning>
 
 ## Parallel and Multiple Tool Calls
 
@@ -626,7 +638,7 @@ Intermediate results are injected into the LLM context as async-tool developer m
 - **Function calling extends LLM capabilities** beyond training data to real-time information
 - **Context integration is automatic** - function calls and results are stored in conversation history
 - **Direct functions are the preferred approach** - one async function is both schema and handler; list it in `LLMContext(tools=[...])` or add it via `LLMSetToolsFrame` to make it available. When you need explicit schema control, use a `FunctionSchema` with its `handler` bundled in
-- **Async function calls are opt-in** - set `cancel_on_interruption=False` for deferred results, intermediate updates, and optional async-tool cancellation
+- **Async function calls are opt-in** - set `cancel_on_interruption=False` for deferred results and intermediate updates, and add `cancellable_by_llm=True` to let the model stop a call
 - **Pipeline integration is seamless** - functions work within your existing voice AI architecture
 - **Advanced control available** - fine-tune LLM execution and monitor function call lifecycle
 
