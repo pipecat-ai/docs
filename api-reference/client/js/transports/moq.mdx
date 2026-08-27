@@ -1,0 +1,158 @@
+---
+title: "MoQ Transport"
+"og:title": "MoQ Transport - JavaScript SDK"
+sidebarTitle: "MoQ"
+description: "MoqTransport for the JavaScript SDK: Media over QUIC audio and RTVI messaging to a Pipecat bot, over WebTransport."
+---
+
+`MoqTransport` connects a `PipecatClient` to a Pipecat bot over [Media over QUIC](https://quic.video) — either through a relay both sides dial, or directly to a bot serving its own socket.
+
+It publishes the microphone as an Opus broadcast and consumes the bot's, discovering codec and sample rate from the bot's catalog at connect time rather than pinning them in code. RTVI messages travel in both directions over a dedicated JSON stream track, so this is a full RTVI transport rather than an audio-only path.
+
+Connection uses WebTransport, with `@moq/net` racing a WebSocket fallback if WebTransport can't be reached.
+
+## Installation
+
+```bash
+npm install @pipecat-ai/client-js @pipecat-ai/moq-transport
+```
+
+## Usage
+
+### Basic Setup
+
+```javascript
+import { PipecatClient } from "@pipecat-ai/client-js";
+import { MoqTransport } from "@pipecat-ai/moq-transport";
+
+const transport = new MoqTransport({
+  relayUrl: "https://relay.example.com:4080/moq",
+  clientId: "request",
+  botId: "response",
+});
+
+const pcClient = new PipecatClient({ transport });
+
+await pcClient.connect();
+```
+
+### With the development runner
+
+The Pipecat development runner returns everything the transport needs from `POST /start`, under a `moq` key — the relay URL, the certificate hash in serve mode, the namespace, and the participant ids. Pass it straight through:
+
+```javascript
+const { moq } = await fetch("/start", { method: "POST" }).then((r) => r.json());
+
+const transport = new MoqTransport({
+  relayUrl: moq.relayUrl,
+  namespace: moq.namespace,
+  clientId: moq.clientId,
+  botId: moq.botId,
+  serverCertificateHashes: moq.certHash
+    ? [{ algorithm: "sha-256", value: moq.certHash }]
+    : undefined,
+});
+```
+
+<Warning>
+  Constructing the transport by hand, take care with `clientId` and `botId`. The
+  defaults here are `client0` and `bot0`, while a Pipecat bot publishes under
+  `response` and listens on `request`. With defaults on both sides the two never
+  find each other — so set `clientId: "request"` and `botId: "response"`, or
+  take the values from `/start` as above.
+</Warning>
+
+### Self-signed development relay
+
+A bot in serve mode mints its own certificate and reports the fingerprint. Pin it rather than disabling verification:
+
+```javascript
+const transport = new MoqTransport({
+  relayUrl: "https://localhost:4080/moq",
+  serverCertificateHashes: [{ algorithm: "sha-256", value: certHashBytes }],
+});
+```
+
+## API Reference
+
+### Constructor Options
+
+<ParamField path="relayUrl" type="string" required>
+  Full URL of the MoQ peer, e.g. `https://relay.example.com:4080/moq`.
+</ParamField>
+
+<ParamField path="clientId" type="string" default="client0">
+  This client's participant id. The client publishes under
+  `<namespace>/<clientId>`.
+</ParamField>
+
+<ParamField path="botId" type="string" default="bot0">
+  The bot's participant id. The client subscribes to `<namespace>/<botId>`.
+</ParamField>
+
+<ParamField path="namespace" type="string" default="pipecat">
+  Top-level namespace, analogous to a room name.
+</ParamField>
+
+<ParamField path="serverCertificateHashes" type="WebTransportHash[]">
+  Certificate hashes to pin, for a self-signed development relay. Same shape as
+  WebTransport's own `serverCertificateHashes`.
+</ParamField>
+
+<ParamField path="transcriptTrack" type="string" default="transcript.json.z">
+  Track name for the bidirectional RTVI message channel. Discovered by
+  convention rather than through the catalog, so it has to match the bot's.
+</ParamField>
+
+<ParamField path="audioLatencyMs" type="number" default="80">
+  Jitter buffer floor, in milliseconds. Lower is more interactive and drops more
+  on a poor network; higher is smoother at the cost of delay.
+</ParamField>
+
+<ParamField path="audioBufferMaxMs" type="number | 'real-time'" default="30000">
+  Ceiling for buffered playback. A bot writes TTS audio faster than real time
+  with future-dated timestamps, and the player buffers it rather than skipping
+  ahead — this caps how much may build up. An interruption flushes it early.
+  Pass `"real-time"` to collapse to the floor instead, which only makes sense
+  against a genuinely live publisher.
+</ParamField>
+
+<ParamField path="audioSampleRate" type="number" default="48000">
+  Rate the client publishes its microphone at. One of Opus's supported rates:
+  8000, 12000, 16000, 24000, or 48000. The bot reads this from the catalog and
+  resamples, so exact agreement isn't required.
+</ParamField>
+
+### Broadcast paths
+
+Each side publishes on one path and subscribes to the other's:
+
+```
+client publishes   <namespace>/<clientId>
+client subscribes  <namespace>/<botId>
+```
+
+Audio track names within a broadcast come from the bot's catalog, so they aren't configured here. The transcript track is the exception — it's a JSON stream rather than a media rendition, so the catalog doesn't describe it and both sides agree on the name by convention.
+
+## Events
+
+`MoqTransport` reports connection state through the standard [`PipecatClient` callbacks](/api-reference/client/js/callbacks) — there are no MoQ-specific events.
+
+## More Information
+
+<CardGroup cols={2}>
+  <Card
+    title="Server-side MoQ transport"
+    icon="server"
+    href="/api-reference/server/services/transport/moq"
+  >
+    The bot half of the pair, including serve and relay modes
+  </Card>
+  <Card
+    title="Choosing a transport"
+    icon="shuffle"
+    href="/client/concepts/choosing-a-transport"
+  >
+    How MoQ compares to the other client transports
+  </Card>
+</CardGroup>
