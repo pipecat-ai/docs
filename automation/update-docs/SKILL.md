@@ -135,10 +135,22 @@ For each doc page that needs updates, edit **only the sections that need changes
 
 #### Proportionality
 
-Match the size of the doc change to the size of the source change. A one-line
-default change is a one-line doc change. Before adding a new section, a callout,
-or a paragraph of explanation, check whether the existing page already covers it
-in the place a reader would look.
+Match the size of the doc change to the size of the source change. A changed
+default is a changed default: edit the value and, if it needs one, the clause
+beside it. A two-line source change should not produce a paragraph. When a diff
+suggests more prose than the change warrants, that prose is usually explaining
+the change rather than the API.
+
+Add a note only when the behavior would surprise **a reader who has never seen
+the previous behavior**. Judge it with the diff covered up: if the note only
+makes sense as an explanation of what changed, it belongs in the changelog, not
+here.
+
+A behavior change is not by itself a reason to add a note. The question is
+whether the _new_ behavior needs explaining on its own terms. A default that
+moved from `True` to `None` needs the default updated; it needs a note only if
+`None` is confusing to someone meeting it for the first time — and then the note
+explains `None`, not the move.
 
 Do not add a `<Note>`, `<Warning>`, or `<Tip>` for a change that fits in the
 sentence that is already there. Callouts are for behavior a reader would
@@ -296,7 +308,7 @@ After all edits are complete, print a summary:
 ## Guidelines
 
 - **Write for a future reader, not the diff** — docs describe the API as it currently stands. Never narrate the change itself: no "newly added," "this replaces," "recently changed," or references to prior behavior. A reader landing on the page should see no sign that a PR just edited it. Match the weight of the prose to the feature — a routine new parameter gets a one-line description, not a paragraph.
-- **The changelog is not the doc** — a PR description or changelog entry explains a change to someone who knew the old behavior. A doc page explains current behavior to someone who has never seen either. Take facts from the changelog; never take its framing, its rationale, or its comparisons.
+- **Don't carry the changelog's reasoning into the docs** — the PR body and the changelog entry argue for a change to someone who knew the old behavior. The docs describe the current state to someone who doesn't. Those need different prose, so the changelog is a source of _facts_ here — the new default, the new name, what a parameter now does — and never a source of sentences. Copying its justification across is the most common way a small change turns into a paragraph, and it survives the rule above because a justification carries no "newly" or "previously" to strip out.
 - **Avoid LLM tells** — write plainly. Skip filler and AI-signalling phrases ("delve," "seamless," "leverage," "it is worth noting," "this underscores"), formulaic "not just X, but Y" contrasts, and overuse of em dashes or boldface. Never leave placeholder text (`[X]`, `{placeholder}`) or assistant meta ("I hope this helps") in a page — this skill runs unattended in CI, so nothing downstream will catch it.
 - **Keep code and prose in sync** — when a page names a parameter, class, or identifier, spell it in prose exactly as the source and the `<ParamField>`/table entry do. After editing a code example or renaming a param, re-read the surrounding prose for stale references.
 - **Backtick inline technical terms** — wrap parameter names, class names, filenames, env vars, and config keys in backticks when they appear in prose (Overview, Notes, descriptions). Structured elements like `<ParamField>` already format these inside tables.
@@ -316,7 +328,7 @@ Before finishing, verify:
 - [ ] No content was removed unless the corresponding source was removed
 - [ ] New parameters have accurate types and defaults from source
 - [ ] Deprecated items are marked as deprecated rather than deleted or left unmarked
-- [ ] The size of each doc change is proportional to the source change
+- [ ] The edit is no larger than the change: no note or paragraph that only makes sense as an explanation of what changed
 - [ ] Formatting matches the existing page style
 - [ ] Guides referencing changed APIs were checked and updated
 - [ ] New pages were registered everywhere the profile requires
