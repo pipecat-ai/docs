@@ -120,6 +120,10 @@ Prettier is configured via `.prettierrc`:
 A husky pre-commit hook runs lint-staged, which formats staged files. The whole
 site is Prettier-clean, so `npm run format` should be a no-op on a clean tree.
 
+The hook also runs `check-imports.mjs`, which needs a pipecat checkout. Without
+one it skips rather than failing, so a contributor who only has this repo is
+unaffected — CI runs the same check against a checkout it makes itself.
+
 ## CI/CD
 
 A GitHub Actions workflow (`.github/workflows/broken-links.yml`) runs `mint broken-links --check-anchors --check-redirects` on PRs and pushes to `main`. It comments on PRs if broken links are detected. Run it with the same flags locally — the bare command skips anchor checking.
