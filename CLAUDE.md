@@ -120,9 +120,11 @@ Prettier is configured via `.prettierrc`:
 A husky pre-commit hook runs lint-staged, which formats staged files. The whole
 site is Prettier-clean, so `npm run format` should be a no-op on a clean tree.
 
-The hook also runs `check-imports.mjs`, which needs a pipecat checkout. Without
-one it skips rather than failing, so a contributor who only has this repo is
-unaffected — CI runs the same check against a checkout it makes itself.
+The hook also runs `check-imports.mjs`, which needs a pipecat checkout at
+`../pipecat`. Without one it prints a note and skips rather than failing, so a
+contributor who only has this repo can still commit — the check does not run
+locally in that case, and CI is what catches the problem, against a checkout it
+makes itself.
 
 ## CI/CD
 
