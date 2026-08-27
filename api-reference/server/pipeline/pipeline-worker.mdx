@@ -69,6 +69,14 @@ await runner.run(worker)
   dangling tasks.
 </ParamField>
 
+<ParamField path="handle_flush_frame" type="bool | None" default="None">
+  Whether this worker answers a flush probe. Defaults to whether the pipeline is
+  unbridged, so a bridged worker leaves the probe to travel on and be completed
+  by the pipeline that owns the transport. A bridged worker with no such peer
+  never completes a flush and every `flush_pipeline()` call waits out its
+  timeout.
+</ParamField>
+
 <ParamField path="idle_timeout_secs" type="float | None" default="300">
   Timeout in seconds before considering the pipeline idle. Set to None to
   disable idle detection. See [Pipeline Idle
@@ -132,6 +140,13 @@ await runner.run(worker)
 
 ### Worker Lifecycle Management
 
+<Note>
+  `end()` and `activate_worker()` wait for in-flight frames to be processed
+  before they take effect, so a closing line is heard rather than cut off and a
+  worker handing over stops talking before the one taking over starts. A
+  pipeline that never started, or one that has already finished, is left alone.
+</Note>
+
 <ResponseField name="run()" type="async">
 Starts and manages the pipeline execution until completion or cancellation. Typically called via `WorkerRunner` rather than directly:
 
@@ -148,6 +163,15 @@ frames have been processed.
 
 ```python
 await worker.stop_when_done()
+```
+
+</ResponseField>
+
+<ResponseField name="end(reason=None)" type="async">
+Requests a graceful end of the session, draining the pipeline first. Whatever this worker has already pushed reaches the end of the pipeline before the session goes away, so a closing line is heard rather than cut off.
+
+```python
+  await worker.end(reason="done")
 ```
 
 </ResponseField>
@@ -171,6 +195,25 @@ if worker.has_finished(): print("Worker is complete")
 </ResponseField>
 
 ### Frame Management
+
+<ResponseField name="flush_pipeline(timeout=5.0)" type="async">
+Wait for in-flight frames to be processed. Pushes a flush probe downstream; the sink bounces it back upstream and the source sets its event once it completes the round-trip, signalling that every frame queued ahead of it has been processed. The probe goes on the worker's push queue, behind whatever is already waiting there.
+
+**Parameters:**
+
+| Parameter | Type    | Default | Description                                                                                                                                               |
+| --------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout` | `float` | `5.0`   | Seconds of no frames reaching the sink before giving up. A pipeline still working keeps the wait alive; one that is stuck gives up after this much quiet. |
+
+```python
+drained = await worker.flush_pipeline(timeout=10.0)
+if not drained:
+    print("Pipeline gave up after timeout")
+```
+
+**Returns:** `True` if the pipeline drained, `False` if it went quiet first.
+
+</ResponseField>
 
 <ResponseField name="queue_frame(frame, direction=FrameDirection.DOWNSTREAM)" type="async">
 Queues a single frame to be pushed through the pipeline.
