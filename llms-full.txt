@@ -3480,6 +3480,7 @@ stt = YourSTTService(
     # Service-specific options...
     audio_passthrough=True,      # Pass audio frames downstream (recommended)
     sample_rate=16000,           # Audio sample rate (better set in PipelineParams)
+    keepalive_timeout=None,      # Silence to hold an idle connection open
 )
 ```
 
@@ -3487,6 +3488,22 @@ stt = YourSTTService(
 
 - **`audio_passthrough=True`**: Allows audio frames to continue downstream to other processors (like audio recording)
 - **`sample_rate`**: Audio sampling rate - best practice is to **set the `audio_in_sample_rate` in `PipelineParams` for consistency**
+- **`stt_ttfb_timeout`** (default `2.0`): Seconds to wait after the user stops
+  speaking before reporting TTFB, which gives the final transcript time to
+  arrive. STT measures TTFB from end of speech to final transcript rather than
+  from a discrete request, since audio arrives continuously.
+- **`keepalive_timeout`** (default `None`) and **`keepalive_interval`** (default
+  `5.0`): Send silence after `keepalive_timeout` seconds without audio to hold
+  the connection open, checking every `keepalive_interval` seconds. `None`
+  disables it. Useful for services that close idle connections — an inactive
+  service behind a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher),
+  for example.
+- **`ttfs_p99_latency`**: P99 latency in seconds from end of speech to final
+  transcript, broadcast at pipeline start so downstream processors such as turn
+  strategies can tune their timing. Each service supplies a measured default;
+  set this to override it for your own deployment.
+
+Runtime settings are covered in [Service Settings](/pipecat/fundamentals/service-settings).
 
 <Warning>
   Setting `audio_passthrough=False` will stop audio frames from being passed
@@ -4164,7 +4181,8 @@ All LLM services inherit from the `LLMService` base class with shared configurat
 ```python
 llm = YourLLMService(
     # Service-specific options...
-    run_in_parallel=True,  # Whether function calls run in parallel (default: True)
+    run_in_parallel=True,             # Whether function calls run in parallel (default: True)
+    function_call_timeout_secs=None,  # Deadline for a function call
 )
 ```
 
@@ -4173,6 +4191,23 @@ llm = YourLLMService(
 - **`run_in_parallel`**: Controls whether function calls execute simultaneously or sequentially
   - `True` (default): Faster execution when multiple functions are called
   - `False`: Sequential execution for dependent function calls
+- **`group_parallel_tools`** (default `True`): Trigger the LLM exactly once after
+  every call in a parallel batch completes. Set to `False` to have each result
+  trigger the LLM independently as it arrives.
+- **`function_call_timeout_secs`** (default `None`): Deadline in seconds for a
+  function call, overridable per tool with `timeout_secs`. A call that runs past
+  it is cancelled — its handler is thrown an `asyncio.CancelledError`, the call
+  settles as cancelled, and inference runs so the LLM can report that it didn't
+  complete. The deadline covers the handler's own execution; work it spawns into
+  a task of its own isn't cancelled with it.
+
+Runtime settings are covered in [Service Settings](/pipecat/fundamentals/service-settings).
+
+<Warning>
+  `enable_async_tool_cancellation` is deprecated and will be removed in 2.0.0.
+  Set `cancellable_by_llm=True` on the tools that should be cancellable instead
+  — see [Function Calling](/pipecat/learn/function-calling).
+</Warning>
 
 ## Event Handlers
 
@@ -4996,6 +5031,62 @@ tts = CartesiaTTSService(
 >
   Explore configuration options for each supported TTS provider
 </Card>
+
+### TTSService Base Class Configuration
+
+Every TTS service inherits from the `TTSService` base class, so the options below
+work with any provider regardless of which service class you use:
+
+```python
+tts = YourTTSService(
+    # Service-specific options...
+    stop_frame_timeout_s=3.0,                  # Idle time before TTSStoppedFrame
+    append_trailing_space=False,               # Avoid vocalized trailing punctuation
+    max_consecutive_zero_audio_contexts=3,     # Write off a silently failing provider
+)
+```
+
+**Key options:**
+
+- **`stop_frame_timeout_s`** (default `3.0`): Idle time in seconds before a
+  `TTSStoppedFrame` is pushed, when `push_stop_frames` is enabled.
+- **`push_silence_after_stop`** (default `False`) and **`silence_time_s`**
+  (default `2.0`): Push silent audio after the `TTSStoppedFrame`. Useful with
+  transports that clip the tail of an utterance.
+- **`append_trailing_space`** (default `False`): Append a trailing space to text
+  before synthesis, which stops some services from vocalizing trailing
+  punctuation as "dot". Applies only in sentence aggregation mode; token
+  streaming preserves the incoming text's own whitespace.
+- **`max_consecutive_zero_audio_contexts`** (default `3`): How many consecutive
+  contexts may finish without producing audio before the service is reported
+  unable to do its job. Set to `0` to report silent contexts without ever
+  writing the service off.
+- **`pause_frame_processing`** (default `False`): Pause frame processing while
+  audio is playing or still on its way.
+- **`transport_destination`**: Destination for the generated audio frames.
+
+<Note>
+  A provider can accept every request and answer with silence — an unknown voice
+  ID, say — without reporting an error, leaving the bot mute with nothing in the
+  logs. Each silent context reports an error the service can carry on from; on
+  reaching `max_consecutive_zero_audio_contexts` it reports a permanent error
+  instead, stops being given work, and the pipeline worker applies its
+  [`ProcessorUnusablePolicy`](/api-reference/server/pipeline/pipeline-worker). A
+  [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher)
+  fails over at that point.
+</Note>
+
+Text handling — `text_aggregation_mode`, `text_transforms`, `text_filters`, and
+`skip_aggregator_types` — is covered in
+[Text Processing and Filtering](#text-processing-and-filtering) below. Runtime
+settings are covered in [Service Settings](/pipecat/fundamentals/service-settings).
+
+<Warning>
+  `aggregate_sentences` and `pause_watchdog_timeout_s` are deprecated and will
+  be removed in 2.0.0. Use `text_aggregation_mode` in place of
+  `aggregate_sentences`; `pause_watchdog_timeout_s` has no replacement and does
+  nothing when passed.
+</Warning>
 
 ### Pipeline-Level Audio Configuration
 
