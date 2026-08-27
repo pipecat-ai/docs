@@ -118,6 +118,23 @@ pipecat cloud agent status [ARGS]
   Unique string identifier for the agent deployment. Must not contain spaces.
 </ParamField>
 
+For a [GitHub-linked agent](#link), the output also carries the linked
+repository and branch, the Dockerfile path and build subdirectory, whether
+pushes auto-deploy, the commit actually running, and the latest deploy attempt
+with its failure reason if it has one.
+
+The running commit and the linked branch can legitimately differ — right after
+you link a repository, after you re-point an agent, or when auto-deploy is off
+and there are unshipped commits. When the running commit didn't come from the
+current link, `status` says so and names the repository and branch it did come
+from.
+
+<Tip>
+  Nothing live from the current link shows as `— (nothing from this link is live
+  yet)`, which is what you'll see between `agent link` and the first [`agent
+  deploy --github`](#deploy).
+</Tip>
+
 ## deployments
 
 Lists deployment history for an agent, including image versions and timestamps.
@@ -171,9 +188,166 @@ pipecat cloud agent logs [ARGS] [OPTIONS]
   sessions [agent-name]`).
 </ParamField>
 
+## link
+
+Link an agent to a GitHub repository and branch, or re-point an existing link. Requires the organization to be [connected to GitHub](/api-reference/cli/cloud/github#connect).
+
+**Usage:**
+
+```shell
+pipecat cloud agent link [ARGS] [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent-name" type="string" required>
+  Name of the agent to link.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--repo" type="string" required>
+  Repository as `owner/repo`.
+</ParamField>
+
+<ParamField path="--branch" type="string" required>
+  Branch to build and deploy from.
+</ParamField>
+
+<ParamField path="--dockerfile-path" type="string" default="Dockerfile">
+  Path to the Dockerfile within the repository.
+</ParamField>
+
+<ParamField path="--subdirectory" type="string">
+  Build context subdirectory within the repository.
+</ParamField>
+
+<ParamField
+  path="--auto-deploy / --no-auto-deploy"
+  type="boolean"
+  default="--auto-deploy"
+>
+  Whether a push to the branch deploys the agent.
+</ParamField>
+
+<ParamField path="--organization / -o" type="string">
+  Organization the agent belongs to. If not provided, uses the current
+  organization from your configuration.
+</ParamField>
+
+```shell
+pipecat cloud agent link my-agent --repo my-org/my-bot --branch main
+```
+
+<Note>
+  Linking never changes what is running. It sets where the *next* deploy comes
+  from — use [`agent deploy --github`](#deploy) to ship the branch now.
+</Note>
+
+Re-running `link` on an already-linked agent re-points it. Options you leave out keep their stored values, so changing only the branch won't reset a Dockerfile path you set earlier.
+
+The repository and branch are validated locally against the same rules the API applies, so a typo fails immediately rather than after a round trip.
+
+## unlink
+
+Remove an agent's GitHub repository link.
+
+**Usage:**
+
+```shell
+pipecat cloud agent unlink [ARGS] [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent-name" type="string" required>
+  Name of the agent to unlink.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization the agent belongs to. If not provided, uses the current
+  organization from your configuration.
+</ParamField>
+
+<ParamField path="--force / -f" type="boolean" default="false">
+  Skip the confirmation prompt.
+</ParamField>
+
+Pushes stop deploying the agent. The running agent is not touched and its current deployment stays live.
+
+## deploy
+
+Build and deploy a GitHub-linked agent from its branch's current HEAD, without waiting for a push.
+
+**Usage:**
+
+```shell
+pipecat cloud agent deploy [ARGS] [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent-name" type="string" required>
+  Name of the agent to deploy.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--github" type="boolean" default="false">
+  Deploy the agent's linked GitHub branch. Currently the only mode this command
+  supports, so it has to be passed — without it the command exits 1 and points
+  you at `pipecat cloud deploy`.
+</ParamField>
+
+<ParamField path="--wait" type="boolean" default="false">
+  Follow the deploy rather than returning as soon as it is queued.
+</ParamField>
+
+<ParamField path="--organization / -o" type="string">
+  Organization the agent belongs to. If not provided, uses the current
+  organization from your configuration.
+</ParamField>
+
+```shell
+pipecat cloud agent deploy my-agent --github --wait
+```
+
+<Note>
+  `--github` is explicit rather than implied so that adding image-based deploys
+  to this command later can't change what an existing script does. To deploy an
+  image or a cloud build, use [`pipecat cloud
+  deploy`](/api-reference/cli/cloud/deploy).
+</Note>
+
+### What `--wait` reports
+
+Without `--wait`, the command returns once the deploy is queued, printing the branch and commit it will build.
+
+With `--wait`, it follows the deploy and reports one of these:
+
+| Outcome        | Meaning                                                                          | Exit |
+| -------------- | -------------------------------------------------------------------------------- | ---- |
+| Succeeded      | The deploy reached a terminal state and succeeded.                               | 0    |
+| Failed         | The deploy reached a terminal state and failed. The reason is printed.           | 1    |
+| Superseded     | A newer push took over as the latest attempt, so this one is no longer reported. | 0    |
+| Still building | Observed and still moving when the wait ran out. It continues server-side.       | 0    |
+| Never observed | The wait never saw the attempt at all.                                           | 1    |
+
+<Warning>
+  A zero exit from `--wait` means the deploy was observed and did not fail — not
+  that it finished. A deploy still building, or superseded by a newer push, also
+  exits 0. Check the outcome itself if you need to gate on completion; in
+  `--output json` it is reported as `waitOutcome`.
+</Warning>
+
+"Never observed" exits non-zero on purpose: a wait that saw nothing can't tell a healthy build from an API that was down the whole time, and calling that success is what would make `--wait` unsafe as a deploy gate.
+
 ## list
 
-Lists all agents in an organization with their details.
+Lists all agents in an organization with their details, including a GitHub
+column for agents built from a repository.
 
 **Usage:**
 
