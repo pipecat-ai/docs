@@ -25441,6 +25441,12 @@ You can add additional secrets to the set by specifying more key-value pairs.
 pipecat cloud secrets set my-secrets SECRET_NAME_3=secret-value-3
 ```
 
+Or load them from a file of `KEY=value` lines with `--file` (`-f`):
+
+```bash
+pipecat cloud secrets set my-secrets --file .env
+```
+
 <Info>
   Whenever a secret is added or updated in an existing set, any deployments
   using that set will need to be redeployed to access the new values. A plain
@@ -25995,7 +26001,16 @@ A deployment with warm instances accrues reserved charges until you delete it. I
 
 ### Set a spend limit as a backstop
 
-As a final safety net, set a spend limit in the Pipecat Cloud Dashboard under **Settings > Billing**. It caps the damage from a misconfiguration but doesn't replace right-sizing `min-agents`.
+As a final safety net, set a spend limit. It caps the damage from a misconfiguration but doesn't replace right-sizing `min-agents`.
+
+In the Pipecat Cloud Dashboard, it's under **Settings > Billing**. From the CLI:
+
+```shell
+pipecat cloud spend-limit set 250
+pipecat cloud spend-limit show
+```
+
+See the [`spend-limit` reference](/api-reference/cli/cloud/spend-limit) for what happens when the cap is reached.
 
 # Pipecat Cloud Health Checks
 Source: https://docs.pipecat.ai/pipecat-cloud/fundamentals/health-checks.md
@@ -26333,14 +26348,25 @@ If a successful build with the same hash already exists, the CLI skips the uploa
 The following patterns are excluded from the build context by default:
 
 - Version control: `.git`, `.gitignore`, `.gitattributes`
-- Python: `__pycache__`, `.venv`, `venv`, `*.pyc`, `*.pyo`, `*.pyd`, `*.so`, `*.egg-info`
+- CI/CD: `.github`
+- Python: `__pycache__`, `*.pyc`, `*.pyo`, `*.pyd`, `*.so`, `.Python`
+- Virtual environments: `.venv`, `venv`, `ENV`, `env`
 - Environment and secrets: `.env`, `.env.*`, `*.pem`, `*.key`
 - Testing: `.pytest_cache`, `.coverage`, `htmlcov`, `.tox`, `.nox`
 - Type checking / linting: `.mypy_cache`, `.ruff_cache`
 - IDE: `.vscode`, `.idea`, `*.swp`, `*.swo`
+- AI tools: `.claude`, `.codex`, `.cursor`
 - OS: `.DS_Store`, `Thumbs.db`
-- Build artifacts: `node_modules`, `dist`, `build`
+- Build artifacts: `node_modules`, `dist`, `build`, `*.egg-info`, `*.egg`, `.eggs`
+- Jupyter: `.ipynb_checkpoints`
+- Caches: `.cache`
+- Pipecat config: `pcc-deploy.toml`
 - Misc: `*.log`
+
+<Note>
+  `.github` and `pcc-deploy.toml` are the two that surprise people. If your
+  `Dockerfile` copies either into the image, it won't be there.
+</Note>
 
 You can add custom exclusion patterns in your `pcc-deploy.toml`:
 
@@ -89570,6 +89596,14 @@ Install the SDK using uv:
 uv add pipecatcloud
 ```
 
+The session-argument types in `pipecatcloud.agent` subclass `pipecat-ai`'s
+runner types, and `pipecat-ai` is an optional dependency. If you use them
+outside an agent image, install the extra:
+
+```bash
+uv add "pipecatcloud[pipecat]"
+```
+
 ## Key Components
 
 The SDK contains several main components:
@@ -89577,6 +89611,7 @@ The SDK contains several main components:
 - [**Session Management**](./sessions) - Start and interact with agent sessions
 - [**Session Arguments**](./session-arguments) - Types of arguments received by `bot()` entry points
 - [**Error Handling**](./exceptions) - Exception classes for handling different error scenarios
+- [**`SmallWebRTCSessionManager`**](./sessions#smallwebrtcsessionmanager) - Waits for a SmallWebRTC connection to arrive
 
 ## Quick Start
 
@@ -89646,7 +89681,8 @@ session = Session(
 ### Constructor Parameters
 
 <ParamField path="agent_name" type="string" required>
-  Name of the deployed agent to interact with.
+  Name of the deployed agent to interact with. A `ValueError` is raised if it is
+  empty.
 </ParamField>
 
 <ParamField path="api_key" type="string" required>
@@ -89707,12 +89743,75 @@ available properties.
 
 </ParamField>
 
+## SmallWebRTCSessionManager
+
+Coordinates the wait between a Pipecat Cloud session starting and a
+`SmallWebRTCTransport` connection arriving. A room-less SmallWebRTC bot is
+activated over HTTP before the WebRTC connection exists, so the entry point has
+to wait for it rather than proceed immediately.
+
+```python
+from pipecatcloud import SmallWebRTCSessionManager
+
+manager = SmallWebRTCSessionManager(timeout_seconds=120)
+
+# In the bot entry point: block until the connection arrives
+await manager.wait_for_webrtc()
+
+# From wherever the connection is handled: release the wait
+manager.complete_session()
+```
+
+### Constructor Parameters
+
+<ParamField path="timeout_seconds" type="int" default="120">
+  How long `wait_for_webrtc()` waits before giving up.
+</ParamField>
+
+### Methods
+
+<ResponseField name="wait_for_webrtc()" type="async">
+Waits for the WebRTC connection.
+
+**Raises**
+
+`TimeoutError` if no connection arrives within `timeout_seconds`.
+`RuntimeError` if a wait is already in progress — one manager handles one wait at a time.
+
+</ResponseField>
+
+<ResponseField name="complete_session()" type="bool">
+Releases a pending wait, cancelling its timeout. Returns `True` if there was a
+wait to complete, `False` otherwise.
+
+</ResponseField>
+
+<ResponseField name="cancel_timeout()" type="bool">
+Cancels the timeout without completing the wait. Returns `True` if there was a
+timeout to cancel, `False` otherwise.
+
+</ResponseField>
+
 # Session Arguments
 Source: https://docs.pipecat.ai/api-reference/pipecat-cloud/sdk-reference/session-arguments.md
 
 Understand the session arguments Pipecat Cloud passes to your bot entry point at session start, from the Python SDK.
 
 When creating agents with Pipecat Cloud, your `bot()` entry point function receives different types of arguments depending on the session type. These classes represent the structure of those arguments.
+
+<Warning>
+  These types subclass `pipecat-ai`'s runner argument types, and `pipecat-ai` is
+  an optional dependency of `pipecatcloud`. Importing anything from
+  `pipecatcloud.agent` without it raises an `ImportError`. Install the extra:
+
+```bash
+uv add "pipecatcloud[pipecat]"
+```
+
+Agent images built on `pipecat-base` already have `pipecat-ai`; the extra
+matters when you install `pipecatcloud` yourself.
+
+</Warning>
 
 ## PipecatSessionArguments
 
@@ -89760,7 +89859,7 @@ def bot(args: DailyRunnerArguments):
   The URL for the Daily room.
 </ParamField>
 
-<ParamField path="token" type="str">
+<ParamField path="token" type="str | None">
   The authentication token for the Daily room.
 </ParamField>
 
@@ -89789,6 +89888,39 @@ async def bot(args: WebSocketRunnerArguments):
 <ParamField path="websocket" type="WebSocket">
   The FastAPI WebSocket connection used to communicate with the client.
 </ParamField>
+
+## SmallWebRTCSessionArguments
+
+Session arguments for an agent using `SmallWebRTCTransport`.
+
+```python
+from pipecatcloud.agent import SmallWebRTCSessionArguments
+
+async def bot(args: SmallWebRTCSessionArguments):
+    print(f"Session ID: {args.session_id}")
+```
+
+Subclasses `pipecat-ai`'s `SmallWebRTCRunnerArguments`, so it carries that
+type's fields alongside `session_id`.
+
+## SessionArguments
+
+The base type the others share. It contributes `session_id` and serves as a
+marker, so you can annotate a handler that accepts any session type:
+
+```python
+from pipecatcloud.agent import SessionArguments
+
+def log_session(args: SessionArguments):
+    print(f"Session ID: {args.session_id}")
+```
+
+<Note>
+  Every concrete type above lists its `pipecat-ai` runner base *first* and
+  `SessionArguments` second. That ordering is what lets `pipecat-ai`'s own
+  `session_id` win once it defines one, so don't reorder the bases if you
+  subclass these yourself.
+</Note>
 
 # Error Handling
 Source: https://docs.pipecat.ai/api-reference/pipecat-cloud/sdk-reference/exceptions.md
@@ -89997,6 +90129,12 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+<Note>
+  The bot entry-point examples below import from `pipecat.runner.types`, which
+  `pipecatcloud` treats as an optional dependency. Outside an agent image,
+  install it with `uv add "pipecatcloud[pipecat]"`.
+</Note>
 
 ## Building a Bot Entry Point with Daily Arguments
 
@@ -91353,13 +91491,20 @@ Shows the current status of an agent deployment, including health and conditions
 **Usage:**
 
 ```shell
-pipecat cloud agent status [ARGS]
+pipecat cloud agent status [ARGS] [OPTIONS]
 ```
 
 **Arguments:**
 
 <ParamField path="agent-name" type="string" required>
   Unique string identifier for the agent deployment. Must not contain spaces.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization the agent belongs to. If not provided, uses the current
+  organization from your configuration.
 </ParamField>
 
 For a [GitHub-linked agent](#link), the output also carries the linked
@@ -91386,13 +91531,20 @@ Lists deployment history for an agent, including image versions and timestamps.
 **Usage:**
 
 ```shell
-pipecat cloud agent deployments [ARGS]
+pipecat cloud agent deployments [ARGS] [OPTIONS]
 ```
 
 **Arguments:**
 
 <ParamField path="agent-name" type="string" required>
   Unique string identifier for the agent deployment. Must not contain spaces.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization the agent belongs to. If not provided, uses the current
+  organization from your configuration.
 </ParamField>
 
 ## logs
@@ -91416,6 +91568,10 @@ pipecat cloud agent logs [ARGS] [OPTIONS]
 <ParamField path="--level / -l" type="string">
   Filter logs by severity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
   Omit it to return every level.
+</ParamField>
+
+<ParamField path="--format / -f" type="string" default="TEXT">
+  Output format for the log lines: `TEXT` or `JSON`.
 </ParamField>
 
 <ParamField path="--limit / -n" type="int" default="100">
@@ -91978,6 +92134,11 @@ pipecat cloud docker build-push [ARGS] [OPTIONS]
   specified version and `latest`.
 </ParamField>
 
+<ParamField path="--yes / -y" type="boolean" default="false">
+  Skip the build confirmation prompt. Required in CI — without it the command
+  reaches a prompt with no terminal and exits 2.
+</ParamField>
+
 ## Configuration
 
 The `docker build-push` command reads configuration from your `pcc-deploy.toml` file to minimize required command-line arguments. Here's how different registry setups work:
@@ -92368,6 +92529,12 @@ See [Agent Profiles](/pipecat-cloud/fundamentals/deploy#agent-profiles) for more
   cloud build list`.
 </ParamField>
 
+<ParamField path="--no-credentials / -nc" type="boolean" default="false">
+  Deploy without an image pull secret. A deploy that names neither
+  `--credentials` nor an `image_credentials` in the config file is refused,
+  since a private image would fail to pull — pass this when the image is public.
+</ParamField>
+
 <ParamField path="--build-dir / -d" type="string">
   Build context directory for cloud builds. Defaults to the current directory.
 </ParamField>
@@ -92612,6 +92779,17 @@ for more information.
 
 ```toml
 max_session_duration = 300
+```
+
+</ParamField>
+
+<ParamField path="websocket_auth" type="string" default="none">
+Authentication required on the agent's WebSocket endpoint. `none` for no
+authentication, or `token` to require an HMAC session token from `/start`. See
+[WebSocket authentication](/pipecat-cloud/guides/websocket-authentication).
+
+```toml
+websocket_auth = "token"
 ```
 
 </ParamField>
@@ -92888,9 +93066,18 @@ pipecat cloud organizations keys create [OPTIONS]
 
 **Options:**
 
+<ParamField path="--name / -n" type="string">
+  Human readable name for the new key. Without it the command prompts, so CI
+  needs to pass it.
+</ParamField>
+
 <ParamField path="--organization / -o" type="string">
   Organization ID to create key for. If not provided, the default organization
   will be used.
+</ParamField>
+
+<ParamField path="--default / -d" type="boolean" default="false">
+  Set the new key as the active key in your local config.
 </ParamField>
 
 ### keys revoke
@@ -93273,8 +93460,14 @@ pipecat cloud secrets image-pull-secret my-registry-creds https://index.docker.i
 
 **Options:**
 
-<ParamField path="--encode" type="boolean" default="true">
+<ParamField path="--encode / -e" type="boolean" default="true">
   Encode the credentials in base64 format. This is enabled by default.
+</ParamField>
+
+<ParamField path="--skip / -s" type="boolean" default="false">
+  Skip the confirmation prompt shown when the image pull secret already exists.
+  Required in CI — without it an update reaches a prompt with no terminal and
+  exits 2.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -93305,6 +93498,130 @@ pipecat cloud secrets image-pull-secret my-registry-creds https://index.docker.i
 >
   Learn more about managing application secrets
 </Card>
+
+# pipecat cloud spend-limit
+Source: https://docs.pipecat.ai/api-reference/cli/cloud/spend-limit.md
+
+pipecat cloud spend-limit sets, shows, and clears an organization's spending cap, blocking new sessions once the cap is reached.
+
+The `spend-limit` command group caps what an organization can spend in a billing period. Once the cap is reached, new sessions are blocked; sessions already running are not interrupted.
+
+It's the backstop for a misconfiguration — a runaway `min-agents`, a loop that starts sessions — rather than a substitute for [right-sizing your deployment](/pipecat-cloud/fundamentals/scaling).
+
+## show
+
+Show the current spend limit and usage.
+
+**Usage:**
+
+```shell
+pipecat cloud spend-limit show [OPTIONS]
+```
+
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization to query. If not provided, uses the current organization from
+  your configuration.
+</ParamField>
+
+<ParamField path="--json" type="boolean" default="false" deprecated>
+  Deprecated alias for `--output json`. Use the [global output
+  mode](/api-reference/cli/cloud/output) instead.
+</ParamField>
+
+Reports the limit, current spend, the billing period it covers, and whether the
+organization is currently blocked. An organization with no limit set shows
+`no limit set` rather than an error.
+
+## set
+
+Set or update the spend limit.
+
+**Usage:**
+
+```shell
+pipecat cloud spend-limit set [ARGS] [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="amount" type="string" required>
+  Limit in dollars, as a non-negative number with at most two decimal places —
+  `50` or `12.34`. More precision than that is rejected.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization to update. If not provided, uses the current organization from
+  your configuration.
+</ParamField>
+
+<ParamField path="--yes / -y" type="boolean" default="false">
+  Skip the confirmation prompt.
+</ParamField>
+
+```shell
+pipecat cloud spend-limit set 250
+```
+
+### When it asks for confirmation
+
+Raising a limit, or setting one for the first time, applies without a prompt.
+Two cases prompt because they block new sessions immediately:
+
+- **Setting the limit to `0`**, which blocks everything until you raise it.
+- **Setting a limit below current spend**, which blocks new sessions for the
+  rest of the period.
+
+<Tip>
+  Only those two cases need `--yes` in CI. A script that raises a limit works
+  non-interactively without it.
+</Tip>
+
+## clear
+
+Remove the spend limit.
+
+**Usage:**
+
+```shell
+pipecat cloud spend-limit clear [OPTIONS]
+```
+
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization to update. If not provided, uses the current organization from
+  your configuration.
+</ParamField>
+
+<ParamField path="--yes / -y" type="boolean" default="false">
+  Skip the confirmation prompt.
+</ParamField>
+
+New sessions stop being capped. This always prompts, so `--yes` is required to
+run it non-interactively.
+
+## More Information
+
+<CardGroup cols={2}>
+  <Card
+    title="Scaling and capacity"
+    icon="chart-line"
+    href="/pipecat-cloud/fundamentals/scaling"
+  >
+    Right-size `min-agents` and `max-agents` so the cap stays a backstop
+  </Card>
+  <Card
+    title="Output modes and exit codes"
+    icon="terminal"
+    href="/api-reference/cli/cloud/output"
+  >
+    Read the limit programmatically with `--output json`
+  </Card>
+</CardGroup>
 
 # pipecat cloud regions
 Source: https://docs.pipecat.ai/api-reference/cli/cloud/regions.md
