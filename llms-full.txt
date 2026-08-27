@@ -73322,6 +73322,18 @@ while streaming_text:
 
 You can create custom filters by subclassing the `BaseTextFilter` class and implementing your own filtering logic in the `filter()` method. This allows for specialized text transformations to suit your application's requirements.
 
+## Transforms
+
+Transforms rewrite text on its way to a TTS service, so that what a bot says matches how the text should be heard rather than how it was written — currency amounts, dates, acronyms, phone numbers. They attach to a TTS service through `text_transforms` and don't touch the conversation context, which keeps the LLM's original text.
+
+<Card
+  title="Voice Formatter"
+  icon="wand-magic-sparkles"
+  href="/api-reference/server/utilities/text/voice-formatter"
+>
+  Bundle the built-in transforms, or register them individually
+</Card>
+
 # MarkdownTextFilter
 Source: https://docs.pipecat.ai/api-reference/server/utilities/text/markdown-text-filter.md
 
@@ -73755,6 +73767,145 @@ flowchart TD
 - Patterns are processed in the order they appear in the text
 - Handlers are called when complete patterns are found
 - Patterns can span multiple sentences of text, but be aware that encoding many "reasoning" tokens may slow down the LLM response
+
+# Voice Formatter
+Source: https://docs.pipecat.ai/api-reference/server/utilities/text/voice-formatter.md
+
+VoiceFormatter rewrites currency, dates, acronyms, and phone numbers into spoken form before TTS synthesis.
+
+## Overview
+
+TTS services read text literally, which is wrong for anything written to be seen rather than said. Left alone, a service reads:
+
+| Written   | Spoken without formatting               |
+| --------- | --------------------------------------- |
+| `$42.50`  | "dollar sign four two point five zero"  |
+| `API`     | as one word, rather than "A P I"        |
+| `3/15/25` | "three slash fifteen slash twenty five" |
+
+`VoiceFormatter` rewrites these before synthesis, so they come out as "forty-two dollars and fifty cents", "A P I", and "March 15th, two thousand and twenty-five".
+
+It bundles the individual transforms in `pipecat.utils.text.transforms` behind one object, applying them in a deliberate order: structural cleanup first, language expansions second, your own replacements last.
+
+<Card
+  title="Example Implementation"
+  icon="play"
+  href="https://github.com/pipecat-ai/pipecat/blob/main/examples/features/features-voice-formatter.py"
+>
+  Runnable bot with voice formatting applied
+</Card>
+
+## Usage
+
+Attach it to any TTS service through `text_transforms`. The `"*"` aggregation type runs it on every text frame regardless of how the text was aggregated:
+
+```python
+from pipecat.utils.text.transforms import VoiceFormatter
+
+voice_formatter = VoiceFormatter()
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    text_transforms=[("*", voice_formatter)],
+)
+```
+
+No extra install: `num2words`, which the number-expanding transforms depend on, is a base dependency.
+
+## Configuration
+
+<ParamField path="strip_markdown" type="bool" default="True">
+  Strip Markdown formatting symbols — bold, italic, headers, code spans.
+</ParamField>
+
+<ParamField path="expand_phone_numbers" type="bool" default="True">
+  Space out phone number digits so they're pronounced individually.
+</ParamField>
+
+<ParamField path="normalize_acronyms" type="bool" default="True">
+  Space out uppercase acronyms, so `"API"` becomes `"A P I"`.
+</ParamField>
+
+<ParamField path="expand_currency" type="bool" default="True">
+  Expand currency amounts, so `"$42.50"` becomes `"forty two dollars and fifty
+  cents"`.
+</ParamField>
+
+<ParamField path="expand_percentages" type="bool" default="True">
+  Expand percentages, so `"50%"` becomes `"fifty percent"`.
+</ParamField>
+
+<ParamField path="expand_units" type="bool" default="True">
+  Expand unit abbreviations, so `"5km"` becomes `"5 kilometers"`.
+</ParamField>
+
+<ParamField path="email_to_speech" type="bool" default="True">
+  Rewrite email addresses into spoken form.
+</ParamField>
+
+<ParamField path="normalize_dates" type="bool" default="True">
+  Expand date expressions into spoken form.
+</ParamField>
+
+<ParamField path="expand_numbers" type="bool" default="False">
+  Expand bare numeric digits into words. Off by default, because plenty of
+  numbers are clearer read as digits — a room number, a year, a version.
+</ParamField>
+
+<ParamField path="number_digit_cutoff" type="int | None" default="None">
+  Numbers above this value are read digit by digit instead of as a quantity.
+  Only applies when `expand_numbers=True`. `None` expands every number as words.
+</ParamField>
+
+<ParamField
+  path="custom_replacements"
+  type="list[tuple[str, str]] | None"
+  default="None"
+>
+  `(regex_pattern, replacement)` pairs, applied after every other transform.
+</ParamField>
+
+### Turning pieces off
+
+Every option is independent, so a bundle can be narrowed to what a particular bot needs:
+
+```python
+# Read numbers as digits, but leave acronyms alone
+voice_formatter = VoiceFormatter(
+    expand_numbers=True,
+    number_digit_cutoff=2025,   # "2026" stays a year, "48291" is read out
+    normalize_acronyms=False,   # this bot's acronyms are said as words
+    custom_replacements=[(r"\bDr\.", "Doctor")],
+)
+```
+
+`number_digit_cutoff` is the option worth knowing about: with `expand_numbers=True` and no cutoff, an account number is read as a single enormous quantity. Setting a cutoff keeps small numbers as words and switches longer ones to digit-by-digit.
+
+## Using transforms individually
+
+`VoiceFormatter` is a convenience. Each transform is also an async callable you can register on its own:
+
+```python
+from pipecat.utils.text.transforms import expand_currency, strip_markdown
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    text_transforms=[("*", strip_markdown), ("*", expand_currency)],
+)
+```
+
+Available individually: `strip_markdown`, `normalize_acronyms`, `expand_currency`, `expand_numbers`, `expand_percentages`, `expand_phone_numbers`, `expand_units`, `email_to_speech`, `normalize_dates`, and `replace_text`.
+
+A transform is any async callable with this signature, so your own slots in the same way:
+
+```python
+async def transform(text: str, aggregation_type: str) -> str: ...
+```
+
+## Notes
+
+- **Order matters.** The bundle applies structural cleanup first, then language expansions, then `custom_replacements`. Registering transforms individually puts that order in your hands — list them in the order you want them applied.
+- **Transforms run before synthesis, not before the context.** What the bundle rewrites is what the TTS service is asked to say; the conversation context keeps the LLM's original text.
 
 # User Turn Strategies
 Source: https://docs.pipecat.ai/api-reference/server/utilities/turn-management/user-turn-strategies.md
