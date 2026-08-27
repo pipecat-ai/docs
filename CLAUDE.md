@@ -19,8 +19,10 @@ npm install
 # Start local dev server
 npx mint dev
 
-# Check for broken links (also runs in CI)
-npx mint broken-links
+# Check for broken links, matching what CI runs. Without --check-anchors an
+# in-page link to a heading that doesn't exist passes locally and fails in CI;
+# note that <ParamField> does not create an anchor, only headings do.
+npx mint broken-links --check-anchors --check-redirects
 
 # Lint frontmatter metadata: title/description uniqueness, lengths,
 # llms.txt + llms-full.txt staleness (also runs in CI)
@@ -115,7 +117,7 @@ site is Prettier-clean, so `npm run format` should be a no-op on a clean tree.
 
 ## CI/CD
 
-A GitHub Actions workflow (`.github/workflows/broken-links.yml`) runs `mint broken-links` on PRs and pushes to `main`. It comments on PRs if broken links are detected.
+A GitHub Actions workflow (`.github/workflows/broken-links.yml`) runs `mint broken-links --check-anchors --check-redirects` on PRs and pushes to `main`. It comments on PRs if broken links are detected. Run it with the same flags locally — the bare command skips anchor checking.
 
 ## Pipecat source reference
 

@@ -9483,6 +9483,197 @@ The IVRNavigator automatically optimizes Voice Activity Detection (VAD) paramete
 
 The IVRNavigator provides a powerful foundation for automating phone system interactions, allowing your bots to handle the complex task of menu navigation while you focus on the core conversation logic.
 
+# Error Handling
+Source: https://docs.pipecat.ai/pipecat/fundamentals/error-handling.md
+
+Handle service failures in Pipecat with is_usable, ErrorCategory, and ProcessorUnusablePolicy, and recover a failed service.
+
+Voice agents fail in two different ways, and telling them apart is most of what error handling amounts to. A provider that returns a 503 will probably work on the next request. A provider that rejects your API key will reject it every time, and a bot that keeps retrying stays silent while it does.
+
+Pipecat separates the two with a single question: **can this processor still do its job?**
+
+## is_usable
+
+Every [`FrameProcessor`](/pipecat/fundamentals/custom-frame-processor) reports whether it can still work:
+
+```python
+if not stt.is_usable:
+    # This service is finished until something changes.
+    ...
+```
+
+A processor stays usable through failures it might recover from, and becomes unusable once its work can no longer succeed — a rejected API key, an unknown model or voice, or enough consecutive failures that it has stopped trying.
+
+Being unusable changes what the framework does with it:
+
+- STT and TTS services stop accepting work, instead of failing once per chunk of audio or piece of text
+- WebSocket services stop reconnecting, instead of retrying credentials the provider has already rejected
+- A [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) fails over to another provider
+
+The flag is set as the error is reported, so a handler reading `frame.processor.is_usable` sees the verdict that came with the error it's handling.
+
+## ErrorCategory
+
+Errors carry a category saying what kind of failure it was, independent of which provider produced it:
+
+| Category          | Meaning                                                      |
+| ----------------- | ------------------------------------------------------------ |
+| `AUTHENTICATION`  | Credentials are missing or invalid                           |
+| `AUTHORIZATION`   | Credentials are valid but lack access to the resource        |
+| `INVALID_REQUEST` | The request is malformed, or names an unknown model or voice |
+| `RATE_LIMIT`      | Too many requests in too short a window                      |
+| `QUOTA`           | The account's credit or usage allowance is exhausted         |
+| `CONNECTIVITY`    | The service could not be reached                             |
+| `SERVER`          | The provider reported an internal failure                    |
+| `APPLICATION`     | Application code failed, not the provider                    |
+| `UNKNOWN`         | The cause could not be determined                            |
+
+```python
+from pipecat.utils.errors import ErrorCategory
+```
+
+`AUTHENTICATION`, `AUTHORIZATION`, and `INVALID_REQUEST` are **permanent**: retrying gives the same result until credentials or settings change. Reporting one is what makes a processor unusable. Read `category.is_permanent` rather than listing the three yourself.
+
+<Note>
+  `APPLICATION` is how a service reports a failure in code it invoked — a tool
+  handler, say. Those failures say nothing about the service's own health, so
+  they never make it unusable.
+</Note>
+
+## Deciding what the pipeline does
+
+`PipelineWorker` takes a policy for what to do when a processor becomes unusable:
+
+```python
+from pipecat.pipeline.worker import PipelineWorker, ProcessorUnusablePolicy
+
+worker = PipelineWorker(
+    pipeline,
+    processor_unusable_policy=ProcessorUnusablePolicy.END,
+)
+```
+
+| Policy     | Behavior                                                       |
+| ---------- | -------------------------------------------------------------- |
+| `CONTINUE` | Report the error and keep running. The default                 |
+| `END`      | End the pipeline gracefully, letting queued frames drain first |
+| `CANCEL`   | Cancel the pipeline immediately, abandoning queued frames      |
+
+The policy is applied **once per processor**, not once per failed request — an unusable processor keeps failing for as long as the pipeline uses it, and the decision only needs making once.
+
+`CONTINUE` leaves the decision to your application, which is the right default when a `ServiceSwitcher` will fail over, or when the bot can carry on degraded. Choose `END` when a bot with a dead service has nothing useful left to do; the Pipecat examples use it, so an example stops rather than running on with a service that will never answer.
+
+## Reacting in your application
+
+Handle `on_error` to decide for yourself:
+
+```python
+@stt.event_handler("on_error")
+async def on_error(processor, frame):
+    if frame.processor and not frame.processor.is_usable:
+        logger.error(f"{frame.processor} is finished: {frame.error}")
+        await notify_ops(frame.category)
+    else:
+        logger.warning(f"Recoverable: {frame.error}")
+```
+
+`on_usable_changed` fires whenever a processor's verdict changes, in either direction:
+
+```python
+@stt.event_handler("on_usable_changed")
+async def on_usable_changed(processor, is_usable):
+    logger.info(f"{processor} usable: {is_usable}")
+```
+
+## Recovering a service
+
+An unusable processor stays that way until you say otherwise. Once whatever broke has been fixed — new credentials, a corrected voice ID — bring it back:
+
+```python
+await stt.set_usable(True)
+```
+
+It then accepts work again, and a `ServiceSwitcher` will consider it a candidate. Switching to a service that is still marked unusable is refused, so recovery has to come first.
+
+## Reporting errors from your own processor
+
+```python
+await self.push_error(
+    "Provider rejected the request",
+    exception=exc,
+    category=ErrorCategory.INVALID_REQUEST,
+)
+```
+
+Passing a permanent `category` marks the processor unusable. When you know the processor is finished but the category doesn't say so on its own — a retry budget exhausted, for instance — pass `force_treat_as_permanent=True` instead of inventing a category.
+
+Implement `_classify_error()` to map exceptions your processor understands onto a category. Errors carrying an HTTP status are classified from it automatically: 401 to `AUTHENTICATION`, 403 to `AUTHORIZATION`, 429 to `RATE_LIMIT`, 5xx to `SERVER`.
+
+## Migrating from fatal errors
+
+`ErrorFrame.fatal`, the `fatal` argument of `push_error()`, and `FatalErrorFrame` are deprecated and will be removed in 2.0.0. A fatal error cancelled the pipeline outright, which conflated "this service is broken" with "this run is over" and left applications no say in the matter.
+
+<Warning>Passing `fatal=True` still cancels the pipeline, and warns.</Warning>
+
+Which replacement you want depends on what the error meant:
+
+**The error leaves its processor unable to work.** Report that, and let the policy decide:
+
+```python
+await self.push_error("API key rejected", force_treat_as_permanent=True)
+```
+
+`ProcessorUnusablePolicy.CANCEL` reproduces what `fatal=True` did. `END` and `CONTINUE` are usually better.
+
+**The error isn't about a processor's state, but the pipeline should stop.** Push the error, then end the pipeline explicitly:
+
+```python
+await self.push_error("Session limit reached")
+await self.push_frame(EndWorkerFrame(), FrameDirection.UPSTREAM)
+```
+
+Use `EndWorkerFrame` to drain queued frames, or `CancelWorkerFrame` to abandon them.
+
+To read errors, replace `if frame.fatal:` with a check on the processor:
+
+```python
+if frame.processor and not frame.processor.is_usable:
+    ...
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card
+    title="Service Switching"
+    icon="shuffle"
+    href="/api-reference/server/utilities/service-switchers/service-switcher"
+  >
+    Fail over to another provider automatically
+  </Card>
+  <Card
+    title="PipelineWorker"
+    icon="gear"
+    href="/api-reference/server/pipeline/pipeline-worker"
+  >
+    Pipeline events, including on_pipeline_error
+  </Card>
+  <Card
+    title="Frame Processor Events"
+    icon="bell"
+    href="/api-reference/server/events/frame-processor-events"
+  >
+    on_error and on_usable_changed
+  </Card>
+  <Card
+    title="System Frames"
+    icon="layer-group"
+    href="/api-reference/server/frames/system-frames"
+  >
+    ErrorFrame and its fields
+  </Card>
+</CardGroup>
+
 # Custom FrameProcessor
 Source: https://docs.pipecat.ai/pipecat/fundamentals/custom-frame-processor.md
 
@@ -37176,6 +37367,7 @@ stt = DeepgramSTTService(
 
 - **Finalize on VAD stop**: When the pipeline's VAD detects the user has stopped speaking, the service sends a [finalize](https://developers.deepgram.com/docs/finalize) request to Deepgram for faster final transcript delivery.
 - **Multilingual support**: Deepgram Nova models support many languages. The default is `Language.EN` (English). Set `language="multi"` in settings to enable multilingual transcription, which will detect and transcribe multiple languages within the same audio stream.
+- **Reconnection limit**: After three consecutive attempts fail to produce a connection that stays up, the service stops reconnecting and reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) moves off it. See [Error Handling](/pipecat/fundamentals/error-handling).
 - **Runtime settings updates**: Changing settings via `STTUpdateSettingsFrame` triggers a reconnection with the new parameters. To avoid audio loss, reconnection is deferred until the current user turn ends (i.e., until `UserStoppedSpeakingFrame` is received). Audio frames arriving during the reconnect are buffered and replayed once the new connection is ready.
 
 ### Event Handlers
@@ -59639,7 +59831,7 @@ llm = GeminiLiveLLMService(
 - **Seed parameter**: Gemini treats the `seed` parameter as best effort. Identical seeds usually but not always produce identical responses.
 - **Transcription aggregation**: Gemini Live sends user transcriptions in small chunks. The service aggregates them into complete sentences using end-of-sentence detection with a 0.5-second timeout fallback.
 - **Session resumption**: The service automatically handles session resumption on reconnection using session resumption handles. In the rare case where reconnection occurs before a resumption handle is received, conversation history is preserved by reseeding it into the new session.
-- **Connection resilience**: The service will attempt up to 3 consecutive reconnections before treating a connection failure as fatal.
+- **Connection resilience**: The service attempts up to 3 consecutive reconnections, then reports an error and stops trying.
 - **Video frame rate**: Video frames are throttled to a maximum of one per second.
 - **Affective dialog and proactivity**: These features require both a supporting model and API version (`v1alpha`).
 
@@ -61299,6 +61491,7 @@ await worker.queue_frame(
 
 ## Notes
 
+- **Connection failure**: A connection that fails leaves the service unable to do its job rather than cancelling the pipeline outright. What happens next follows the pipeline's [`processor_unusable_policy`](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does); pass `ProcessorUnusablePolicy.CANCEL` to keep the pipeline stopping on it.
 - **Audio-native model**: Ultravox processes audio directly rather than relying on a separate STT step. Voice transcriptions are provided for reference but may not always align with the model's understanding of user input.
 - **Server-side context management**: Ultravox handles conversation context server-side. The LLM context in Pipecat is only used for passing function call results back to the service.
 - **Audio sample rate**: The service uses a 48kHz sample rate. Input audio at different sample rates is automatically resampled.
@@ -75081,6 +75274,7 @@ Events on every [`FrameProcessor`](/api-reference/server/events/frame-processor-
 | Event                     | Description                                         |
 | ------------------------- | --------------------------------------------------- |
 | `on_error`                | An error occurred in this processor                 |
+| `on_usable_changed`       | The processor's ability to do its job changed       |
 | `on_before_process_frame` | A frame is about to be processed                    |
 | `on_after_process_frame`  | A frame has just been processed                     |
 | `on_before_push_frame`    | A frame is about to be pushed to the next processor |
@@ -75356,6 +75550,7 @@ Every frame processor in Pipecat — including all services, transports, and cus
 | Event                     | Description                                         |
 | ------------------------- | --------------------------------------------------- |
 | `on_error`                | An error occurred in this processor                 |
+| `on_usable_changed`       | The processor's ability to do its job changed       |
 | `on_before_process_frame` | A frame is about to be processed                    |
 | `on_after_process_frame`  | A frame has just been processed                     |
 | `on_before_push_frame`    | A frame is about to be pushed to the next processor |
@@ -75373,8 +75568,8 @@ async def on_tts_error(processor, error):
     print(f"Error in {processor}: {error.error}")
     if error.exception:
         print(f"Exception: {error.exception}")
-    if error.fatal:
-        print("This is a fatal error — pipeline will be cancelled")
+    if error.processor and not error.processor.is_usable:
+        print("This processor can no longer do its job")
 ```
 
 **Parameters:**
@@ -75388,14 +75583,35 @@ The `ErrorFrame` provides:
 
 - `error` (str): The error message
 - `exception` (Exception | None): The underlying exception, if any
-- `fatal` (bool): Whether this is a fatal error that will cancel the pipeline
-- `processor` (FrameProcessor | None): The processor that originated the error
+- `category` (ErrorCategory | None): What kind of failure it was, e.g. `AUTHENTICATION` or `SERVER`
+- `processor` (FrameProcessor | None): The processor that originated the error. Its `is_usable` already reflects this error, so reading it here tells you whether the processor is finished or merely had a bad moment
+- `fatal` (bool): _Deprecated in v1.8.0, removed in 2.0.0._ Check `processor.is_usable` instead
 
 <Note>
   Since `on_error` is synchronous, the handler runs before the error frame
   propagates upstream. Keep your handler fast — use it for logging or setting
   flags, not for I/O operations.
 </Note>
+
+### on_usable_changed
+
+Fired when the processor's ability to do its job changes, in either direction — when an error leaves it unable to work, and again when [`set_usable(True)`](/pipecat/fundamentals/error-handling#recovering-a-service) brings it back.
+
+```python
+@tts.event_handler("on_usable_changed")
+async def on_usable_changed(processor, is_usable):
+    if not is_usable:
+        await page_oncall(f"{processor} is down")
+```
+
+**Parameters:**
+
+| Parameter   | Type             | Description                         |
+| ----------- | ---------------- | ----------------------------------- |
+| `processor` | `FrameProcessor` | The processor whose verdict changed |
+| `is_usable` | `bool`           | Whether it can be given work        |
+
+See [Error Handling](/pipecat/fundamentals/error-handling) for what makes a processor unusable and what the pipeline does about it.
 
 ### Example: Error handling across multiple processors
 
@@ -75578,6 +75794,12 @@ async def on_tts_connection_error(service, error):
   WebSocket-based services automatically reconnect with exponential backoff (3
   retries, 4-10s waits) when connection errors occur. The `on_connection_error`
   event fires for each failed attempt.
+
+Reconnection stops once the service can no longer do its job — credentials the
+provider has already rejected aren't worth retrying, and exhausting the
+retries leaves the service unusable too. See [Error
+Handling](/pipecat/fundamentals/error-handling).
+
 </Note>
 
 ## TTS Events
@@ -77581,19 +77803,38 @@ Carries an error notification, typically pushed upstream so earlier processors c
   Human-readable error message.
 </ParamField>
 
-<ParamField path="fatal" type="bool" default="False">
-  Whether this error is fatal and requires the bot to shut down.
+<ParamField path="category" type="ErrorCategory | None" default="None">
+  What kind of failure this was — a rejected API key (`AUTHENTICATION`) versus a
+  provider outage (`SERVER`), for example. See [Error
+  Handling](/pipecat/fundamentals/error-handling#errorcategory).
 </ParamField>
 
 <ParamField path="processor" type="FrameProcessor | None" default="None">
-  The processor that raised the error.
+  The processor that raised the error. Read `processor.is_usable` to tell an
+  error the processor can carry on from apart from one that has finished it.
 </ParamField>
 
 <ParamField path="exception" type="Exception | None" default="None">
   The underlying exception, if one was caught.
 </ParamField>
 
+<ParamField path="fatal" type="bool" default="False" deprecated>
+  _Deprecated in v1.8.0. Will be removed in 2.0.0._ Check `processor.is_usable`
+  instead, and set the pipeline's
+  [`processor_unusable_policy`](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does)
+  to decide what an unusable processor does to the run.
+</ParamField>
+
 ### FatalErrorFrame
+
+<Warning>
+  Deprecated in v1.8.0, removed in 2.0.0. Report the error with `push_error(...,
+  force_treat_as_permanent=True)` when it leaves its processor unable to work,
+  or push an `EndWorkerFrame` after a plain `ErrorFrame` when the pipeline
+  should stop for a reason that isn't about a processor's state. See [Migrating
+  from fatal
+  errors](/pipecat/fundamentals/error-handling#migrating-from-fatal-errors).
+</Warning>
 
 An unrecoverable error requiring the bot to shut down. The `fatal` field is always `True`.
 
@@ -80318,6 +80559,20 @@ await runner.run(worker)
   for details.
 </ParamField>
 
+<ParamField
+  path="processor_unusable_policy"
+  type="ProcessorUnusablePolicy"
+  default="ProcessorUnusablePolicy.CONTINUE"
+>
+  What the pipeline does when a processor reports an error that leaves it unable
+  to do its job, such as a service whose API key was rejected. `CONTINUE` (the
+  default) reports the error and keeps running, leaving the decision to the
+  application; `END` stops the pipeline gracefully and `CANCEL` stops it
+  immediately. Applied once per processor, not once per failed request. See
+  [Error
+  Handling](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does).
+</ParamField>
+
 <ParamField path="app_resources" type="Any" default="None">
   Application-defined bag of resources (database handles, API clients, state,
   etc.) shared across tool handlers. Passed by reference to every function
@@ -80513,14 +80768,14 @@ async def on_pipeline_finished(worker, frame):
 
 ### on_pipeline_error
 
-Fired when an `ErrorFrame` reaches the pipeline worker (upstream from a processor). If the error is fatal, the pipeline will be cancelled after this handler runs.
+Fired when an `ErrorFrame` reaches the pipeline worker (upstream from a processor). If the error left its processor unable to do its job, the pipeline applies its [`processor_unusable_policy`](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does) after this handler runs.
 
 ```python
 @worker.event_handler("on_pipeline_error")
 async def on_pipeline_error(worker, frame):
     print(f"Pipeline error: {frame.error}")
-    if frame.fatal:
-        print("Fatal error — pipeline will be cancelled")
+    if frame.processor and not frame.processor.is_usable:
+        print(f"{frame.processor} can no longer do its job")
 ```
 
 **Parameters:**
