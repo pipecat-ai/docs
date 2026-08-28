@@ -879,20 +879,21 @@ async def on_client_connected(transport, client):
 @transport.event_handler("on_client_disconnected")
 async def on_client_disconnected(transport, client):
     logger.info("Client disconnected")
-    # Cancel the worker when the client disconnects
+    # Cancel the runner when the client disconnects
     # This stops the pipeline and all processors, cleaning up resources
-    await worker.cancel()
+    await runner.cancel()
 ```
 
-When the client signals it's ready over the RTVI protocol, the bot adds a greeting instruction and queues an `LLMRunFrame` to start the conversation. When the client disconnects, the worker is cancelled to clean up resources.
+When the client signals it's ready over the RTVI protocol, the bot adds a greeting instruction and queues an `LLMRunFrame` to start the conversation. When the client disconnects, the runner is cancelled to clean up resources.
 
 ### Running the Pipeline
 
-Finally, the pipeline is executed by a WorkerRunner:
+Finally, the pipeline is executed by a WorkerRunner. Note that the runner must be created **before** registering event handlers so that handlers can call `runner.cancel()`:
 
 ```python
 # Create a WorkerRunner to run the worker
-runner = WorkerRunner(handle_sigint=False)
+# In scaffolded bots, use runner_args.handle_sigint
+runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
 # Finally, add the worker and run it
 # This will start the pipeline and begin processing frames
@@ -5515,7 +5516,7 @@ Use event handlers to detect disconnections and trigger cancellation:
 @transport.event_handler("on_client_disconnected")
 async def on_client_disconnected(transport, client):
     logger.info("Client disconnected - terminating pipeline")
-    await worker.cancel()
+    await runner.cancel()
 ```
 
 **How immediate termination works:**
@@ -5611,11 +5612,12 @@ async def on_client_connected(transport, client):
 @transport.event_handler("on_client_disconnected")
 async def on_client_disconnected(transport, client):
     logger.info("Client disconnected - immediate termination")
-    await worker.cancel()
+    await runner.cancel()
 
 # Run the pipeline
-runner = WorkerRunner(handle_sigint=False)
-await runner.run(worker)
+runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+await runner.add_workers(worker)
+await runner.run()
 ```
 
 ### Conditional Termination
@@ -5640,12 +5642,13 @@ Ensure pipelines can terminate properly even when exceptions occur:
 
 ```python
 try:
-    runner = WorkerRunner(handle_sigint=False)
-    await runner.run(worker)
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.add_workers(worker)
+    await runner.run()
 except Exception as e:
     logger.error(f"Pipeline error: {e}")
     # Ensure cleanup happens even on errors
-    await worker.cancel()
+    await runner.cancel()
 ```
 
 ### Running Cleanup Code on Shutdown
@@ -71257,7 +71260,7 @@ Runner arguments are how the runner communicates transport-specific information 
 
 All runner arguments also include:
 
-- **`handle_sigint`**: Whether the bot should handle SIGINT (Ctrl+C) signals (managed automatically)
+- **`handle_sigint`**: Whether the bot should handle SIGINT (Ctrl+C) signals. Pass this to `WorkerRunner(handle_sigint=runner_args.handle_sigint)` so bots run directly can install their own signal handler while hosted bots leave signals to the host.
 - **`handle_sigterm`**: Whether the bot should handle SIGTERM signals (managed automatically)
 
 <Note>
@@ -71281,6 +71284,38 @@ Notice how we use lazy imports (`from pipecat.transports.daily.transport import 
   common interface for the runner to pass transport-specific information to your
   bot.
 </Info>
+
+## Runner Lifecycle Management
+
+### Ending Sessions Early
+
+The `WorkerRunner` provides a `cancel()` method to end a session before it completes naturally. This is commonly used in event handlers to clean up when clients disconnect:
+
+```python
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    # Create the runner before registering event handlers
+    # so handlers can call runner.cancel()
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+    # Your bot setup: services, pipeline, worker...
+    worker = PipelineWorker(pipeline)
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected")
+        await runner.cancel()
+
+    await runner.add_workers(worker)
+    await runner.run()
+```
+
+The runner must be created **before** registering event handlers that need to call `runner.cancel()`. Bots scaffolded by `pipecat init` follow this pattern automatically.
+
+<Tip>
+  Use `runner.cancel()` rather than `worker.cancel()` in event handlers. The
+  runner-level cancel is the recommended approach for ending sessions, as it
+  properly coordinates shutdown across all workers and the runner itself.
+</Tip>
 
 ## Environment Detection
 
