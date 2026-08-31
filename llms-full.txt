@@ -31048,6 +31048,7 @@ Memory services can be used to store and retrieve conversations.
 | Service                                              | Setup                          | Maintainer |
 | ---------------------------------------------------- | ------------------------------ | ---------- |
 | [mem0](/api-reference/server/services/memory/mem0)   | `uv add "pipecat-ai[mem0]"`    | Pipecat    |
+| [MemorySync](/api-reference/server/services/memory/memorysync) | `uv add pipecat-memorysync` | Community |
 | [Synap](/api-reference/server/services/memory/synap) | `uv add maximem-synap-pipecat` | Community  |
 
 ## Realtime LLM
@@ -64153,6 +64154,162 @@ else:
 - **Non-blocking operation**: All Mem0 API calls (storage, retrieval, search) run in background threads to avoid blocking the event loop. Message storage is fire-and-forget, so it doesn't delay downstream processing.
 - **Message role filtering**: Only messages with `user` or `assistant` roles are stored in Mem0. Messages with other roles (such as `system` or `developer`) are automatically filtered out, as the Mem0 API does not accept them.
 
+# undefined
+Source: https://docs.pipecat.ai/api-reference/server/services/memory/memorysync.md
+
+---
+title: "MemorySync Memory"
+sidebarTitle: "MemorySync"
+description: "The pipecat-memorysync integration gives Pipecat voice agents long-term, cross-session memory backed by MemorySync â€” budgeted recall that never stalls a reply."
+---
+
+
+## Overview
+
+The `pipecat-memorysync` integration connects
+[MemorySync](https://memorysync.io), a managed long-term memory layer, to
+Pipecat voice pipelines. It ships one `FrameProcessor`:
+`MemorySyncMemoryService` sits between the user context aggregator and the LLM
+service, enriches every `LLMContextFrame` with relevant memories under a hard
+time budget (default 1.2 s), and mines the same frames for new turns to
+persist in the background â€” so the frame is always pushed on time, enriched or
+not. Capture is delta-only with deterministic idempotency seeds, and the
+injected memory block is excluded from capture, so recalled context never
+re-enters storage.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/memorysyncio/memorysync-pipecat"
+  >
+    Source code, foundational example, and issues for the Pipecat integration
+  </Card>
+  <Card
+    title="Documentation"
+    icon="book"
+    href="https://docs.memorysync.io/guides/pipecat"
+  >
+    Full MemorySync guide for Pipecat pipelines
+  </Card>
+  <Card title="Website" icon="globe" href="https://memorysync.io">
+    Learn more about MemorySync
+  </Card>
+  <Card title="Dashboard" icon="key" href="https://app.memorysync.io">
+    Manage your MemorySync account and API keys
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-memorysync
+```
+
+Requires `pipecat-ai>=1.0.0` and Python 3.10+.
+
+## Prerequisites
+
+### MemorySync Account Setup
+
+Before using the MemorySync integration, you need:
+
+1. **MemorySync API Key**: Get one at
+   [app.memorysync.io](https://app.memorysync.io)
+2. Set it as the `MEMORYSYNC_API_KEY` environment variable, or pass it as the
+   `api_key` constructor argument.
+
+## Configuration
+
+### `MemorySyncMemoryService`
+
+Inserted **after** the user context aggregator and **before** the LLM service.
+On each `LLMContextFrame`, fetches user-scoped memories from MemorySync under
+a hard budget and appends them as a system message to the context, then
+persists any new turns in the background.
+
+<ParamField path="user_id" type="str" required>
+  Required â€” MemorySync memory is user-scoped. Use a stable end-user id.
+</ParamField>
+
+<ParamField path="api_key" type="str" default="None">
+  MemorySync API key. Falls back to the `MEMORYSYNC_API_KEY` environment
+  variable.
+</ParamField>
+
+<ParamField path="session_id" type="str" default="None">
+  Stable id for this call, used to scope the conversation transcript.
+  Auto-generated per service lifetime when absent.
+</ParamField>
+
+<ParamField path="params" type="InputParams" default="InputParams()">
+  Runtime tuning, see below.
+</ParamField>
+
+### `InputParams`
+
+<ParamField path="top_k" type="int" default="5">
+  Memories injected per turn.
+</ParamField>
+
+<ParamField path="recall_timeout" type="float" default="1.2">
+  Hard recall budget in seconds. On timeout the frame proceeds unenriched â€”
+  a slow memory backend can never stall a voice reply.
+</ParamField>
+
+<ParamField path="add_as_system_message" type="bool" default="True">
+  Inject the memory block as a `system` message (else it is appended to the
+  latest user message).
+</ParamField>
+
+<ParamField path="position" type="str" default='"end"'>
+  Where the memory block lands in the message list (`"start"` or `"end"`).
+</ParamField>
+
+<ParamField path="min_prompt_chars" type="int" default="8">
+  Skip recall for user prompts shorter than this.
+</ParamField>
+
+## Usage
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_memorysync import MemorySyncMemoryService
+
+memory = MemorySyncMemoryService(
+    api_key="ms_...",       # or MEMORYSYNC_API_KEY env var
+    user_id="caller-42",    # stable end-user id
+    session_id="call-123",  # optional: scope to this call
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    memory,   # enrich with memories + capture new turns, on budget
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+<Note>
+  Reads and writes both degrade gracefully â€” HTTP errors, quota limits, and
+  timeouts all result in "no memories this turn" and nothing propagates into
+  the pipeline. On `EndFrame`, queued writes get a bounded window to land so
+  the call's final exchange is never lost.
+</Note>
+
+## Compatibility
+
+The integration requires `pipecat-ai>=1.0.0` (tested with Pipecat v1.8.1,
+through `pipecat.tests.utils.run_test` â€” the framework's own harness). Check
+the [source repository](https://github.com/memorysyncio/memorysync-pipecat)
+for the latest tested version and changelog.
+
 # Synap Memory
 Source: https://docs.pipecat.ai/api-reference/server/services/memory/synap.md
 
@@ -91284,10 +91441,11 @@ pipecat context-hub refresh [OPTIONS]
 </ParamField>
 
 <ParamField path="--framework-version" type="string">
-  Pin the framework repo to a specific git tag, e.g. `v1.7.0`, or `latest` for
-  its newest release tag. Source chunks come from that version instead of
-  `HEAD`, so results match the release your project runs rather than whatever is
-  on `main`. Also settable with `PIPECAT_HUB_FRAMEWORK_VERSION`.
+  Pin the framework repo to a specific git tag. Defaults to the newest release
+  tag, so results match the release your project runs. Pass a specific tag (e.g.
+  `v1.7.0`), `latest` (same as the default), or `head` to track the default
+  branch instead — the right choice when developing Pipecat itself or building
+  against unreleased code. Also settable with `PIPECAT_HUB_FRAMEWORK_VERSION`.
 </ParamField>
 
 ## context-hub status
@@ -94072,17 +94230,12 @@ If the index gets corrupted, force a rebuild:
 pipecat context-hub refresh --force
 ```
 
-By default `refresh` indexes framework source from `main`, which runs ahead of any release. Pin it so results match the version your project actually runs — `latest` for the newest release tag, or an exact tag when you target an older one:
+By default `refresh` indexes framework source at the newest release tag, so results match a typical project. Pin it to target a specific older release, or pass `head` to track the default branch instead — the right choice when developing Pipecat itself or building against unreleased code:
 
 ```bash
-pipecat context-hub refresh --framework-version latest
 pipecat context-hub refresh --framework-version v1.7.0
+pipecat context-hub refresh --framework-version head
 ```
-
-<Note>
-  `--framework-version latest` needs `pipecat-ai-context-hub` 0.5.3 or newer,
-  the floor the `cli` extra pins. Earlier versions reject the value.
-</Note>
 
 ### Without the Pipecat CLI
 
