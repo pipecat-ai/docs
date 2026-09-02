@@ -1,12 +1,16 @@
 ---
 title: "AssemblyAI Speech-to-Text"
 sidebarTitle: "AssemblyAI"
-description: "Real-time STT with AssemblyAISTTService: WebSocket streaming, interim results, and end-of-turn detection for voice agents."
+description: "AssemblyAI STT services: streaming WebSocket API (AssemblyAISTTService) and segmented HTTP API (AssemblyAISyncSTTService) for voice agents."
 ---
 
 ## Overview
 
-`AssemblyAISTTService` provides real-time speech recognition using AssemblyAI's WebSocket API with support for interim results, end-of-turn detection, and configurable audio processing parameters for accurate transcription in conversational AI applications.
+AssemblyAI provides two speech-to-text services:
+
+- **`AssemblyAISTTService`**: Real-time streaming via WebSocket. Opens a persistent connection and transcribes audio as it arrives, with support for interim results, end-of-turn detection, and continuous transcription.
+
+- **`AssemblyAISyncSTTService`**: Segmented transcription via HTTP. Uses VAD to detect speech segments and transcribes each complete segment (up to 120 seconds) in a single HTTP request. No persistent session to manage. Ideal for dictation, scribe workflows, and voice agents where speech is detected locally.
 
 <CardGroup cols={2}>
   <Card
@@ -144,6 +148,55 @@ Before using AssemblyAI STT services, you need:
   deployment.
 </ParamField>
 
+### AssemblyAISyncSTTService
+
+<ParamField path="api_key" type="str" required>
+  AssemblyAI API key for authentication.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession" required>
+  aiohttp ClientSession for HTTP requests. Pre-warming only helps when the warm
+  and transcribe requests share this session's connection pool, so keep one
+  session for the service.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://sync.assemblyai.com">
+  Base URL for the Sync API. Override for a data-residency endpoint (e.g.
+  `https://sync.us.assemblyai.com` or `https://sync.eu.assemblyai.com`).
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None" default="None">
+  Audio sample rate in Hz. If None, uses the pipeline's rate.
+</ParamField>
+
+<ParamField path="enable_prewarming" type="bool" default="True">
+  Whether to open the connection when the user starts speaking so the
+  transcription request avoids the connection handshake.
+</ParamField>
+
+<ParamField path="max_context_turns" type="int" default="5">
+  Number of prior conversation turns — user transcripts and agent replies
+  together, in one chronological buffer — automatically carried as
+  `conversation_context` on each request, so the model transcribes each turn
+  with the surrounding dialogue. Set to 0 to disable automatic context. Ignored
+  when `conversation_context` is set explicitly in `settings`.
+</ParamField>
+
+<ParamField path="max_context_chars" type="int" default="1500">
+  Character budget for the automatic context buffer; the oldest turns are
+  dropped first once either cap is exceeded.
+</ParamField>
+
+<ParamField path="settings" type="AssemblyAISyncSTTService.Settings" default="None">
+  Runtime-configurable settings for the Sync STT service. See [Sync
+  Settings](#sync-settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="ASSEMBLYAI_SYNC_TTFS_P99">
+  P99 latency from speech end to final transcript in seconds. Broadcast at
+  pipeline start for downstream turn timing; set it to your measured value.
+</ParamField>
+
 ### Settings
 
 Runtime-configurable settings passed via the `settings` constructor argument using `AssemblyAISTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
@@ -171,6 +224,18 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `voice_focus`                      | `Literal["near-field", "far-field"]`                 | `None`                | Enable Voice Focus to isolate the primary voice and suppress background noise before transcription. Set to `"near-field"` for close-talking mics (headsets, phones) or `"far-field"` for distant mics (conference rooms). Off when unset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `voice_focus_threshold`            | `float`                                              | `None`                | Controls how aggressively Voice Focus suppresses background audio, from `0.0` (least) to `1.0` (most). Requires `voice_focus` to be set, otherwise a validation error is returned.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `mode`                             | `Literal["min_latency", "balanced", "max_accuracy"]` | `None`                | Latency and accuracy preset controlling turn-detection and partial-emission defaults. `max_accuracy` favors quality, `min_latency` favors speed, and `balanced` trades off between them. When omitted, the server applies its own preset, which sets the defaults for mode-dependent fields such as `interruption_delay`, `min_turn_silence`, `vad_threshold`, `previous_context_n_turns`, and `continuous_partials`.                                                                                                                                                                                                                                                                                                                      |
+
+### Sync Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `AssemblyAISyncSTTService.Settings(...)`. The Sync service has a simpler settings surface than the streaming service — it supports prompting, key terms, and conversation context, but not turn detection or real-time features like voice focus.
+
+| Parameter               | Type              | Default               | Description                                                                                                                                                                                                                                                                                                                                                          |
+| ----------------------- | ----------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                 | `str`             | `"universal-3-5-pro"` | STT model identifier. Set to `"universal-3-5-pro"`. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                            |
+| `language`              | `Language \| str` | `Language.EN`         | Language for speech recognition. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                               |
+| `prompt`                | `str \| None`     | `None`                | Custom transcription instruction prepended to the model's system prompt. When set, `language` is ignored — state the language in the prompt instead.                                                                                                                                                                                                                 |
+| `keyterms_prompt`       | `List[str]`       | `None`                | Key terms or phrases to bias the decoder toward.                                                                                                                                                                                                                                                                                                                     |
+| `conversation_context`  | `str \| List[str] \| None` | `None`     | Prior turns from the same conversation, oldest first, giving the model the surrounding dialogue for better continuity and proper-noun consistency across a multi-turn conversation. A single string is treated as one turn. Setting this explicitly turns off the service's automatic context buffer and sends exactly this value; leave it unset to let the service manage context (see `max_context_turns`). |
 
 ## Usage
 
@@ -304,6 +369,82 @@ stt = AssemblyAISTTService(
 
 Language steering is prompt-based and applies to U3 Pro models only. Regional variants (e.g. `Language.ES_MX`) resolve to their base code (`"es"`). At most 10 distinct languages can be declared. Unlike most settings, `language_codes` can be updated mid-session without reconnecting using `STTUpdateSettingsFrame`.
 
+### AssemblyAISyncSTTService Usage
+
+The Sync service transcribes VAD-detected speech segments via HTTP requests rather than a persistent WebSocket connection.
+
+#### Basic Setup
+
+```python
+import aiohttp
+from pipecat.services.assemblyai.stt import AssemblyAISyncSTTService
+from pipecat.transcriptions.language import Language
+
+async with aiohttp.ClientSession() as session:
+    stt = AssemblyAISyncSTTService(
+        api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+        aiohttp_session=session,
+        settings=AssemblyAISyncSTTService.Settings(
+            language=Language.EN,
+        ),
+    )
+```
+
+#### With Custom Settings
+
+```python
+import aiohttp
+from pipecat.services.assemblyai.stt import AssemblyAISyncSTTService
+
+async with aiohttp.ClientSession() as session:
+    stt = AssemblyAISyncSTTService(
+        api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+        aiohttp_session=session,
+        settings=AssemblyAISyncSTTService.Settings(
+            prompt="Transcribe this customer support call.",
+            keyterms_prompt=["Pipecat", "AssemblyAI"],
+        ),
+    )
+```
+
+#### With Custom Context Management
+
+```python
+import aiohttp
+from pipecat.services.assemblyai.stt import AssemblyAISyncSTTService
+
+async with aiohttp.ClientSession() as session:
+    stt = AssemblyAISyncSTTService(
+        api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+        aiohttp_session=session,
+        max_context_turns=10,  # Keep more conversation history
+        max_context_chars=2000,  # Allow more characters
+    )
+```
+
+Or provide explicit context:
+
+```python
+stt = AssemblyAISyncSTTService(
+    api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+    aiohttp_session=session,
+    settings=AssemblyAISyncSTTService.Settings(
+        conversation_context=["Booking a flight to Lisbon."],
+    ),
+)
+```
+
+#### Data Residency
+
+```python
+async with aiohttp.ClientSession() as session:
+    stt = AssemblyAISyncSTTService(
+        api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+        aiohttp_session=session,
+        base_url="https://sync.eu.assemblyai.com",  # EU endpoint
+    )
+```
+
 ## Methods
 
 ### update_agent_context()
@@ -327,6 +468,25 @@ await stt.update_agent_context("What is your order ID?")
 
 > It is automatically invoked each time an assistant turn is completed.
 
+### warm()
+
+```python
+async def warm()
+```
+
+Pre-warm the connection to the Sync API (AssemblyAISyncSTTService only). Establishes the connection (DNS, TCP, TLS) ahead of a transcription request so the next segment starts uploading audio immediately. The warmed connection is reused only by requests that share this service's aiohttp session and base URL.
+
+Best-effort: failures are logged and swallowed, since a failed warm-up only forfeits the latency saving.
+
+**Example:**
+
+```python
+# Manually warm the connection
+await stt.warm()
+```
+
+> When `enable_prewarming=True` (the default), the connection is warmed automatically when the user starts speaking.
+
 ## Notes
 
 - **Model**: Use `universal-3-5-pro`, AssemblyAI's flagship streaming model. It supports built-in turn detection, prompting, continuous partials, context carryover, and voice focus.
@@ -338,6 +498,15 @@ await stt.update_agent_context("What is your order ID?")
 - **Speaker diarization**: Enable `speaker_labels=True` in Settings to automatically identify different speakers. Final transcripts will include a speaker field (e.g., "Speaker A", "Speaker B"). Use the `speaker_format` parameter to format transcripts with speaker labels.
 - **Prompting** (U3 Pro models only): The `prompt` parameter allows you to guide transcription for specific names, terms, or domain vocabulary. May be combined with `keyterms_prompt` on U3 Pro models. AssemblyAI recommends testing without a prompt first.
 - **Dynamic settings updates**: Most settings can be updated at runtime using `STTUpdateSettingsFrame`. `agent_context` and `language_codes` are hot-updatable without reconnecting; other settings require a reconnect.
+
+### AssemblyAISyncSTTService
+
+- **Segment limit**: Audio segments must be at most 120 seconds. The API rejects longer segments. This suits dictation, scribe workflows, and voice-agent turns where the client detects speech locally.
+- **No persistent connection**: The Sync API is stateless. Each speech segment is transcribed in a single HTTP POST request with no upload step, no polling, and no session to manage.
+- **Automatic conversation context**: Recent conversation turns — user transcripts and agent replies together — are automatically carried as `conversation_context` on each request. Control the buffer size with `max_context_turns` (default 5, set to 0 to disable) and `max_context_chars` (default 1500). Setting `conversation_context` explicitly in Settings turns off the automatic buffer and sends exactly that value.
+- **Pre-warming**: When `enable_prewarming=True` (the default), the connection is opened when the user starts speaking so the transcription request skips the DNS, TCP, and TLS handshake. Call `warm()` directly to warm the connection at any other time.
+- **aiohttp session**: Pre-warming only helps when the warm and transcribe requests share the same aiohttp session's connection pool, so keep one session for the service.
+- **Data residency**: Override `base_url` for data-residency endpoints (e.g. `https://sync.us.assemblyai.com` or `https://sync.eu.assemblyai.com`).
 
 <Tip>
   The `connection_params=` / `InputParams` / `params=` pattern is deprecated as
