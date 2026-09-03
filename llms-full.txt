@@ -31336,7 +31336,7 @@ Before registering a {productNameSingular}, make sure your cluster, network, and
 
 ## Kubernetes cluster
 
-- **A conforming Kubernetes cluster, version 1.29 or later.** Any distribution works — managed (EKS, GKE, AKS, OKE) or self-managed. The [AWS EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks) is one proven layout.
+- **A conforming Kubernetes cluster, version 1.29 or later.** Any distribution works — managed (EKS, GKE, AKS, OKE) or self-managed. The [reference architectures](/pipecat-cloud/self-hosted/reference/aws-eks) for AWS EKS and Oracle OKE are proven layouts.
 - **cgroup v2 on the nodes that run agents.** Per-session CPU and memory metrics are sampled from the node's cgroup filesystem, which must be the unified (v2) hierarchy — the default on recent distributions (Amazon Linux 2023, Ubuntu 22.04+, RHEL 9+). On cgroup v1 nodes, sessions run normally but resource metrics are unavailable and the dashboard says so; see [Session metrics](/pipecat-cloud/self-hosted/logs#session-metrics).
 - **Nodes for the architectures you intend to run.** Agents are scheduled on `amd64` or `arm64` nodes according to the architecture each deployment declares. Provide nodes for one or both, and [declare what the region supports](/pipecat-cloud/self-hosted/sizing#architecture) when you register it.
 - **A namespace for agents that permits privileged pods.** The package creates a workloads namespace (`pipecat-agents` by default) labeled `pod-security.kubernetes.io/enforce: privileged`, because agent pods currently mount a host path to read cgroup metrics. If you create the namespace yourself (for example, from a GitOps pipeline), apply that label; the install refuses to proceed without a usable namespace.
@@ -31378,7 +31378,7 @@ The platform components run in a system namespace (`pipecat-system` by default) 
 
 Plan roughly **6 vCPU and 8 GiB** for the platform at default replica counts, on nodes with at least 4 allocatable vCPU. Several components request a full vCPU each, so nodes with 2 vCPU fit at most one of them and a `helm install --wait` will time out with pods left pending.
 
-Capacity for the agents themselves comes on top of this. Size it from your expected concurrency and the [resources you assign per agent](/pipecat-cloud/self-hosted/sizing) — a voice agent typically needs 0.5 vCPU and 1 GiB. A dedicated, autoscaled node pool for agent pods, as in the [EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks), keeps platform and agent capacity independent.
+Capacity for the agents themselves comes on top of this. Size it from your expected concurrency and the [resources you assign per agent](/pipecat-cloud/self-hosted/sizing) — a voice agent typically needs 0.5 vCPU and 1 GiB. A dedicated, autoscaled node pool for agent pods, as in the [EKS reference architecture](/pipecat-cloud/self-hosted/reference/aws-eks), keeps platform and agent capacity independent.
 
 ## Supporting services
 
@@ -31770,7 +31770,7 @@ pipecat-cloud-operator:
   botScalingPolicy: {}
 ```
 
-Scheduling constraints for agent pods (node selectors, tolerations, affinity) are set through the operator's scheduling overlay; the [EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks) shows a dedicated, tainted agent node pool wired this way.
+Scheduling constraints for agent pods (node selectors, tolerations, affinity) are set through the operator's scheduling overlay; the [EKS reference architecture](/pipecat-cloud/self-hosted/reference/aws-eks) shows a dedicated, tainted agent node pool wired this way.
 
 ## Image pull credentials
 
@@ -32177,7 +32177,7 @@ What to watch:
 - **Activation service CPU** — it relays every WebSocket frame in line, so it is the first platform component to need more replicas as WebSocket session volume grows.
 - **Autoscaler and node provisioning latency**, if you scale agent nodes on demand: cold starts are dominated by node launch and image pull, not by Pipecat Cloud.
 
-The [EKS reference architecture](/pipecat-cloud/self-hosted/aws-eks#monitoring) includes an optional Prometheus and Grafana stack wired to all of the above.
+The [EKS reference architecture](/pipecat-cloud/self-hosted/reference/aws-eks#monitoring) includes an optional Prometheus and Grafana stack wired to all of the above.
 
 # Operating a Self-Hosted Region
 Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/operations.md
@@ -32431,7 +32431,7 @@ Independent of any setting:
 Nothing connects inbound to your cluster. The region agent opens an outbound, mutually authenticated connection to Pipecat Cloud, and every control-plane operation — deploying, starting sessions, querying logs, pulling a support bundle — travels over it and is limited to the operations above. Revoking the region cuts that connection off.
 
 # Self-Hosted Region on AWS EKS
-Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/aws-eks.md
+Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/reference/aws-eks.md
 
 A reference architecture for a self-hosted region on Amazon EKS: VPC, node pools, managed broker and log store, WebSocket front door, monitoring.
 
@@ -32510,6 +32510,59 @@ Approximate idle cost (us-west-2, on-demand list prices, before agent nodes and 
 | `production` | 3–8 × 4 vCPU, 3 AZs | `cache.m7g.large` with failover, 3 × `m7g.large.search` zone-aware with 200 GB | ~$1,250/mo | Production, before measured tuning     |
 
 The `production` shape is the right structure; its instance sizes should be adjusted from your own measured load.
+
+# Self-Hosted Region on Oracle OKE
+Source: https://docs.pipecat.ai/pipecat-cloud/self-hosted/reference/oci-oke.md
+
+A reference architecture for a self-hosted region on Oracle Cloud's OKE: standalone VCN, Karpenter node pools, managed stores, Gateway API front door.
+
+This page describes a {productNameSingular} on Oracle Cloud Infrastructure's Kubernetes Engine (OKE) as Daily builds and validates it. Like the [AWS EKS layout](/pipecat-cloud/self-hosted/reference/aws-eks) it is one proven shape, not a requirement; it is worth reading even if you are not on OCI, because it is the layout that uses the package's release-owned Gateway mode and Karpenter for the platform nodes as well as the agent nodes.
+
+## Layout
+
+- **A standalone VCN** with no peering and no path in from any other network. The region agent dials out to Pipecat Cloud; nothing needs to reach in. Public: the WebSocket front door and the cluster's API endpoint.
+- **An OKE enhanced cluster** (VCN-native pod networking, OIDC discovery for workload identity) on a stock OKE arm64 image, with one small static **bootstrap pool** tainted for critical add-ons — Karpenter, CoreDNS, and DaemonSets, and nothing else.
+- **Karpenter** (Oracle's provider) with two node pools on Ampere shapes: `platform` for the platform components, cert-manager, and monitoring, and `bots`, tainted so only agent pods land there. Shape menus follow the 1:2 CPU:memory ratio of voice agents; disruption is graceful — nodes leave only when empty.
+- **Managed stores** for sizes above `dev`: **OCI Cache** (Valkey) as the broker and **OCI Search with OpenSearch** as the log store, TLS and password on both, wired through `externalBroker.*` and `logging.external.*`. Note that OCI's floor for OpenSearch is three nodes. `dev` runs the package's bundled stores.
+- **Platform prerequisites** cert-manager and trust-manager, and optionally a local kube-prometheus-stack.
+
+## WebSocket front door
+
+OKE's native ingress controller implements only the Ingress API and cannot change its load balancer's 60-second idle timeout, which ends a WebSocket session at 60 idle seconds. This layout therefore uses **Gateway API** with **Envoy Gateway** as the implementation — what Oracle's own OKE documentation installs for Gateway API — fronted by an **OCI network load balancer** through one annotation, with TLS terminating in Envoy from a cert-manager (Let's Encrypt, HTTP-01) certificate and **external-dns** writing the hostname into an OCI DNS zone. All of it is authenticated by workload identity; no key material is stored anywhere.
+
+The front door itself belongs to the region package's `gateway` exposure mode, so it is created at `helm install` and removed at uninstall:
+
+```yaml
+wsExposure:
+  mode: gateway
+  gateway:
+    host: ws.acme-oci.example.com
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt
+    infrastructureAnnotations:
+      oci.oraclecloud.com/load-balancer-type: nlb
+      oci-network-load-balancer.oraclecloud.com/security-list-management-mode: "None"
+    tls:
+      secretName: pipecat-ws-tls
+envoy-gateway:
+  enabled: true
+```
+
+Registering the region reads the architecture from the cluster and the WebSocket endpoint from the stack's outputs, so the region record declares exactly what was built. A `dig` of the hostname resolving to the load balancer and `curl -I https://<hostname>/` answering with a valid certificate confirms the path.
+
+## Values
+
+As on EKS, the region's values file is generated from the infrastructure's outputs — front door, agent placement, monitors — and your own tuning is layered after it. It carries no image references or versions, so [upgrades stay version-only](/pipecat-cloud/self-hosted/operations#upgrading-the-region-package).
+
+## Sizes
+
+`dev` (one bootstrap node, bundled stores, no monitoring), `small` (two bootstrap nodes, managed stores, monitoring), `load`, and `production`. The bootstrap pool never scales; everything that scales with load is a Karpenter node pool.
+
+## Provider notes
+
+- **Container runtime.** OKE's Oracle Linux nodes run CRI-O with strict short-name resolution, which rejects unqualified image names such as `curlimages/curl`. The region package qualifies every third-party image it references (package 0.1.11 or later); if you mirror images, keep them fully qualified.
+- **Compartment isolation.** Use a compartment with nothing else in it: the node dynamic group matches every instance in the compartment, so a shared compartment means shared node identity.
+- **Kubernetes version.** Pin the OKE version after the first apply; left unset, the newest OKE release becomes an unplanned control-plane upgrade on the next apply.
 
 # Pipecat Cloud Security Guide
 Source: https://docs.pipecat.ai/pipecat-cloud/security/security-and-compliance.md
