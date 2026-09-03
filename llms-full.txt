@@ -29301,6 +29301,606 @@ For more details on Smart Turn, see the following links:
   </Card>
 </CardGroup>
 
+# Pipecat Cloud Webhooks
+Source: https://docs.pipecat.ai/pipecat-cloud/guides/webhooks.md
+
+Register webhook endpoints, subscribe to Pipecat Cloud events, and verify signed webhook deliveries in TypeScript and Python.
+
+Webhooks let Pipecat Cloud notify your own services when something happens in your organization: a build finishes, a deployment replaces your pods, spend crosses a threshold, a session starts. Instead of polling the REST API, you register an endpoint URL and Pipecat Cloud POSTs a signed JSON payload to it.
+
+Every delivery is signed, so your handler can prove the request came from Pipecat Cloud and not from anyone who happened to guess your URL.
+
+<Note>
+  Webhook endpoints are managed per organization from the dashboard. There is no
+  CLI command or API-key-authenticated REST route for endpoint management.
+</Note>
+
+## Register an endpoint
+
+<Steps>
+  <Step title="Open the webhooks settings">
+    Go to the [Pipecat Cloud dashboard <Icon icon="arrow-up-right-from-square" iconType="solid" />](https://pipecat.daily.co/) and select **Settings > Webhooks** for your organization.
+  </Step>
+  <Step title="Add an endpoint">
+    Click **Add endpoint** and enter the URL that should receive events. Only
+    `http` and `https` URLs are accepted; use `https` for anything reachable
+    from the internet.
+  </Step>
+  <Step title="Choose the events to receive">
+    Select at least one event type. Pipecat Cloud only delivers the types you
+    subscribe to, so you do not have to filter unwanted traffic in your handler.
+    An endpoint with no event types is rejected: if you want an endpoint to stop
+    receiving everything, disable or delete it instead.
+
+    See the [webhook event reference](/pipecat-cloud/guides/webhook-events) for
+    the full catalog and payload shapes.
+
+  </Step>
+  <Step title="Copy the signing secret">
+    Use the key icon on the endpoint's row to reveal its signing secret. It
+    looks like `whsec_...`. Store it wherever your handler reads its
+    configuration from, and treat it like any other credential.
+  </Step>
+</Steps>
+
+Each endpoint row also gives you a **delivery history** view, an **edit** action for changing the URL or subscriptions, an **enable/disable** switch, and a **send test event** action.
+
+<Warning>
+  Deleting an endpoint destroys its signing secret and delivery history. To stop
+  deliveries temporarily, disable the endpoint instead. Recreating an endpoint
+  at the same URL issues a **new** secret, and any handler still using the old
+  one will reject every delivery.
+</Warning>
+
+## Verify the signature
+
+Your endpoint URL is the only thing standing between the public internet and your handler, so verify every request before you act on it. Pipecat Cloud signs every delivery following the [Standard Webhooks](https://www.standardwebhooks.com/) specification, so any Standard Webhooks library will verify it for you, including the timestamp check that prevents replay of an old but validly signed payload.
+
+Three headers carry the signature:
+
+| Header           | Description                                                         |
+| ---------------- | ------------------------------------------------------------------- |
+| `svix-id`        | The message id. Stable across every retry of the same message.      |
+| `svix-timestamp` | When the message was sent, as Unix seconds.                         |
+| `svix-signature` | A space-delimited list of versioned signatures, each `v1,<base64>`. |
+
+These names carry a prefix from the delivery provider, while Standard Webhooks libraries look for them as `webhook-id`, `webhook-timestamp` and `webhook-signature`. Map the three across before verifying, as both samples below do. Nothing else about the scheme differs.
+
+Verification also rejects a payload whose timestamp is more than five minutes away from your server's clock, so keep the receiving host's time in sync.
+
+Pass the library the **raw request body** exactly as received. Parsing the JSON and re-serializing it changes the bytes, and the signature will no longer match.
+
+<CodeGroup>
+
+```typescript TypeScript (Express)
+import express from "express";
+import { Webhook, WebhookVerificationError } from "standardwebhooks";
+
+const app = express();
+const wh = new Webhook(process.env.PIPECAT_WEBHOOK_SECRET!);
+
+// Deliveries name the signature headers with a provider prefix; Standard
+// Webhooks libraries look for them unprefixed. Empty strings rather than
+// `undefined` so a request with no signature fails verification (a 400)
+// instead of throwing (a 500).
+function signatureHeaders(headers: Record<string, unknown>) {
+  return {
+    "webhook-id": (headers["svix-id"] as string) ?? "",
+    "webhook-timestamp": (headers["svix-timestamp"] as string) ?? "",
+    "webhook-signature": (headers["svix-signature"] as string) ?? "",
+  };
+}
+
+// `express.raw` is essential: the JSON body parser would hand you an object,
+// and the signature is over the bytes that arrived on the wire.
+app.post(
+  "/webhooks/pipecat",
+  express.raw({ type: "application/json" }),
+  (req, res) => {
+    let event: any;
+    try {
+      event = wh.verify(req.body, signatureHeaders(req.headers));
+    } catch (err) {
+      if (err instanceof WebhookVerificationError) {
+        // Wrong secret, tampered body, or a replayed old delivery.
+        return res.status(400).send("Invalid signature");
+      }
+      throw err;
+    }
+
+    // Acknowledge immediately, then do the real work out of band. The
+    // response has already gone out, so nothing downstream will surface a
+    // failure in here and the delivery will not be retried: catch it
+    // yourself, and hand off to a real queue in production.
+    res.status(204).end();
+    handleEvent(event).catch((err) => {
+      console.error("Webhook handler failed", err);
+    });
+  },
+);
+
+async function handleEvent(event: any) {
+  switch (event.event_type) {
+    case "build.succeeded":
+      console.log(
+        `Build ${event.data.build_id} produced ${event.data.image_uri}`,
+      );
+      break;
+    case "deployment.updated":
+      console.log(
+        `${event.data.service_name} redeployed in ${event.data.region}`,
+      );
+      break;
+    default:
+      // Subscribing to a new event type in the dashboard should not break
+      // a running handler, so ignore anything you do not handle yet.
+      break;
+  }
+}
+
+app.listen(3000);
+```
+
+```python Python (FastAPI)
+import os
+
+from fastapi import BackgroundTasks, FastAPI, Request, Response
+from standardwebhooks import Webhook, WebhookVerificationError
+
+app = FastAPI()
+wh = Webhook(os.environ["PIPECAT_WEBHOOK_SECRET"])
+
+
+def signature_headers(headers) -> dict[str, str]:
+    """Deliveries name the signature headers with a provider prefix; Standard
+    Webhooks libraries look for them unprefixed. Defaulting to "" rather than
+    raising means a request with no signature fails verification (a 400)
+    instead of erroring (a 500)."""
+    return {
+        "webhook-id": headers.get("svix-id", ""),
+        "webhook-timestamp": headers.get("svix-timestamp", ""),
+        "webhook-signature": headers.get("svix-signature", ""),
+    }
+
+
+@app.post("/webhooks/pipecat")
+async def pipecat_webhook(request: Request, background_tasks: BackgroundTasks):
+    # The raw bytes, not a parsed model: the signature is over what arrived.
+    payload = await request.body()
+
+    try:
+        event = wh.verify(payload, signature_headers(request.headers))
+    except WebhookVerificationError:
+        # Wrong secret, tampered body, or a replayed old delivery.
+        return Response(status_code=400)
+
+    # Acknowledge immediately, then do the real work out of band.
+    background_tasks.add_task(handle_event, event)
+    return Response(status_code=204)
+
+
+async def handle_event(event: dict):
+    event_type = event["event_type"]
+    data = event["data"]
+
+    if event_type == "build.succeeded":
+        print(f"Build {data['build_id']} produced {data.get('image_uri')}")
+    elif event_type == "deployment.updated":
+        print(f"{data['service_name']} redeployed in {data['region']}")
+    # Subscribing to a new event type in the dashboard should not break a
+    # running handler, so ignore anything you do not handle yet.
+```
+
+</CodeGroup>
+
+Install the library with `npm install standardwebhooks` or `pip install standardwebhooks`.
+
+<Warning>
+  A handler that skips verification will act on anything anyone POSTs to the
+  URL, including forged `spend.limit_reached` or `service.suspended` events. If
+  you cannot verify for some reason, do not let the handler take a consequential
+  action on the payload alone.
+</Warning>
+
+## Respond quickly
+
+Pipecat Cloud treats any `2xx` response as a successful delivery and anything else as a failure to be retried. Acknowledge as soon as the signature checks out and move the real work to a queue or a background task, as both samples above do. A handler that does its work inline turns a slow downstream dependency into a delivery failure and a retry storm.
+
+## Handle duplicates
+
+**Delivery is at-least-once.** A retry after a timeout can arrive even though your handler already processed the message, and some events are produced by periodic jobs that can overlap.
+
+The `svix-id` header is stable across every retry of the same message, which makes it the right deduplication key:
+
+<CodeGroup>
+
+```typescript TypeScript
+const messageId = req.headers["svix-id"] as string;
+
+if (await seen.has(messageId)) {
+  return res.status(204).end(); // Already handled; acknowledge and stop.
+}
+await seen.add(messageId, { ttlSeconds: 60 * 60 * 24 });
+```
+
+```python Python
+message_id = request.headers["svix-id"]
+
+if await seen.has(message_id):
+    return Response(status_code=204)  # Already handled; acknowledge and stop.
+await seen.add(message_id, ttl_seconds=60 * 60 * 24)
+```
+
+</CodeGroup>
+
+Two details worth knowing:
+
+- Events produced by periodic jobs (`org.trial_ended` and the `spend.*` threshold events) carry an idempotency key, so overlapping runs of the same job deliver once rather than twice.
+- Deployment events are sent after the deploy commits. A process restart in that window can drop the event; the deploy itself is unaffected.
+
+## Test your handler
+
+Use the **send test event** action on an endpoint's row to deliver a sample of any event type that endpoint subscribes to. The body is generated from the event type's registered schema, so it is shaped exactly like the real event: you can exercise signature verification and payload parsing without producing a real build or session first.
+
+The endpoint has to be enabled to receive a test event. Like a manual retry, the action reports that the event was _accepted_, not that it was delivered. The outcome appears in the delivery history.
+
+Test deliveries carry a `webhook-test: true` header, which real events do not. If it is useful to route them differently, branch on that rather than on anything in the payload: a test event's body is a realistic sample, so it names a service and a region that may well exist in your account.
+
+## Inspect deliveries
+
+The history icon on an endpoint's row opens its delivery history, newest first. Each row is one message, with its event type, status, and, when a retry is still scheduled, when the next attempt will happen.
+
+Opening a delivery shows the exact payload that was sent and every attempt against it, including:
+
+- the response status code your server returned,
+- how long the request took,
+- the response body (truncated if large),
+- whether the attempt was scheduled or produced by a manual retry.
+
+You can re-dispatch any delivery from here. A retry is queued rather than made inline, so its outcome shows up as a new attempt in the history rather than in the response to the retry itself.
+
+<Note>
+  Delivery history looks back 90 days. A delivery older than that reports as not
+  found rather than as aged out.
+</Note>
+
+## Troubleshooting
+
+| Symptom                                            | Likely cause                                                                                                                                                                                               |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Every delivery fails signature verification        | The handler is verifying a re-serialized body instead of the raw bytes, or the secret belongs to a deleted-and-recreated endpoint.                                                                         |
+| No deliveries arrive at all                        | The endpoint is disabled, or it is not subscribed to the event type you expect. Check the badges on its row.                                                                                               |
+| An event you expected never fires                  | Some events are deliberately narrow. A deploy that resolves to no configuration change emits nothing, and `build.started` is best-effort. See the [event reference](/pipecat-cloud/guides/webhook-events). |
+| Deliveries succeed but your handler acts twice     | Delivery is at-least-once. Deduplicate on the `svix-id` header.                                                                                                                                            |
+| "Webhooks are not configured on this environment." | Webhooks are not available on the environment your organization is on. Contact support.                                                                                                                    |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Webhook event reference"
+    icon="list"
+    href="/pipecat-cloud/guides/webhook-events"
+  >
+    Every event type, when it fires, and the exact payload it carries.
+  </Card>
+  <Card
+    title="Pipecat Cloud REST API"
+    icon="code"
+    href="/api-reference/pipecat-cloud/rest-reference/overview"
+  >
+    Read build, deployment, and session state directly when you need more than
+    an event carries.
+  </Card>
+</CardGroup>
+
+# Webhook Event Reference
+Source: https://docs.pipecat.ai/pipecat-cloud/guides/webhook-events.md
+
+Every Pipecat Cloud webhook event: the delivery envelope plus payloads for build, deployment, service, spend, session, API key, and secret events.
+
+This is the full catalog of events Pipecat Cloud can deliver to a [webhook endpoint](/pipecat-cloud/guides/webhooks). Each section lists when an event fires and what its `data` payload carries.
+
+<Note>
+  The catalog holds an invariant worth relying on: **an event type is offered
+  only if it can actually fire.** Nothing you can subscribe to is a placeholder.
+</Note>
+
+## The envelope
+
+Every event arrives in the same envelope. Only `data` differs between event types.
+
+```json
+{
+  "event_type": "build.succeeded",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {}
+}
+```
+
+| Field        | Type   | Description                                  |
+| ------------ | ------ | -------------------------------------------- |
+| `event_type` | string | Which event this is, e.g. `build.succeeded`. |
+| `org`        | string | The organization name.                       |
+| `created_at` | string | When the event was emitted (ISO 8601, UTC).  |
+| `data`       | object | The per-event payload documented below.      |
+
+### Payload conventions
+
+- Entities are identified by an `_id` / `_name` pair, such as `service_id` plus `service_name`, rather than a bare noun.
+- Field names are `snake_case`.
+- Money is always `*_cents`, as a JSON number.
+- Enum-ish fields name the cause, not the event: `reason` on `service.suspended` says `trial_exhausted`, not `suspended`.
+
+<Warning>
+  **One documented exception.** `session.started` sends the service name as
+  `service`, not `service_name`. It shipped before this convention and has
+  existing subscribers, so it stays as it is. If you correlate across event
+  types, the two spellings mean the same thing.
+</Warning>
+
+Fields marked nullable below are always present and may be `null`. Fields marked optional are omitted entirely when they do not apply, so read them defensively.
+
+## Builds
+
+| Event             | Fires when                                                                                                                    |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `build.started`   | The build enters `building`, either when CodeBuild accepts the trigger or on the first status check that observes it running. |
+| `build.succeeded` | CodeBuild reports `SUCCEEDED`.                                                                                                |
+| `build.failed`    | CodeBuild reports `FAILED` or `STOPPED`, or the trigger call itself failed.                                                   |
+| `build.timeout`   | CodeBuild reports `TIMED_OUT`. Separate from `build.failed` so you can subscribe to timeouts alone.                           |
+
+<Warning>
+  **`build.started` is best-effort and not guaranteed.** Build status is
+  reconciled periodically rather than streamed, so a build that finishes between
+  two checks goes straight to a terminal state and emits only that event. Do not
+  pair `build.started` with `build.succeeded` as an open/close bracket: a
+  subscriber counting in-flight builds, or closing a tracing span opened on
+  `build.started`, will leak on exactly the fastest builds. Treat the terminal
+  events as authoritative.
+</Warning>
+
+| Field                    | Type             | Notes                                                                 |
+| ------------------------ | ---------------- | --------------------------------------------------------------------- |
+| `build_id`               | string           |                                                                       |
+| `region`                 | string           | Region the build ran in.                                              |
+| `status`                 | string           | `building`, `success`, `failed`, or `timeout`, matching the event.    |
+| `triggered_by`           | string           | `api` or `github`.                                                    |
+| `commit_sha`             | string \| null   | Null for CLI and API builds.                                          |
+| `ref`                    | string \| null   | Null for CLI and API builds.                                          |
+| `repo_full_name`         | string \| null   | `owner/repo`. Null for CLI and API builds.                            |
+| `image_uri`              | string, optional | The image the build produced. On `build.succeeded` only.              |
+| `build_duration_seconds` | number, optional | Wall-clock duration. On the three terminal events.                    |
+| `error_message`          | string, optional | Why the build did not succeed. On `build.failed` and `build.timeout`. |
+
+```json build.succeeded
+{
+  "event_type": "build.succeeded",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "build_id": "9f1c3a52-6b0e-4c11-9a76-2d5f8b41e0c7",
+    "region": "us-west-2",
+    "status": "success",
+    "commit_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
+    "ref": "refs/heads/main",
+    "repo_full_name": "acme-co/voice-agent",
+    "triggered_by": "github",
+    "image_uri": "123456789012.dkr.ecr.us-west-2.amazonaws.com/acme-co/voice-agent:e3b0c44",
+    "build_duration_seconds": 94
+  }
+}
+```
+
+## Deployments
+
+| Event                | Fires when                                 |
+| -------------------- | ------------------------------------------ |
+| `deployment.created` | A service's first deployment.              |
+| `deployment.updated` | A redeploy that replaced the running pods. |
+
+<Note>
+  **A deploy that changes nothing emits nothing.** When a deploy resolves to no
+  configuration change, Pipecat Cloud records an audit version without creating
+  a deployment or replacing pods, and sends no event. `deployment.updated` means
+  pods were actually replaced.
+</Note>
+
+| Field           | Type           | Notes                                                      |
+| --------------- | -------------- | ---------------------------------------------------------- |
+| `deployment_id` | string         |                                                            |
+| `service_id`    | string         |                                                            |
+| `service_name`  | string         |                                                            |
+| `region`        | string         |                                                            |
+| `build_id`      | string \| null | The build that was deployed. Null for image-based deploys. |
+
+```json deployment.updated
+{
+  "event_type": "deployment.updated",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "deployment_id": "d1f7b2c8-4e35-4a90-8c62-7b1e9a0f3d44",
+    "service_id": "2a8e5c17-9d3b-4f60-a1e8-6c04b7f2591d",
+    "service_name": "voice-agent",
+    "region": "us-west-2",
+    "build_id": "9f1c3a52-6b0e-4c11-9a76-2d5f8b41e0c7"
+  }
+}
+```
+
+## Services
+
+| Event               | Fires when                                                                                    |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| `service.suspended` | The service was torn down because the organization is suspended or its trial credits ran out. |
+| `service.resumed`   | The suspension was lifted.                                                                    |
+
+`service.resumed` fires whenever a suspension is lifted, including when there is nothing to bring back up, so every `service.suspended` has a matching `service.resumed`.
+
+| Field          | Type   | Notes                                                                  |
+| -------------- | ------ | ---------------------------------------------------------------------- |
+| `service_id`   | string |                                                                        |
+| `service_name` | string |                                                                        |
+| `region`       | string |                                                                        |
+| `reason`       | string | `trial_exhausted` or `account_suspended`. On `service.suspended` only. |
+
+When both causes apply, `trial_exhausted` is reported: it is the more specific one, and the one you can resolve yourself by adding a payment method.
+
+```json service.suspended
+{
+  "event_type": "service.suspended",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "service_id": "2a8e5c17-9d3b-4f60-a1e8-6c04b7f2591d",
+    "service_name": "voice-agent",
+    "region": "us-west-2",
+    "reason": "trial_exhausted"
+  }
+}
+```
+
+## Spend
+
+| Event                     | Fires when                             | Payload                                                        |
+| ------------------------- | -------------------------------------- | -------------------------------------------------------------- |
+| `spend.threshold_reached` | Spend crosses 80% or 90% of the limit. | `percent` (`80` or `90`), `current_spend_cents`, `limit_cents` |
+| `spend.limit_reached`     | Spend reaches 100% of the limit.       | `current_spend_cents`, `limit_cents`                           |
+| `spend.limit_cleared`     | The spend limit is removed.            | `previous_limit_cents`                                         |
+
+Thresholds re-arm each billing period, so an organization sitting at a zero limit receives one `spend.limit_reached` per cycle.
+
+<Note>
+  A limit of `0` is a deliberate kill switch, not a cleared limit, and does not
+  fire `spend.limit_cleared`. That event means the limit was removed entirely,
+  and carries only the limit that was in force beforehand.
+</Note>
+
+```json spend.threshold_reached
+{
+  "event_type": "spend.threshold_reached",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "percent": 80,
+    "current_spend_cents": 8000,
+    "limit_cents": 10000
+  }
+}
+```
+
+## Sessions
+
+| Event             | Fires when                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `session.started` | An agent session starts. For WebSocket transport this fires when the API hands out the session token, not when the bot is live. |
+
+| Field        | Type             | Notes                                                                                   |
+| ------------ | ---------------- | --------------------------------------------------------------------------------------- |
+| `session_id` | string           |                                                                                         |
+| `service`    | string           | The service name. Spelled `service`, not `service_name`; see the exception noted above. |
+| `region`     | string           |                                                                                         |
+| `transport`  | string, optional | `daily`, `webrtc`, or `websocket`. Absent when no transport was specified or implied.   |
+
+```json session.started
+{
+  "event_type": "session.started",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "session_id": "b4d9e017-52a3-4c8f-9e16-3f70a5c2d8b1",
+    "service": "voice-agent",
+    "transport": "daily",
+    "region": "us-west-2"
+  }
+}
+```
+
+## Organization
+
+| Event               | Fires when                                                                                  | Payload                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `org.trial_started` | A trial code is redeemed for the first time. Not sent for a top-up over an exhausted trial. | `org_name`, `trial_credits_cents` (nullable when the code carries none) |
+| `org.trial_ended`   | Trial credits are exhausted and further usage is blocked.                                   | `org_name`, `amount_due_cents`                                          |
+
+<Note>
+  `org.trial_ended` means the trial **ran out**, not that it finished. Adding a
+  payment method also ends a trial and deliberately does not send this event:
+  subscribers alert on it, and a successful conversion is not an alert.
+</Note>
+
+`amount_due_cents` is what is owed past the consumed credits, taken from the upcoming-invoice snapshot.
+
+## API keys
+
+| Event             | Fires when                                                                          |
+| ----------------- | ----------------------------------------------------------------------------------- |
+| `api_key.created` | An API key was created.                                                             |
+| `api_key.rotated` | An API key was rotated. Its id and name are unchanged; only the credential differs. |
+| `api_key.deleted` | An API key was revoked.                                                             |
+
+| Field           | Type           | Notes                                                                                |
+| --------------- | -------------- | ------------------------------------------------------------------------------------ |
+| `key_id`        | string         |                                                                                      |
+| `name`          | string \| null | The key name, if one was set.                                                        |
+| `type`          | string         | `public` or `private`.                                                               |
+| `actor_user_id` | string \| null | Who performed the action. Null on private-API-key routes, which have no acting user. |
+
+<Warning>
+  **The key value is never included** in any `api_key.*` payload. Use these
+  events to drive an audit trail, not to distribute credentials.
+</Warning>
+
+## Secrets
+
+| Event            | Fires when                                                  |
+| ---------------- | ----------------------------------------------------------- |
+| `secret.created` | A secret set was created.                                   |
+| `secret.updated` | A secret value changed.                                     |
+| `secret.deleted` | A secret set, or an individual key within one, was removed. |
+
+| Field           | Type               | Notes                                                           |
+| --------------- | ------------------ | --------------------------------------------------------------- |
+| `set_name`      | string             |                                                                 |
+| `region`        | string             |                                                                 |
+| `type`          | string             | `secret` or `imagePullSecret`.                                  |
+| `scope`         | string             | `set` for the whole set, `field` for individual keys within it. |
+| `actor_user_id` | string \| null     | Null on private-API-key routes.                                 |
+| `field_names`   | string[], optional | Which keys changed. Present when `scope` is `field`.            |
+
+Removing a field emits `secret.deleted` with scope `field`, not `secret.updated`, so a subscriber mirroring which keys exist can tell a removal from a value change.
+
+<Warning>
+  **Secret values are never included** in any `secret.*` payload.
+</Warning>
+
+```json secret.updated
+{
+  "event_type": "secret.updated",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "set_name": "voice-agent-secrets",
+    "region": "us-west-2",
+    "type": "secret",
+    "scope": "field",
+    "actor_user_id": "user_2mK9xQvR3nL5pW8t",
+    "field_names": ["OPENAI_API_KEY"]
+  }
+}
+```
+
+## Not in the catalog
+
+Two event types you might expect are deliberately absent:
+
+- **`deployment.deleted`** is retired. Deployments are never destroyed, so it could never fire. An endpoint already subscribed to it keeps working, but nothing will ever arrive.
+- **`session.ended`** is not offered. Session end is recorded by a component outside the service that emits these events, so there is no hook point that could report it faithfully. It is deliberately absent rather than offered and silent.
+
+To detect the end of a session today, use the [Session API](/pipecat-cloud/guides/session-api) or your agent's own instrumentation rather than waiting for a webhook.
+
 # Pipecat Cloud Generic WebSocket
 Source: https://docs.pipecat.ai/pipecat-cloud/guides/generic-websocket.md
 

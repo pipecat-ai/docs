@@ -1,0 +1,307 @@
+---
+title: "Webhook Event Reference"
+sidebarTitle: "Event Reference"
+description: "Every Pipecat Cloud webhook event: the delivery envelope plus payloads for build, deployment, service, spend, session, API key, and secret events."
+---
+
+This is the full catalog of events Pipecat Cloud can deliver to a [webhook endpoint](/pipecat-cloud/guides/webhooks). Each section lists when an event fires and what its `data` payload carries.
+
+<Note>
+  The catalog holds an invariant worth relying on: **an event type is offered
+  only if it can actually fire.** Nothing you can subscribe to is a placeholder.
+</Note>
+
+## The envelope
+
+Every event arrives in the same envelope. Only `data` differs between event types.
+
+```json
+{
+  "event_type": "build.succeeded",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {}
+}
+```
+
+| Field        | Type   | Description                                  |
+| ------------ | ------ | -------------------------------------------- |
+| `event_type` | string | Which event this is, e.g. `build.succeeded`. |
+| `org`        | string | The organization name.                       |
+| `created_at` | string | When the event was emitted (ISO 8601, UTC).  |
+| `data`       | object | The per-event payload documented below.      |
+
+### Payload conventions
+
+- Entities are identified by an `_id` / `_name` pair, such as `service_id` plus `service_name`, rather than a bare noun.
+- Field names are `snake_case`.
+- Money is always `*_cents`, as a JSON number.
+- Enum-ish fields name the cause, not the event: `reason` on `service.suspended` says `trial_exhausted`, not `suspended`.
+
+<Warning>
+  **One documented exception.** `session.started` sends the service name as
+  `service`, not `service_name`. It shipped before this convention and has
+  existing subscribers, so it stays as it is. If you correlate across event
+  types, the two spellings mean the same thing.
+</Warning>
+
+Fields marked nullable below are always present and may be `null`. Fields marked optional are omitted entirely when they do not apply, so read them defensively.
+
+## Builds
+
+| Event             | Fires when                                                                                                                    |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `build.started`   | The build enters `building`, either when CodeBuild accepts the trigger or on the first status check that observes it running. |
+| `build.succeeded` | CodeBuild reports `SUCCEEDED`.                                                                                                |
+| `build.failed`    | CodeBuild reports `FAILED` or `STOPPED`, or the trigger call itself failed.                                                   |
+| `build.timeout`   | CodeBuild reports `TIMED_OUT`. Separate from `build.failed` so you can subscribe to timeouts alone.                           |
+
+<Warning>
+  **`build.started` is best-effort and not guaranteed.** Build status is
+  reconciled periodically rather than streamed, so a build that finishes between
+  two checks goes straight to a terminal state and emits only that event. Do not
+  pair `build.started` with `build.succeeded` as an open/close bracket: a
+  subscriber counting in-flight builds, or closing a tracing span opened on
+  `build.started`, will leak on exactly the fastest builds. Treat the terminal
+  events as authoritative.
+</Warning>
+
+| Field                    | Type             | Notes                                                                 |
+| ------------------------ | ---------------- | --------------------------------------------------------------------- |
+| `build_id`               | string           |                                                                       |
+| `region`                 | string           | Region the build ran in.                                              |
+| `status`                 | string           | `building`, `success`, `failed`, or `timeout`, matching the event.    |
+| `triggered_by`           | string           | `api` or `github`.                                                    |
+| `commit_sha`             | string \| null   | Null for CLI and API builds.                                          |
+| `ref`                    | string \| null   | Null for CLI and API builds.                                          |
+| `repo_full_name`         | string \| null   | `owner/repo`. Null for CLI and API builds.                            |
+| `image_uri`              | string, optional | The image the build produced. On `build.succeeded` only.              |
+| `build_duration_seconds` | number, optional | Wall-clock duration. On the three terminal events.                    |
+| `error_message`          | string, optional | Why the build did not succeed. On `build.failed` and `build.timeout`. |
+
+```json build.succeeded
+{
+  "event_type": "build.succeeded",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "build_id": "9f1c3a52-6b0e-4c11-9a76-2d5f8b41e0c7",
+    "region": "us-west-2",
+    "status": "success",
+    "commit_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
+    "ref": "refs/heads/main",
+    "repo_full_name": "acme-co/voice-agent",
+    "triggered_by": "github",
+    "image_uri": "123456789012.dkr.ecr.us-west-2.amazonaws.com/acme-co/voice-agent:e3b0c44",
+    "build_duration_seconds": 94
+  }
+}
+```
+
+## Deployments
+
+| Event                | Fires when                                 |
+| -------------------- | ------------------------------------------ |
+| `deployment.created` | A service's first deployment.              |
+| `deployment.updated` | A redeploy that replaced the running pods. |
+
+<Note>
+  **A deploy that changes nothing emits nothing.** When a deploy resolves to no
+  configuration change, Pipecat Cloud records an audit version without creating
+  a deployment or replacing pods, and sends no event. `deployment.updated` means
+  pods were actually replaced.
+</Note>
+
+| Field           | Type           | Notes                                                      |
+| --------------- | -------------- | ---------------------------------------------------------- |
+| `deployment_id` | string         |                                                            |
+| `service_id`    | string         |                                                            |
+| `service_name`  | string         |                                                            |
+| `region`        | string         |                                                            |
+| `build_id`      | string \| null | The build that was deployed. Null for image-based deploys. |
+
+```json deployment.updated
+{
+  "event_type": "deployment.updated",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "deployment_id": "d1f7b2c8-4e35-4a90-8c62-7b1e9a0f3d44",
+    "service_id": "2a8e5c17-9d3b-4f60-a1e8-6c04b7f2591d",
+    "service_name": "voice-agent",
+    "region": "us-west-2",
+    "build_id": "9f1c3a52-6b0e-4c11-9a76-2d5f8b41e0c7"
+  }
+}
+```
+
+## Services
+
+| Event               | Fires when                                                                                    |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| `service.suspended` | The service was torn down because the organization is suspended or its trial credits ran out. |
+| `service.resumed`   | The suspension was lifted.                                                                    |
+
+`service.resumed` fires whenever a suspension is lifted, including when there is nothing to bring back up, so every `service.suspended` has a matching `service.resumed`.
+
+| Field          | Type   | Notes                                                                  |
+| -------------- | ------ | ---------------------------------------------------------------------- |
+| `service_id`   | string |                                                                        |
+| `service_name` | string |                                                                        |
+| `region`       | string |                                                                        |
+| `reason`       | string | `trial_exhausted` or `account_suspended`. On `service.suspended` only. |
+
+When both causes apply, `trial_exhausted` is reported: it is the more specific one, and the one you can resolve yourself by adding a payment method.
+
+```json service.suspended
+{
+  "event_type": "service.suspended",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "service_id": "2a8e5c17-9d3b-4f60-a1e8-6c04b7f2591d",
+    "service_name": "voice-agent",
+    "region": "us-west-2",
+    "reason": "trial_exhausted"
+  }
+}
+```
+
+## Spend
+
+| Event                     | Fires when                             | Payload                                                        |
+| ------------------------- | -------------------------------------- | -------------------------------------------------------------- |
+| `spend.threshold_reached` | Spend crosses 80% or 90% of the limit. | `percent` (`80` or `90`), `current_spend_cents`, `limit_cents` |
+| `spend.limit_reached`     | Spend reaches 100% of the limit.       | `current_spend_cents`, `limit_cents`                           |
+| `spend.limit_cleared`     | The spend limit is removed.            | `previous_limit_cents`                                         |
+
+Thresholds re-arm each billing period, so an organization sitting at a zero limit receives one `spend.limit_reached` per cycle.
+
+<Note>
+  A limit of `0` is a deliberate kill switch, not a cleared limit, and does not
+  fire `spend.limit_cleared`. That event means the limit was removed entirely,
+  and carries only the limit that was in force beforehand.
+</Note>
+
+```json spend.threshold_reached
+{
+  "event_type": "spend.threshold_reached",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "percent": 80,
+    "current_spend_cents": 8000,
+    "limit_cents": 10000
+  }
+}
+```
+
+## Sessions
+
+| Event             | Fires when                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `session.started` | An agent session starts. For WebSocket transport this fires when the API hands out the session token, not when the bot is live. |
+
+| Field        | Type             | Notes                                                                                   |
+| ------------ | ---------------- | --------------------------------------------------------------------------------------- |
+| `session_id` | string           |                                                                                         |
+| `service`    | string           | The service name. Spelled `service`, not `service_name`; see the exception noted above. |
+| `region`     | string           |                                                                                         |
+| `transport`  | string, optional | `daily`, `webrtc`, or `websocket`. Absent when no transport was specified or implied.   |
+
+```json session.started
+{
+  "event_type": "session.started",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "session_id": "b4d9e017-52a3-4c8f-9e16-3f70a5c2d8b1",
+    "service": "voice-agent",
+    "transport": "daily",
+    "region": "us-west-2"
+  }
+}
+```
+
+## Organization
+
+| Event               | Fires when                                                                                  | Payload                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `org.trial_started` | A trial code is redeemed for the first time. Not sent for a top-up over an exhausted trial. | `org_name`, `trial_credits_cents` (nullable when the code carries none) |
+| `org.trial_ended`   | Trial credits are exhausted and further usage is blocked.                                   | `org_name`, `amount_due_cents`                                          |
+
+<Note>
+  `org.trial_ended` means the trial **ran out**, not that it finished. Adding a
+  payment method also ends a trial and deliberately does not send this event:
+  subscribers alert on it, and a successful conversion is not an alert.
+</Note>
+
+`amount_due_cents` is what is owed past the consumed credits, taken from the upcoming-invoice snapshot.
+
+## API keys
+
+| Event             | Fires when                                                                          |
+| ----------------- | ----------------------------------------------------------------------------------- |
+| `api_key.created` | An API key was created.                                                             |
+| `api_key.rotated` | An API key was rotated. Its id and name are unchanged; only the credential differs. |
+| `api_key.deleted` | An API key was revoked.                                                             |
+
+| Field           | Type           | Notes                                                                                |
+| --------------- | -------------- | ------------------------------------------------------------------------------------ |
+| `key_id`        | string         |                                                                                      |
+| `name`          | string \| null | The key name, if one was set.                                                        |
+| `type`          | string         | `public` or `private`.                                                               |
+| `actor_user_id` | string \| null | Who performed the action. Null on private-API-key routes, which have no acting user. |
+
+<Warning>
+  **The key value is never included** in any `api_key.*` payload. Use these
+  events to drive an audit trail, not to distribute credentials.
+</Warning>
+
+## Secrets
+
+| Event            | Fires when                                                  |
+| ---------------- | ----------------------------------------------------------- |
+| `secret.created` | A secret set was created.                                   |
+| `secret.updated` | A secret value changed.                                     |
+| `secret.deleted` | A secret set, or an individual key within one, was removed. |
+
+| Field           | Type               | Notes                                                           |
+| --------------- | ------------------ | --------------------------------------------------------------- |
+| `set_name`      | string             |                                                                 |
+| `region`        | string             |                                                                 |
+| `type`          | string             | `secret` or `imagePullSecret`.                                  |
+| `scope`         | string             | `set` for the whole set, `field` for individual keys within it. |
+| `actor_user_id` | string \| null     | Null on private-API-key routes.                                 |
+| `field_names`   | string[], optional | Which keys changed. Present when `scope` is `field`.            |
+
+Removing a field emits `secret.deleted` with scope `field`, not `secret.updated`, so a subscriber mirroring which keys exist can tell a removal from a value change.
+
+<Warning>
+  **Secret values are never included** in any `secret.*` payload.
+</Warning>
+
+```json secret.updated
+{
+  "event_type": "secret.updated",
+  "org": "acme-co",
+  "created_at": "2026-08-25T11:40:32.000Z",
+  "data": {
+    "set_name": "voice-agent-secrets",
+    "region": "us-west-2",
+    "type": "secret",
+    "scope": "field",
+    "actor_user_id": "user_2mK9xQvR3nL5pW8t",
+    "field_names": ["OPENAI_API_KEY"]
+  }
+}
+```
+
+## Not in the catalog
+
+Two event types you might expect are deliberately absent:
+
+- **`deployment.deleted`** is retired. Deployments are never destroyed, so it could never fire. An endpoint already subscribed to it keeps working, but nothing will ever arrive.
+- **`session.ended`** is not offered. Session end is recorded by a component outside the service that emits these events, so there is no hook point that could report it faithfully. It is deliberately absent rather than offered and silent.
+
+To detect the end of a session today, use the [Session API](/pipecat-cloud/guides/session-api) or your agent's own instrumentation rather than waiting for a webhook.
