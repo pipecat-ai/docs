@@ -1,0 +1,233 @@
+---
+title: "Media over QUIC Transport"
+sidebarTitle: "MoQ"
+description: "Real-time audio over Media over QUIC with MOQTransport and MOQParams: serve mode, relay client mode, and TLS."
+---
+
+## Overview
+
+`MOQTransport` carries a session over [Media over QUIC](https://quic.video), moving audio and RTVI messages over QUIC instead of a WebRTC stack. It runs in two modes:
+
+- **Serve mode** (the default) — the bot binds its own UDP socket and the browser dials it. No relay process to run, and a self-signed certificate is minted for local development.
+- **Client mode** — the bot and the browser both dial a relay and rendezvous there. Neither side needs a reachable address, so this works when the bot is behind NAT.
+
+<CardGroup cols={2}>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/transports/transports-moq.py"
+  >
+    Runnable bot covering both modes
+  </Card>
+  <Card title="Media over QUIC" icon="book" href="https://quic.video">
+    The protocol and its reference relay
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[moq]"
+```
+
+## Serve mode vs client mode
+
+Serve mode is the shorter path for local development: nothing to run besides the bot.
+
+```bash
+python bot.py -t moq
+```
+
+The bot listens on `[::]:4080`, mints a self-signed certificate for `localhost`, and publishes its SHA-256 fingerprint so the browser can pin it.
+
+Client mode is selected by naming a relay:
+
+```bash
+python bot.py -t moq --moq-connect https://cdn.moq.dev/anon
+```
+
+Both peers dial the relay, so neither needs to be reachable from the other.
+
+<Warning>
+  Each client-mode session gets its own random namespace, and on an anonymous
+  relay that namespace is the session's only access control — anyone who knows
+  it can subscribe. Pass `--moq-namespace` to pin a well-known room only when
+  the relay itself restricts who may join.
+</Warning>
+
+## Broadcast paths
+
+Each side publishes on one path and subscribes to the other's. By default they're composed from the namespace and the two participant ids, which are named by direction:
+
+```
+bot publishes   <namespace>/<participant_id>   default: pipecat/response
+bot subscribes  <namespace>/<peer_id>          default: pipecat/request
+```
+
+Set `response_path` and `request_path` to bypass the namespace entirely and give the paths directly. That suits a deployment where the paths are assigned externally — a host running one bot per caller, naming both paths after an id the caller minted, with no namespace for the two sides to agree on beforehand. Either can be set alone; the other still derives from the namespace.
+
+## Configuration
+
+### MOQTransport
+
+<ParamField path="params" type="MOQParams" required>
+  Transport configuration. See [MOQParams](#moqparams) below.
+</ParamField>
+
+<ParamField path="host" type="str" default="localhost">
+  Host used to compose the relay URL when `params.relay_url` is unset.
+</ParamField>
+
+<ParamField path="port" type="int" default="4080">
+  Port used to compose the relay URL, and the serve-mode listen port when
+  `params.bind` is unset.
+</ParamField>
+
+<ParamField path="path" type="str" default="/moq">
+  Path used to compose the relay URL.
+</ParamField>
+
+<ParamField path="input_name" type="str | None" default="None">
+  Optional name for the input transport processor.
+</ParamField>
+
+<ParamField path="output_name" type="str | None" default="None">
+  Optional name for the output transport processor.
+</ParamField>
+
+### MOQParams
+
+Extends [`TransportParams`](/api-reference/server/services/transport/transport-params), so the standard audio, VAD, and turn-analyzer options apply too.
+
+**Connection**
+
+| Parameter            | Type          | Default | Description                                                                                               |
+| -------------------- | ------------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `relay_url`          | `str \| None` | `None`  | Full relay URL. When unset, composed from the constructor's host/port/path. Ignored in serve mode         |
+| `serve`              | `bool`        | `False` | Bind a local UDP socket and accept sessions instead of dialing a relay                                    |
+| `bind`               | `str \| None` | `None`  | Serve mode: the listen address, defaulting to `[::]:<port>`. Client mode: the source address to dial from |
+| `connection_timeout` | `float`       | `30.0`  | Seconds to wait for the peer's broadcast to be announced                                                  |
+
+**Paths**
+
+| Parameter          | Type          | Default               | Description                                                     |
+| ------------------ | ------------- | --------------------- | --------------------------------------------------------------- |
+| `namespace`        | `str`         | `"pipecat"`           | Top-level namespace shared by both participants                 |
+| `participant_id`   | `str`         | `"response"`          | The bot's id; it publishes under `<namespace>/<participant_id>` |
+| `peer_id`          | `str`         | `"request"`           | The peer's id; the bot subscribes to `<namespace>/<peer_id>`    |
+| `response_path`    | `str \| None` | `None`                | Full path the bot publishes on, bypassing the namespace         |
+| `request_path`     | `str \| None` | `None`                | Full path the bot subscribes to, bypassing the namespace        |
+| `audio_out_track`  | `str`         | `"bot-audio"`         | Name of the bot's outgoing audio track                          |
+| `transcript_track` | `str`         | `"transcript.json.z"` | Name of the JSON stream track carrying RTVI messages            |
+
+**Client-side TLS** (client mode only)
+
+| Parameter                 | Type                | Default | Description                                                         |
+| ------------------------- | ------------------- | ------- | ------------------------------------------------------------------- |
+| `verify_ssl`              | `bool`              | `True`  | Verify the relay's certificate                                      |
+| `client_tls_cert`         | `str \| None`       | `None`  | PEM client certificate chain to present, for a relay using mTLS     |
+| `client_tls_key`          | `str \| None`       | `None`  | PEM private key matching `client_tls_cert`. Both must be set        |
+| `client_tls_roots`        | `list[str] \| None` | `None`  | Extra PEM CA certificates to trust, for a relay behind a private CA |
+| `client_tls_fingerprints` | `list[str] \| None` | `None`  | SHA-256 fingerprints to accept, pinning one specific certificate    |
+
+<Note>
+  `client_tls_roots` and `client_tls_fingerprints` are alternatives to turning
+  `verify_ssl` off, not companions to it. Reach for them when a relay uses a
+  private CA or a self-signed certificate, and leave verification on.
+</Note>
+
+**Serve-side TLS** (serve mode only)
+
+| Parameter        | Type          | Default       | Description                                                      |
+| ---------------- | ------------- | ------------- | ---------------------------------------------------------------- |
+| `serve_tls_host` | `str`         | `"localhost"` | Hostname in the generated self-signed certificate                |
+| `serve_tls_cert` | `str \| None` | `None`        | PEM certificate chain. Unset alongside the key, one is generated |
+| `serve_tls_key`  | `str \| None` | `None`        | PEM private key matching `serve_tls_cert`                        |
+
+**Audio**
+
+| Parameter                 | Type  | Default | Description                                                            |
+| ------------------------- | ----- | ------- | ---------------------------------------------------------------------- |
+| `audio_out_sample_rate`   | `int` | `24000` | Rate the bot publishes at; audio is resampled to the nearest Opus rate |
+| `audio_in_sample_rate`    | `int` | `16000` | Rate decoded audio is resampled to before going downstream             |
+| `audio_in_max_latency_ms` | `int` | `500`   | How long to wait for a late frame before skipping ahead                |
+| `audio_out_frame_ms`      | `int` | `20`    | Outgoing frame duration. One of 2, 5, 10, 20, 40, 60                   |
+| `audio_out_max_buffer_ms` | `int` | `25000` | Maximum outgoing buffer                                                |
+
+<Warning>
+  `serve_bind` is deprecated since v1.8.0 and will be removed in 2.0.0. Use
+  `bind`, which sets the listen address in serve mode and the source address in
+  client mode.
+</Warning>
+
+## Properties
+
+### cert_fingerprints
+
+```python
+transport.cert_fingerprints -> list[str]
+```
+
+SHA-256 fingerprints of the certificate the bot serves, as hex. In serve mode the browser pins one of these to accept a self-signed certificate.
+
+## Usage
+
+```python
+from pipecat.transports.moq.transport import MOQTransport, MOQParams
+
+transport = MOQTransport(
+    params=MOQParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        namespace="my-room",
+    ),
+    host="localhost",
+    port=4080,
+)
+
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    await worker.queue_frames([context_aggregator.user().get_context_frame()])
+```
+
+With the [development runner](/api-reference/server/utilities/runner/guide), `create_transport` builds this for you:
+
+```python
+transport_params = {
+    "moq": lambda: MOQParams(audio_in_enabled=True, audio_out_enabled=True),
+}
+```
+
+## Runner options
+
+| Flag                      | Default                           | Description                                                     |
+| ------------------------- | --------------------------------- | --------------------------------------------------------------- |
+| `--moq-connect URL`       | unset                             | Relay to dial. Passing it selects client mode                   |
+| `--moq-bind ADDR:PORT`    | `[::]:4080` in serve mode         | Serve: listen address. Client: source address to dial from      |
+| `--moq-serve`             | on when `--moq-connect` is absent | Force serve mode                                                |
+| `--moq-namespace NAME`    | `pipecat` serving, random dialing | Pin a well-known room instead of a per-session namespace        |
+| `--moq-bot-id ID`         | `response`                        | The bot publishes under `<namespace>/<id>`                      |
+| `--moq-client-id ID`      | `request`                         | The bot subscribes to `<namespace>/<id>`                        |
+| `--moq-tls-cert PEM`      | unset                             | Serve: certificate, with `--moq-tls-key`                        |
+| `--moq-tls-key PEM`       | unset                             | Key for `--moq-tls-cert`                                        |
+| `--moq-tls-generate HOST` | `localhost` when no TLS given     | Generate a self-signed development certificate. Serve mode only |
+| `--moq-tls-insecure`      | `False`                           | Skip relay certificate verification. Development only           |
+
+The `/start` response carries a `moq` block — `relayUrl`, `certHash`, `serve`, `namespace`, `clientId`, `botId`, and `transcriptTrack` — which is what the browser needs to join. The prebuilt client UI shipped with the `runner` extra speaks MoQ, so `http://localhost:7860` can connect without any client code of your own.
+
+## Event Handlers
+
+| Event                    | Description                           |
+| ------------------------ | ------------------------------------- |
+| `on_connected`           | Connection to the relay established   |
+| `on_disconnected`        | Connection lost or closed             |
+| `on_client_connected`    | The peer's broadcast was announced    |
+| `on_client_disconnected` | The peer's broadcast went away        |
+| `on_track_subscribed`    | A remote track subscription succeeded |
+| `on_error`               | An error in the underlying transport  |
+
+## Notes
+
+- **RTVI over MoQ**: the `transcript_track` is a lossless, ordered JSON stream carrying RTVI messages in both directions, so MoQ is a full RTVI transport on par with Daily or WebSocket rather than an audio-only path.
+- **Audio**: a single Opus track each way. The library resamples to the nearest Opus-supported rate before encoding, so `audio_out_sample_rate` doesn't have to be one of them.
+- **Latency**: `audio_in_max_latency_ms` trades interactivity against resilience — lower waits less for a late frame, at the cost of more drops on a poor network.

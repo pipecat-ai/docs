@@ -1,0 +1,153 @@
+---
+title: "OpenClaw Gateway"
+description: "Drive an OpenClaw coding agent from a pipeline with OpenClawGatewayService: start, steer, and abort agent runs."
+---
+
+## Overview
+
+`OpenClawGatewayService` turns OpenClaw Gateway traffic into frames, and frames into Gateway calls. The Gateway is the websocket an OpenClaw agent publishes for other programs to drive it, so a pipeline can start a run, redirect it while it's going, and stop it.
+
+An agent run is not a spoken turn. It can take minutes and it answers in prose, so the service deliberately reads and writes **no conversational frames** — what a run should sound like belongs to whatever wraps it. The usual shape is a voice loop that answers the user itself and forwards real work to the agent, so asking for something that takes ten minutes doesn't cost you the conversation for ten minutes.
+
+<Card
+  title="Example Implementation"
+  icon="play"
+  href="https://github.com/pipecat-ai/pipecat/tree/main/examples/multi-worker/openclaw-agent"
+>
+  Voice loop with an OpenClaw agent behind it
+</Card>
+
+## Installation
+
+No extra required — the service is part of the base install.
+
+```bash
+uv add pipecat-ai
+```
+
+## Prerequisites
+
+A running OpenClaw agent with its Gateway enabled. `openclaw gateway status` reports which port it's on and whether it's running.
+
+```bash
+export OPENCLAW_TOKEN=your_gateway_token
+export OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789   # optional
+export OPENCLAW_SESSION_KEY=agent:main:main        # optional
+```
+
+The token is `gateway.auth.token` in `~/.openclaw/openclaw.json`.
+
+<Warning>
+  The token is required even on loopback. Without a shared secret the Gateway
+  asks for a paired device identity instead and refuses the connection with
+  `NOT_PAIRED`.
+</Warning>
+
+<Note>
+  A NemoClaw sandbox prints its own token with `nemoclaw <sandbox> gateway-token
+  --quiet` and republishes the Gateway on port 18790, so a bot running outside
+  the sandbox points `OPENCLAW_GATEWAY_URL` at that port.
+</Note>
+
+## Configuration
+
+<ParamField path="url" type="str" default="ws://127.0.0.1:18789">
+  The Gateway websocket, or the port a NemoClaw sandbox republishes it on.
+</ParamField>
+
+<ParamField path="token" type="str | None" default="None">
+  The Gateway's shared token. Required even on loopback.
+</ParamField>
+
+<ParamField path="password" type="str | None" default="None">
+  Gateway password, for a deployment that uses one instead of a token.
+</ParamField>
+
+<ParamField path="session_key" type="str" default="agent:main:main">
+  Which OpenClaw session to run in.
+</ParamField>
+
+<ParamField path="connect_timeout" type="float" default="15.0">
+  Seconds to wait for the handshake.
+</ParamField>
+
+<ParamField path="request_timeout" type="float" default="30.0">
+  Seconds to wait for a Gateway method to answer.
+</ParamField>
+
+<ParamField path="run_timeout" type="float" default="300.0">
+  Seconds the agent is given to finish a run.
+</ParamField>
+
+<ParamField path="scopes" type="list[str] | None" default="None">
+  Handshake scopes.
+</ParamField>
+
+<ParamField path="role" type="str" default="operator">
+  Handshake role.
+</ParamField>
+
+<ParamField path="max_message_size" type="int" default="26214400">
+  Largest websocket frame to accept, in bytes. Defaults to 25 MB.
+</ParamField>
+
+<ParamField path="reconnect_on_error" type="bool" default="True">
+  Whether to reconnect after the socket fails.
+</ParamField>
+
+## Properties
+
+### client
+
+```python
+service.client -> OpenClawGatewayClient
+```
+
+The underlying Gateway client, which can also be used on its own without a pipeline.
+
+## Frames
+
+**Sent to the service:**
+
+| Frame                | Fields                              | Effect                      |
+| -------------------- | ----------------------------------- | --------------------------- |
+| `OpenClawSendFrame`  | `message`, `session_key` (optional) | Starts a run                |
+| `OpenClawSteerFrame` | `message`                           | Redirects the run in flight |
+| `OpenClawAbortFrame` | `reason` (optional)                 | Stops the run in flight     |
+
+**Pushed by the service:**
+
+| Frame                  | Fields                     | Meaning                     |
+| ---------------------- | -------------------------- | --------------------------- |
+| `OpenClawStartedFrame` | `run_id`                   | The Gateway accepted a run  |
+| `OpenClawTextFrame`    | `text`, `run_id`           | A chunk of the run's answer |
+| `OpenClawEndFrame`     | `run_id`, `status`, `text` | The run ended, and how      |
+
+`status` is `"completed"`, `"cancelled"`, or `"failed"`.
+
+```python
+from pipecat.services.openclaw.frames import OpenClawSendFrame
+
+await worker.queue_frame(OpenClawSendFrame(message="Add a test for the parser"))
+```
+
+## Usage
+
+```python
+import os
+
+from pipecat.services.openclaw.gateway import OpenClawGatewayService
+
+openclaw = OpenClawGatewayService(token=os.getenv("OPENCLAW_TOKEN"))
+
+pipeline = Pipeline([
+    # ... the voice loop ...
+    openclaw,
+])
+```
+
+## Notes
+
+- **One run at a time**: a session runs one turn at a time, so a send arriving while a run is live stops that run first.
+- **Paired frames**: every `OpenClawStartedFrame` is followed by exactly one `OpenClawEndFrame`, whatever the outcome.
+- **Connects during setup**: the Gateway connection is established in `setup()`, before frames start flowing, rather than on the `StartFrame`.

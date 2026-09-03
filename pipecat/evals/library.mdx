@@ -37,15 +37,29 @@ The agent must already be running with its eval transport (`python bot.py -t eva
 
 `run()` returns an `EvalResult`:
 
-| Field           | Description                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------------- |
-| `scenario_name` | Name of the scenario that ran.                                                              |
-| `passed`        | Whether every assertion passed.                                                             |
-| `failures`      | The failed assertions, each with the turn index, expectation index, event name, and reason. |
-| `duration_ms`   | Wall-clock time the run took.                                                               |
-| `events_seen`   | Every semantic event observed, for diagnostics.                                             |
-| `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).    |
-| `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.  |
+| Field           | Description                                                                                         |
+| --------------- | --------------------------------------------------------------------------------------------------- |
+| `scenario_name` | Name of the scenario that ran.                                                                      |
+| `passed`        | Whether every assertion passed.                                                                     |
+| `failures`      | The failed assertions, each with the turn index, expectation index, event name, reason, and `kind`. |
+| `turns`         | One `EvalTurnResult` per scenario turn, in order. See below.                                        |
+| `duration_ms`   | Wall-clock time the run took.                                                                       |
+| `events_seen`   | Every semantic event observed, for diagnostics.                                                     |
+| `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).            |
+| `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.          |
+
+Each `EvalTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, and its `duration_ms`. `EvalResult.failures` is these turns' failures flattened, plus any that belong to no turn — a failed connect, say.
+
+`not_run` is deliberately distinct from a pass, so a turn the scenario never reached doesn't inflate a rate:
+
+```python
+result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
+
+scored = [t for t in result.turns if t.status != "not_run"]
+print(f"{sum(1 for t in scored if t.status == 'passed')}/{len(scored)} turns")
+```
+
+`failures` carry a `kind` alongside the reason — `timeout`, `judge_no`, `text_mismatch`, `missing_function_call`, and so on — which is the stable key to group by when scoring a sweep rather than reading one run.
 
 This maps cleanly onto a pytest test:
 
@@ -119,18 +133,23 @@ The same injection points exist for the user's synthesized voice (`speech=`, wra
 
 ## Observing progress
 
-Pass `on_progress` to get a callback as each turn and expectation resolves, which is how the CLI implements its `--verbose` output:
+Register an `on_progress` event handler to receive notifications as each turn and expectation resolves:
 
 ```python
 from pipecat.evals.harness import EvalSession, EvalTurnProgress
 
-
-def show(p: EvalTurnProgress):
-    print(f"turn {p.turn_index} [{p.status}] {p.event_name} {p.detail}")
+session = EvalSession.from_scenario(scenario, url)
 
 
-session = EvalSession.from_scenario(scenario, url, on_progress=show)
+@session.event_handler("on_progress")
+async def on_progress(session, progress):
+    print(f"turn {progress.turn_index} [{progress.status}] {progress.event_name} {progress.detail}")
 ```
+
+<Warning>
+  The `on_progress` callback parameter is deprecated since 1.9.0 and will be
+  removed in 2.0.0. Use the `on_progress` event handler instead.
+</Warning>
 
 ## Orchestrating suites
 
@@ -150,10 +169,11 @@ async def main():
     # Optionally narrow the runs, like the CLI's -p / -s flags.
     suite.filter(pattern="support")
 
-    await suite.run(
-        Path("eval-runs/logs"),
-        on_update=lambda run: print(run.bot, run.scenario, run.status),
-    )
+    @suite.event_handler("on_update")
+    async def on_update(suite, run):
+        print(run.bot, run.scenario, run.status)
+
+    await suite.run(Path("eval-runs/logs"))
 
     for run in suite.runs:
         verdict = run.error or ("passed" if run.result and run.result.passed else "failed")
@@ -164,5 +184,10 @@ asyncio.run(main())
 ```
 
 Each run is mutated in place as it executes (`status`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`.
+
+<Warning>
+  The `on_update` callback parameter to `suite.run()` is deprecated since 1.9.0
+  and will be removed in 2.0.0. Use the `on_update` event handler instead.
+</Warning>
 
 `EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, and so on), mirroring the CLI flags.

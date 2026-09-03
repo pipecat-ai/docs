@@ -9,36 +9,24 @@ SystemFrames have higher priority than DataFrames and ControlFrames and are neve
 
 ### StartFrame
 
-The first frame pushed into a pipeline, initializing all processors. Every processor receives this before any DataFrames or ControlFrames arrive.
+The first frame pushed into a pipeline, marking the point at which frames start flowing. Every processor receives this before any DataFrames or ControlFrames arrive; a processor holds anything that reaches it earlier and delivers it, in arrival order, once the `StartFrame` has passed.
 
-<ParamField path="audio_in_sample_rate" type="int" default="16000">
-  Input audio sample rate in Hz.
-</ParamField>
+Pipeline configuration reaches processors through [`FrameProcessorSetup`](/pipecat/fundamentals/custom-frame-processor#frameprocessorsetup) in `setup()`, which runs before this frame.
 
-<ParamField path="audio_out_sample_rate" type="int" default="24000">
-  Output audio sample rate in Hz.
-</ParamField>
+<Warning>
+  Reading `audio_in_sample_rate`, `audio_out_sample_rate`, `enable_metrics`,
+  `enable_tracing`, `enable_usage_metrics`, `report_only_initial_ttfb`, or
+  `tracing_context` off a `StartFrame` is deprecated since v1.8.0 and warns.
+  These fields are removed in 2.0.0 — read them from the `FrameProcessorSetup`
+  passed to `setup()` instead:
 
-<ParamField path="enable_metrics" type="bool" default="False">
-  Enable performance metrics collection from processors.
-</ParamField>
+```python
+async def setup(self, setup: FrameProcessorSetup):
+    await super().setup(setup)
+    self._sample_rate = setup.audio_out_sample_rate
+```
 
-<ParamField path="enable_tracing" type="bool" default="False">
-  Enable tracing for pipeline execution.
-</ParamField>
-
-<ParamField path="enable_usage_metrics" type="bool" default="False">
-  Enable usage metrics (token counts, API calls) from services.
-</ParamField>
-
-<ParamField path="report_only_initial_ttfb" type="bool" default="False">
-  When `True`, only report time-to-first-byte for the initial response rather
-  than every response.
-</ParamField>
-
-<ParamField path="tracing_context" type="TracingContext | None" default="None">
-  Optional tracing context for distributed tracing integration.
-</ParamField>
+</Warning>
 
 ### CancelFrame
 
@@ -58,27 +46,54 @@ Carries an error notification, typically pushed upstream so earlier processors c
   Human-readable error message.
 </ParamField>
 
-<ParamField path="fatal" type="bool" default="False">
-  Whether this error is fatal and requires the bot to shut down.
+<ParamField path="category" type="ErrorCategory | None" default="None">
+  What kind of failure this was — a rejected API key (`AUTHENTICATION`) versus a
+  provider outage (`SERVER`), for example. See [Error
+  Handling](/pipecat/fundamentals/error-handling#errorcategory).
 </ParamField>
 
 <ParamField path="processor" type="FrameProcessor | None" default="None">
-  The processor that raised the error.
+  The processor that raised the error. Read `processor.is_usable` to tell an
+  error the processor can carry on from apart from one that has finished it.
 </ParamField>
 
 <ParamField path="exception" type="Exception | None" default="None">
   The underlying exception, if one was caught.
 </ParamField>
 
+<ParamField path="fatal" type="bool" default="False" deprecated>
+  _Deprecated in v1.8.0. Will be removed in 2.0.0._ Check `processor.is_usable`
+  instead, and set the pipeline's
+  [`processor_unusable_policy`](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does)
+  to decide what an unusable processor does to the run.
+</ParamField>
+
 ### FatalErrorFrame
+
+<Warning>
+  Deprecated in v1.8.0, removed in 2.0.0. Report the error with `push_error(...,
+  force_treat_as_permanent=True)` when it leaves its processor unable to work,
+  or push an `EndWorkerFrame` after a plain `ErrorFrame` when the pipeline
+  should stop for a reason that isn't about a processor's state. See [Migrating
+  from fatal
+  errors](/pipecat/fundamentals/error-handling#migrating-from-fatal-errors).
+</Warning>
 
 An unrecoverable error requiring the bot to shut down. The `fatal` field is always `True`.
 
 Inherits from `ErrorFrame`.
 
-## Processor Pause/Resume (Urgent)
+## Processor Pause/Resume
 
-These are the `SystemFrame` variants of `FrameProcessorPauseFrame` and `FrameProcessorResumeFrame`. As SystemFrames, they flow through the high-priority input queue rather than the process queue, so they are not blocked by paused state or buffered frames. This makes `FrameProcessorResumeUrgentFrame` the correct way to resume a processor externally — the `ControlFrame` variant (`FrameProcessorResumeFrame`) would get stuck behind any DataFrames that queued up during the pause. See [Control Frames](/api-reference/server/frames/control-frames#processor-pause/resume) for the full explanation.
+Resuming always travels the high-priority input queue, so a paused processor is reached regardless of what has queued up behind the pause. Pausing comes in two forms: [`FrameProcessorPauseFrame`](/api-reference/server/frames/control-frames#frameprocessorpauseframe) is a `ControlFrame` that takes effect in order, after the frames ahead of it, while `FrameProcessorPauseUrgentFrame` takes effect immediately.
+
+### FrameProcessorResumeFrame
+
+Resumes a previously paused processor, releasing all buffered frames for processing in the order they arrived.
+
+<ParamField path="processor" type="FrameProcessor">
+  The processor to resume.
+</ParamField>
 
 ### FrameProcessorPauseUrgentFrame
 
@@ -90,7 +105,7 @@ Pauses a processor immediately, without waiting for queued frames to drain first
 
 ### FrameProcessorResumeUrgentFrame
 
-Resumes a paused processor immediately, releasing buffered frames. Use this instead of `FrameProcessorResumeFrame` when the processor may have frames queued up.
+Equivalent to `FrameProcessorResumeFrame`. Either resumes a paused processor and releases its buffered frames.
 
 <ParamField path="processor" type="FrameProcessor">
   The processor to resume.
@@ -116,9 +131,7 @@ Marks the end of a user turn. The bot's response is triggered separately by the 
 
 Proposes that a user turn has started. Emitted by a component with its own turn detection, typically an STT or realtime LLM service whose provider reports speech boundaries. It is a proposal rather than a decision: an [`ExternalUserTurnStartStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstartstrategy) resolves it into a `UserStartedSpeakingFrame` and broadcasts the interruption.
 
-### ProposedUserStoppedSpeakingFrame
-
-Proposes that a user turn has ended. The end-of-turn counterpart to `ProposedUserStartedSpeakingFrame`, resolved into a `UserStoppedSpeakingFrame` by an [`ExternalUserTurnStopStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstopstrategy).
+Its end-of-turn counterpart, [`ProposedUserStoppedSpeakingFrame`](/api-reference/server/frames/control-frames#proposeduserstoppedspeakingframe), is a `ControlFrame`. Resolving a start proposal broadcasts an interruption, which has to reach the pipeline ahead of whatever is queued; resolving a stop proposal has to stay ordered against the final `TranscriptionFrame`, since the strategy needs that text in hand to close the turn on.
 
 ### UserSpeakingFrame
 
@@ -362,7 +375,7 @@ Updates the user idle timeout at runtime. Setting the timeout to `0` disables id
 
 ### MetricsFrame
 
-Performance metrics collected from processors. Emitted when metrics reporting is enabled via `StartFrame`.
+Performance metrics collected from processors. Emitted when metrics reporting is enabled in the pipeline configuration.
 
 <ParamField path="data" type="List[MetricsData]" required>
   List of metrics data entries.
@@ -378,6 +391,16 @@ Base metadata frame broadcast by services at startup, providing information abou
   Name of the service that emitted this metadata.
 </ParamField>
 
+<ParamField
+  path="user_turn_strategies"
+  type="UserTurnStrategies | None"
+  default="None"
+>
+  The turn strategies the service recommends, when it has an opinion — a service
+  with its own turn detection uses this to ask for
+  [`ExternalUserTurnStrategies`](/api-reference/server/utilities/turn-management/external-turn-management).
+</ParamField>
+
 ### STTMetadataFrame
 
 Metadata from an STT service, including latency characteristics used for turn detection tuning.
@@ -389,19 +412,14 @@ Inherits from `ServiceMetadataFrame`.
   calibrate wait times.
 </ParamField>
 
-### RealtimeServiceMetadataFrame
+### LLMServiceMetadataFrame
 
-Broadcast at pipeline start by realtime (speech-to-speech) LLM services (OpenAI Realtime, Azure Realtime, Inworld, Grok/xAI Realtime, Gemini Live, AWS Nova Sonic, Ultravox). Its presence lets downstream processors — notably `LLMContextAggregatorPair` — detect that a realtime service is in the pipeline and configure themselves accordingly. See [Realtime (Speech-to-Speech) Services](/api-reference/server/utilities/turn-management/external-turn-management#realtime-speech-to-speech-services).
+Broadcast at pipeline start by an LLM service. Downstream processors — notably `LLMContextAggregatorPair` — read `is_realtime_service` to tell whether a realtime (speech-to-speech) service is in the pipeline and configure themselves accordingly. See [Realtime (Speech-to-Speech) Services](/api-reference/server/utilities/turn-management/external-turn-management#realtime-speech-to-speech-services).
 
 Inherits from `ServiceMetadataFrame`.
 
-<ParamField path="emits_user_turn_frames" type="bool" default="True">
-  Whether the service is currently configured to emit `UserStartedSpeakingFrame`
-  / `UserStoppedSpeakingFrame` from server-side turn signals. `False` for
-  services with no server-side turn signals (e.g. Gemini Live, AWS Nova Sonic,
-  Ultravox), and also `False` when a service's server-side turn detection has
-  been disabled by configuration (e.g. OpenAI Realtime with
-  `turn_detection=False`).
+<ParamField path="is_realtime_service" type="bool" default="False">
+  Whether the broadcasting service is a realtime (speech-to-speech) LLM service.
 </ParamField>
 
 ## RTVI

@@ -13,7 +13,8 @@ name: multi_turn # required: the eval's name
 judge: # optional: judge modality and LLM (defaults shown below)
   eval:
     service: ollama
-    model: gemma2:9b
+    model: gemma4:12b
+    extra: { reasoning_effort: none }
 
 turns: # required: the conversation, in order
   - user: "My name is Alex, and I'm planning a trip to Italy."
@@ -59,7 +60,7 @@ Two top-level blocks control a scenario's modalities, and each has its own `moda
 
 When `modality:` isn't specified, or a block is omitted entirely, it defaults to `text`. The two sides are also independent: you can drive the agent with text while judging its real speech, or speak to it and judge the LLM text.
 
-A scenario with neither block runs entirely in text mode. No audio flows on either side, so this is the fastest and cheapest way to test prompts, conversational logic, and function calling: no audio service cost, and a multi-turn scenario finishes in seconds. The judge LLM is the only service the harness itself needs (Ollama with `gemma2:9b` by default).
+A scenario with neither block runs entirely in text mode. No audio flows on either side, so this is the fastest and cheapest way to test prompts, conversational logic, and function calling: no audio service cost, and a multi-turn scenario finishes in seconds. The judge LLM is the only service the harness itself needs (Ollama with `gemma4:12b` by default).
 
 <Note>
   The top-level `user:` block here only configures delivery. Each turn's `user:`
@@ -76,7 +77,7 @@ user:
   modality: text
 ```
 
-**Audio.** Each turn's utterance is synthesized by a TTS the harness runs and streamed into your agent's pipeline at real-time cadence, exercising its VAD, turn detection, and STT exactly as a live microphone would. Synthesized audio is cached across runs, so repeated turns don't re-synthesize. The `speech:` block (the TTS service and voice) is required:
+**Audio.** Each turn's utterance is synthesized by a TTS the harness runs and streamed into your agent's pipeline at real-time cadence, exercising its VAD, turn detection, and STT exactly as a live microphone would. Synthesized audio is cached across runs, so repeated turns don't re-synthesize. The `speech:` block (the TTS service and voice) is required unless every spoken turn names an [`audio:` file](#playing-audio-files-with-audio) to play instead:
 
 ```yaml
 user:
@@ -91,6 +92,25 @@ user:
   The built-in speech services are `kokoro`, a local model and the recommended
   default, and `cartesia` (HTTP) when you want a cloud voice.
 </Note>
+
+Both the `speech:` and `judge.transcription:` blocks take an optional `language`, so a non-English agent can be driven and judged in the language it speaks:
+
+```yaml
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: zf_xiaobei # voices are language-specific — match the language
+    language: zh
+```
+
+It accepts a code like `zh` or a `Language`, and an unrecognized code raises a `ValueError` naming it. Omitting it leaves the service's own default, which is English. Voices are not selected for you: `af_heart` speaks US English whatever `language` says.
+
+<Tip>
+  Prefer `whisper` over `moonshine` for transcribing a non-English agent.
+  Moonshine's non-English models return empty or truncated transcripts, and an
+  empty transcript is indistinguishable from a bot that said nothing.
+</Tip>
 
 ### Judging with `judge:`
 
@@ -111,7 +131,7 @@ judge:
     model: small-streaming
   eval:
     service: ollama # the judge LLM
-    model: gemma2:9b
+    model: gemma4:12b
 ```
 
 <Note>
@@ -119,7 +139,23 @@ judge:
   When `transcription.service:` is omitted, it defaults to `moonshine`.
 </Note>
 
-In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma2:9b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`. This is the LLM that decides [`eval:`](#semantic-judging-with-eval) assertions.
+In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma4:12b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`. This is the LLM that decides [`eval:`](#semantic-judging-with-eval) assertions.
+
+An `extra:` mapping is forwarded to the judge as top-level request parameters, which is how provider-specific options reach it. The default judge is thinking-capable and only its JSON verdict is ever read, so the default `extra:` turns reasoning off — it buys nothing while costing latency and eating into the token budget the verdict needs.
+
+<Note>
+  Naming a `model:` without an `extra:` drops the defaults rather than merging
+  with them, since they are chosen for the default model. To pin an older judge,
+  set only what it needs:
+
+```yaml
+judge:
+  eval:
+    service: ollama
+    model: gemma2:9b # no extra: — gemma2 isn't thinking-capable
+```
+
+</Note>
 
 ### Custom services with `factory:`
 
@@ -206,6 +242,31 @@ The trade-off is that anything the bot accumulated in one scenario is still ther
 - **Conversation context**: seed or clear it per scenario with [`context:`](#seeding-the-context-with-context). The harness replaces the bot's LLM context with the messages you provide (via an `LLMMessagesUpdateFrame`); without it, the previous conversation carries forward, which is rarely what you want across independent scenarios.
 - **Application state**: counters, flags, cached data, anything your bot holds outside the LLM context. The harness can't see this, so resetting it is your bot's job. A common place is the bot's connect handler, which runs again for each scenario's connection.
 
+### Scoring every turn
+
+By default the first turn with a failed assertion ends the scenario, since a conversation that has gone wrong rarely tells you much about the turns after it. Set `stop_on_failure: false` when the turns are independent and you want a score across all of them — benchmarking intent classification over a list of utterances, say:
+
+```yaml
+name: intent_benchmark
+stop_on_failure: false
+
+turns:
+  - user: "Book me a flight to Tokyo."
+    expect:
+      - event: function_call
+        within_ms: 15000
+        calls: [{ name: book_flight }]
+```
+
+<Warning>
+  Give those turns an explicit `within_ms`. With the 60-second default, a bot
+  that has stopped answering costs a full budget on every remaining turn.
+</Warning>
+
+This governs progression from one turn to the next. Within a turn, an
+expectation that times out still ends that turn's matching, because a turn's
+expectations share one deadline anchored at the moment its input was sent.
+
 ### Exercising the disconnect path
 
 Some bots do meaningful work in `on_client_disconnected`, like a goodbye message, session teardown, or resource cleanup. Because the eval transport suppresses that handler by default, set `trigger_disconnect: true` on a scenario to fire it when that scenario ends:
@@ -249,6 +310,25 @@ turns:
       - event: response
         eval: "the bot opens the conversation with a greeting or an offer to help"
 ```
+
+### Playing audio files with `audio:`
+
+In audio mode, a turn can play a recording instead of synthesizing its `user:` text. The `audio:` field (a path relative to the scenario file) names the audio file to stream to the agent:
+
+```yaml
+turns:
+  - user: "What is the capital of Germany?"
+    audio: ../assets/capital_question.wav
+    expect:
+      - event: user_transcription
+        text_contains: "capital of Germany"
+      - event: response
+        eval: "the response says the capital of Germany is Berlin"
+```
+
+The file is sent at its own sample rate (it need not match the agent's input rate), and any format `soundfile` reads works — WAV, MP3, FLAC, OGG. Multi-channel audio is downmixed to mono. `user:` is required alongside `audio:` and gives what the recording says, since the judge and `text_contains` see it as the turn's input.
+
+A scenario whose spoken turns all name an `audio:` file needs no [`user.speech:` block](#user-delivery-with-user), since nothing is synthesized.
 
 ### DTMF keypresses with `dtmf:`
 
@@ -351,6 +431,7 @@ Scenarios assert on a small set of semantic events, mapped from the RTVI message
 | `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                                   |
 | `llm_started`           | The LLM began generating a response.                                                                                                                                                         |
 | `function_call`         | The LLM called a function.                                                                                                                                                                   |
+| `function_call_stopped` | A function call ended. Its `args` carry `tool_call_id` and `cancelled`, so a scenario can tell work that was stopped from work that finished on its own.                                     |
 | `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-keypresses-with-dtmf), where the aggregated keys become a transcription in either mode. |
 | `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                  |
 | `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                    |
@@ -384,7 +465,7 @@ The judge handles interim replies gracefully: if the agent says "Let me check on
 
 ### Substring checks with `text_contains:`
 
-For exact content, `text_contains:` does a plain substring check, with no judge round-trip:
+For exact content, `text_contains:` does a substring check, ignoring whitespace differences:
 
 ```yaml
 - user: "What is the capital of France?"
@@ -392,6 +473,8 @@ For exact content, `text_contains:` does a plain substring check, with no judge 
     - event: response
       text_contains: "Paris"
 ```
+
+On `response`, `llm_response`, and `tts_response`, the harness accumulates successive segments and re-checks on each new segment until the check passes. On `user_transcription`, it accumulates the STT's final transcription segments within the turn, so an STT that finalizes an utterance in pieces can still satisfy a phrase that spans them.
 
 ### Latency budgets with `within_ms:`
 
@@ -427,6 +510,19 @@ A `function_call` expectation asserts that the turn invoked one or more tools. L
 ```
 
 `args` is a subset check: every listed key/value must be present in the call's arguments, and extra arguments are ignored. A single expected call can use the `name:`/`args:` shorthand directly on the expectation, and a bare `function_call` with neither just asserts that some call happened.
+
+Arguments take part in the matching, so the turn is satisfied by any call matching both the name and the arguments — a call the model gets wrong and immediately repeats correctly still passes. When nothing matches, the failure names the arguments that did arrive.
+
+`function_call_stopped` takes the same `calls:` shape and reports a call ending, which is how a scenario asserts that a [cancellable tool](/pipecat/learn/function-calling#async-function-call-cancellation) was actually stopped:
+
+```yaml
+- user: "Actually, cancel that report."
+  expect:
+    - event: function_call_stopped
+      calls:
+        - name: write_report
+          args: { cancelled: true }
+```
 
 ## Next steps
 

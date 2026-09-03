@@ -1,0 +1,190 @@
+---
+title: "Error Handling"
+description: "Handle service failures in Pipecat with is_usable, ErrorCategory, and ProcessorUnusablePolicy, and recover a failed service."
+---
+
+Voice agents fail in two different ways, and telling them apart is most of what error handling amounts to. A provider that returns a 503 will probably work on the next request. A provider that rejects your API key will reject it every time, and a bot that keeps retrying stays silent while it does.
+
+Pipecat separates the two with a single question: **can this processor still do its job?**
+
+## is_usable
+
+Every [`FrameProcessor`](/pipecat/fundamentals/custom-frame-processor) reports whether it can still work:
+
+```python
+if not stt.is_usable:
+    # This service is finished until something changes.
+    ...
+```
+
+A processor stays usable through failures it might recover from, and becomes unusable once its work can no longer succeed — a rejected API key, an unknown model or voice, or enough consecutive failures that it has stopped trying.
+
+Being unusable changes what the framework does with it:
+
+- STT and TTS services stop accepting work, instead of failing once per chunk of audio or piece of text
+- WebSocket services stop reconnecting, instead of retrying credentials the provider has already rejected
+- A [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) fails over to another provider
+
+The flag is set as the error is reported, so a handler reading `frame.processor.is_usable` sees the verdict that came with the error it's handling.
+
+## ErrorCategory
+
+Errors carry a category saying what kind of failure it was, independent of which provider produced it:
+
+| Category          | Meaning                                                      |
+| ----------------- | ------------------------------------------------------------ |
+| `AUTHENTICATION`  | Credentials are missing or invalid                           |
+| `AUTHORIZATION`   | Credentials are valid but lack access to the resource        |
+| `INVALID_REQUEST` | The request is malformed, or names an unknown model or voice |
+| `RATE_LIMIT`      | Too many requests in too short a window                      |
+| `QUOTA`           | The account's credit or usage allowance is exhausted         |
+| `CONNECTIVITY`    | The service could not be reached                             |
+| `SERVER`          | The provider reported an internal failure                    |
+| `APPLICATION`     | Application code failed, not the provider                    |
+| `UNKNOWN`         | The cause could not be determined                            |
+
+```python
+from pipecat.utils.errors import ErrorCategory
+```
+
+`AUTHENTICATION`, `AUTHORIZATION`, and `INVALID_REQUEST` are **permanent**: retrying gives the same result until credentials or settings change. Reporting one is what makes a processor unusable. Read `category.is_permanent` rather than listing the three yourself.
+
+<Note>
+  `APPLICATION` is how a service reports a failure in code it invoked — a tool
+  handler, say. Those failures say nothing about the service's own health, so
+  they never make it unusable.
+</Note>
+
+## Deciding what the pipeline does
+
+`PipelineWorker` takes a policy for what to do when a processor becomes unusable:
+
+```python
+from pipecat.pipeline.worker import PipelineWorker, ProcessorUnusablePolicy
+
+worker = PipelineWorker(
+    pipeline,
+    processor_unusable_policy=ProcessorUnusablePolicy.END,
+)
+```
+
+| Policy     | Behavior                                                       |
+| ---------- | -------------------------------------------------------------- |
+| `CONTINUE` | Report the error and keep running. The default                 |
+| `END`      | End the pipeline gracefully, letting queued frames drain first |
+| `CANCEL`   | Cancel the pipeline immediately, abandoning queued frames      |
+
+The policy is applied **once per processor**, not once per failed request — an unusable processor keeps failing for as long as the pipeline uses it, and the decision only needs making once.
+
+`CONTINUE` leaves the decision to your application, which is the right default when a `ServiceSwitcher` will fail over, or when the bot can carry on degraded. Choose `END` when a bot with a dead service has nothing useful left to do; the Pipecat examples use it, so an example stops rather than running on with a service that will never answer.
+
+## Reacting in your application
+
+Handle `on_error` to decide for yourself:
+
+```python
+@stt.event_handler("on_error")
+async def on_error(processor, frame):
+    if frame.processor and not frame.processor.is_usable:
+        logger.error(f"{frame.processor} is finished: {frame.error}")
+        await notify_ops(frame.category)
+    else:
+        logger.warning(f"Recoverable: {frame.error}")
+```
+
+`on_usable_changed` fires whenever a processor's verdict changes, in either direction:
+
+```python
+@stt.event_handler("on_usable_changed")
+async def on_usable_changed(processor, is_usable):
+    logger.info(f"{processor} usable: {is_usable}")
+```
+
+## Recovering a service
+
+An unusable processor stays that way until you say otherwise. Once whatever broke has been fixed — new credentials, a corrected voice ID — bring it back:
+
+```python
+await stt.set_usable(True)
+```
+
+It then accepts work again, and a `ServiceSwitcher` will consider it a candidate. Switching to a service that is still marked unusable is refused, so recovery has to come first.
+
+## Reporting errors from your own processor
+
+```python
+await self.push_error(
+    "Provider rejected the request",
+    exception=exc,
+    category=ErrorCategory.INVALID_REQUEST,
+)
+```
+
+Passing a permanent `category` marks the processor unusable. When you know the processor is finished but the category doesn't say so on its own — a retry budget exhausted, for instance — pass `force_treat_as_permanent=True` instead of inventing a category.
+
+Implement `_classify_error()` to map exceptions your processor understands onto a category. Errors carrying an HTTP status are classified from it automatically: 401 to `AUTHENTICATION`, 403 to `AUTHORIZATION`, 429 to `RATE_LIMIT`, 5xx to `SERVER`.
+
+## Migrating from fatal errors
+
+`ErrorFrame.fatal`, the `fatal` argument of `push_error()`, and `FatalErrorFrame` are deprecated and will be removed in 2.0.0. A fatal error cancelled the pipeline outright, which conflated "this service is broken" with "this run is over" and left applications no say in the matter.
+
+<Warning>Passing `fatal=True` still cancels the pipeline, and warns.</Warning>
+
+Which replacement you want depends on what the error meant:
+
+**The error leaves its processor unable to work.** Report that, and let the policy decide:
+
+```python
+await self.push_error("API key rejected", force_treat_as_permanent=True)
+```
+
+`ProcessorUnusablePolicy.CANCEL` reproduces what `fatal=True` did. `END` and `CONTINUE` are usually better.
+
+**The error isn't about a processor's state, but the pipeline should stop.** Push the error, then end the pipeline explicitly:
+
+```python
+await self.push_error("Session limit reached")
+await self.push_frame(EndWorkerFrame(), FrameDirection.DOWNSTREAM)
+```
+
+Use `EndWorkerFrame` to drain queued frames, or `CancelWorkerFrame` to abandon them. Push either one downstream (the default direction) so the frames already queued ahead of it are handled first.
+
+To read errors, replace `if frame.fatal:` with a check on the processor:
+
+```python
+if frame.processor and not frame.processor.is_usable:
+    ...
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card
+    title="Service Switching"
+    icon="shuffle"
+    href="/api-reference/server/utilities/service-switchers/service-switcher"
+  >
+    Fail over to another provider automatically
+  </Card>
+  <Card
+    title="PipelineWorker"
+    icon="gear"
+    href="/api-reference/server/pipeline/pipeline-worker"
+  >
+    Pipeline events, including on_pipeline_error
+  </Card>
+  <Card
+    title="Frame Processor Events"
+    icon="bell"
+    href="/api-reference/server/events/frame-processor-events"
+  >
+    on_error and on_usable_changed
+  </Card>
+  <Card
+    title="System Frames"
+    icon="layer-group"
+    href="/api-reference/server/frames/system-frames"
+  >
+    ErrorFrame and its fields
+  </Card>
+</CardGroup>

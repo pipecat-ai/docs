@@ -1,0 +1,293 @@
+---
+title: "Pipecat Cloud Webhooks"
+sidebarTitle: "Webhooks"
+description: "Register webhook endpoints, subscribe to Pipecat Cloud events, and verify signed webhook deliveries in TypeScript and Python."
+---
+
+Webhooks let Pipecat Cloud notify your own services when something happens in your organization: a build finishes, a deployment replaces your pods, spend crosses a threshold, a session starts. Instead of polling the REST API, you register an endpoint URL and Pipecat Cloud POSTs a signed JSON payload to it.
+
+Every delivery is signed, so your handler can prove the request came from Pipecat Cloud and not from anyone who happened to guess your URL.
+
+<Note>
+  Webhook endpoints are managed per organization from the dashboard. There is no
+  CLI command or API-key-authenticated REST route for endpoint management.
+</Note>
+
+## Register an endpoint
+
+<Steps>
+  <Step title="Open the webhooks settings">
+    Go to the [Pipecat Cloud dashboard <Icon icon="arrow-up-right-from-square" iconType="solid" />](https://pipecat.daily.co/) and select **Settings > Webhooks** for your organization.
+  </Step>
+  <Step title="Add an endpoint">
+    Click **Add endpoint** and enter the URL that should receive events. Only
+    `http` and `https` URLs are accepted; use `https` for anything reachable
+    from the internet.
+  </Step>
+  <Step title="Choose the events to receive">
+    Select at least one event type. Pipecat Cloud only delivers the types you
+    subscribe to, so you do not have to filter unwanted traffic in your handler.
+    An endpoint with no event types is rejected: if you want an endpoint to stop
+    receiving everything, disable or delete it instead.
+
+    See the [webhook event reference](/pipecat-cloud/guides/webhook-events) for
+    the full catalog and payload shapes.
+
+  </Step>
+  <Step title="Copy the signing secret">
+    Use the key icon on the endpoint's row to reveal its signing secret. It
+    looks like `whsec_...`. Store it wherever your handler reads its
+    configuration from, and treat it like any other credential.
+  </Step>
+</Steps>
+
+Each endpoint row also gives you a **delivery history** view, an **edit** action for changing the URL or subscriptions, an **enable/disable** switch, and a **send test event** action.
+
+<Warning>
+  Deleting an endpoint destroys its signing secret and delivery history. To stop
+  deliveries temporarily, disable the endpoint instead. Recreating an endpoint
+  at the same URL issues a **new** secret, and any handler still using the old
+  one will reject every delivery.
+</Warning>
+
+## Verify the signature
+
+Your endpoint URL is the only thing standing between the public internet and your handler, so verify every request before you act on it. Pipecat Cloud signs every delivery following the [Standard Webhooks](https://www.standardwebhooks.com/) specification, so any Standard Webhooks library will verify it for you, including the timestamp check that prevents replay of an old but validly signed payload.
+
+Three headers carry the signature:
+
+| Header           | Description                                                         |
+| ---------------- | ------------------------------------------------------------------- |
+| `svix-id`        | The message id. Stable across every retry of the same message.      |
+| `svix-timestamp` | When the message was sent, as Unix seconds.                         |
+| `svix-signature` | A space-delimited list of versioned signatures, each `v1,<base64>`. |
+
+These names carry a prefix from the delivery provider, while Standard Webhooks libraries look for them as `webhook-id`, `webhook-timestamp` and `webhook-signature`. Map the three across before verifying, as both samples below do. Nothing else about the scheme differs.
+
+Verification also rejects a payload whose timestamp is more than five minutes away from your server's clock, so keep the receiving host's time in sync.
+
+Pass the library the **raw request body** exactly as received. Parsing the JSON and re-serializing it changes the bytes, and the signature will no longer match.
+
+<CodeGroup>
+
+```typescript TypeScript (Express)
+import express from "express";
+import { Webhook, WebhookVerificationError } from "standardwebhooks";
+
+const app = express();
+const wh = new Webhook(process.env.PIPECAT_WEBHOOK_SECRET!);
+
+// Deliveries name the signature headers with a provider prefix; Standard
+// Webhooks libraries look for them unprefixed. Empty strings rather than
+// `undefined` so a request with no signature fails verification (a 400)
+// instead of throwing (a 500).
+function signatureHeaders(headers: Record<string, unknown>) {
+  return {
+    "webhook-id": (headers["svix-id"] as string) ?? "",
+    "webhook-timestamp": (headers["svix-timestamp"] as string) ?? "",
+    "webhook-signature": (headers["svix-signature"] as string) ?? "",
+  };
+}
+
+// `express.raw` is essential: the JSON body parser would hand you an object,
+// and the signature is over the bytes that arrived on the wire.
+app.post(
+  "/webhooks/pipecat",
+  express.raw({ type: "application/json" }),
+  (req, res) => {
+    let event: any;
+    try {
+      event = wh.verify(req.body, signatureHeaders(req.headers));
+    } catch (err) {
+      if (err instanceof WebhookVerificationError) {
+        // Wrong secret, tampered body, or a replayed old delivery.
+        return res.status(400).send("Invalid signature");
+      }
+      throw err;
+    }
+
+    // Acknowledge immediately, then do the real work out of band. The
+    // response has already gone out, so nothing downstream will surface a
+    // failure in here and the delivery will not be retried: catch it
+    // yourself, and hand off to a real queue in production.
+    res.status(204).end();
+    handleEvent(event).catch((err) => {
+      console.error("Webhook handler failed", err);
+    });
+  },
+);
+
+async function handleEvent(event: any) {
+  switch (event.event_type) {
+    case "build.succeeded":
+      console.log(
+        `Build ${event.data.build_id} produced ${event.data.image_uri}`,
+      );
+      break;
+    case "deployment.updated":
+      console.log(
+        `${event.data.service_name} redeployed in ${event.data.region}`,
+      );
+      break;
+    default:
+      // Subscribing to a new event type in the dashboard should not break
+      // a running handler, so ignore anything you do not handle yet.
+      break;
+  }
+}
+
+app.listen(3000);
+```
+
+```python Python (FastAPI)
+import os
+
+from fastapi import BackgroundTasks, FastAPI, Request, Response
+from standardwebhooks import Webhook, WebhookVerificationError
+
+app = FastAPI()
+wh = Webhook(os.environ["PIPECAT_WEBHOOK_SECRET"])
+
+
+def signature_headers(headers) -> dict[str, str]:
+    """Deliveries name the signature headers with a provider prefix; Standard
+    Webhooks libraries look for them unprefixed. Defaulting to "" rather than
+    raising means a request with no signature fails verification (a 400)
+    instead of erroring (a 500)."""
+    return {
+        "webhook-id": headers.get("svix-id", ""),
+        "webhook-timestamp": headers.get("svix-timestamp", ""),
+        "webhook-signature": headers.get("svix-signature", ""),
+    }
+
+
+@app.post("/webhooks/pipecat")
+async def pipecat_webhook(request: Request, background_tasks: BackgroundTasks):
+    # The raw bytes, not a parsed model: the signature is over what arrived.
+    payload = await request.body()
+
+    try:
+        event = wh.verify(payload, signature_headers(request.headers))
+    except WebhookVerificationError:
+        # Wrong secret, tampered body, or a replayed old delivery.
+        return Response(status_code=400)
+
+    # Acknowledge immediately, then do the real work out of band.
+    background_tasks.add_task(handle_event, event)
+    return Response(status_code=204)
+
+
+async def handle_event(event: dict):
+    event_type = event["event_type"]
+    data = event["data"]
+
+    if event_type == "build.succeeded":
+        print(f"Build {data['build_id']} produced {data.get('image_uri')}")
+    elif event_type == "deployment.updated":
+        print(f"{data['service_name']} redeployed in {data['region']}")
+    # Subscribing to a new event type in the dashboard should not break a
+    # running handler, so ignore anything you do not handle yet.
+```
+
+</CodeGroup>
+
+Install the library with `npm install standardwebhooks` or `pip install standardwebhooks`.
+
+<Warning>
+  A handler that skips verification will act on anything anyone POSTs to the
+  URL, including forged `spend.limit_reached` or `service.suspended` events. If
+  you cannot verify for some reason, do not let the handler take a consequential
+  action on the payload alone.
+</Warning>
+
+## Respond quickly
+
+Pipecat Cloud treats any `2xx` response as a successful delivery and anything else as a failure to be retried. Acknowledge as soon as the signature checks out and move the real work to a queue or a background task, as both samples above do. A handler that does its work inline turns a slow downstream dependency into a delivery failure and a retry storm.
+
+## Handle duplicates
+
+**Delivery is at-least-once.** A retry after a timeout can arrive even though your handler already processed the message, and some events are produced by periodic jobs that can overlap.
+
+The `svix-id` header is stable across every retry of the same message, which makes it the right deduplication key:
+
+<CodeGroup>
+
+```typescript TypeScript
+const messageId = req.headers["svix-id"] as string;
+
+if (await seen.has(messageId)) {
+  return res.status(204).end(); // Already handled; acknowledge and stop.
+}
+await seen.add(messageId, { ttlSeconds: 60 * 60 * 24 });
+```
+
+```python Python
+message_id = request.headers["svix-id"]
+
+if await seen.has(message_id):
+    return Response(status_code=204)  # Already handled; acknowledge and stop.
+await seen.add(message_id, ttl_seconds=60 * 60 * 24)
+```
+
+</CodeGroup>
+
+Two details worth knowing:
+
+- Events produced by periodic jobs (`org.trial_ended` and the `spend.*` threshold events) carry an idempotency key, so overlapping runs of the same job deliver once rather than twice.
+- Deployment events are sent after the deploy commits. A process restart in that window can drop the event; the deploy itself is unaffected.
+
+## Test your handler
+
+Use the **send test event** action on an endpoint's row to deliver a sample of any event type that endpoint subscribes to. The body is generated from the event type's registered schema, so it is shaped exactly like the real event: you can exercise signature verification and payload parsing without producing a real build or session first.
+
+The endpoint has to be enabled to receive a test event. Like a manual retry, the action reports that the event was _accepted_, not that it was delivered. The outcome appears in the delivery history.
+
+Test deliveries carry a `webhook-test: true` header, which real events do not. If it is useful to route them differently, branch on that rather than on anything in the payload: a test event's body is a realistic sample, so it names a service and a region that may well exist in your account.
+
+## Inspect deliveries
+
+The history icon on an endpoint's row opens its delivery history, newest first. Each row is one message, with its event type, status, and, when a retry is still scheduled, when the next attempt will happen.
+
+Opening a delivery shows the exact payload that was sent and every attempt against it, including:
+
+- the response status code your server returned,
+- how long the request took,
+- the response body (truncated if large),
+- whether the attempt was scheduled or produced by a manual retry.
+
+You can re-dispatch any delivery from here. A retry is queued rather than made inline, so its outcome shows up as a new attempt in the history rather than in the response to the retry itself.
+
+<Note>
+  Delivery history looks back 90 days. A delivery older than that reports as not
+  found rather than as aged out.
+</Note>
+
+## Troubleshooting
+
+| Symptom                                            | Likely cause                                                                                                                                                                                               |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Every delivery fails signature verification        | The handler is verifying a re-serialized body instead of the raw bytes, or the secret belongs to a deleted-and-recreated endpoint.                                                                         |
+| No deliveries arrive at all                        | The endpoint is disabled, or it is not subscribed to the event type you expect. Check the badges on its row.                                                                                               |
+| An event you expected never fires                  | Some events are deliberately narrow. A deploy that resolves to no configuration change emits nothing, and `build.started` is best-effort. See the [event reference](/pipecat-cloud/guides/webhook-events). |
+| Deliveries succeed but your handler acts twice     | Delivery is at-least-once. Deduplicate on the `svix-id` header.                                                                                                                                            |
+| "Webhooks are not configured on this environment." | Webhooks are not available on the environment your organization is on. Contact support.                                                                                                                    |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Webhook event reference"
+    icon="list"
+    href="/pipecat-cloud/guides/webhook-events"
+  >
+    Every event type, when it fires, and the exact payload it carries.
+  </Card>
+  <Card
+    title="Pipecat Cloud REST API"
+    icon="code"
+    href="/api-reference/pipecat-cloud/rest-reference/overview"
+  >
+    Read build, deployment, and session state directly when you need more than
+    an event carries.
+  </Card>
+</CardGroup>

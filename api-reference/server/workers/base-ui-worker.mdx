@@ -1,0 +1,67 @@
+---
+title: "BaseUIWorker"
+description: "Worker that surfaces its jobs and job groups on the client UI as progress cards, without involving an LLM."
+---
+
+`BaseUIWorker` extends [`BaseWorker`](/api-reference/server/workers/base-worker) with client visibility. Every job group it dispatches streams its lifecycle to the client as `ui-job-group` envelopes, so background work appears as a progress card the user can watch and cancel.
+
+It involves no LLM. Instantiate one directly and register it on the runner as a dispatcher when a pipeline app wants client-visible background work driven by its own tools:
+
+```python
+from pipecat.pipeline.job_context import JobGroupParams
+from pipecat.workers.base_ui_worker import BaseUIWorker
+
+ui_jobs = BaseUIWorker("ui-jobs")
+
+async def research(params: FunctionCallParams, query: str):
+    job_id = await params.worker_runner.get_worker("ui-jobs").request_job_group(
+        "wikipedia", "news",
+        params=JobGroupParams(payload={"query": query}, label=f"Research: {query}"),
+    )
+    await params.result_callback({"status": "started", "job_id": job_id})
+```
+
+## Choosing a worker
+
+|                                                                 | Class                                                     |
+| --------------------------------------------------------------- | --------------------------------------------------------- |
+| Work the client shouldn't see                                   | [`BaseWorker`](/api-reference/server/workers/base-worker) |
+| Client-visible work, dispatched by the main pipeline's LLM      | `BaseUIWorker`                                            |
+| Client-visible work, plus an LLM that reads and drives the page | [`UIWorker`](/api-reference/server/workers/ui-worker)     |
+
+[`UIWorker`](/api-reference/server/workers/ui-worker) inherits from `BaseUIWorker`, so it keeps this behavior and adds an LLM with the screen in context. Reach for it when the work depends on what the user is looking at; a `BaseUIWorker` dispatcher is enough when the main pipeline's LLM already decides what to run.
+
+## What reaches the client
+
+A group dispatched by a `BaseUIWorker` publishes:
+
+| Envelope          | When                                                                  |
+| ----------------- | --------------------------------------------------------------------- |
+| `group_started`   | At dispatch, carrying the group's workers, `label`, and `cancellable` |
+| `job_update`      | As each worker sends an intermediate update                           |
+| `job_completed`   | As each worker responds                                               |
+| `group_completed` | At group teardown — normal completion, cancellation, or timeout       |
+
+The client's reserved `__cancel_job_group` event is translated into a cancellation for any group dispatched with `JobGroupParams(cancellable=True)`. A group dispatched without it is still reported to the client, but the client cannot stop it.
+
+## Dispatching
+
+`BaseUIWorker` uses the same job API as `BaseWorker` — [`job_group()`](/api-reference/server/workers/base-worker#job_group), [`request_job_group()`](/api-reference/server/workers/base-worker#request_job_group), and [`create_job_group_and_request_job()`](/api-reference/server/workers/base-worker#create_job_group_and_request_job). There is no separate UI-specific dispatch method: every group this worker dispatches is client-visible by virtue of the class.
+
+Give the group a `label`. It titles the card the user sees, and without one the card has nothing to name the work:
+
+```python
+async with self.job_group(
+    "wikipedia", "news", "scholar",
+    params=JobGroupParams(
+        payload={"query": query},
+        label=f"Research: {query}",
+        cancellable=True,
+    ),
+) as jg:
+    results = await jg.wait()
+```
+
+## Job hooks
+
+The same hooks as [`BaseWorker`](/api-reference/server/workers/base-worker#job-hooks) — `on_job_update`, `on_job_response`, `on_job_stream_end`, and `on_job_completed` — with the client forwarding layered on top. Always call `super()` when overriding, or the client stops receiving the group's lifecycle.

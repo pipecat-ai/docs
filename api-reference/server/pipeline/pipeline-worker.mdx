@@ -69,6 +69,14 @@ await runner.run(worker)
   dangling tasks.
 </ParamField>
 
+<ParamField path="handle_flush_frame" type="bool | None" default="None">
+  Whether this worker answers a flush probe. Defaults to whether the pipeline is
+  unbridged, so a bridged worker leaves the probe to travel on and be completed
+  by the pipeline that owns the transport. A bridged worker with no such peer
+  never completes a flush and every `flush_pipeline()` call waits out its
+  timeout.
+</ParamField>
+
 <ParamField path="idle_timeout_secs" type="float | None" default="300">
   Timeout in seconds before considering the pipeline idle. Set to None to
   disable idle detection. See [Pipeline Idle
@@ -79,10 +87,11 @@ await runner.run(worker)
 <ParamField
   path="idle_timeout_frames"
   type="Tuple[Type[Frame], ...]"
-  default="(BotSpeakingFrame, UserSpeakingFrame)"
+  default="(BotSpeakingFrame, InterimTranscriptionFrame, TranscriptionFrame, UserSpeakingFrame, UserStartedSpeakingFrame)"
 >
-  Frame types that should prevent the pipeline from being considered idle. See
-  [Pipeline Idle
+  Frame types that should prevent the pipeline from being considered idle. The
+  default pairs the VAD-only `UserSpeakingFrame` with the turn and transcription
+  frames a provider-driven pipeline reports instead. See [Pipeline Idle
   Detection](/api-reference/server/pipeline/pipeline-idle-detection) for
   details.
 </ParamField>
@@ -116,6 +125,31 @@ await runner.run(worker)
   for details.
 </ParamField>
 
+<ParamField path="setup_timeout_secs" type="float" default="20.0">
+  How long to wait for every processor to finish setting up. A processor that
+  blocks while connecting would otherwise leave `run()` waiting on it forever;
+  when the wait runs out the pipeline reports `on_setup_timeout` and tears down.
+</ParamField>
+
+<ParamField path="start_timeout_secs" type="float" default="20.0">
+  How long to wait for the `StartFrame` to reach the end of the pipeline. When
+  the wait runs out the pipeline reports `on_pipeline_timeout`.
+</ParamField>
+
+<ParamField
+  path="processor_unusable_policy"
+  type="ProcessorUnusablePolicy"
+  default="ProcessorUnusablePolicy.CONTINUE"
+>
+  What the pipeline does when a processor reports an error that leaves it unable
+  to do its job, such as a service whose API key was rejected. `CONTINUE` (the
+  default) reports the error and keeps running, leaving the decision to the
+  application; `END` stops the pipeline gracefully and `CANCEL` stops it
+  immediately. Applied once per processor, not once per failed request. See
+  [Error
+  Handling](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does).
+</ParamField>
+
 <ParamField path="app_resources" type="Any" default="None">
   Application-defined bag of resources (database handles, API clients, state,
   etc.) shared across tool handlers. Passed by reference to every function
@@ -131,6 +165,13 @@ await runner.run(worker)
 ## Methods
 
 ### Worker Lifecycle Management
+
+<Note>
+  `end()` and `activate_worker()` wait for in-flight frames to be processed
+  before they take effect, so a closing line is heard rather than cut off and a
+  worker handing over stops talking before the one taking over starts. A
+  pipeline that never started, or one that has already finished, is left alone.
+</Note>
 
 <ResponseField name="run()" type="async">
 Starts and manages the pipeline execution until completion or cancellation. Typically called via `WorkerRunner` rather than directly:
@@ -148,6 +189,15 @@ frames have been processed.
 
 ```python
 await worker.stop_when_done()
+```
+
+</ResponseField>
+
+<ResponseField name="end(reason=None)" type="async">
+Requests a graceful end of the session, draining the pipeline first. Whatever this worker has already pushed reaches the end of the pipeline before the session goes away, so a closing line is heard rather than cut off.
+
+```python
+  await worker.end(reason="done")
 ```
 
 </ResponseField>
@@ -171,6 +221,25 @@ if worker.has_finished(): print("Worker is complete")
 </ResponseField>
 
 ### Frame Management
+
+<ResponseField name="flush_pipeline(timeout=5.0)" type="async">
+Wait for in-flight frames to be processed. Pushes a flush probe downstream; the sink bounces it back upstream and the source sets its event once it completes the round-trip, signalling that every frame queued ahead of it has been processed. The probe goes on the worker's push queue, behind whatever is already waiting there.
+
+**Parameters:**
+
+| Parameter | Type    | Default | Description                                                                                                                                               |
+| --------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout` | `float` | `5.0`   | Seconds of no frames reaching the sink before giving up. A pipeline still working keeps the wait alive; one that is stuck gives up after this much quiet. |
+
+```python
+drained = await worker.flush_pipeline(timeout=10.0)
+if not drained:
+    print("Pipeline gave up after timeout")
+```
+
+**Returns:** `True` if the pipeline drained, `False` if it went quiet first.
+
+</ResponseField>
 
 <ResponseField name="queue_frame(frame, direction=FrameDirection.DOWNSTREAM)" type="async">
 Queues a single frame to be pushed through the pipeline.
@@ -230,6 +299,8 @@ PipelineWorker provides event handlers for monitoring pipeline lifecycle and fra
 | `on_pipeline_started`         | Pipeline has started processing                                       |
 | `on_pipeline_finished`        | Pipeline reached a terminal state                                     |
 | `on_pipeline_error`           | An error frame reached the pipeline worker                            |
+| `on_setup_timeout`            | Processors never finished setting up                                  |
+| `on_pipeline_timeout`         | A frame the worker was waiting on never arrived                       |
 | `on_frame_reached_upstream`   | A filtered frame type reached the pipeline source                     |
 | `on_frame_reached_downstream` | A filtered frame type reached the pipeline sink                       |
 | `on_heartbeat_timeout`        | No heartbeat received within the monitor timeout (pipeline may stall) |
@@ -274,16 +345,49 @@ async def on_pipeline_finished(worker, frame):
 | `worker`  | `PipelineWorker` | The pipeline worker instance                                   |
 | `frame`   | `Frame`          | The terminal frame (`EndFrame`, `StopFrame`, or `CancelFrame`) |
 
+### on_setup_timeout
+
+Fired when the processors never finish setting up within `setup_timeout_secs`. The pipeline is torn down afterwards. Takes no frame — nothing has flowed yet.
+
+```python
+@worker.event_handler("on_setup_timeout")
+async def on_setup_timeout(worker):
+    print("A processor never finished connecting")
+```
+
+**Parameters:**
+
+| Parameter | Type             | Description                  |
+| --------- | ---------------- | ---------------------------- |
+| `worker`  | `PipelineWorker` | The pipeline worker instance |
+
+### on_pipeline_timeout
+
+Fired when a frame the worker was waiting on never arrived — a `StartFrame` that never reached the end of the pipeline within `start_timeout_secs`, or a `CancelFrame` that never drained. Inspect `frame` to tell the two apart.
+
+```python
+@worker.event_handler("on_pipeline_timeout")
+async def on_pipeline_timeout(worker, frame):
+    print(f"Timed out waiting for {frame}")
+```
+
+**Parameters:**
+
+| Parameter | Type             | Description                    |
+| --------- | ---------------- | ------------------------------ |
+| `worker`  | `PipelineWorker` | The pipeline worker instance   |
+| `frame`   | `Frame`          | The frame the worker waited on |
+
 ### on_pipeline_error
 
-Fired when an `ErrorFrame` reaches the pipeline worker (upstream from a processor). If the error is fatal, the pipeline will be cancelled after this handler runs.
+Fired when an `ErrorFrame` reaches the pipeline worker (upstream from a processor). If the error left its processor unable to do its job, the pipeline applies its [`processor_unusable_policy`](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does) after this handler runs.
 
 ```python
 @worker.event_handler("on_pipeline_error")
 async def on_pipeline_error(worker, frame):
     print(f"Pipeline error: {frame.error}")
-    if frame.fatal:
-        print("Fatal error — pipeline will be cancelled")
+    if frame.processor and not frame.processor.is_usable:
+        print(f"{frame.processor} can no longer do its job")
 ```
 
 **Parameters:**
