@@ -6,6 +6,8 @@ description: "Measure processor startup times and transport readiness during pip
 
 The `StartupTimingObserver` measures what each processor costs to get ready — its `setup()` and its `start()` together — and tracks transport connection timing. This is useful for diagnosing startup slowness and identifying initialization bottlenecks such as WebSocket connections, API authentication, or model loading.
 
+Startup also loads the framework's deferred imports, which no processor accounts for, so the report carries what that cost alongside the per-processor timings and the whole span is attributable.
+
 ## Features
 
 - Measures per-processor readiness cost, from `setup()` through `StartFrame` propagation
@@ -32,6 +34,8 @@ async def on_startup_timing_report(observer, report):
     print(f"Total startup: {report.total_duration_secs:.3f}s")
     for timing in report.processor_timings:
         print(f"  {timing.processor_name}: {timing.duration_secs:.3f}s")
+    if report.warmup:
+        print(f"  warmup: {report.warmup.blocking_duration_secs:.3f}s")
 
 @observer.event_handler("on_transport_timing_report")
 async def on_transport_timing_report(observer, report):
@@ -87,20 +91,31 @@ async def on_startup_timing_report(observer, report):
 
 **Report fields (`StartupTimingReport`):**
 
-| Field                 | Type                           | Description                                                                                                                                                   |
-| --------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `start_time`          | `float`                        | Unix timestamp when the pipeline began setting up                                                                                                             |
-| `total_duration_secs` | `float`                        | Wall-clock span from the pipeline starting to set up until it had started. Processors set up concurrently, so this is the span, not the sum of what each cost |
-| `processor_timings`   | `List[ProcessorStartupTiming]` | Per-processor timing data, in pipeline order                                                                                                                  |
+| Field                 | Type                           | Description                                                                                              |
+| --------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `start_time`          | `float`                        | Unix timestamp when the pipeline began setting up                                                        |
+| `total_duration_secs` | `float`                        | Wall-clock time from the pipeline starting to set up until it had started                                |
+| `setup_phase_secs`    | `float`                        | How long getting every processor ready took. Setup runs concurrently and warming runs alongside it       |
+| `start_phase_secs`    | `float`                        | How long the `StartFrame` took to travel the pipeline. It reaches processors one after another          |
+| `processor_timings`   | `List[ProcessorStartupTiming]` | Per-processor timing data, in pipeline order                                                             |
+| `warmup`              | `StartupWarmupTiming \| None`  | What warming the framework's deferred imports cost, or `None` when the pipeline started without warming |
 
 **Processor timing fields (`ProcessorStartupTiming`):**
 
-| Field                 | Type    | Description                                                                    |
-| --------------------- | ------- | ------------------------------------------------------------------------------ |
-| `processor_name`      | `str`   | The name of the processor                                                      |
-| `start_offset_secs`   | `float` | Offset from the `StartFrame` to when this processor's `start()` began          |
-| `duration_secs`       | `float` | What the processor cost to get ready: its `setup()` and its `start()` together |
-| `setup_duration_secs` | `float` | How long `setup()` took — the part of `duration_secs` spent connecting         |
+| Field                  | Type    | Description                                                                                                 |
+| ---------------------- | ------- | ----------------------------------------------------------------------------------------------------------- |
+| `processor_name`       | `str`   | The name of the processor                                                                                   |
+| `start_offset_secs`    | `float` | Offset from the `StartFrame` to when this processor's `start()` began                                       |
+| `duration_secs`        | `float` | What the processor cost to get ready: its `setup()` and its `start()` together                              |
+| `setup_duration_secs`  | `float` | How long `setup()` took. Processors are set up concurrently, so this overlaps every other processor's      |
+| `start_duration_secs`  | `float` | How long the processor spent on the `StartFrame`. The frame reaches processors one after another, so this adds up |
+
+**Warmup timing fields (`StartupWarmupTiming`):**
+
+| Field                      | Type    | Description                                                                                                                                        |
+| -------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `duration_secs`            | `float` | How long warming took, in seconds                                                                                                                  |
+| `blocking_duration_secs`   | `float` | The part of warming the pipeline waited on once every processor had finished setting up. Warming runs alongside setup, so a pipeline whose processors take longer to connect than warming takes to load pays nothing for it |
 
 ### on_transport_timing_report
 
