@@ -57,6 +57,9 @@ and multimodal AI agents. Its primary components:
 - **Pipecat Cloud**: Managed infrastructure for deploying and scaling agents,
   run by the Pipecat team. See the
   [Cloud introduction](${BASE}pipecat-cloud/introduction.md).
+- **Pipecat Enterprise**: The same Pipecat Cloud control plane, with agents
+  running in a Kubernetes cluster you operate. See the
+  [Enterprise overview](${BASE}enterprise/overview.md).
 - **Pipecat CLI**: Scaffold projects, run evals, and deploy from the terminal.
   See the [CLI overview](${BASE}api-reference/cli/overview.md).
 
