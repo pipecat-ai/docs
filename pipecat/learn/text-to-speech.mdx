@@ -266,6 +266,85 @@ tts.add_text_transformer(replace_acronyms, "*")  # Apply to all text
 #   llm -> llm_text_processor -> tts
 ```
 
+### Bulk pronunciation overrides
+
+Some bots need hundreds of pronunciation overrides: medication names, product names, place names. There are two ways to do this.
+
+#### Client side with `replace_text`
+
+`replace_text` builds one transform from a list of `(pattern, replacement)` pairs. It works with every TTS service because the substitution happens in Pipecat before the text is sent.
+
+```python
+from pipecat.utils.text.transforms import replace_text
+
+# Load your lexicon from wherever it lives: a CSV, a database, a config file
+lexicon = [
+    (r"(?i)\bmetformin\b", "met-FOR-min"),
+    (r"(?i)\blisinopril\b", "ly-SIN-oh-pril"),
+    (r"(?i)\bomeprazole\b", "oh-MEP-ray-zol"),
+    # ... hundreds more
+]
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    text_transforms=[("*", replace_text(lexicon))],
+)
+```
+
+Rules are regular expressions, compiled once. Each chunk of text runs through the list in order, so cost grows in a straight line with rule count and stays small: on an Apple silicon laptop, 300 rules added about 0.4 ms per sentence and 1000 rules about 1.4 ms. Your hardware and patterns will move those numbers.
+
+Two tips:
+
+- Order matters. Rules run in sequence, so an earlier replacement can change what a later rule matches.
+- Use word boundaries (`\b`) so "cat" does not rewrite the middle of "catheter".
+
+<Warning>
+  **Multi-word replacements need sentence aggregation.** Text transforms run
+  *after* text aggregation and see one aggregation at a time. With
+  `TextAggregationMode.TOKEN`, text passes straight through with no buffering,
+  so a pattern that spans more than one word never matches: the words arrive in
+  separate calls. If your lexicon has any multi-word entry (`"beta blocker"`,
+  `"St. John's wort"`), keep the default sentence aggregation.
+</Warning>
+
+#### Provider side lexicons
+
+Some services host the lexicon for you. This keeps the list out of your process but ties you to that provider.
+
+| Service        | Option                              | What it takes                                                        |
+| -------------- | ----------------------------------- | -------------------------------------------------------------------- |
+| **AWS Polly**  | `lexicon_names`                     | A list of PLS lexicon names you have already uploaded to Polly       |
+| **NVIDIA**     | `custom_dictionary`                 | A dict mapping each written word to its IPA pronunciation            |
+| **Cartesia**   | `pronunciation_dict_id`             | The ID of a pronunciation dictionary you created in Cartesia         |
+| **ElevenLabs** | `pronunciation_dictionary_locators` | Deprecated since 1.6.0, removed in 2.0.0. Use `replace_text` instead |
+| **Azure**      | Not available                       | See the note below                                                   |
+
+<Warning>
+  **NVIDIA `custom_dictionary` entries cannot contain commas.** The dictionary
+  is sent as one comma separated string with no escaping, so a comma inside an
+  entry splits it and corrupts the rest of the dictionary. Strip commas first.
+</Warning>
+
+<Note>
+  **Azure has no pronunciation lexicon path in Pipecat.** `AzureTTSService`
+  escapes your text before wrapping it in SSML, so a `<phoneme>` tag injected by
+  a text transform is read out loud as literal characters. There is no flag to
+  turn this off. On Azure, use respellings through `replace_text`.
+</Note>
+
+#### ElevenLabs: prefer respellings over IPA
+
+```python
+# Works on every ElevenLabs model
+(r"(?i)\bmetformin\b", "met-FOR-min")
+
+# IPA phoneme tags need enable_ssml_parsing=True and, per ElevenLabs,
+# only work on their v2 models
+(r"(?i)\bmetformin\b", '<phoneme alphabet="ipa" ph="mɛtˈfɔːrmɪn">metformin</phoneme>')
+```
+
+Respellings need no flags and work on every model, so they are the safer default for a large lexicon.
+
 ### Text Filters
 
 <Warning>

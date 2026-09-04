@@ -5258,6 +5258,85 @@ tts.add_text_transformer(replace_acronyms, "*")  # Apply to all text
 #   llm -> llm_text_processor -> tts
 ```
 
+### Bulk pronunciation overrides
+
+Some bots need hundreds of pronunciation overrides: medication names, product names, place names. There are two ways to do this.
+
+#### Client side with `replace_text`
+
+`replace_text` builds one transform from a list of `(pattern, replacement)` pairs. It works with every TTS service because the substitution happens in Pipecat before the text is sent.
+
+```python
+from pipecat.utils.text.transforms import replace_text
+
+# Load your lexicon from wherever it lives: a CSV, a database, a config file
+lexicon = [
+    (r"(?i)\bmetformin\b", "met-FOR-min"),
+    (r"(?i)\blisinopril\b", "ly-SIN-oh-pril"),
+    (r"(?i)\bomeprazole\b", "oh-MEP-ray-zol"),
+    # ... hundreds more
+]
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    text_transforms=[("*", replace_text(lexicon))],
+)
+```
+
+Rules are regular expressions, compiled once. Each chunk of text runs through the list in order, so cost grows in a straight line with rule count and stays small: on an Apple silicon laptop, 300 rules added about 0.4 ms per sentence and 1000 rules about 1.4 ms. Your hardware and patterns will move those numbers.
+
+Two tips:
+
+- Order matters. Rules run in sequence, so an earlier replacement can change what a later rule matches.
+- Use word boundaries (`\b`) so "cat" does not rewrite the middle of "catheter".
+
+<Warning>
+  **Multi-word replacements need sentence aggregation.** Text transforms run
+  *after* text aggregation and see one aggregation at a time. With
+  `TextAggregationMode.TOKEN`, text passes straight through with no buffering,
+  so a pattern that spans more than one word never matches: the words arrive in
+  separate calls. If your lexicon has any multi-word entry (`"beta blocker"`,
+  `"St. John's wort"`), keep the default sentence aggregation.
+</Warning>
+
+#### Provider side lexicons
+
+Some services host the lexicon for you. This keeps the list out of your process but ties you to that provider.
+
+| Service        | Option                              | What it takes                                                        |
+| -------------- | ----------------------------------- | -------------------------------------------------------------------- |
+| **AWS Polly**  | `lexicon_names`                     | A list of PLS lexicon names you have already uploaded to Polly       |
+| **NVIDIA**     | `custom_dictionary`                 | A dict mapping each written word to its IPA pronunciation            |
+| **Cartesia**   | `pronunciation_dict_id`             | The ID of a pronunciation dictionary you created in Cartesia         |
+| **ElevenLabs** | `pronunciation_dictionary_locators` | Deprecated since 1.6.0, removed in 2.0.0. Use `replace_text` instead |
+| **Azure**      | Not available                       | See the note below                                                   |
+
+<Warning>
+  **NVIDIA `custom_dictionary` entries cannot contain commas.** The dictionary
+  is sent as one comma separated string with no escaping, so a comma inside an
+  entry splits it and corrupts the rest of the dictionary. Strip commas first.
+</Warning>
+
+<Note>
+  **Azure has no pronunciation lexicon path in Pipecat.** `AzureTTSService`
+  escapes your text before wrapping it in SSML, so a `<phoneme>` tag injected by
+  a text transform is read out loud as literal characters. There is no flag to
+  turn this off. On Azure, use respellings through `replace_text`.
+</Note>
+
+#### ElevenLabs: prefer respellings over IPA
+
+```python
+# Works on every ElevenLabs model
+(r"(?i)\bmetformin\b", "met-FOR-min")
+
+# IPA phoneme tags need enable_ssml_parsing=True and, per ElevenLabs,
+# only work on their v2 models
+(r"(?i)\bmetformin\b", '<phoneme alphabet="ipa" ph="mɛtˈfɔːrmɪn">metformin</phoneme>')
+```
+
+Respellings need no flags and work on every model, so they are the safer default for a large lexicon.
+
 ### Text Filters
 
 <Warning>
@@ -57545,47 +57624,61 @@ tts = RimeTTSService(
 )
 ```
 
-### PRONOUNCE(self, text: str, word: str, phoneme: str) -> str:
+### PRONOUNCE(text: str, word: str, phoneme: str) -> str
 
-Convenience method to support Rime's [custom pronunciations feature](https://docs.rime.ai/api-reference/custom-pronunciation). It takes a word and its desired phoneme representation, returning the text with the provided word replaced by the appropriate phoneme tag.
+Instance method that implements Rime's [custom pronunciations feature](https://docs.rime.ai/api-reference/custom-pronunciation). It replaces `word` in `text` with the phoneme tag. Unlike `SPELL` and `PAUSE_TAG`, call it on the service instance, not on the class. Its three arguments do not match the `(text, aggregation_type)` transform shape, so wrap it in a function.
 
 ```python
+tts = RimeTTSService(
+    api_key=os.getenv("RIME_API_KEY"),
+    settings=RimeTTSService.Settings(
+        # Keep bracket phonemization on for the whole session
+        phonemizeBetweenBrackets=True,
+    ),
+)
+
 # Text transformers for TTS
-# This will a phoneme in place of the word "potato" to define how it
+# This puts a phoneme in place of the word "potato" to define how it
 # should be pronounced.
 async def maybe_say_potato_all_fancylike(text: str, type: str) -> str:
     if using_fancy_voice:
-        return RimeTTSService.PRONOUNCE(text, "potato", "potato")
+        return tts.PRONOUNCE(text, "potato", "potato")
     else:
-        return RimeTTSService.PRONOUNCE(text, "potato", "poteto")
+        return tts.PRONOUNCE(text, "potato", "poteto")
 
-tts = RimeTTSService(
-    api_key=os.getenv("RIME_API_KEY"),
-    text_transforms=[
-        ("*", maybe_say_potato_all_fancylike), # Apply to all text
-    ],
-)
+tts.add_text_transformer(maybe_say_potato_all_fancylike, "*")  # Apply to all text
 ```
 
-### INLINE_SPEED(self, text: str, speed: float) -> str:
+<Note>
+  `PRONOUNCE` turns on bracket phonemization for the next message only. If any
+  message may contain a phoneme, set `phonemizeBetweenBrackets=True` in
+  `Settings` (as above) so it stays on for the whole session.
+</Note>
 
-A convenience method to support Rime's [inline speed adjustment feature](https://docs.rime.ai/api-reference/speed). It will wrap the provided text in the `[]` tags and add the provided speed to the `inlineSpeedAlpha` field in the request metadata.
+<Tip>
+  `PRONOUNCE` handles one word at a time. For hundreds of overrides, use the
+  `replace_text` transform. See [Bulk pronunciation
+  overrides](/pipecat/learn/text-to-speech#bulk-pronunciation-overrides).
+</Tip>
+
+### INLINE_SPEED(text: str, speed: float) -> str
+
+Instance method that implements Rime's [inline speed adjustment feature](https://docs.rime.ai/api-reference/speed). It wraps `text` in `[]` and adds `speed` to the `inlineSpeedAlpha` request field. Like `PRONOUNCE`, call it on the service instance, not on the class.
 
 ```python
+tts = RimeTTSService(
+    api_key=os.getenv("RIME_API_KEY"),
+)
+
 # Text transformers for TTS
 # This will make the word slow always be spoken more slowly.
 async def slow_down_slow_words(text: str, type: str) -> str:
     return text.replace(
         "slow",
-        RimeTTSService.INLINE_SPEED("slow", speed=0.5)
+        tts.INLINE_SPEED("slow", speed=0.5)
     )
 
-tts = RimeTTSService(
-    api_key=os.getenv("RIME_API_KEY"),
-    text_transforms=[
-        ("*", slow_down_slow_words), # Apply to all text
-    ],
-)
+tts.add_text_transformer(slow_down_slow_words, "*")  # Apply to all text
 ```
 
 <Tip>
