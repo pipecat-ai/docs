@@ -1,0 +1,118 @@
+---
+title: "Speaking Observer"
+description: "SpeakingObserver reports speaking lifecycle moments: user speech and turn events, bot speech, and interruptions with accurate timestamps."
+---
+
+The `SpeakingObserver` reports the speaking lifecycle of a conversation as a sequence of discrete moments. Each moment is reported as it happens, and moments that close a stretch of speech include when that speech began, so an interval reads whole from one record.
+
+## Overview
+
+A conversation is a sequence of people taking the floor and occasionally taking it from each other. This observer reports each of those moments, leaving what counts as a turn to whoever reads them. The moments themselves can be grouped later, differently, over the same history.
+
+The observer distinguishes between two layers of user speech:
+
+- **Speech detection** (`user_speech_*`): What the voice activity detector heard, including speech that never becomes a turn (coughs, false starts, pauses mid-sentence)
+- **Turn decisions** (`user_turn_*`): The turn strategy's ruling on that speech, which is what the rest of the pipeline acts on
+
+## Events
+
+### on_speech_event
+
+Emitted for each moment in the speaking lifecycle. Receives a `SpeechEvent` with the following fields:
+
+| Field        | Type              | Description                                                                                                                                                          |
+| ------------ | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`       | `SpeechEventKind` | What happened: `user_speech_started`, `user_speech_stopped`, `user_turn_started`, `user_turn_stopped`, `bot_speech_started`, `bot_speech_stopped`, or `interruption` |
+| `timestamp`  | `float`           | Unix timestamp of the moment itself. Speech is timed to when it began and ended, not to when the detector confirmed it                                               |
+| `started_at` | `float \| None`   | When the matching stretch of speech began (only on moments that end a stretch), so an interval reads without pairing records                                         |
+
+## Usage
+
+### Basic Setup
+
+Add the observer to your pipeline and handle speech events:
+
+```python
+from pipecat.observers.speaking_observer import SpeakingObserver
+
+observer = SpeakingObserver()
+
+@observer.event_handler("on_speech_event")
+async def on_speech_event(observer, event):
+    logger.info(event.model_dump_json())
+
+worker = PipelineWorker(
+    pipeline,
+    observers=[observer],
+)
+```
+
+### Logging Speech Intervals
+
+Calculate speech duration from closing moments:
+
+```python
+@observer.event_handler("on_speech_event")
+async def on_speech_event(observer, event):
+    if event.kind == "bot_speech_stopped" and event.started_at:
+        duration = event.timestamp - event.started_at
+        logger.info(f"Bot spoke for {duration:.2f}s")
+```
+
+### Separating Detection from Turn Strategy
+
+Track both what the detector heard and what the strategy acted on:
+
+```python
+@observer.event_handler("on_speech_event")
+async def on_speech_event(observer, event):
+    if event.kind == "user_speech_started":
+        # Raw speech detected
+        logger.debug("User audio detected")
+    elif event.kind == "user_turn_started":
+        # Turn strategy confirmed this is a user turn
+        logger.info("User turn started")
+```
+
+### Building a Timeline
+
+Reconstruct conversation flow with overlapping speech:
+
+```python
+events = []
+
+@observer.event_handler("on_speech_event")
+async def on_speech_event(observer, event):
+    events.append(event)
+
+    # Later: detect interruptions by checking if user started
+    # while bot speech was still open
+```
+
+## Configuration
+
+### Constructor Parameters
+
+<ParamField path="time_source" type="Callable[[], float]" default="time.time">
+  Reads the current time in seconds. Supply a custom function for testing to
+  control timestamps without waiting.
+</ParamField>
+
+## Speech Event Kinds
+
+The `SpeechEventKind` enum includes:
+
+- **`user_speech_started`** / **`user_speech_stopped`**: Speech as the voice activity detector heard it
+- **`user_turn_started`** / **`user_turn_stopped`**: Turn strategy's ruling on that speech
+- **`bot_speech_started`** / **`bot_speech_stopped`**: Bot speaking lifecycle
+- **`interruption`**: An interruption occurred (any processor can trigger one)
+
+The user appears at two layers because they answer different questions: `user_speech_*` captures all detected audio including false starts and coughs that never become turns, while `user_turn_*` shows what the pipeline actually acted on. The turn events follow the speech events by however long the strategy took to rule.
+
+## Notes
+
+- **Accurate timing**: Speech is timed to when it began and ended, not to when the detector confirmed it. An interval drawn from these timestamps matches what was actually said.
+- **Self-contained records**: Moments that close a stretch of speech include `started_at`, so you can read duration from a single record without pairing it with the opening moment.
+- **No turn definition**: What counts as a turn stays with the reader. A turn built into the records would freeze one definition into every event, where the moments can be grouped differently later.
+- **Duplicate prevention**: Each frame is reported once, even if relayed through multiple processors. Broadcast interruptions (which arrive as two frames) are reported once.
+- **Open stretches**: A stretch whose closing moment never arrives stays open rather than quietly joining itself to the next one.
