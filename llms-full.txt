@@ -72222,6 +72222,167 @@ Each error is reported as an `ErrorEvent` with the following fields:
 - `processor_usable` distinguishes transient failures (unreachable service) from permanent ones (invalid credentials)
 - Errors recovered by a processor (e.g., service switcher failover) are still reported, unlike `PipelineWorker.on_pipeline_error` which only sees errors that reach the top
 
+# Function Call Observer
+Source: https://docs.pipecat.ai/api-reference/server/utilities/observers/function-call-observer.md
+
+FunctionCallObserver reports each function call a conversation makes, from start to outcome, as FunctionCallEvent moments.
+
+The `FunctionCallObserver` reports each function call a conversation makes, tracking it through multiple moments rather than summarizing it once it is over. This is useful because the moments can be far apart and a call need not reach all of them: one waiting its turn to run is dropped if the conversation moves on, and one the conversation doesn't wait for can settle long after the turn that asked for it.
+
+## Function Call Lifecycle
+
+A function call progresses through several distinct moments:
+
+1. **Started**: When the LLM asks for the call
+2. **In Progress**: When the call begins running (can wait between these two)
+3. **Settled**: One of four outcomes:
+   - **Completed**: The handler returned successfully
+   - **Failed**: The handler raised an exception
+   - **Timed Out**: The call ran past its deadline
+   - **Cancelled**: Interrupted or cancelled by the LLM
+
+## Events
+
+The observer emits one event:
+
+- **`on_function_call_event`**: Emitted for each moment a call reaches
+  - Parameters: `observer` (FunctionCallObserver), `event` (FunctionCallEvent)
+
+## Usage
+
+```python
+from pipecat.observers.function_call_observer import FunctionCallObserver
+
+observer = FunctionCallObserver()
+
+@observer.event_handler("on_function_call_event")
+async def on_function_call_event(observer, event):
+    logger.info(event.model_dump_json())
+
+worker = PipelineWorker(
+    pipeline,
+    observers=[observer],
+)
+```
+
+## Configuration
+
+<ParamField path="include_arguments" type="bool" default="True">
+  Whether to report the arguments a call was made with. Arguments are small and
+  the reason a call is worth reading at all, so they travel by default.
+</ParamField>
+
+<ParamField path="include_results" type="bool" default="False">
+  Whether to report what a call returned. Results are whatever a provider
+  decided to return and can be large, so they do not travel by default.
+</ParamField>
+
+<ParamField path="time_source" type="Callable[[], float]" default="time.time">
+  Reads the current time in seconds. Supplying one lets a test place moments
+  without waiting.
+</ParamField>
+
+## FunctionCallEvent
+
+Each event is a `FunctionCallEvent` with the following fields:
+
+<ParamField path="kind" type="FunctionCallEventKind" required>
+  What happened to the call. One of: `function_call_started`,
+  `function_call_in_progress`, `function_call_completed`,
+  `function_call_failed`, `function_call_timed_out`, or
+  `function_call_cancelled`.
+</ParamField>
+
+<ParamField path="function_name" type="str" required>
+  The name of the function.
+</ParamField>
+
+<ParamField path="tool_call_id" type="str" required>
+  The LLM's identifier for this call, unique within a conversation.
+</ParamField>
+
+<ParamField path="timestamp" type="float" required>
+  Unix timestamp of the moment.
+</ParamField>
+
+<ParamField path="group_id" type="str | None" default="None">
+  Identifies the calls the LLM asked for in one response, which run together.
+  Set when the call goes in progress.
+</ParamField>
+
+<ParamField path="blocking" type="bool | None" default="None">
+  Whether the conversation waited for this call. A call that doesn't block is
+  answered later through a developer message, while the LLM carries on talking.
+  Set when the call goes in progress.
+</ParamField>
+
+<ParamField path="arguments" type="Any | None" default="None">
+  What the LLM passed to the function, when the observer is reporting arguments.
+  Set both when the call starts and when it goes in progress, since a call can
+  be reported at either moment without the other.
+</ParamField>
+
+<ParamField path="started_at" type="float | None" default="None">
+  When the call started, on the moment it goes in progress, so the wait between
+  the two reads from one record.
+</ParamField>
+
+<ParamField path="in_progress_at" type="float | None" default="None">
+  When the call went in progress, on the moment that settles it, so the time it
+  ran reads from one record.
+</ParamField>
+
+<ParamField path="result" type="Any | None" default="None">
+  What the handler returned, when the observer is reporting results.
+</ParamField>
+
+<ParamField path="error" type="str | None" default="None">
+  What went wrong, on a call whose handler raised.
+</ParamField>
+
+## Example Event Sequence
+
+For a successful function call:
+
+```json
+// 1. Call starts when LLM asks for it
+{
+  "kind": "function_call_started",
+  "function_name": "get_weather",
+  "tool_call_id": "call_1",
+  "timestamp": 1000000.0,
+  "arguments": {"city": "SF"}
+}
+
+// 2. Call goes in progress (may have waited)
+{
+  "kind": "function_call_in_progress",
+  "function_name": "get_weather",
+  "tool_call_id": "call_1",
+  "timestamp": 1000000.9,
+  "group_id": "group_1",
+  "blocking": true,
+  "arguments": {"city": "SF"},
+  "started_at": 1000000.0
+}
+
+// 3. Call completes
+{
+  "kind": "function_call_completed",
+  "function_name": "get_weather",
+  "tool_call_id": "call_1",
+  "timestamp": 1000002.3,
+  "in_progress_at": 1000000.9
+}
+```
+
+## Use Cases
+
+- **Analytics**: Measure function call latency, success rates, and wait times
+- **Debugging**: Track which calls are made, what arguments they receive, and how they settle
+- **Monitoring**: Alert on failed or timed-out calls
+- **Tracing**: Build complete traces of function call execution
+
 # LLM Log Observer
 Source: https://docs.pipecat.ai/api-reference/server/utilities/observers/llm-observer.md
 
@@ -80161,6 +80322,12 @@ Inherits from `UninterruptibleFrame` to ensure the result always reaches the con
   default="None"
 >
   Additional properties for result handling.
+</ParamField>
+
+<ParamField path="error" type="str | None" default="None">
+  What went wrong, when the call ended because its handler raised. The `result`
+  is then a stand-in message written for the LLM to read, rather than anything
+  the handler returned.
 </ParamField>
 
 # Control Frames
