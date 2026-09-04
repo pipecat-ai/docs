@@ -1,0 +1,217 @@
+---
+title: "Self-Hosted Region Configuration"
+sidebarTitle: "Configuration"
+description: "Region package Helm values reference: workloads namespace, external broker and log store, WebSocket exposure, replica counts, and pull secrets."
+---
+
+import { productNameSingular } from "/snippets/self-hosted-vars.mdx";
+
+The region package installs with working defaults for evaluation. The values below are the ones a production {productNameSingular} typically sets. Two rules keep upgrades painless:
+
+- **Your values file carries only what the package cannot know about your cluster** — endpoints, hostnames, sizing. Never add image references or versions: an image reference in your values is a pin that survives every upgrade.
+- **Upgrading is the version alone.** `helm upgrade … --version <new>` with the same values file moves every platform component together. If you rely on `--reuse-values`, use `--reset-then-reuse-values` instead, so the new package's defaults are not overridden by the previous one's.
+
+## Region identity
+
+```yaml
+global:
+  regionKey: acme-us-east # usually passed as --set global.regionKey=…
+  workloadsNamespace: pipecat-agents # must match the registered region
+workloadsNamespace:
+  create: true # false if a GitOps pipeline owns the namespace
+```
+
+`global.regionKey` is the one value every install must supply. `global.workloadsNamespace` must match the namespace you registered the region with; every component derives its copy from this single value.
+
+Set `workloadsNamespace.create: false` when your own tooling creates namespaces. The namespace must exist before the install and carry the label `pod-security.kubernetes.io/enforce: privileged` (see [Requirements](/enterprise/requirements#kubernetes-cluster)). The platform adopts it by adding one management label; Argo CD and Flux tolerate foreign labels by default, so avoid prune or self-heal rules that would remove it.
+
+## Broker
+
+The platform uses a Valkey- or Redis-compatible broker for session activation and autoscaling signals. The bundled broker is single-replica and intended for evaluation; a production region brings its own:
+
+```yaml
+valkey:
+  enabled: false
+externalBroker:
+  host: my-broker.internal
+  port: 6379
+  tls: true
+  username: default
+  passwordSecret: broker-auth # Secret in pipecat-system, key `password`
+  # password: "…"            # alternatively, the value itself (see below)
+```
+
+The broker must be reachable from both the system namespace and the workloads namespace, since agent pods connect to it too. The password can be supplied two ways; leave both empty for a broker without authentication:
+
+- **`passwordSecret`** — the name of a Secret in `pipecat-system` carrying the password under the key `password`. Create it before installing. The chart reads it from the cluster while rendering, so this works with `helm install` and `helm upgrade` run against the cluster; a render that cannot read the Secret (for example `helm template` with no cluster) fails with a message naming the alternative rather than installing an empty password.
+- **`password`** — the value itself, for pipelines that already inject secrets into values (SOPS-encrypted values files, secrets materialized by an operator, a vault plugin). This is the path for Argo CD, Flux, and CI renders. It wins over `passwordSecret` when both are set.
+
+Either way the value is read when the chart is rendered, so rotating the broker password is: change the value or Secret, run `helm upgrade` (or sync), then restart the platform components.
+
+## Activation secret
+
+The region agent and the session activation service share one secret that authenticates session starts inside your cluster. It lives in a Secret named `pipecat-bot-starter-secret` in `pipecat-system`, with the same value under two keys (`secret` and `BOT_STARTER_SECRET`), and must exist before the platform components start — they reference it as required, so a missing Secret blocks startup rather than running unauthenticated. Three ways to supply it, mutually exclusive:
+
+```yaml
+botStarter:
+  generateSecret: true # default: a pre-install/pre-upgrade job creates it if absent
+# botStarterSecret: "…" # or: render it from this value (deterministic; GitOps-safe)
+```
+
+- **Generated (default).** A pre-install/pre-upgrade job creates the Secret if it is absent and never rotates an existing value. It runs the same way under `helm install` and under Argo CD's pre-sync phase, and the Secret appears in no rendered manifest, so nothing drifts. It carries no Helm or Argo ownership labels and survives `helm uninstall`.
+- **From a value.** Set `botStarterSecret` and the chart renders the Secret from it; the job does not run. For shops that inject secrets into values.
+- **Supplied by you.** Set `botStarter.generateSecret: false` and create the Secret yourself before installing — two keys, one value. With External Secrets Operator, use its `Password` generator with `refreshPolicy: CreatedOnce` and an immutable target so a later reconcile never rewrites it:
+
+  ```yaml
+  apiVersion: generators.external-secrets.io/v1alpha1
+  kind: Password
+  metadata:
+    name: pipecat-bot-starter-secret
+    namespace: pipecat-system
+  spec:
+    length: 43
+  ---
+  apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: pipecat-bot-starter-secret
+    namespace: pipecat-system
+  spec:
+    refreshPolicy: CreatedOnce
+    target:
+      name: pipecat-bot-starter-secret
+      immutable: true
+      template:
+        data:
+          secret: "{{ .password }}"
+          BOT_STARTER_SECRET: "{{ .password }}"
+    dataFrom:
+      - sourceRef:
+          generatorRef:
+            apiVersion: generators.external-secrets.io/v1alpha1
+            kind: Password
+            name: pipecat-bot-starter-secret
+  ```
+
+Rotation is deliberate, never a side effect of an upgrade or sync: delete the Secret and re-run the hook (or set a new value under both keys), then restart the activation service first and the region agent second.
+
+## Log store
+
+Agent log collection is **off by default** and stays in your region when enabled. Enabling it means three settings, because the components that write logs, query them, and bootstrap the store are configured separately:
+
+```yaml
+logging:
+  enabled: true
+  bundled:
+    enabled: false # the bundled store is single-node and for evaluation only
+  external:
+    url: https://my-opensearch.internal:9200
+    credsSecret: pipecat-log-store-creds # Secret in pipecat-system: username, password (+ ca.crt for a private CA)
+  retentionDays: 7
+
+pipecat-cloud-operator:
+  logShipper:
+    enabled: true # do not set an image — the package provides it
+    opensearchUrl: https://my-opensearch.internal:9200
+    credsSecret: pipecat-log-store-creds
+  operatorConfig:
+    systemCopySecrets:
+      - pipecat-log-store-creds # mirrored into the workloads namespace for agent pods
+
+region-agent:
+  logs:
+    opensearch:
+      url: https://my-opensearch.internal:9200
+      index: pcc-logs
+      credsSecretName: pipecat-log-store-creds
+      caInSecret: false # true if the Secret carries ca.crt
+```
+
+The install applies the log schema to your store automatically; there is no manual step. See [Logs and observability](/enterprise/logs) for what is captured and how retention works.
+
+## WebSocket exposure
+
+How the region's WebSocket routes are exposed outside the cluster. The default, `none`, renders nothing — you route to the activation service yourself. The other modes render a standard `Ingress`, a Gateway API `HTTPRoute` bound to a Gateway you operate, or a Gateway API `Gateway` of the release's own:
+
+```yaml
+wsExposure:
+  mode: ingress # none | ingress | httpRoute | gateway
+  ingress:
+    host: ws.acme-us-east.example.com
+    className: alb
+    annotations: {}
+    tls: []
+  httpRoute:
+    parentRefs: [] # your Gateway, for mode: httpRoute
+    hostnames: []
+    requestTimeout: "0s" # disabled — WebSocket sessions outlive request deadlines
+  gateway: # mode: gateway — the release owns the Gateway, load balancer, and certificate
+    host: ws.acme-us-east.example.com
+    className: "" # a Gateway API implementation installed in the cluster
+    annotations: {} # on the Gateway (for example, a cert-manager issuer)
+    infrastructureAnnotations: {} # passed to the load balancer the implementation creates
+    tls:
+      secretName: "" # certificate Secret for the https listener
+    requestTimeout: "0s"
+
+envoy-gateway:
+  enabled: false # bundle Envoy Gateway as the Gateway API implementation
+```
+
+`gateway` mode needs a Gateway API implementation in the cluster. Set `envoy-gateway.enabled: true` to have the package install [Envoy Gateway](https://gateway.envoyproxy.io/), or leave it off and name your own implementation's class in `className`.
+
+Whatever public URL results is what you register as the region's WebSocket endpoint. Details, including controller-specific timeout settings, are on [WebSockets and telephony](/enterprise/websockets).
+
+## Replicas and availability
+
+```yaml
+region-agent:
+  replicaCount: 2 # default; each replica holds its own connection to Pipecat Cloud
+pipecat-bot-starter:
+  replicaCount: 2 # default; scale up as session-start volume grows
+```
+
+Both components are highly available at two replicas and render a `PodDisruptionBudget`. The activation service's horizontal autoscaler is off by default; `replicaCount` owns its scale unless you enable it (which requires a metrics server in the cluster).
+
+## Agent pod settings
+
+Two operator settings shape every agent pod. Both apply to a service on its next deploy, never to running pods:
+
+```yaml
+pipecat-cloud-operator:
+  # Resolver settings for agent pods. ndots:2 stops every external lookup
+  # from walking the cluster search list first — recommended at scale.
+  botPodDnsConfig:
+    options:
+      - name: ndots
+        value: "2"
+  # Spare-capacity policy for autoscaled services. Empty keeps the default
+  # (two pods per active or pending session).
+  botScalingPolicy: {}
+```
+
+Scheduling constraints for agent pods (node selectors, tolerations, affinity) are set through the operator's scheduling overlay; the [EKS reference architecture](/enterprise/reference/aws-eks) shows a dedicated, tainted agent node pool wired this way.
+
+## Image pull credentials
+
+```yaml
+registry:
+  pullSecret:
+    managed: true
+```
+
+With the default, enrollment delivers the cluster's pull credential for platform images as the `pipecat-pull` Secret and rotates it automatically; nothing sensitive appears in your values. Set `managed: false` only if you provide `pipecat-pull` yourself end to end (a private mirror, node-level registry authentication, or your own secrets tooling).
+
+## Network policies
+
+Per-agent egress network policies are **off by default** in a {productNameSingular}: it is your cluster, and agents calling services on your network is often the point. Attach your own `NetworkPolicy` resources to the workloads namespace, or enable the platform's per-agent egress policy under `pipecat-cloud-operator.networkPolicy` if you want agents restricted to public destinations plus the platform services. Either requires a CNI that enforces network policies.
+
+## Diagnostics
+
+```yaml
+region-agent:
+  supportBundle:
+    enabled: true # default
+```
+
+The support bundle lets Daily support pull a read-only snapshot of the platform components' state when you ask for help. It is limited to what the two read-only roles the package renders can see, never includes secret values or agent logs, and every pull is recorded on the region's event feed. Set `enabled: false` to remove both the route and the roles. See [What Pipecat Cloud Can See](/enterprise/what-daily-can-see).

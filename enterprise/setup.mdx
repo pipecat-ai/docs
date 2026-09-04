@@ -1,0 +1,183 @@
+---
+title: "Set Up a Self-Hosted Region"
+sidebarTitle: "Set up a region"
+description: "Register a self-hosted region, mint an enrollment token and registry key, install the region package with Helm, and verify the region is active."
+---
+
+import {
+  productNameSingular,
+  cliMinVersion,
+  packageMinVersion,
+} from "/snippets/self-hosted-vars.mdx";
+
+This guide takes a cluster that meets the [requirements](/enterprise/requirements) to an active {productNameSingular} your organization can deploy agents to. Every step has a CLI form and a dashboard form; the cluster-side commands are the same either way.
+
+<Info>
+  The region commands require `pipecatcloud` {cliMinVersion} or later. Check
+  with `pipecat cloud --version` and upgrade with `uv tool upgrade pipecat-ai
+  --with pipecatcloud` if needed.
+</Info>
+
+## Before you begin
+
+Pick a **region key**: a short, DNS-safe identifier such as `acme-us-east`. Region keys are unique across all of Pipecat Cloud, so include your organization or company name. You will use the same key for the life of the region, including across cluster rebuilds.
+
+Decide on the **workloads namespace** where your agents will run. The default, `pipecat-agents`, is fine unless you have a naming convention to follow. The namespace is created by the install and is yours: it survives uninstalls, and you can pre-create it yourself if a GitOps pipeline owns your namespaces.
+
+<Steps>
+  <Step title="Mint a registry key">
+    A registry key is a pull-only credential that lets `helm` on your workstation fetch the region package. It is shown exactly once.
+
+    ```bash
+    pipecat cloud organizations registry-keys mint --name acme-us-east-workstation
+    ```
+
+    The command prints the key and the matching `helm registry login` command. Run it, supplying the key on stdin rather than the command line:
+
+    ```bash
+    echo "$REGISTRY_KEY" | helm registry login registry.pipecat.daily.co -u pcc --password-stdin
+    ```
+
+    In the dashboard, mint registry keys from the **Keys** page under your organization's settings.
+
+    <Note>
+      This is a workstation credential only. Your cluster's own credential for
+      pulling platform images is delivered automatically during enrollment —
+      you never create an image pull secret for the platform components.
+    </Note>
+
+  </Step>
+
+  <Step title="Register the region">
+    Registration creates the region record in your organization: its key, a display name, the workloads namespace, the CPU architectures its nodes provide, and — if you plan to run WebSocket or telephony agents — the public WebSocket endpoint you will expose.
+
+    ```bash
+    pipecat cloud regions register acme-us-east \
+      --display-name "Acme US East" \
+      --workloads-namespace pipecat-agents \
+      --architectures amd64,arm64 \
+      --default-architecture amd64 \
+      --ws-public-endpoint wss://ws.acme-us-east.example.com
+    ```
+
+    Only declare architectures your cluster can actually schedule; deploys are validated against this list. Omit `--ws-public-endpoint` if the region will not expose a WebSocket endpoint — you can add it later.
+
+    Registering is an upsert: re-running the command with different options updates the record, and options you leave out keep their stored values. Use it whenever something about the region changes, such as a new WebSocket hostname.
+
+    In the dashboard, open **Settings → Regions** and choose **Register Region**.
+
+  </Step>
+
+  <Step title="Mint an enrollment token and stage it in the cluster">
+    Enrollment is how your cluster proves it is the region you registered and receives its certificates. It is bootstrapped by a one-time token that must be present in the cluster before you install the package.
+
+    ```bash
+    pipecat cloud regions enroll-token acme-us-east
+    ```
+
+    The command prints the token together with the `kubectl` command that stages it. Create the system namespace first, then run the printed command:
+
+    ```bash
+    kubectl create namespace pipecat-system
+    kubectl -n pipecat-system create secret generic pipecat-region-enroll-token \
+      --from-literal=token=<token>
+    ```
+
+    In the dashboard, open the region on **Settings → Regions** and choose **Mint Enrollment Token**.
+
+    <Warning>
+      The token is single-use, expires after one hour, and cannot be retrieved
+      again. If it expires before you install, mint a new one — nothing else
+      needs to change.
+    </Warning>
+
+  </Step>
+
+  <Step title="Write your values file">
+    Create a values file for the region. It should contain only what the package cannot know about your cluster — your broker, your log store if you use one, your WebSocket exposure — and never image references or versions. See [Configuration](/enterprise/configuration) for the reference; a minimal production file looks like this:
+
+    ```yaml
+    valkey:
+      enabled: false
+    externalBroker:
+      host: my-broker.internal
+      port: 6379
+      tls: true
+      username: default
+      passwordSecret: broker-auth # a Secret in pipecat-system with key `password`
+
+    wsExposure:
+      mode: ingress
+      ingress:
+        host: ws.acme-us-east.example.com
+        className: alb
+        annotations:
+          alb.ingress.kubernetes.io/scheme: internet-facing
+          alb.ingress.kubernetes.io/target-type: ip
+          alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=4000
+    ```
+
+    Any Secrets your values reference (such as `broker-auth` above) must exist in `pipecat-system` before you install.
+
+  </Step>
+
+  <Step title="Install the region package">
+    ```bash
+    helm upgrade --install pipecat oci://registry.pipecat.daily.co/pcc/pcc-region \
+      --version <version> \
+      --namespace pipecat-system --create-namespace \
+      -f values-acme-us-east.yaml \
+      --set global.regionKey=acme-us-east \
+      --wait --timeout 10m
+    ```
+
+    Use the latest published version ({packageMinVersion} or later). The package carries its own control-plane configuration and every platform image at that version, so `--set global.regionKey` and your values file are the entire configuration.
+
+    During the install, an enrollment job runs first: it exchanges your one-time token for the region's certificates, receives the cluster's image pull credential, and writes both into the cluster. The remaining components then start and the region agent opens its connection to Pipecat Cloud.
+
+    `--wait` returning cleanly is the acceptance test: enrollment completed and every component is ready. If it times out, see [Diagnostics](/enterprise/diagnostics#common-failures) — the most common cause on a fresh cluster is nodes too small for the platform components' requests.
+
+  </Step>
+
+  <Step title="Verify">
+    From your workstation:
+
+    ```bash
+    pipecat cloud regions show acme-us-east
+    ```
+
+    The enrollment status should read `active`, with an intermediate certificate expiry about a year out. In the dashboard, the region appears on **Settings → Regions** with its status and certificate expiry, and in every region picker.
+
+    In the cluster, all pods in `pipecat-system` should be `Running` and the enrollment job `Completed`:
+
+    ```bash
+    kubectl -n pipecat-system get pods
+    ```
+
+    The install also prints two ready-to-run diagnostic commands; re-read them any time with `helm get notes pipecat -n pipecat-system`.
+
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Reference your secrets" icon="key" href="/enterprise/secrets">
+    Create Secrets in your workloads namespace and reference them as secret
+    sets.
+  </Card>
+  <Card
+    title="Deploy an agent"
+    icon="rocket"
+    href="/pipecat-cloud/fundamentals/deploy"
+  >
+    `pipecat cloud deploy --region acme-us-east`, exactly as for any other
+    region.
+  </Card>
+  <Card title="Size your agents" icon="sliders" href="/enterprise/sizing">
+    Explicit CPU and memory, your own profiles, and architecture targeting.
+  </Card>
+  <Card title="Expose WebSockets" icon="phone" href="/enterprise/websockets">
+    Telephony and WebSocket sessions connect directly to your region.
+  </Card>
+</CardGroup>

@@ -1,0 +1,123 @@
+---
+title: "Self-Hosted Region Diagnostics"
+sidebarTitle: "Diagnostics & support"
+description: "Diagnose a self-hosted region with the doctor, region status and event feed, and the support bundle, and what to collect before contacting support."
+---
+
+import { productNameSingular } from "/snippets/self-hosted-vars.mdx";
+
+A {productNameSingular} ships with its own diagnostics, and Pipecat Cloud keeps a record of what happened to it. Start here when something is off.
+
+## Region status
+
+From your workstation:
+
+```bash
+pipecat cloud regions show acme-us-east
+```
+
+The record shows the region's enrollment status, certificate expiry, declared architectures, workloads namespace, and WebSocket endpoint. The dashboard's **Settings → Regions** page shows the same, plus whether the region is currently connected and which platform version each region agent is running.
+
+In the cluster, the platform components live in `pipecat-system`:
+
+```bash
+kubectl -n pipecat-system get pods
+kubectl -n pipecat-system logs deploy/pipecat-region-agent
+```
+
+A healthy region has every pod `Running`, the `pipecat-region-enroll` job `Completed`, and the region agent's log reporting an established channel.
+
+## The doctor
+
+The package includes a self-diagnosis command that runs tiered pass/fail checks over the region's configuration, enrollment material, certificate chain, platform pods, and — most usefully — its ability to reach Pipecat Cloud, distinguishing "egress is blocked" from "the certificate is wrong", the two failures that look identical from the outside. Nothing leaves the cluster; the report is yours, and it is the first thing to include when you contact support.
+
+The install prints two ready-to-run forms; re-read them any time with:
+
+```bash
+helm get notes pipecat -n pipecat-system
+```
+
+- **While the region agent is running** — the richest view, since it tests the real connection:
+
+  ```bash
+  kubectl -n pipecat-system exec deploy/pipecat-region-agent -- /app doctor
+  ```
+
+- **When the agent cannot run** — never enrolled, image pulls failing, egress blocked — the second form runs the doctor from the enrollment image, which is pullable without credentials, under a read-only service account the package creates for exactly this purpose. Use the command from `helm get notes`; it carries the right image tag for your installed version.
+
+## Region events
+
+Pipecat Cloud records a timeline for every region: registration, enrollment, each certificate renewal and its outcome, agent connections and disconnections, deployment failures reported by the region, support bundle pulls, and revocation. Daily support reads this feed when you contact them, so a report needs only your region key and roughly when the problem started.
+
+## Support bundle
+
+When you ask for help, Daily support can pull a read-only snapshot of your region's platform state through the region's own connection — pods and events in the system and workloads namespaces, the status of each deployment, autoscaler state, the platform components' recent log lines, and reachability checks. It never includes your agents' logs, secret values, or environment variables; [What Pipecat Cloud Can See](/enterprise/what-daily-can-see) lists its contents exactly. Every pull is recorded on the region's event feed, and you can disable the capability with `region-agent.supportBundle.enabled: false`.
+
+## Common failures
+
+<AccordionGroup>
+  <Accordion title="Registering the region fails with 403">
+    Either your organization does not have self-hosted regions enabled, or it
+    has used all of its region allowance. If you are rebuilding a cluster, reuse
+    the existing region key rather than registering a new one. Otherwise,
+    [contact Daily](/enterprise-support).
+  </Accordion>
+  <Accordion title="helm install --wait times out">
+    Look at the pods in `pipecat-system`. Pods stuck in `Pending` on a fresh
+    cluster usually mean nodes too small for the platform components' requests —
+    see [Sizing the platform
+    components](/enterprise/requirements#sizing-the-platform-components). An
+    enrollment job that failed usually means the token expired (mint a new one
+    and run the install again), the cluster cannot reach `api.pipecat.daily.co`,
+    or cert-manager is not ready. The enrollment job's log states the cause.
+  </Accordion>
+  <Accordion title="The region shows as active but is not connected">
+    Run the doctor. It separates a blocked egress path to
+    `region-gateway.pipecat.daily.co:8443` from a certificate problem. If the
+    region's certificate authority has expired, see [Certificate
+    lifecycle](/enterprise/operations#certificate-lifecycle).
+  </Accordion>
+  <Accordion title="A deploy fails with ImageResolutionFailed">
+    The platform resolves the agent image to a digest before creating any pod,
+    so a private image whose pull secret is missing or wrong fails here, not
+    with `ImagePullBackOff`. Check that the referenced image pull secret exists
+    in the workloads namespace and is `ready`. On a rebuilt cluster, referenced
+    secrets must be re-created.
+  </Accordion>
+  <Accordion title="An agent pod fails with CreateContainerConfigError">
+    A referenced secret set the agent uses does not exist in the workloads
+    namespace. Re-create it; the reference recovers on its own.
+  </Accordion>
+  <Accordion title="A deploy is rejected: architecture not supported">
+    The deployment declares an architecture the region was not registered with.
+    Either build the image for a supported architecture, or update the region's
+    declared architectures with `pipecat cloud regions register …
+    --architectures …` — only if your nodes can actually run it.
+  </Accordion>
+  <Accordion title="WebSocket sessions stop connecting">
+    If the region is healthy, check the registered WebSocket endpoint with
+    `pipecat cloud regions show`: `/start` hands clients whatever hostname is
+    stored, so a changed hostname that was not re-registered fails every session
+    while every in-cluster diagnostic passes. Also confirm your load balancer's
+    idle timeout exceeds your longest session.
+  </Accordion>
+  <Accordion title="pipecat cloud agent logs says logs are not available">
+    Log collection is off by default in self-hosted regions. See [Enabling the
+    log store](/enterprise/logs#enabling-the-log-store).
+  </Accordion>
+  <Accordion title="Session metrics are missing">
+    The node runs cgroup v1. Sessions are unaffected; see [Session
+    metrics](/enterprise/logs#session-metrics).
+  </Accordion>
+</AccordionGroup>
+
+## Contacting support
+
+Include:
+
+- your organization and **region key**;
+- the **doctor report**;
+- the approximate time of the problem and, for a failed API call, the `X-Request-Id` from the response, which lets support find the request on both sides;
+- what you observed in the cluster (`kubectl -n pipecat-system get pods`, and the relevant pod's log if a platform component is failing).
+
+Daily does not read your agents' logs. If a problem is inside your agent and you want support to look at its output, include the relevant lines yourself.

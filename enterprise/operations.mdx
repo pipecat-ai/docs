@@ -1,0 +1,84 @@
+---
+title: "Operating a Self-Hosted Region"
+sidebarTitle: "Operations"
+description: "Day-two operations for a self-hosted region: package upgrades, certificate lifecycle, high availability, rebuilding a cluster, and retiring a region."
+---
+
+import { productNameSingular } from "/snippets/self-hosted-vars.mdx";
+
+Once a {productNameSingular} is active, most of its lifecycle is hands-free. This page covers the operations you perform and the ones that happen on their own.
+
+## Upgrading the region package
+
+Upgrading is the version alone. Your values file carries no image references, so a new version moves every platform component together:
+
+```bash
+helm upgrade pipecat oci://registry.pipecat.daily.co/pcc/pcc-region \
+  --version <new version> \
+  --namespace pipecat-system \
+  -f values-acme-us-east.yaml \
+  --set global.regionKey=acme-us-east \
+  --wait --timeout 10m
+```
+
+Schema updates for the platform's custom resources are applied as part of the upgrade, before the new components start, so there is no separate step. If you use `--reuse-values`, switch to `--reset-then-reuse-values`: plain `--reuse-values` carries the previous package's defaults forward and pins every image to the old version.
+
+Running agents are not restarted by an upgrade. Platform changes that affect how agent pods are built (such as [agent pod settings](/enterprise/configuration#agent-pod-settings)) reach each agent on its next deploy.
+
+Pipecat Cloud records the package version each region runs and can tell you when a region falls behind the supported range. Upgrade at least when Daily asks you to; there is otherwise no requirement to track every release.
+
+## Certificate lifecycle
+
+Your region authenticates to Pipecat Cloud with certificates issued during enrollment. Two levels exist, and both renew without intervention:
+
+- **The region's certificate authority** is valid for about a year and is renewed automatically once two-thirds of its lifetime has elapsed. Renewal is authenticated by the current certificate, so no new enrollment token is needed. Its expiry is visible in `pipecat cloud regions show` and on the region's dashboard page.
+- **The region agent's own certificate** is valid for 90 days and is re-issued in the cluster 15 days before expiry. The agent picks the new certificate up without a restart, and existing connections are unaffected.
+
+The one case that needs you: if the region's certificate authority is allowed to **expire** — for example, the cluster was powered off for months — it cannot renew itself, and the region stops connecting. Recovery is a fresh enrollment: mint a new enrollment token, stage it in the cluster, delete the `pipecat-region-ca` Secret in `pipecat-system`, and run `helm upgrade` with your usual values. The enrollment job runs again and the region reconnects. Nothing about the region record, your agents, or your referenced secrets changes.
+
+## High availability
+
+By default the package runs two replicas of the region agent and two of the session activation service, each with a `PodDisruptionBudget`. Every region agent replica holds its own connection to Pipecat Cloud, and the control plane spreads requests across them, so one replica can be drained or fail without interrupting deploys or session starts. Session records are buffered in the region and delivered when a connection is available, so a full disconnection delays them rather than losing them.
+
+Scale the activation service (`pipecat-bot-starter.replicaCount`) as WebSocket session volume grows — it relays every frame of every WebSocket session in line.
+
+## Rebuilding a cluster
+
+The region record lives in Pipecat Cloud and survives your cluster. To rebuild:
+
+1. Delete the old cluster (or uninstall the release).
+2. On the new cluster, install the platform prerequisites, mint a **new** enrollment token, and stage it.
+3. Install the package with the **same region key** and values. Do not re-register the region — the record is unchanged.
+4. Re-create every [referenced secret](/enterprise/secrets#after-rebuilding-a-cluster) in the workloads namespace; Pipecat Cloud still lists them, but they report `pending` until they exist again.
+5. Redeploy your agents, or wait for the next deploy — deployments are re-created in the new cluster when their services are next deployed.
+
+Reuse the same region key for the life of the region. Registering a new key for a rebuilt cluster counts as an additional region against your organization's allowance.
+
+## Retiring a region
+
+Deleting a region is deliberate and refused while anything still depends on it:
+
+1. Delete or move every agent deployed to the region (`pipecat cloud agent delete <name>`), and let any active sessions end. Deleting an agent removes it from the region first and from Pipecat Cloud only once the region confirms, so if the region is unreachable the delete is refused with a retryable error and nothing changes — bring the region back, or [contact Daily](/enterprise-support) if the cluster is permanently gone.
+2. Delete the region:
+
+   ```bash
+   pipecat cloud regions delete acme-us-east
+   ```
+
+   The request is refused while the region still has deployed agents or active sessions; the response says which. In the dashboard, use **Revoke Region** on the region's page.
+
+3. Uninstall the release from the cluster (`helm uninstall pipecat -n pipecat-system`). The workloads namespace and everything you put in it — including your Secrets — are left in place on purpose.
+
+Once deleted, the region's connection is cut off within moments and it disappears from region pickers. The key of a region that ever enrolled stays reserved for your organization; a region deleted before it enrolled releases its key.
+
+## GitOps-managed clusters
+
+The package works under Argo CD, Flux, and similar tools with two adjustments:
+
+- Set `workloadsNamespace.create: false` and manage the workloads namespace yourself, with the Pod Security label described in [Requirements](/enterprise/requirements#kubernetes-cluster). The platform adds one management label to it; do not prune that label.
+- The enrollment token is consumed once, at first install. Keep it out of your repository: stage it with `kubectl` (or your secrets tooling) before the first sync, exactly as in the [setup guide](/enterprise/setup).
+
+- Supply the broker password as a value (`externalBroker.password`) from your secrets tooling rather than by Secret name: tools that render with `helm template` have no cluster to read a Secret from, and the chart refuses to render in that case. See [Broker](/enterprise/configuration#broker).
+- The activation secret needs nothing extra: the default pre-install job runs in Argo CD's pre-sync phase and creates it once. If your pipeline owns all Secrets, see the [supply-it-yourself option](/enterprise/configuration#activation-secret).
+
+Two consecutive renders of the chart with the same values are byte-identical, so a repeated sync changes nothing.
