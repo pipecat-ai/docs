@@ -266,6 +266,87 @@ tts.add_text_transformer(replace_acronyms, "*")  # Apply to all text
 #   llm -> llm_text_processor -> tts
 ```
 
+### Bulk pronunciation overrides
+
+Some bots need a large pronunciation list: medication names, product names, drug brands, place names. Hundreds or even a thousand entries is normal. There are two ways to do this, and they are not equivalent.
+
+#### Client side with `replace_text`
+
+`replace_text` builds one transform from a list of `(pattern, replacement)` pairs. This is the portable option: it works with every TTS service, because the substitution happens in Pipecat before the text is ever sent.
+
+```python
+from pipecat.utils.text.transforms import replace_text
+
+# Load your lexicon from wherever it lives: a CSV, a database, a config file
+lexicon = [
+    (r"(?i)\bmetformin\b", "met-FOR-min"),
+    (r"(?i)\blisinopril\b", "ly-SIN-oh-pril"),
+    (r"(?i)\bomeprazole\b", "oh-MEP-ray-zol"),
+    # ... hundreds more
+]
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    text_transforms=[("*", replace_text(lexicon))],
+)
+```
+
+The rules are regular expressions and they are compiled once when you build the transform, not on every chunk of text. Each chunk is then run through the list in order. Cost grows in a straight line with the number of rules and stays small: on an Apple silicon laptop, a 300 rule list added roughly 0.4 ms per sentence and a 1000 rule list roughly 1.4 ms. Treat those as an order of magnitude, not a guarantee. Your hardware and your patterns will move the number.
+
+Two practical notes. Order matters, since rules are applied in sequence and an earlier replacement can change the text a later rule tries to match. And use word boundaries (`\b`) so that "cat" does not rewrite the middle of "catheter".
+
+<Warning>
+  **Multi-word replacements need sentence aggregation.** Text transforms run
+  *after* text aggregation, so a transform only ever sees one aggregation at a
+  time. With `TextAggregationMode.TOKEN`, each piece of text is passed straight
+  through with no buffering, so a pattern that spans more than one word can
+  never match: the words arrive in separate calls. If your lexicon contains any
+  multi-word entry (`"beta blocker"`, `"St. John's wort"`), keep the default
+  sentence aggregation.
+</Warning>
+
+#### Provider side lexicons
+
+Several services can host the lexicon themselves. This keeps the list out of your process, but ties you to that provider.
+
+| Service        | Option                              | What it takes                                                        |
+| -------------- | ----------------------------------- | -------------------------------------------------------------------- |
+| **AWS Polly**  | `lexicon_names`                     | A list of PLS lexicon names you have already uploaded to Polly       |
+| **NVIDIA**     | `custom_dictionary`                 | A dict mapping each written word to its IPA pronunciation            |
+| **Cartesia**   | `pronunciation_dict_id`             | The ID of a pronunciation dictionary you created in Cartesia         |
+| **ElevenLabs** | `pronunciation_dictionary_locators` | Deprecated since 1.6.0, removed in 2.0.0. Use `replace_text` instead |
+| **Azure**      | Not available                       | See the note below                                                   |
+
+<Warning>
+  **NVIDIA `custom_dictionary` entries cannot contain commas.** The dictionary
+  is sent as a single comma separated string, and the values are not escaped, so
+  one comma inside an entry splits it and corrupts the rest of the dictionary.
+  Strip commas from your entries before passing them in.
+</Warning>
+
+<Note>
+  **Azure has no pronunciation lexicon path in Pipecat.** `AzureTTSService`
+  escapes your text before wrapping it in SSML, so a `<phoneme>` tag you inject
+  through a text transform is escaped and read out loud as literal characters.
+  There is no flag to turn that off. On Azure, use respellings through
+  `replace_text` instead.
+</Note>
+
+#### A note on ElevenLabs
+
+On ElevenLabs, prefer respellings over IPA:
+
+```python
+# Works on every ElevenLabs model
+(r"(?i)\bmetformin\b", "met-FOR-min")
+
+# IPA phoneme tags need enable_ssml_parsing=True and, per ElevenLabs,
+# only work on their v2 models
+(r"(?i)\bmetformin\b", '<phoneme alphabet="ipa" ph="mɛtˈfɔːrmɪn">metformin</phoneme>')
+```
+
+Respellings need no extra flags and behave the same across models, which makes them the safer default for a large lexicon.
+
 ### Text Filters
 
 <Warning>
