@@ -9150,6 +9150,29 @@ Metrics from turn completion prediction, emitted by turn analyzers like Krisp Vi
 
 In addition to `MetricsLogObserver`, Pipecat provides observers that track higher-level conversational metrics.
 
+### ServiceMetricsObserver
+
+Reports each service metric as a structured record rather than a log line. Emits separate events for latency measurements (TTFB, TTFA, TTFAT) and usage reports (STT audio seconds, TTS characters, LLM token counts).
+
+```python
+from pipecat.observers.service_metrics_observer import ServiceMetricsObserver
+
+observer = ServiceMetricsObserver()
+
+@observer.event_handler("on_service_latency")
+async def on_service_latency(observer, record):
+    print(f"{record.kind}: {record.seconds:.3f}s from {record.processor}")
+
+@observer.event_handler("on_service_usage")
+async def on_service_usage(observer, record):
+    if record.kind == "llm":
+        print(f"LLM: {record.total_tokens} tokens")
+
+worker = PipelineWorker(pipeline, observers=[observer])
+```
+
+Records arrive per piece of work (not summed), allowing flexible grouping by turn, session, or model. See the [Service Metrics Observer](/api-reference/server/utilities/observers/service-metrics-observer) reference for full details.
+
 ### StartupTimingObserver
 
 Measures the time taken by each processor to start up.
@@ -71951,6 +71974,7 @@ Pipecat provides several built-in observers:
 - **LLMLogObserver**: Logs LLM activity and responses
 - **TranscriptionLogObserver**: Logs speech-to-text transcription events
 - **RTVIObserver**: Converts internal frames to RTVI protocol messages for server to client messaging
+- **[ServiceMetricsObserver](/api-reference/server/utilities/observers/service-metrics-observer)**: Reports service latency and usage metrics as structured records
 - **[StartupTimingObserver](/api-reference/server/utilities/observers/startup-timing-observer)**: Measures processor startup times and transport readiness
 - **[UserBotLatencyObserver](/api-reference/server/utilities/observers/user-bot-latency-observer)**: Measures user-to-bot response latency
 - **[TurnTrackingObserver](/api-reference/server/utilities/observers/turn-tracking-observer)**: Tracks conversation turns and events
@@ -72158,6 +72182,175 @@ The observer uses emojis and consistent formatting for easy log reading:
 - 🧠 → [Destination] LLM CONTEXT FRAME: [context]
 
 All log entries include timestamps for precise timing analysis.
+
+# Service Metrics Observer
+Source: https://docs.pipecat.ai/api-reference/server/utilities/observers/service-metrics-observer.md
+
+Track service latency and usage metrics with ServiceMetricsObserver for STT, TTS, and LLM services in Pipecat
+
+The `ServiceMetricsObserver` reports each metric a service publishes as its own record, turning service measurements into structured data for logging, monitoring, or analytics. It tracks both latency (time to first byte, first audio, first answer token) and usage (audio seconds, characters, token counts).
+
+## Features
+
+- Emits one record per measurement (never summed)
+- Tracks service latency: TTFB, TTFA, TTFAT
+- Tracks service usage: STT audio seconds, TTS characters, LLM token counts
+- Includes processor name, model, and timestamp with each record
+- Records survive process crashes (not held in memory)
+- Supports custom time sources for testing
+
+## Usage
+
+### Basic Usage
+
+Add the observer to your pipeline and handle latency and usage events:
+
+```python
+from pipecat.observers.service_metrics_observer import ServiceMetricsObserver
+
+observer = ServiceMetricsObserver()
+
+@observer.event_handler("on_service_latency")
+async def on_service_latency(observer, record):
+    print(f"{record.kind}: {record.seconds:.3f}s from {record.processor}")
+
+@observer.event_handler("on_service_usage")
+async def on_service_usage(observer, record):
+    print(f"{record.kind} usage: {record.model_dump_json()}")
+
+worker = PipelineWorker(
+    pipeline,
+    observers=[observer],
+)
+```
+
+### Logging to JSON
+
+Emit each record as JSON for external consumption:
+
+```python
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+observer = ServiceMetricsObserver()
+
+@observer.event_handler("on_service_usage")
+async def on_service_usage(observer, record):
+    logger.info(record.model_dump_json())
+```
+
+### Aggregating by Session
+
+Records arrive individually, allowing flexible grouping:
+
+```python
+session_metrics = {"latency": [], "usage": []}
+
+@observer.event_handler("on_service_latency")
+async def on_service_latency(observer, record):
+    session_metrics["latency"].append(record)
+
+@observer.event_handler("on_service_usage")
+async def on_service_usage(observer, record):
+    session_metrics["usage"].append(record)
+```
+
+## Event Handlers
+
+### on_service_latency
+
+Called for each latency measurement (TTFB, TTFA, TTFAT). Receives a `ServiceLatencyRecord`.
+
+```python
+@observer.event_handler("on_service_latency")
+async def on_service_latency(observer, record):
+    # record is a ServiceLatencyRecord
+    logger.info(
+        f"{record.kind} latency: {record.seconds:.3f}s "
+        f"from {record.processor} ({record.model})"
+    )
+```
+
+**ServiceLatencyRecord fields:**
+
+| Field                  | Type                 | Description                                                  |
+| ---------------------- | -------------------- | ------------------------------------------------------------ |
+| `kind`                 | `ServiceLatencyKind` | Which measurement: `TTFB`, `TTFA`, or `TTFAT`                |
+| `processor`            | `str`                | Name of the processor that reported it                       |
+| `model`                | `str \| None`        | Model the processor was using, if named                      |
+| `timestamp`            | `float`              | Unix timestamp when the measurement was observed             |
+| `seconds`              | `float`              | The measurement itself                                       |
+| `ttfb_secs`            | `float \| None`      | Time to first byte (for TTFA and TTFAT measurements)         |
+| `leading_silence_secs` | `float \| None`      | Leading silence in first audio (for TTFA)                    |
+| `thinking_time_secs`   | `float \| None`      | Time between first output and first answer token (for TTFAT) |
+
+### on_service_usage
+
+Called for each usage report (STT, TTS, LLM). Receives a `ServiceUsageRecord`.
+
+```python
+@observer.event_handler("on_service_usage")
+async def on_service_usage(observer, record):
+    # record is a ServiceUsageRecord
+    if record.kind == "llm":
+        logger.info(
+            f"LLM tokens: {record.prompt_tokens} prompt, "
+            f"{record.completion_tokens} completion"
+        )
+    elif record.kind == "tts":
+        logger.info(f"TTS characters: {record.characters}")
+    elif record.kind == "stt":
+        logger.info(f"STT audio: {record.audio_seconds}s")
+```
+
+**ServiceUsageRecord fields:**
+
+| Field                           | Type               | Description                                      |
+| ------------------------------- | ------------------ | ------------------------------------------------ |
+| `kind`                          | `ServiceUsageKind` | Which service: `STT`, `TTS`, or `LLM`            |
+| `processor`                     | `str`              | Name of the processor that reported it           |
+| `model`                         | `str \| None`      | Model the processor was using, if named          |
+| `timestamp`                     | `float`            | Unix timestamp when the usage was observed       |
+| `audio_seconds`                 | `float \| None`    | Audio transcribed (STT only)                     |
+| `characters`                    | `int \| None`      | Characters synthesized (TTS only)                |
+| `prompt_tokens`                 | `int \| None`      | Tokens in the prompt (LLM only)                  |
+| `completion_tokens`             | `int \| None`      | Tokens generated (LLM only)                      |
+| `total_tokens`                  | `int \| None`      | Prompt + completion tokens (LLM only)            |
+| `cache_read_input_tokens`       | `int \| None`      | Prompt tokens served from cache (LLM only)       |
+| `cache_creation_input_tokens`   | `int \| None`      | Prompt tokens written to cache (LLM only)        |
+| `reasoning_tokens`              | `int \| None`      | Tokens spent reasoning (LLM only)                |
+| `input_audio_tokens`            | `int \| None`      | Audio tokens in the prompt (LLM only)            |
+| `output_audio_tokens`           | `int \| None`      | Audio tokens generated (LLM only)                |
+| `cache_read_input_audio_tokens` | `int \| None`      | Audio prompt tokens served from cache (LLM only) |
+
+## Configuration
+
+### Constructor Parameters
+
+<ParamField path="time_source" type="Callable[[], float]" default="time.time">
+  Reads the current time in seconds. Supply a custom function for testing to
+  control timestamps without waiting.
+</ParamField>
+
+## How It Works
+
+The observer monitors `MetricsFrame` instances flowing through the pipeline. Each frame carries metrics from a service:
+
+1. Service completes work and emits a `MetricsFrame`
+2. Observer extracts each metric from the frame
+3. Observer converts metrics to structured records
+4. Observer emits `on_service_latency` or `on_service_usage` events
+5. Frame is marked as reported to avoid duplicates
+
+Metrics are reported individually per piece of work. A turn that triggers two LLM inferences reports two `on_service_usage` events.
+
+## Notes
+
+- **No aggregation**: Records are never summed. Group them yourself as needed.
+- **What's excluded**: Processing time, text aggregation latency, and smart-turn predictions are deliberately absent. They describe internal behavior rather than what users wait for.
+- **Duplicate prevention**: Each `MetricsFrame` is reported once, even if relayed through multiple processors.
+- **Requires metrics**: Services must emit `MetricsFrame` instances (most do by default).
 
 # Transcription Log Observer
 Source: https://docs.pipecat.ai/api-reference/server/utilities/observers/transcription-observer.md
