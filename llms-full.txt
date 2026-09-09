@@ -11138,8 +11138,6 @@ A **simulated** scenario hands the user's side to an LLM with a persona and a go
 ```yaml book_table.yaml
 name: book_table
 
-simulator: { service: openai, model: gpt-4o-mini }
-
 persona: |
   Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number
   when asked (Jamie Lee, 555-0142). Polite, answers one question at a time.
@@ -11149,7 +11147,7 @@ success: "the bot confirmed a reservation for two at 6 PM"
 metrics:
   - name: politeness
     criterion: "the reply is courteous, never curt or dismissive"
-    min_quality: 1
+    min_score: 1
 ```
 
 Both run with the same command:
@@ -11252,7 +11250,7 @@ Scenarios are YAML files, so they're easy to write, review, and share. Everythin
 
 - **Pipecat CLI**: the `pipecat eval` commands ship with the CLI extra: `uv tool install "pipecat-ai[cli]"`. If you've added `pipecat-ai[cli]` to your project instead, run them with `uv run pipecat eval` (just like `uv run bot.py`). The same commands are also available as `python -m pipecat.evals`.
 - **A judge LLM** (for `eval:` assertions, and for every simulation): Ollama by default (`ollama pull gemma4:12b`), or point the scenario's `judge:` block at OpenAI or any OpenAI-compatible endpoint.
-- **A persona LLM** (simulations only): the `simulator:` block names an OpenAI, Ollama, or OpenAI-compatible model that supports function calling. `pipecat eval` loads the nearest `.env` before it runs, so the persona LLM finds its API key the way your agent does.
+- **A persona LLM** (simulations only): by default the same local Ollama model as the judge, so a simulation needs no API key. A `simulator:` block can name another Ollama model, or any OpenAI-compatible model that supports function calling through a `factory:`.
 - **Audio services** (audio mode only): the harness needs a TTS to synthesize the user's voice and an STT to transcribe the agent's speech. Both can be local models or HTTP-based services; the defaults are local (Kokoro and Moonshine or Whisper, installed with `uv add "pipecat-ai[kokoro,moonshine]"` or `uv add "pipecat-ai[kokoro,whisper]"`), which download once on first use and run with no keys and no per-run cost. WebSocket-streaming services aren't supported here, which keeps the harness simple.
 - **Your agent's own credentials**: the agent under test is your real agent, so it needs the same service API keys it normally would.
 
@@ -11526,8 +11524,6 @@ flow. A local simulation answers it without leaving the repository:
 ```yaml book_appointment_flexible.yaml
 name: book_appointment_flexible
 
-simulator: { service: openai, model: gpt-4o-mini }
-
 persona: |
   Sam, booking a check-up. Asks for Tuesday at 3 PM first; if that's taken,
   accepts any afternoon slot this week. Gives a name and phone number when asked.
@@ -11537,7 +11533,7 @@ success: "the bot booked an appointment at a time the caller accepted, and read 
 metrics:
   - name: recovery
     criterion: "when the reply turns down a requested time, it offers concrete alternatives; a reply that turns down no time passes"
-    min_quality: 1
+    min_score: 1
   - measure: function_calls
     calls: [book_appointment]
 
@@ -11679,8 +11675,7 @@ This guide takes an existing agent, starts it with the eval transport, runs a tw
 - The Pipecat CLI: `uv tool install "pipecat-ai[cli]"` (or add `pipecat-ai[cli]` to your project and run the commands below with `uv run pipecat eval`).
 - A judge LLM. Either:
   - **Ollama** (local, the default): install [Ollama](https://ollama.com) and run `ollama pull gemma4:12b`, or
-  - **OpenAI**: set `OPENAI_API_KEY` and point the scenario's `judge:` block at it (shown below).
-- For the simulation step, an `OPENAI_API_KEY` in your agent's `.env`. The simulated caller is played by an OpenAI model, and `pipecat eval` loads the nearest `.env` before it runs.
+  - **OpenAI**: set `OPENAI_API_KEY` and point the scenario's `judge:` block at it through a small factory (shown below).
 
 <Steps>
   <Step title="Run your agent with the eval transport">
@@ -11745,7 +11740,7 @@ This guide takes an existing agent, starts it with the eval transport, runs a tw
 
         judge:
           eval:
-            service: openai
+            factory: my_evals.judge
             model: gpt-4o-mini
 
         turns:
@@ -11768,9 +11763,23 @@ This guide takes an existing agent, starts it with the eval transport, runs a tw
 
     <Note>
       Ollama with `gemma4:12b` is the default judge, which is why the first tab
-      has no `judge:` block. To use a different judge LLM, add a `judge.eval:`
-      block as in the OpenAI tab.
+      has no `judge:` block. Any other LLM is a `factory:`, a dotted path to a
+      callable that takes the block and returns the service, as in the OpenAI
+      tab. That one needs a `my_evals.py` next to the agent:
     </Note>
+
+    ```python my_evals.py
+    import os
+
+    from pipecat.services.openai.llm import OpenAILLMService
+
+
+    def judge(config):
+        return OpenAILLMService(
+            api_key=os.environ["OPENAI_API_KEY"],
+            settings=OpenAILLMService.Settings(model=config["model"]),
+        )
+    ```
 
   </Step>
 
@@ -11821,10 +11830,6 @@ This guide takes an existing agent, starts it with the eval transport, runs a tw
     ```yaml
     name: capital_curious
 
-    simulator:
-      service: openai
-      model: gpt-4o-mini
-
     persona: |
       A friendly, curious traveler planning a trip to Europe. Polite and concise:
       asks one question at a time, and thanks the assistant once satisfied.
@@ -11836,14 +11841,14 @@ This guide takes an existing agent, starts it with the eval transport, runs a tw
     metrics:
       - name: politeness
         criterion: "the reply is courteous and helpful, never curt or dismissive"
-        min_quality: 1
+        min_score: 1
       - measure: words
         max_value: 60
 
     max_turns: 6
     ```
 
-    There are no turns to write. The `simulator:` block names the LLM that plays the caller, `persona:` and `goal:` tell it who it is and what it wants, and `success:` tells the judge what the agent must have done. The `politeness` metric is judged on every reply, and `words` bounds the longest one.
+    There are no turns to write. `persona:` and `goal:` tell the LLM playing the caller who it is and what it wants, and `success:` tells the judge what the agent must have done. The caller runs on the same local Ollama model as the judge, so this needs no API key; a `simulator:` block would name another LLM. The `politeness` metric is judged on every reply, and `words` bounds the longest one.
 
     Run it with `-v` to watch the conversation as it happens:
 
@@ -12247,10 +12252,6 @@ A simulated scenario, a simulation for short, describes a caller rather than a s
 ```yaml book_table.yaml
 name: book_table
 
-simulator:
-  service: openai
-  model: gpt-4o-mini
-
 persona: |
   Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number
   when asked (Jamie Lee, 555-0142). Polite, answers one question at a time.
@@ -12262,7 +12263,7 @@ success: "the bot confirmed a reservation for two at 6 PM (a booking tool was ca
 metrics:
   - name: politeness
     criterion: "the reply is courteous, never curt or dismissive"
-    min_quality: 1
+    min_score: 1
   - measure: latency
     max_value: 5
 
@@ -12280,9 +12281,9 @@ A file with a top-level `persona:` is a simulation; one with `turns:` is a [scri
 ```yaml
 name: book_table # required: the simulation's name
 
-simulator: # required: the LLM that plays the caller
-  service: openai
-  model: gpt-4o-mini
+simulator: # optional: the LLM that plays the caller (default shown)
+  service: ollama
+  model: gemma4:12b
 
 user: # optional: how the caller's turns reach the agent (default text)
   modality: text
@@ -12304,12 +12305,13 @@ success: "the bot confirmed a reservation for two at 6 PM" # required
 metrics: # optional: judged criteria and measured bounds
   - name: politeness
     criterion: "the reply is courteous, never curt or dismissive"
-    min_quality: 1
+    min_score: 1
   - measure: latency
     max_value: 5
 
 max_turns: 20 # optional: cap on the caller's turns (default 20)
 max_duration_s: 300 # optional: cap on the run's wall clock (default 300)
+max_silence_s: 30 # optional: cap on a lull with nothing happening (default 30)
 runs: 1 # optional: how many times a suite runs it (default 1)
 trigger_disconnect: false # optional: fire on_client_disconnected at the end
 ```
@@ -12356,20 +12358,28 @@ The persona ends the call by calling an `end_call` tool, reporting whether it th
   The persona listens first. It answers each finished response of the agent, so
   the agent has to open the conversation, as most do with a greeting on connect.
   An agent that waits for the user to speak leaves the persona waiting too, and
-  the run ends on `max_duration_s`.
+  the run ends as `silence` after `max_silence_s`.
 </Note>
 
 ### The persona LLM with `simulator:`
 
-`simulator:` configures the LLM that plays the caller. It has the same shape as the `judge.eval:` block: a `service` (`openai` or `ollama`), a `model`, and an optional `endpoint:` for any OpenAI-compatible API and `extra:` mapping forwarded as request parameters:
+`simulator:` configures the LLM that plays the caller. It is optional: without one, the persona runs on the same local Ollama model as the default judge, `gemma4:12b`, so a simulation needs no API key. The block has the same shape as `judge.eval:`: a `service` (`ollama`, the only built-in), a `model`, an optional `endpoint:`, and an `extra:` mapping forwarded as request parameters. This is the default, written out:
 
 ```yaml
 simulator:
-  service: openai
+  service: ollama
+  model: gemma4:12b
+```
+
+Any other provider is a `factory:`, a dotted path to a callable that takes the block and returns an OpenAI-compatible LLM service, exactly as for the [judge](/pipecat/evals/configuration#judging-with-judge):
+
+```yaml
+simulator:
+  factory: my_evals.persona
   model: gpt-4o-mini
 ```
 
-The model must support function calling, since the persona hangs up through its `end_call` tool. `pipecat eval` loads the nearest `.env` file, walking up from the working directory, before it runs, so the persona LLM finds its API key the same way your agent does. Variables already set in the shell win.
+The model must support function calling, since the persona hangs up through its `end_call` tool. A model that writes the call out as text never hangs up. `pipecat eval` loads the nearest `.env` file, walking up from the working directory, before it runs, so a factory finds its API key in the environment the same way your agent does. Variables already set in the shell win.
 
 <Tip>
   Share one `simulator:` block across a directory of simulations with
@@ -12430,7 +12440,7 @@ The same judge call also scores every judged metric on every agent reply, so a s
 
 ## Metrics
 
-`metrics:` is a list of quality checks. Each is either **judged**, a `criterion:` the judge decides on every agent reply, or **measured**, a `measure:` the harness computes from the run with no judge involved. A metric fails the run only when it has a threshold: `min_quality:` for a judged metric, a range or a `calls:` list for a measured one. Without one, it is reported and never fails anything.
+`metrics:` is a list of quality checks. Each is either **judged**, a `criterion:` the judge decides on every agent reply, or **measured**, a `measure:` the harness computes from the run with no judge involved. A metric fails the run only when it has a threshold: `min_score:` for a judged metric, a range or a `calls:` list for a measured one. Without one, it is reported and never fails anything.
 
 ### Judged metrics with `criterion:`
 
@@ -12440,19 +12450,19 @@ A criterion says what every reply of the agent should be. The judge decides it f
 metrics:
   - name: politeness
     criterion: "the reply is courteous and helpful, never curt or dismissive"
-    min_quality: 1
+    min_score: 1
   - name: recovery
     criterion: "when the reply turns down a requested time, it offers concrete alternative times; a reply that turns down no time passes"
-    min_quality: 1
+    min_score: 1
   - name: brevity
     criterion: "the reply is at most three sentences, with no monologue"
 ```
 
-`min_quality:` is the share of turns that must pass, in `0..1`: `1` means every reply, `0.8` allows one slip in five. The `brevity` metric above has none, so its score is reported but never fails the run.
+`min_score:` is the share of turns that must pass, in `0..1`: `1` means every reply, `0.8` allows one slip in five. The `brevity` metric above has none, so its score is reported but never fails the run.
 
 Phrase a rule as a condition plus what a reply outside it does. The judge is told that a criterion which forbids something or applies only in a situation is satisfied by a reply that doesn't do the forbidden thing or isn't in that situation, but spelling it out ("a reply that turns down no time passes") keeps a bare "never" from being read as "always".
 
-A turn the judge leaves out of its verdicts counts as a no. A run in which the agent said nothing has no turns to score, so a judged metric is unscored and passes.
+A turn the judge leaves out of its verdicts counts as a no, but is recorded as a verdict of `none` rather than `no`, so a sweep can tell judge trouble from agent trouble: a metric that failed only on unanswered turns carries the kind `judge_no_verdict`, one the judge rejected carries `judge_no`. A run in which the agent said nothing has no turns to score, so a judged metric is unscored and passes.
 
 ### Measured metrics with `measure:`
 
@@ -12479,7 +12489,7 @@ The built-in measures:
 | `latency`        | The slowest agent reply. In text mode, from the persona's send to the reply's first LLM token; in audio mode, from the agent noticing the persona stop speaking to its first spoken sentence. Bounds every reply. | seconds |
 | `function_calls` | The function calls the agent made, checked against a `calls:` list instead of a range. See [below](#checking-tool-calls-with-function_calls).                                                                     | calls   |
 
-The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode `latency` is an LLM budget, not a listening budget: there is no speech for the agent to wait on.
+The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode `latency` is an LLM budget, not a listening budget: there is no speech for the agent to wait on. The two are not comparable, so a failed `latency` metric says what it timed, "to the first token" or "from the persona stopping to the first spoken sentence". A measure outside its range fails with the kind `out_of_range`; a `function_calls` list that did not match, with `function_calls`.
 
 There is deliberately no interruptions measure. The persona causes interruptions; the agent cannot.
 
@@ -12500,7 +12510,7 @@ Every listed call must have happened, and any call not listed fails the metric. 
 
 ## Limits and runs
 
-`max_turns:` caps the persona's turns (default 20) and `max_duration_s:` caps the run's wall clock (default 300 seconds). They are backstops against a conversation that never ends. A run they cut short has not succeeded, whatever the transcript says.
+`max_turns:` caps the persona's turns (default 20), `max_duration_s:` caps the run's wall clock (default 300 seconds), and `max_silence_s:` caps a lull in which neither side does anything (default 30 seconds), so an agent that never greets, or stops answering, ends the run as `silence` instead of running out the clock. A slow reply is not silence; only nothing happening is. They are backstops against a conversation that never ends, and a run they cut short has not succeeded, whatever the transcript says. A failure of the harness's own pipeline, the persona LLM first among them, ends the run at once as an error.
 
 `runs:` is how many times a [suite](/pipecat/evals/suites) runs the simulation (default 1), and every run must pass. A persona doesn't say the same thing twice, so one run is an anecdote and three are a check:
 
@@ -12518,13 +12528,14 @@ runs: 3
 
 A run ends in one of these ways:
 
-| Ending         | Meaning                                                         |
-| -------------- | --------------------------------------------------------------- |
-| `end_call`     | The persona called its `end_call` tool.                         |
-| `bot`          | The agent ended the call by closing the connection.             |
-| `max_turns`    | The persona's turn cap was reached.                             |
-| `max_duration` | The run's wall-clock cap was reached.                           |
-| `error`        | The run did not complete: a failed connect, or a harness error. |
+| Ending         | Meaning                                                                                                                                                             |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `end_call`     | The persona called its `end_call` tool.                                                                                                                             |
+| `bot`          | The agent ended the call by closing the connection.                                                                                                                 |
+| `max_turns`    | The persona's turn cap was reached.                                                                                                                                 |
+| `max_duration` | The run's wall-clock cap was reached.                                                                                                                               |
+| `silence`      | Neither side did anything for `max_silence_s`.                                                                                                                      |
+| `error`        | The run did not complete: a failed connect, a harness error such as the persona LLM failing, or a judge that gave no verdict on the goal (kind `judge_no_verdict`). |
 
 A run **passes** when it completed, the judge said `success:` was met, and no metric with a threshold fell short. A run that ended in `error` is neither a goal success nor a goal failure: it is reported as an error and kept out of any pass rate, since a run that never connected says nothing about whether the agent did its job.
 
@@ -12551,7 +12562,7 @@ pipecat eval run book_table.yaml -v
 
     metrics:
       politeness: 1.00 (min 1.00) | 4/4 turns
-      latency: 1.00 | slowest reply 1.83 s, at most 5
+      latency: 1.00 | slowest reply 1.83 s to the first token, at most 5
 
     persona: succeeded: The reservation was confirmed for two at 6 PM.
 
@@ -12659,8 +12670,9 @@ user:
 ```
 
 <Note>
-  The built-in speech services are `kokoro`, a local model and the recommended
-  default, and `cartesia` (HTTP) when you want a cloud voice.
+  The built-in speech service is `kokoro`, a local model. For a cloud voice,
+  name a [`factory:`](#custom-services-with-factory). `service: cartesia` is
+  deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0.
 </Note>
 
 Both the `speech:` and `judge.transcription:` blocks take an optional `language`, so a non-English agent can be driven and judged in the language it speaks:
@@ -12709,7 +12721,7 @@ judge:
   When `transcription.service:` is omitted, it defaults to `moonshine`.
 </Note>
 
-In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma4:12b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`. This is the LLM that decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics.
+In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma4:12b`, with an optional `endpoint:` for a remote Ollama), or any other OpenAI-compatible LLM through a [`factory:`](#custom-services-with-factory). `service: openai` is deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0. This is the LLM that decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics.
 
 An `extra:` mapping is forwarded to the judge as top-level request parameters, which is how provider-specific options reach it. The default judge is thinking-capable and only its JSON verdict is ever read, so the default `extra:` turns reasoning off — it buys nothing while costing latency and eating into the token budget the verdict needs.
 
@@ -12727,52 +12739,63 @@ judge:
 
 </Note>
 
-A simulation's `simulator:` block, the LLM that plays the caller, takes the same `service`, `model`, `endpoint`, and `extra` keys as `judge.eval:`. See [The persona LLM](/pipecat/evals/simulated-scenarios#the-persona-llm-with-simulator).
+A simulation's `simulator:` block, the LLM that plays the caller, takes the same `service`, `model`, `endpoint`, `extra`, and `factory` keys as `judge.eval:`, and defaults to the same local model. See [The persona LLM](/pipecat/evals/simulated-scenarios#the-persona-llm-with-simulator).
 
 ## Custom services with `factory:`
 
-To use a TTS or STT beyond the built-ins, both blocks accept a `factory:` escape hatch: a dotted path to a callable that receives the block's mapping and the resolved sample rate, and returns the service. Any extra keys you put in the block are passed through to your factory:
+The built-in `service:` names are the local, keyless services: Ollama for the judge and the persona, Kokoro for the user's voice, Moonshine and Whisper for the agent's audio. Any other provider is a `factory:`, a dotted path to a callable that takes the block's mapping and returns the service. The scenario stays a description of the test, while the provider, its settings, and its key live in code. Any extra keys you put in the block are passed through to your factory:
 
 ```yaml
+judge:
+  modality: audio
+  eval:
+    factory: my_evals.judge
+    model: gpt-4o-mini # available to your factory as config["model"]
+  transcription:
+    factory: my_evals.transcriber
+
 user:
   modality: audio
   speech:
-    factory: "my_evals.services.make_tts"
-    voice: luna # available to your factory as speech_cfg["voice"]
-
-judge:
-  modality: audio
-  transcription:
-    factory: "my_evals.services.make_stt"
+    factory: my_evals.voice
+    voice: luna
 ```
 
-```python my_evals/services.py
+```python my_evals.py
 import os
 
 from pipecat.services.fal.stt import FalSTTService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.rime.tts import RimeHttpTTSService
 
 
-def make_tts(speech_cfg, sample_rate):
-    return RimeHttpTTSService(
-        api_key=os.environ["RIME_API_KEY"],
-        settings=RimeHttpTTSService.Settings(voice=speech_cfg["voice"]),
-        sample_rate=sample_rate,
+def judge(config):
+    return OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(model=config["model"]),
     )
 
 
-def make_stt(transcription_cfg, sample_rate):
+def transcriber(config):
     return FalSTTService(api_key=os.environ["FAL_KEY"])
+
+
+def voice(config):
+    return RimeHttpTTSService(
+        api_key=os.environ["RIME_API_KEY"],
+        settings=RimeHttpTTSService.Settings(voice=config["voice"]),
+    )
 ```
 
-<Note>
-  The service your factory returns must be a local model or an HTTP-based
-  service. WebSocket-streaming services aren't supported: they need a running
-  pipeline to manage their connection lifecycle, and keeping them out keeps the
-  evals code simple.
-</Note>
+The pipeline sets each service's sample rate, so a factory doesn't. What a factory must return depends on the block:
 
-For a fully custom setup (your own caching, a pre-built service instance), pass the services to a session as `user_tts=` and `bot_stt=` through the [library](/pipecat/evals/library#custom-audio-services).
+- `judge.eval:` and `simulator:`: an OpenAI-compatible LLM service, and for the persona one that supports function calling.
+- `user.speech:`: a local or HTTP TTS. The cache around it drives synthesis directly, so a WebSocket-streaming TTS yields nothing there.
+- `judge.transcription:`: any pipeline STT.
+
+`pipecat eval` loads the nearest `.env` before it runs, so a factory can read its API key from the environment the way your agent does.
+
+For a fully custom setup (your own caching, a pre-built service instance), pass the services to a session as `judge=`, `persona_llm=`, `user_tts=`, and `bot_stt=` through the [library](/pipecat/evals/library#customizing-the-judge-and-the-persona).
 
 ## Sharing config with `!include`
 
@@ -12937,7 +12960,7 @@ eval-runs/20260610_142200/
     bots_support-agent.py__greeting.wav        # conversation audio (record: true or -a)
 ```
 
-`results.jsonl` carries one line per run, and every line names its `kind`, `script` or `simulation`. A scripted record carries the bot, scenario, attempt, outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, and per-turn verdicts, the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+`results.jsonl` carries one line per run, and every line names its `kind`, `script` or `simulation`. A scripted record carries the bot, scenario, attempt, outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, failure `kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
 
 Each run executes in its own process, so a harness that loads local audio models does so on its own, and one run's crash doesn't take the others with it.
 
@@ -12970,7 +12993,7 @@ A persona doesn't say the same thing twice, so one run of a simulation is an ane
   bots/booking-agent.py  simulated/book_table      3/3 (100%)  ✓  ~12.4s each
 ```
 
-A run that errored (the agent never came up, the persona's LLM failed) is reported but kept out of the rate: it says nothing about whether the agent did its job.
+A run that errored (the agent never came up, the persona's LLM failed, the judge gave no verdict on the goal) is reported but kept out of the rate: it says nothing about whether the agent did its job.
 
 ## Repeating a run
 
@@ -13004,7 +13027,7 @@ The exit code makes suites CI-ready with no extra glue:
   run: pipecat eval suite manifest.yaml
 ```
 
-For deterministic, key-free CI runs, prefer text-mode scripted scenarios and an OpenAI-compatible judge endpoint you control. Simulations need the persona LLM's API key in the environment as well, and say something different each run by design, so give them `runs: 3` and expect them to take longer. `-k script` runs the scripted half alone when you want a fast gate on every push and the simulations on a schedule. Audio-mode scenarios work in CI too, but need the harness's TTS and STT services available (local models by default, which also need more CPU).
+For deterministic, key-free CI runs, prefer text-mode scripted scenarios and an OpenAI-compatible judge endpoint you control. Simulations run their persona on the local Ollama model by default, so they need no extra key, but they say something different each run by design, so give them `runs: 3` and expect them to take longer. `-k script` runs the scripted half alone when you want a fast gate on every push and the simulations on a schedule. Audio-mode scenarios work in CI too, but need the harness's TTS and STT services available (local models by default, which also need more CPU).
 
 # Using the Library
 Source: https://docs.pipecat.ai/pipecat/evals/library.md
@@ -13046,7 +13069,7 @@ async def main():
 asyncio.run(main())
 ```
 
-The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`. When you know the kind up front, `EvalScriptSession.from_scenario()` from `pipecat.evals.script_session` takes the same arguments and returns the typed session.
+The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`. `from_scenario()` is typed by what it is given, so a session built from an `EvalScriptScenario` is an `EvalScriptSession` to a type checker with no narrowing. `EvalScriptSession.from_scenario()` from `pipecat.evals.script_session` takes the same arguments.
 
 ### The result
 
@@ -13119,7 +13142,7 @@ async def main():
 asyncio.run(main())
 ```
 
-A session runs the simulation once. The `runs:` field is honored by the [suite](#orchestrating-suites), which spawns a fresh agent for each run. The typed counterpart is `EvalSimulationSession.from_scenario()` from `pipecat.evals.simulation_session`.
+A session runs the simulation once. The `runs:` field is honored by the [suite](#orchestrating-suites), which spawns a fresh agent for each run. `EvalSimulationSession.from_scenario()` from `pipecat.evals.simulation_session` is the same call on the kind's own class.
 
 ### The result
 
@@ -13136,13 +13159,13 @@ A session runs the simulation once. The `runs:` field is honored by the [suite](
 | `metrics`         | One `EvalSimulationMetricScore` per metric, in the order the file lists them. See below.                                                            |
 | `messages`        | The conversation, the persona's turns as `user` messages and the agent's as `assistant`. The `assistant` messages are the turns the metrics scored. |
 | `turns`           | The persona's turn count.                                                                                                                           |
-| `ended_by`        | How the run ended: `end_call`, `bot`, `max_turns`, `max_duration`, or `error`.                                                                      |
+| `ended_by`        | How the run ended: `end_call`, `bot`, `max_turns`, `max_duration`, `silence`, or `error`.                                                           |
 | `end_call`        | The persona's own `end_call` claim (`success`, `reason`) when it made one. Advisory: the judge decides `succeeded`.                                 |
 | `duration_ms`     | Wall-clock time the run took.                                                                                                                       |
 | `events_seen`     | Every semantic event observed, for diagnostics.                                                                                                     |
 | `debug_log`       | The harness's timestamped decision trace.                                                                                                           |
 
-Each `EvalSimulationMetricScore` carries the metric's `name`, its `score` (the share of turns the judge said yes to for a judged metric, `1.0` or `0.0` for a measured one, `None` when there was nothing to judge or measure), whether it `passed`, its `reason`, its `min_quality`, its measured `value` (the seconds, words, turns, or number of calls), and for a judged metric one `EvalSimulationTurnVerdict` per agent turn with the 1-based `turn`, whether it `passed`, and the judge's `reason`:
+Each `EvalSimulationMetricScore` carries the metric's `name`, its `score` (the share of turns the judge said yes to for a judged metric, `1.0` or `0.0` for a measured one, `None` when there was nothing to judge or measure), whether it `passed`, its `reason`, its `min_score`, its measured `value` (the seconds, words, turns, or number of calls), and a failure `kind` (`judge_no`, `judge_no_verdict`, `out_of_range`, or `function_calls`; `None` when it passed). A judged metric also carries one `EvalSimulationTurnVerdict` per agent turn with the 1-based `turn`, whether it `passed`, the judge's `verdict` (`yes`, `no`, or `none` when the judge gave none, which counts as a no), and its `reason`:
 
 ```python
 bot_turns = [m["content"] for m in result.messages if m["role"] == "assistant"]
@@ -13233,14 +13256,13 @@ scenario = EvalScriptScenario(
   `response` only when you also configure audio judging).
 </Note>
 
-A simulation is built the same way. The `simulator` block is a plain mapping with the same shape as the YAML, and each metric is an `EvalSimulationMetric` with either a `criterion` or a `measure`:
+A simulation is built the same way. Each metric is an `EvalSimulationMetric` with either a `criterion` or a `measure`, and `simulator=` takes a plain mapping with the same shape as the YAML block when the persona shouldn't run on the default local model:
 
 ```python
 from pipecat.evals.simulation import EvalSimulationMetric, EvalSimulationScenario
 
 simulation = EvalSimulationScenario(
     name="book_table",
-    simulator={"service": "openai", "model": "gpt-4o-mini"},
     persona="Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number when asked.",
     goal="Book a table for two at 6 PM, then end the call.",
     success="the bot confirmed a reservation for two at 6 PM",
@@ -13248,7 +13270,7 @@ simulation = EvalSimulationScenario(
         EvalSimulationMetric(
             name="politeness",
             criterion="the reply is courteous, never curt or dismissive",
-            min_quality=1.0,
+            min_score=1.0,
         ),
         EvalSimulationMetric(name="latency", measure="latency", max_value=5.0),
     ],
@@ -13512,7 +13534,7 @@ A simulation works as an acceptance criterion for a whole flow. "A caller who wa
 
 A few practices keep autonomous loops honest:
 
-- **Review scenario changes like code.** An assistant that can edit scenarios can also weaken them, by loosening an `eval:` criterion, a `success:`, or a metric's `min_quality`. Failing evals should usually be fixed in the agent, not in the scenario.
+- **Review scenario changes like code.** An assistant that can edit scenarios can also weaken them, by loosening an `eval:` criterion, a `success:`, or a metric's `min_score`. Failing evals should usually be fixed in the agent, not in the scenario.
 - **Keep a regression set.** As behaviors accumulate, so should scenarios. Run the full set (or a suite) before merging, not just the scenario being worked on.
 - **Gate merges in CI.** `pipecat eval suite manifest.yaml` in CI makes "the evals pass" a property of the branch, whoever (or whatever) wrote it. See [Eval Suites](/pipecat/evals/suites).
 - **Run simulations more than once.** A persona says something different each run, so set `runs: 3` and let `pipecat eval suite` require every run to pass rather than trusting one.
@@ -94048,8 +94070,8 @@ pipecat eval run [OPTIONS] SCENARIOS...
 
 <ParamField path="--timeout / -t" type="integer" default="60">
   Default per-expectation timeout in seconds, for scripted expectations without
-  their own `within_ms`. A simulation is bounded by its own `max_turns` and
-  `max_duration_s` instead.
+  their own `within_ms`. A simulation is bounded by its own `max_turns`,
+  `max_duration_s`, and `max_silence_s` instead.
 </ParamField>
 
 <ParamField path="--logs-dir" type="string" default=".">

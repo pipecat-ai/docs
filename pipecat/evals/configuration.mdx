@@ -47,8 +47,9 @@ user:
 ```
 
 <Note>
-  The built-in speech services are `kokoro`, a local model and the recommended
-  default, and `cartesia` (HTTP) when you want a cloud voice.
+  The built-in speech service is `kokoro`, a local model. For a cloud voice,
+  name a [`factory:`](#custom-services-with-factory). `service: cartesia` is
+  deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0.
 </Note>
 
 Both the `speech:` and `judge.transcription:` blocks take an optional `language`, so a non-English agent can be driven and judged in the language it speaks:
@@ -97,7 +98,7 @@ judge:
   When `transcription.service:` is omitted, it defaults to `moonshine`.
 </Note>
 
-In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma4:12b`), `openai`, or any OpenAI-compatible endpoint via `endpoint:`. This is the LLM that decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics.
+In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma4:12b`, with an optional `endpoint:` for a remote Ollama), or any other OpenAI-compatible LLM through a [`factory:`](#custom-services-with-factory). `service: openai` is deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0. This is the LLM that decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics.
 
 An `extra:` mapping is forwarded to the judge as top-level request parameters, which is how provider-specific options reach it. The default judge is thinking-capable and only its JSON verdict is ever read, so the default `extra:` turns reasoning off — it buys nothing while costing latency and eating into the token budget the verdict needs.
 
@@ -115,52 +116,63 @@ judge:
 
 </Note>
 
-A simulation's `simulator:` block, the LLM that plays the caller, takes the same `service`, `model`, `endpoint`, and `extra` keys as `judge.eval:`. See [The persona LLM](/pipecat/evals/simulated-scenarios#the-persona-llm-with-simulator).
+A simulation's `simulator:` block, the LLM that plays the caller, takes the same `service`, `model`, `endpoint`, `extra`, and `factory` keys as `judge.eval:`, and defaults to the same local model. See [The persona LLM](/pipecat/evals/simulated-scenarios#the-persona-llm-with-simulator).
 
 ## Custom services with `factory:`
 
-To use a TTS or STT beyond the built-ins, both blocks accept a `factory:` escape hatch: a dotted path to a callable that receives the block's mapping and the resolved sample rate, and returns the service. Any extra keys you put in the block are passed through to your factory:
+The built-in `service:` names are the local, keyless services: Ollama for the judge and the persona, Kokoro for the user's voice, Moonshine and Whisper for the agent's audio. Any other provider is a `factory:`, a dotted path to a callable that takes the block's mapping and returns the service. The scenario stays a description of the test, while the provider, its settings, and its key live in code. Any extra keys you put in the block are passed through to your factory:
 
 ```yaml
+judge:
+  modality: audio
+  eval:
+    factory: my_evals.judge
+    model: gpt-4o-mini # available to your factory as config["model"]
+  transcription:
+    factory: my_evals.transcriber
+
 user:
   modality: audio
   speech:
-    factory: "my_evals.services.make_tts"
-    voice: luna # available to your factory as speech_cfg["voice"]
-
-judge:
-  modality: audio
-  transcription:
-    factory: "my_evals.services.make_stt"
+    factory: my_evals.voice
+    voice: luna
 ```
 
-```python my_evals/services.py
+```python my_evals.py
 import os
 
 from pipecat.services.fal.stt import FalSTTService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.rime.tts import RimeHttpTTSService
 
 
-def make_tts(speech_cfg, sample_rate):
-    return RimeHttpTTSService(
-        api_key=os.environ["RIME_API_KEY"],
-        settings=RimeHttpTTSService.Settings(voice=speech_cfg["voice"]),
-        sample_rate=sample_rate,
+def judge(config):
+    return OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(model=config["model"]),
     )
 
 
-def make_stt(transcription_cfg, sample_rate):
+def transcriber(config):
     return FalSTTService(api_key=os.environ["FAL_KEY"])
+
+
+def voice(config):
+    return RimeHttpTTSService(
+        api_key=os.environ["RIME_API_KEY"],
+        settings=RimeHttpTTSService.Settings(voice=config["voice"]),
+    )
 ```
 
-<Note>
-  The service your factory returns must be a local model or an HTTP-based
-  service. WebSocket-streaming services aren't supported: they need a running
-  pipeline to manage their connection lifecycle, and keeping them out keeps the
-  evals code simple.
-</Note>
+The pipeline sets each service's sample rate, so a factory doesn't. What a factory must return depends on the block:
 
-For a fully custom setup (your own caching, a pre-built service instance), pass the services to a session as `user_tts=` and `bot_stt=` through the [library](/pipecat/evals/library#custom-audio-services).
+- `judge.eval:` and `simulator:`: an OpenAI-compatible LLM service, and for the persona one that supports function calling.
+- `user.speech:`: a local or HTTP TTS. The cache around it drives synthesis directly, so a WebSocket-streaming TTS yields nothing there.
+- `judge.transcription:`: any pipeline STT.
+
+`pipecat eval` loads the nearest `.env` before it runs, so a factory can read its API key from the environment the way your agent does.
+
+For a fully custom setup (your own caching, a pre-built service instance), pass the services to a session as `judge=`, `persona_llm=`, `user_tts=`, and `bot_stt=` through the [library](/pipecat/evals/library#customizing-the-judge-and-the-persona).
 
 ## Sharing config with `!include`
 
