@@ -11117,9 +11117,11 @@ Explore these examples to see Pipecat Flows in action. Each example demonstrates
 # Pipecat Evals
 Source: https://docs.pipecat.ai/pipecat/evals/overview.md
 
-Behavioral testing for your agents: scripted conversations, semantic assertions, and an LLM judge.
+Behavioral testing for your agents: scripted scenarios that pin a behavior, simulated callers with a persona and a goal, and an LLM judge.
 
 Pipecat Evals is the framework's built-in system for testing agent behavior. You describe a conversation and the behavior you expect, and Pipecat runs it against your real agent (the same pipeline, the same services, the same code) and tells you whether the expectation still holds.
+
+There are two ways to describe that conversation. A **scripted** scenario writes the user's turns out and asserts on what the agent does after each one:
 
 ```yaml capital_question.yaml
 name: capital_question
@@ -11131,8 +11133,29 @@ turns:
         eval: "the response says the capital of Germany is Berlin"
 ```
 
+A **simulated** scenario hands the user's side to an LLM with a persona and a goal, and a judge decides from the whole conversation whether the agent got the job done and how well:
+
+```yaml book_table.yaml
+name: book_table
+
+simulator: { service: openai, model: gpt-4o-mini }
+
+persona: |
+  Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number
+  when asked (Jamie Lee, 555-0142). Polite, answers one question at a time.
+goal: "Book a table for two at 6 PM, then end the call."
+success: "the bot confirmed a reservation for two at 6 PM"
+
+metrics:
+  - name: politeness
+    criterion: "the reply is courteous, never curt or dismissive"
+    min_quality: 1
+```
+
+Both run with the same command:
+
 ```bash
-pipecat eval run capital_question.yaml
+pipecat eval run capital_question.yaml book_table.yaml
 ```
 
 ## Why evals matter
@@ -11144,9 +11167,43 @@ Evals make agent behavior testable the way unit tests make code testable:
 - **Regression safety**: run your scenarios after every prompt, model, or pipeline change and catch breakage before users do.
 - **Fast iteration**: text-mode evals skip STT and TTS entirely, so a full conversation test runs in seconds with no audio service cost.
 - **Semantic assertions**: an LLM judge checks meaning ("the response says the capital is Berlin"), not exact strings, so tests don't break when wording changes.
+- **Whole-flow coverage**: a simulated caller pursues a goal in its own words, so you learn whether the agent finishes the job, not just whether one scripted path still works.
 - **A feedback signal for AI coding assistants**: evals give a coding assistant a command it can run and a pass/fail result it can read, closing the loop between writing agent code and verifying it. See [The Eval Loop](/pipecat/evals/the-eval-loop).
 
-Pipecat itself relies on this framework: before every release, an eval suite drives 100+ example agents end to end.
+Pipecat itself relies on this framework: before every release, an eval suite drives 100+ example agents end to end, with scripted scenarios and simulations side by side.
+
+## Two kinds of scenario
+
+Every scenario has a **kind**, decided by its top-level key: `turns:` makes it scripted, `persona:` makes it simulated.
+
+| Kind          | You write                                                                                                                                     | Best for                                                                                                                                                                     |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scripted**  | The user's turns, each with the events expected back: `text_contains`, a `function_call` with its args, `within_ms`, or an `eval:` criterion. | Pinning one behavior. The same input every run, so a failure is reproducible and you fix from the assertion. Prompts, tool calls, multi-turn context, barge-in.              |
+| **Simulated** | A `persona:`, a `goal:`, a `success:` criterion, and `metrics:`. An LLM plays the caller and hangs up when done.                              | Proving the agent reaches a goal against a caller who phrases things their own way, and scoring conversation-level quality: politeness, brevity, latency, the calls it made. |
+
+The two complement each other. A script walks one path through a flow; a simulation covers the flow end to end but says something different each run. **Simulate to discover, script to pin**: when a simulation fails, reproduce the exchange where the agent lost the caller as a scripted scenario, fix the agent against it, and keep both.
+
+<CardGroup cols={2}>
+  <Card
+    title="Scripted Scenarios"
+    icon="file-pen"
+    iconType="duotone"
+    href="/pipecat/evals/scripted-scenarios"
+  >
+    Turns, events, and assertions: `eval:`, `text_contains:`, function calls,
+    latency budgets, DTMF, vision, and interruptions.
+  </Card>
+
+  <Card
+    title="Simulated Scenarios"
+    icon="user-headset"
+    iconType="duotone"
+    href="/pipecat/evals/simulated-scenarios"
+  >
+    A persona and a goal, a success criterion, judged and measured metrics,
+    and runs.
+  </Card>
+</CardGroup>
 
 ## How it works
 
@@ -11154,38 +11211,48 @@ Pipecat Evals has two halves:
 
 1. **The eval transport.** Your agent runs unchanged with the eval transport. If your agent uses `create_transport()` and the development runner, this is already built in: start it with `-t eval` and it hosts a local WebSocket server speaking RTVI, instead of connecting to Daily, WebRTC, or telephony.
 
-2. **The eval harness.** The harness connects to that transport as an RTVI client, plays the scenario's user turns (as text, or as synthesized speech in audio mode), collects the events your agent emits, and asserts on them in order: transcriptions, LLM responses, spoken output, function calls, and timing.
+2. **The eval harness.** The harness connects to that transport as an RTVI client and plays the user's side of the conversation: a scripted scenario's turns, or a persona LLM's replies. It collects the events your agent emits (transcriptions, LLM responses, spoken output, function calls, and timing) and either asserts on them in order, for a script, or hands the whole transcript to a judge, for a simulation.
 
-When a scenario asserts on meaning rather than exact text, a **judge LLM** evaluates the agent's response against a natural-language criterion. The judge runs locally with [Ollama](https://ollama.com) by default, or against OpenAI or any OpenAI-compatible endpoint.
+When a scenario asserts on meaning rather than exact text, a **judge LLM** evaluates the agent's output against a natural-language criterion: each `eval:` assertion in a scripted scenario, and the `success:` criterion plus every judged metric in a simulation. The judge runs locally with [Ollama](https://ollama.com) by default, or against OpenAI or any OpenAI-compatible endpoint.
 
 ### Text and audio modes
 
-Every scenario runs in one of two modes:
+Every scenario of either kind also has a **modality**:
 
 | Mode               | User input                                               | Agent output                                                    | Best for                                                        |
 | ------------------ | -------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------- |
 | **Text** (default) | Sent as text, bypassing the STT                          | LLM text; TTS is skipped automatically                          | Fast, cheap iteration on prompts, logic, and function calling   |
 | **Audio**          | Synthesized by a TTS the harness runs (local by default) | Real synthesized speech, transcribed by an STT the harness runs | True end-to-end coverage of the full STT, LLM, and TTS pipeline |
 
-Text mode exercises your agent's actual pipeline and context handling while skipping the audio services, so it costs nothing in TTS or STT usage and runs fast. Audio mode synthesizes the user's voice, streams it through your agent's real STT, and transcribes the agent's actual spoken audio for judging, catching issues that only surface with real speech (turn detection, homophones, barge-in).
+Text mode exercises your agent's actual pipeline and context handling while skipping the audio services, so it costs nothing in TTS or STT usage and runs fast. Audio mode synthesizes the user's voice (a scripted turn or a persona's reply), streams it through your agent's real STT, and transcribes the agent's actual spoken audio for judging, catching issues that only surface with real speech (turn detection, homophones, barge-in). A speech-to-speech agent has no separate text LLM step, so it is evaluated in audio mode only.
+
+Kind and modality are independent, which gives four ways to run a scenario:
+
+|               | Text                                                                                                 | Audio                                                                                                                                        |
+| ------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scripted**  | The inner loop: prompts, tool calls and their args, multi-turn context, barge-in. Run it constantly. | One behavior on the real speech path: how numbers, names, and accents transcribe; turn-taking and VAD timing; how the agent's speech sounds. |
+| **Simulated** | A flow end to end, against a caller who phrases things their own way. Conversation-level quality.    | What a real caller experiences. The pre-ship pass, and the only option for speech-to-speech agents.                                          |
 
 ## What you can test
 
 - **Response content**: substring checks (`text_contains`) or semantic judging (`eval`) of the agent's replies.
 - **Multi-turn context**: verify the agent remembers earlier turns.
-- **Function calling**: assert that specific tools were called, with specific arguments.
+- **Function calling**: assert that specific tools were called, with specific arguments, in a scripted turn or across a whole simulated conversation.
 - **Interruptions**: barge in mid-response and verify the agent recovers (`send_after`).
-- **Latency**: per-event budgets with `within_ms`.
+- **Latency**: per-event budgets with `within_ms`, or the slowest reply of a simulation with the `latency` measure.
+- **Goals and outcomes**: whether a simulated caller got what they came for, or was turned down correctly when they shouldn't.
+- **Conversation quality**: per-reply criteria such as politeness or brevity, scored across every reply of a simulation.
 - **Vision**: serve an image when the agent requests one and judge its description.
 
 ## YAML or Python
 
-Scenarios are YAML files, so they're easy to write, review, and share. Everything is also available as a library: load and run scenarios programmatically, build them in code, inject a custom judge, or orchestrate whole suites from your own tooling. See [Using the Library](/pipecat/evals/library).
+Scenarios are YAML files, so they're easy to write, review, and share. Everything is also available as a library: load and run scenarios of either kind programmatically, build them in code, inject a custom judge or persona LLM, or orchestrate whole suites from your own tooling. See [Using the Library](/pipecat/evals/library).
 
 ## Requirements
 
 - **Pipecat CLI**: the `pipecat eval` commands ship with the CLI extra: `uv tool install "pipecat-ai[cli]"`. If you've added `pipecat-ai[cli]` to your project instead, run them with `uv run pipecat eval` (just like `uv run bot.py`). The same commands are also available as `python -m pipecat.evals`.
-- **A judge LLM** (for `eval:` assertions): Ollama by default (`ollama pull gemma4:12b`), or point the scenario's `judge:` block at OpenAI or any OpenAI-compatible endpoint.
+- **A judge LLM** (for `eval:` assertions, and for every simulation): Ollama by default (`ollama pull gemma4:12b`), or point the scenario's `judge:` block at OpenAI or any OpenAI-compatible endpoint.
+- **A persona LLM** (simulations only): the `simulator:` block names an OpenAI, Ollama, or OpenAI-compatible model that supports function calling. `pipecat eval` loads the nearest `.env` before it runs, so the persona LLM finds its API key the way your agent does.
 - **Audio services** (audio mode only): the harness needs a TTS to synthesize the user's voice and an STT to transcribe the agent's speech. Both can be local models or HTTP-based services; the defaults are local (Kokoro and Moonshine or Whisper, installed with `uv add "pipecat-ai[kokoro,moonshine]"` or `uv add "pipecat-ai[kokoro,whisper]"`), which download once on first use and run with no keys and no per-run cost. WebSocket-streaming services aren't supported here, which keeps the harness simple.
 - **Your agent's own credentials**: the agent under test is your real agent, so it needs the same service API keys it normally would.
 
@@ -11193,8 +11260,8 @@ Scenarios are YAML files, so they're easy to write, review, and share. Everythin
 
 Pipecat Evals is built for development: fast, local, repeatable, and run on every change. Once your agent is deployed, third-party evaluation platforms complement it with testing and monitoring at production scale:
 
-- **Simulations**: scripted or AI-driven test calls over API, WebSocket, or telephony, exercising multi-turn flows, edge cases, and real phone-network conditions before they reach users.
-- **Observability**: continuous evaluation of live traffic, with automated quality scoring of calls and transcripts, and metrics tracked over time to catch quality drift.
+- **Testing over the deployed path**: test calls over API, WebSocket, or telephony, with varied caller populations, real phone-network conditions, and load, exercising the transport your users actually hit.
+- **Observability**: continuous evaluation of live traffic, with automated quality scoring of calls and transcripts, audio-signal metrics, and trends tracked over time to catch quality drift.
 
 <CardGroup cols={2}>
   <Card
@@ -11263,13 +11330,32 @@ Pipecat's other building blocks feed into any evaluation workflow: [Metrics](/pi
 
 <CardGroup cols={2}>
   <Card
-    title="Writing Scenarios"
-    icon="file-pen"
+    title="Quickstart"
+    icon="rocket"
     iconType="duotone"
-    href="/pipecat/evals/scenarios"
+    href="/pipecat/evals/quickstart"
   >
-    The full scenario format: turns, expectations, modalities, and the judge.
+    Run a scripted scenario and a simulation against an existing agent in a
+    few minutes.
   </Card>
+
+<Card
+  title="Scripted Scenarios"
+  icon="file-pen"
+  iconType="duotone"
+  href="/pipecat/evals/scripted-scenarios"
+>
+  The full scripted format: turns, expectations, modalities, and the judge.
+</Card>
+
+<Card
+  title="Simulated Scenarios"
+  icon="user-headset"
+  iconType="duotone"
+  href="/pipecat/evals/simulated-scenarios"
+>
+  Personas, goals, success criteria, judged and measured metrics, and runs.
+</Card>
 
 <Card
   title="Eval Suites"
@@ -11277,7 +11363,8 @@ Pipecat's other building blocks feed into any evaluation workflow: [Metrics](/pi
   iconType="duotone"
   href="/pipecat/evals/suites"
 >
-  Spawn multiple agents and run many scenarios concurrently from a manifest.
+  Spawn multiple agents and run many scenarios of both kinds concurrently from a
+  manifest.
 </Card>
 
   <Card
@@ -11298,10 +11385,12 @@ How local Pipecat Evals fit with platform testing, monitoring, and team-scale ev
 
 Pipecat Evals gives you a durable first layer for agent quality: fast, local,
 repeatable checks for the behavior your agent should preserve as code, prompts,
-models, and tools change. As the agent moves toward production, the evaluation
-surface expands: local scenarios stay active, and realistic simulations,
-audio-signal metrics, trace-backed checks, submitted production calls, and
-review workflows give product, QA, and operations teams shared quality signals.
+models, and tools change: scripted scenarios that pin a behavior, and simulated
+callers that prove a flow reaches its goal. As the agent moves toward
+production, the evaluation surface expands: local scenarios stay active, and
+caller populations at scale, audio-signal metrics, trace-backed checks,
+submitted production calls, and review workflows give product, QA, and
+operations teams shared quality signals.
 
 Strong evaluation programs keep both layers active:
 
@@ -11329,11 +11418,16 @@ Good local evals look like small executable specs:
 - "The agent calls `lookup_order` before answering an order-status question."
 - "The agent recovers when the user interrupts a long answer."
 - "The first response starts within the expected latency budget."
+- "A caller who wants a table for two at 6 PM gets one booked, and every reply
+  stays courteous."
 
-This is where Pipecat Evals is strongest. Text mode keeps the loop fast and
-cheap while you iterate on prompts, logic, and function calling. Audio mode adds
-an end-to-end check for VAD, STT, TTS, turn-taking, and speech transcription
-before you merge or release.
+The first five are [scripted scenarios](/pipecat/evals/scripted-scenarios);
+the last is a [simulation](/pipecat/evals/simulated-scenarios), where an LLM
+plays the caller and a judge reads the whole conversation. This is where
+Pipecat Evals is strongest. Text mode keeps the loop fast and cheap while you
+iterate on prompts, logic, and function calling. Audio mode adds an end-to-end
+check for VAD, STT, TTS, turn-taking, and speech transcription before you merge
+or release.
 
 The [Eval Suites](/pipecat/evals/suites) page describes Pipecat's own release
 evals as a manifest with 100+ example agents. The same pass/fail result is also
@@ -11350,7 +11444,8 @@ Use Pipecat Evals in CI when:
 
 - The agent is still changing quickly.
 - The question is "did this code or prompt change preserve an expected behavior?"
-- The expected behavior can be expressed as a scripted conversation.
+- The expected behavior can be expressed as a scripted conversation or as a
+  caller's goal.
 - The failure should block a pull request.
 - The debug artifact should live next to the code as a log or trace file.
 
@@ -11365,7 +11460,7 @@ shared workflows, and production feedback.
 
 | Signal                                  | Outside Pipecat Evals' scope                                                                  | What to add                                                                                        |
 | --------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Realistic caller behavior matters       | Scripted turns prove one path, not how varied users phrase, interrupt, or recover             | Simulated callers with varied personas, edge cases, and abuse attempts                             |
+| Caller variety at scale matters         | A local simulation plays one persona at a time, on your laptop or in CI                       | Simulated caller populations with varied personas, edge cases, and abuse attempts                  |
 | Voice behavior is part of the product   | Transcripts hide TTS loops, clipping, dropouts, phoneme stretch, timbre drift, and odd pauses | Audio-signal metrics, a Speech Artifact Score, and an audio LLM judge that scores the audio itself |
 | The deployed transport matters          | The local eval transport isn't a real WebSocket, Pipecat Cloud, SIP, or telephony path        | Tests over the deployed path users actually hit                                                    |
 | Volume and concurrency matter           | Local suites skip sustained load, burst traffic, queueing, and service limits                 | Load tests for concurrency, latency, error rates, and saturation                                   |
@@ -11384,8 +11479,8 @@ the world**.
 <CardGroup cols={2}>
   <Card title="Use Pipecat Evals for" icon="terminal" iconType="duotone">
     Local development, pull-request gates, coding-assistant loops, scripted
-    behavioral specs, function-call assertions, latency budgets, and fast text
-    mode iteration.
+    behavioral specs, simulated callers with a goal, function-call assertions,
+    latency budgets, per-reply quality metrics, and fast text mode iteration.
   </Card>
 
   <Card
@@ -11393,10 +11488,10 @@ the world**.
     icon="flask-vial"
     iconType="duotone"
   >
-    Multi-turn simulations, caller variation, realistic voice and telephony
-    paths, audio-signal metrics, trace metrics, submitted production calls,
-    dashboards, human review, scheduled runs, and agent-native CLI, MCP, or
-    skill-based workflows.
+    Caller populations and variation at scale, realistic voice and telephony
+    paths, load, audio-signal metrics, trace metrics, submitted production
+    calls, dashboards, human review, scheduled runs, and agent-native CLI, MCP,
+    or skill-based workflows.
   </Card>
 </CardGroup>
 
@@ -11425,27 +11520,51 @@ turns:
 This is exactly the kind of check you want in your repository. If a prompt edit
 stops the tool call, CI should fail.
 
-Before this agent handles real users, the quality question gets broader:
+The next question is whether the agent gets a real caller through the whole
+flow. A local simulation answers it without leaving the repository:
 
-- What happens when the caller changes the time three turns later?
-- Can the agent handle an impatient caller who interrupts while it is checking
-  availability?
+```yaml book_appointment_flexible.yaml
+name: book_appointment_flexible
+
+simulator: { service: openai, model: gpt-4o-mini }
+
+persona: |
+  Sam, booking a check-up. Asks for Tuesday at 3 PM first; if that's taken,
+  accepts any afternoon slot this week. Gives a name and phone number when asked.
+goal: "Book an appointment this week, preferably Tuesday at 3 PM, then end the call."
+success: "the bot booked an appointment at a time the caller accepted, and read the day and time back"
+
+metrics:
+  - name: recovery
+    criterion: "when the reply turns down a requested time, it offers concrete alternatives; a reply that turns down no time passes"
+    min_quality: 1
+  - measure: function_calls
+    calls: [book_appointment]
+
+runs: 3
+```
+
+Before this agent handles real users, the quality question gets broader still:
+
+- Can the agent handle a hundred different callers, impatient ones included,
+  over a real phone line?
 - Does the agent still work when the caller is in a noisy room?
 - Did the booking API actually succeed, or did the agent only say that it did?
 - Are users getting frustrated when the available slots are limited?
 - Is the booking-success rate drifting after a model or voice-provider change?
 
 Those are platform-level questions. The same booking flow can become a
-simulation suite that varies caller goals, phrasing, interruptions, voice
-conditions, transport paths, load, and tool outcomes before launch. After
-launch, production conversations can feed monitoring, review, and future
-regression coverage.
+platform simulation suite that varies caller populations, voice conditions,
+transport paths, load, and tool outcomes before launch. After launch,
+production conversations can feed monitoring, review, and future regression
+coverage.
 
 ## Simulate before launch
 
-Local scenarios are intentionally crisp. Platform simulations broaden the same
-flow across realistic user variation, voice conditions, transport paths, load,
-abuse attempts, and tool behavior.
+Local scripted scenarios are intentionally crisp, and a local simulation plays
+one caller at a time. Platform simulations broaden the same flow across caller
+populations, voice conditions, transport paths, load, abuse attempts, and tool
+behavior.
 
 For regressions that need exact replay, use fixed transcripts, scripted turns,
 or pre-recorded audio. For tool-heavy flows, include traces so evaluation can
@@ -11475,29 +11594,33 @@ segment.
 ## Feed findings back into tests
 
 Production monitoring and human review should create the next evaluation inputs:
-new local Pipecat scenarios for crisp regressions, new simulation cases for
-broader user behavior, new trace metrics for hidden tool failures, and new
-monitoring metrics for recurring production patterns.
+new local scripted scenarios for crisp regressions, new local simulations for
+the flows that broke, new platform simulation cases for broader user behavior,
+new trace metrics for hidden tool failures, and new monitoring metrics for
+recurring production patterns.
 
 ## Practical adoption path
 
 Start small and grow in layers:
 
-1. **Create 5-10 Pipecat scenarios** for the agent's most important scripted
+1. **Create 5-10 scripted scenarios** for the agent's most important
    behaviors.
 2. **Run the suite in CI** and require it before merging prompt, model, tool, or
    pipeline changes.
-3. **Add audio-mode checks** before release for the flows most sensitive to STT,
+3. **Add a simulation for each flow with a job to finish**, a booking, an
+   intake, an order, with `runs: 3` so the flow has to hold more than once.
+   When one fails, pin the exchange that broke as a scripted scenario.
+4. **Add audio-mode checks** before release for the flows most sensitive to STT,
    TTS, VAD, and turn-taking.
-4. **Add platform simulations** when you need realistic multi-turn behavior,
-   varied callers, telephony or WebSocket coverage, load testing, trace checks,
-   and audio-signal metrics.
-5. **Instrument traces** for tool-heavy workflows so evaluations can verify what
+5. **Add platform simulations** when you need caller populations at scale,
+   telephony or WebSocket coverage, load testing, trace checks, and
+   audio-signal metrics.
+6. **Instrument traces** for tool-heavy workflows so evaluations can verify what
    happened under the hood.
-6. **Expose platform controls to your coding assistant** through CLI, MCP, or
+7. **Expose platform controls to your coding assistant** through CLI, MCP, or
    agent-skill surfaces so the same assistant that fixes local evals can launch
    simulations, inspect failures, and triage monitoring results.
-7. **Send production calls to monitoring** once users are live, then turn
+8. **Send production calls to monitoring** once users are live, then turn
    recurring failures into new simulations, metrics, human-review projects, or
    local scenarios.
 
@@ -11523,13 +11646,13 @@ Start small and grow in layers:
 </Card>
 
 <Card
-  title="Writing Scenarios"
+  title="Scripted and Simulated Scenarios"
   icon="file-pen"
   iconType="duotone"
-  href="/pipecat/evals/scenarios"
+  href="/pipecat/evals/scripted-scenarios"
 >
-  Learn the YAML format for turns, expectations, function calls, interruptions,
-  latency budgets, and audio mode.
+  Learn the YAML formats: turns and expectations for a script, a persona and a
+  goal for a [simulation](/pipecat/evals/simulated-scenarios).
 </Card>
 
   <Card
@@ -11546,9 +11669,9 @@ Start small and grow in layers:
 # Evals Quickstart
 Source: https://docs.pipecat.ai/pipecat/evals/quickstart.md
 
-Run your first Pipecat behavioral eval against an existing agent with pipecat eval and a simple scenario.
+Run your first Pipecat behavioral evals against an existing agent: a scripted scenario, then a simulated caller with a goal.
 
-This guide takes an existing agent, starts it with the eval transport, and runs a two-turn scenario against it. Total time: a few minutes.
+This guide takes an existing agent, starts it with the eval transport, runs a two-turn scripted scenario against it, and then lets a simulated caller hold a conversation with it. Total time: a few minutes.
 
 ## Prerequisites
 
@@ -11557,6 +11680,7 @@ This guide takes an existing agent, starts it with the eval transport, and runs 
 - A judge LLM. Either:
   - **Ollama** (local, the default): install [Ollama](https://ollama.com) and run `ollama pull gemma4:12b`, or
   - **OpenAI**: set `OPENAI_API_KEY` and point the scenario's `judge:` block at it (shown below).
+- For the simulation step, an `OPENAI_API_KEY` in your agent's `.env`. The simulated caller is played by an OpenAI model, and `pipecat eval` loads the nearest `.env` before it runs.
 
 <Steps>
   <Step title="Run your agent with the eval transport">
@@ -11595,8 +11719,8 @@ This guide takes an existing agent, starts it with the eval transport, and runs 
 
   </Step>
 
-  <Step title="Write a scenario">
-    A scenario is a YAML file describing a scripted conversation and the behavior you expect. Save this as `scenarios/capital_question.yaml`:
+  <Step title="Write a scripted scenario">
+    A scripted scenario is a YAML file that writes the user's turns out, each with the behavior you expect back. Save this as `scenarios/capital_question.yaml`:
 
     <Tabs>
       <Tab title="Ollama judge (default)">
@@ -11690,20 +11814,85 @@ This guide takes an existing agent, starts it with the eval transport, and runs 
     A failing eval tells you which turn, which expectation, and why. That message (plus the `.eval.log` trace) is what you, or your AI coding assistant, iterate against.
 
   </Step>
+
+  <Step title="Let a simulated caller talk to it">
+    A scripted scenario walks one path. A **simulated** scenario hands the user's side to an LLM with a persona and a goal, and a judge decides from the whole conversation whether the agent did its job. Save this as `scenarios/capital_curious.yaml`:
+
+    ```yaml
+    name: capital_curious
+
+    simulator:
+      service: openai
+      model: gpt-4o-mini
+
+    persona: |
+      A friendly, curious traveler planning a trip to Europe. Polite and concise:
+      asks one question at a time, and thanks the assistant once satisfied.
+
+    goal: "Find out what the capital of Germany is, then end the call."
+
+    success: "the bot told the caller that the capital of Germany is Berlin"
+
+    metrics:
+      - name: politeness
+        criterion: "the reply is courteous and helpful, never curt or dismissive"
+        min_quality: 1
+      - measure: words
+        max_value: 60
+
+    max_turns: 6
+    ```
+
+    There are no turns to write. The `simulator:` block names the LLM that plays the caller, `persona:` and `goal:` tell it who it is and what it wants, and `success:` tells the judge what the agent must have done. The `politeness` metric is judged on every reply, and `words` bounds the longest one.
+
+    Run it with `-v` to watch the conversation as it happens:
+
+    ```bash
+    pipecat eval run scenarios/capital_curious.yaml -v
+    ```
+
+    ```
+          bot: Hello! How can I help you today?
+          user: Hi! I'm planning a trip to Europe. Could you tell me what the capital of Germany is?
+          bot: The capital of Germany is Berlin.
+          user: Great, thank you so much!
+          bot: You're welcome! Enjoy your trip.
+
+          ended by end_call after 2 persona turn(s)
+
+        judge: the bot told the caller the capital of Germany is Berlin
+
+        metrics:
+          politeness: 1.00 (min 1.00) | 3/3 turns
+          words: 1.00 | longest reply 7 words, at most 60
+
+        persona: succeeded: I learned that the capital of Germany is Berlin.
+
+      ✓ ws://localhost:7860 capital_curious end_call (9814ms)
+
+      1/1 passed  ·  9.8s
+    ```
+
+    The caller says something different every run, which is the point: it checks that the agent gets a real caller to the goal, not that one scripted path still works. When a simulation fails, reproduce the exchange where the agent lost the caller as a scripted scenario and fix against that.
+
+  </Step>
 </Steps>
 
 ## Where to go next
 
-- Learn the full scenario format, including multi-turn conversations, function call assertions, interruptions, latency budgets, and text vs audio modes, in [Writing Scenarios](/pipecat/evals/scenarios).
+- Learn the full scripted format, including multi-turn conversations, function call assertions, interruptions, latency budgets, and text vs audio modes, in [Scripted Scenarios](/pipecat/evals/scripted-scenarios).
+- Learn how personas, success criteria, judged and measured metrics, and `runs:` work in [Simulated Scenarios](/pipecat/evals/simulated-scenarios).
 - Have many scenarios or agents? Let Pipecat spawn the agents for you with [Eval Suites](/pipecat/evals/suites).
 - Want your coding assistant to run these for you? See [The Eval Loop](/pipecat/evals/the-eval-loop).
 
-# Writing Scenarios
-Source: https://docs.pipecat.ai/pipecat/evals/scenarios.md
+# Scripted Scenarios
+Source: https://docs.pipecat.ai/pipecat/evals/scripted-scenarios.md
 
-The scenario file format: configuration, turns, events, and assertions.
+The scripted scenario file format: user turns, expected events, eval and text_contains assertions, function calls, latency budgets, and modalities.
 
-A scenario is a YAML file describing a scripted conversation and the events you expect your agent to emit. This page covers the full format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
+A scripted scenario is a YAML file that writes the user's turns out, each with the events you expect your agent to emit in response. A file with a top-level `turns:` key is scripted; one with a `persona:` key is a [simulated scenario](/pipecat/evals/simulated-scenarios), where an LLM plays the user instead. This page covers the full scripted format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
+
+Use a scripted scenario to pin one behavior: the same input every run, so a failure is reproducible and you fix from the assertion. Use a simulation to check that the agent gets a caller to a goal when the caller phrases things their own way.
 
 ## Anatomy of a scenario
 
@@ -11750,6 +11939,8 @@ The rest of this page is in four parts:
 ## Configuration
 
 Everything in this section is optional. A scenario with no configuration blocks runs entirely in [text mode](#text-and-audio-modes) with the default judge, which is the fastest way to start. To write the turns themselves, skip ahead to [User turns](#user-turns) and [Events](#events).
+
+The `user:` and `judge:` blocks, `factory:`, and `!include` are shared with [simulated scenarios](/pipecat/evals/simulated-scenarios), which configure their modalities the same way.
 
 ### Text and audio modes
 
@@ -12228,6 +12419,16 @@ Arguments take part in the matching, so the turn is satisfied by any call matchi
 
 <CardGroup cols={2}>
   <Card
+    title="Simulated Scenarios"
+    icon="user-headset"
+    iconType="duotone"
+    href="/pipecat/evals/simulated-scenarios"
+  >
+    Hand the user's side to an LLM with a persona and a goal, and judge the
+    whole conversation.
+  </Card>
+
+  <Card
     title="The Eval Loop"
     icon="arrows-rotate"
     iconType="duotone"
@@ -12238,14 +12439,388 @@ Arguments take part in the matching, so the turn is satisfied by any call matchi
   </Card>
 </CardGroup>
 
+# Simulated Scenarios
+Source: https://docs.pipecat.ai/pipecat/evals/simulated-scenarios.md
+
+The simulated scenario file format: a persona and goal an LLM plays against your agent, a success criterion, judged and measured metrics, and runs.
+
+A simulated scenario, a simulation for short, describes a caller rather than a script: who they are, what they want, and how the outcome is judged. An LLM plays that caller and holds the whole conversation with your agent on its own, in text or over synthesized speech, and hangs up once it has what it came for. A judge then reads the transcript, the agent's tool calls in place, and decides whether the agent did its job and how every reply scored against your metrics.
+
+```yaml book_table.yaml
+name: book_table
+
+simulator:
+  service: openai
+  model: gpt-4o-mini
+
+persona: |
+  Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number
+  when asked (Jamie Lee, 555-0142). Polite, answers one question at a time.
+
+goal: "Book a table for two at 6 PM, then end the call."
+
+success: "the bot confirmed a reservation for two at 6 PM (a booking tool was called)"
+
+metrics:
+  - name: politeness
+    criterion: "the reply is courteous, never curt or dismissive"
+    min_quality: 1
+  - measure: latency
+    max_value: 5
+
+runs: 3
+```
+
+```bash
+pipecat eval run book_table.yaml -v
+```
+
+A file with a top-level `persona:` is a simulation; one with `turns:` is a [scripted scenario](/pipecat/evals/scripted-scenarios). A scripted scenario walks one path through a flow and pins it. A simulation proves the agent reaches a goal against a caller who phrases things their own way, and checks conversation-level quality along the way. Both run with the same commands, sit side by side in a [suite manifest](/pipecat/evals/suites), and share the `user:` and `judge:` blocks.
+
+## Anatomy of a simulation
+
+```yaml
+name: book_table # required: the simulation's name
+
+simulator: # required: the LLM that plays the caller
+  service: openai
+  model: gpt-4o-mini
+
+user: # optional: how the caller's turns reach the agent (default text)
+  modality: text
+
+judge: # optional: judge modality and LLM (defaults shown)
+  modality: text
+  eval:
+    service: ollama
+    model: gemma4:12b
+    extra: { reasoning_effort: none }
+
+persona: | # required: who the caller is
+  Jamie, booking dinner for two tonight at 6 PM. ...
+
+goal: "Book a table for two at 6 PM, then end the call." # required
+
+success: "the bot confirmed a reservation for two at 6 PM" # required
+
+metrics: # optional: judged criteria and measured bounds
+  - name: politeness
+    criterion: "the reply is courteous, never curt or dismissive"
+    min_quality: 1
+  - measure: latency
+    max_value: 5
+
+max_turns: 20 # optional: cap on the caller's turns (default 20)
+max_duration_s: 300 # optional: cap on the run's wall clock (default 300)
+runs: 1 # optional: how many times a suite runs it (default 1)
+trigger_disconnect: false # optional: fire on_client_disconnected at the end
+```
+
+The rest of this page covers each part:
+
+<CardGroup cols={2}>
+  <Card title="The caller" icon="user-headset" href="#the-caller">
+    The persona, its goal, and the LLM that plays it.
+  </Card>
+  <Card title="Text and audio" icon="waveform" href="#text-and-audio-modes">
+    Drive the agent with text or synthesized speech, and judge text or real
+    audio.
+  </Card>
+  <Card title="Judging the outcome" icon="gavel" href="#judging-the-outcome">
+    The `success:` criterion, and what the judge sees.
+  </Card>
+  <Card title="Metrics" icon="chart-simple" href="#metrics">
+    Judged criteria scored per reply, and the built-in measures.
+  </Card>
+</CardGroup>
+
+## The caller
+
+### Persona and goal
+
+`persona:` says who the caller is and `goal:` what they want from the call. Both go verbatim into the persona LLM's instructions, which tell it to stay in character, reply with one short spoken turn at a time, ask for or give one thing at a time, and end the call once the goal is achieved or clearly out of reach:
+
+```yaml
+persona: |
+  Casey, calling to book a table for tonight. Polite but constrained: gives the
+  party size and the time when asked, one detail per turn. Can only make 7 PM
+  or 8 PM; asks for the other one if the first is unavailable, and if neither
+  works, thanks the assistant and ends the call without booking anything.
+
+goal: "Book a table for two tonight at 7 PM or 8 PM; if neither is available, end the call without a reservation."
+```
+
+Give the persona every fact the agent will ask for: a name, a phone number, a party size, a date of birth. Without them the persona invents details or stalls, and the run fails for a reason that isn't the agent's. The goal can include what to do when the agent can't help, as above, so the persona gives up gracefully rather than looping.
+
+The persona ends the call by calling an `end_call` tool, reporting whether it thinks it succeeded and why. That claim is advisory: it's shown in verbose output and recorded in the result, but the [judge](#judging-the-outcome) decides the outcome.
+
+<Note>
+  The persona listens first. It answers each finished response of the agent, so
+  the agent has to open the conversation, as most do with a greeting on connect.
+  An agent that waits for the user to speak leaves the persona waiting too, and
+  the run ends on `max_duration_s`.
+</Note>
+
+### The persona LLM with `simulator:`
+
+`simulator:` configures the LLM that plays the caller. It has the same shape as the `judge.eval:` block: a `service` (`openai` or `ollama`), a `model`, and an optional `endpoint:` for any OpenAI-compatible API and `extra:` mapping forwarded as request parameters:
+
+```yaml
+simulator:
+  service: openai
+  model: gpt-4o-mini
+```
+
+The model must support function calling, since the persona hangs up through its `end_call` tool. `pipecat eval` loads the nearest `.env` file, walking up from the working directory, before it runs, so the persona LLM finds its API key the same way your agent does. Variables already set in the shell win.
+
+<Tip>
+  Share one `simulator:` block across a directory of simulations with
+  `!include`, resolved relative to the scenario file, just as scripted scenarios
+  share their `user:` and `judge:` blocks: `simulator: !include
+  ../simulator.yaml`.
+</Tip>
+
+## Text and audio modes
+
+A simulation takes the same top-level `user:` and `judge:` blocks as a scripted scenario, with the same defaults, so the [scripted configuration reference](/pipecat/evals/scripted-scenarios#configuration) applies here: `user.modality` and `user.speech` decide whether the persona's turns reach the agent as text or as synthesized speech, and `judge.modality`, `judge.transcription`, and `judge.eval` decide whether the agent speaks and which LLM judges the outcome. `factory:` and `!include` work the same way.
+
+With neither block, a simulation runs entirely in text mode: the persona's replies are sent to the agent as text, the agent's TTS is skipped, and the persona hears the LLM's text output. This is the fast way to check a flow end to end and to iterate on prompts and tools.
+
+In audio mode every persona turn is synthesized, so `user.modality: audio` requires a `user.speech:` block naming the TTS service and voice. The agent's real VAD, STT, and turn taking run against an autonomous caller, and the persona hears the agent's transcribed speech:
+
+```yaml
+simulator: !include ../simulator.yaml
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+judge:
+  modality: audio
+  transcription:
+    service: moonshine
+    model: small-streaming
+```
+
+Interruptions aren't scripted in a simulation. The persona is a caller: when the agent keeps talking over it, its speech is cut off the way a real caller's would be, and the conversation carries on from there. A speech-to-speech agent has no separate text LLM step, so for it both audio blocks are required rather than an escalation.
+
+## Judging the outcome
+
+### The `success:` criterion
+
+`success:` says what counts as the agent having done its job, judged once over the whole conversation. Write it as prose, as long as it needs to be. It is the agent's side of the `goal:`: usually that the caller got what they asked for, but where the right outcome is to refuse, to qualify, or to escalate, it says so:
+
+```yaml
+goal: "Book a table for two tonight at 7 PM or 8 PM; if neither is available, end the call without a reservation."
+
+success: "the bot said neither 7 PM nor 8 PM was available, offered other times, and did not book a table at a time the caller had not accepted; the call ended without a reservation"
+```
+
+Anything the agent must do once, like reading the order back or calling `complete_order`, belongs in `success:`, not in a metric. Metrics are scored on every reply.
+
+### What the judge sees
+
+The judge reads the whole transcript in one call, with each of the agent's function calls placed before the reply it preceded, by name and arguments. A completed call is stronger evidence of an action than the agent saying it did it, and the judge is told so. The judge does not see a call's result. So:
+
+- Whether the agent made a call at all is a [`function_calls` measure](#checking-tool-calls-with-function_calls), no judge needed.
+- If a reply must match backend data, write the expected value into the criterion ("the reply says the appointment is on Tuesday September fifteenth") and keep your mocks deterministic so it stays true across runs.
+
+The same judge call also scores every judged metric on every agent reply, so a simulation costs one judge call however many metrics it has. The judge LLM comes from the `judge.eval:` block, Ollama with `gemma4:12b` by default.
+
+## Metrics
+
+`metrics:` is a list of quality checks. Each is either **judged**, a `criterion:` the judge decides on every agent reply, or **measured**, a `measure:` the harness computes from the run with no judge involved. A metric fails the run only when it has a threshold: `min_quality:` for a judged metric, a range or a `calls:` list for a measured one. Without one, it is reported and never fails anything.
+
+### Judged metrics with `criterion:`
+
+A criterion says what every reply of the agent should be. The judge decides it for each agent turn, in the light of the conversation before it and the tool calls the agent had made by then, with a yes or a no, never a partial score. The metric's score is the share of turns that got a yes: `0.80` is four replies in five.
+
+```yaml
+metrics:
+  - name: politeness
+    criterion: "the reply is courteous and helpful, never curt or dismissive"
+    min_quality: 1
+  - name: recovery
+    criterion: "when the reply turns down a requested time, it offers concrete alternative times; a reply that turns down no time passes"
+    min_quality: 1
+  - name: brevity
+    criterion: "the reply is at most three sentences, with no monologue"
+```
+
+`min_quality:` is the share of turns that must pass, in `0..1`: `1` means every reply, `0.8` allows one slip in five. The `brevity` metric above has none, so its score is reported but never fails the run.
+
+Phrase a rule as a condition plus what a reply outside it does. The judge is told that a criterion which forbids something or applies only in a situation is satisfied by a reply that doesn't do the forbidden thing or isn't in that situation, but spelling it out ("a reply that turns down no time passes") keeps a bare "never" from being read as "always".
+
+A turn the judge leaves out of its verdicts counts as a no. A run in which the agent said nothing has no turns to score, so a judged metric is unscored and passes.
+
+### Measured metrics with `measure:`
+
+A measured metric names one of the built-in measures and bounds it with `min_value:` and/or `max_value:`, both inclusive. The harness computes the value from the run, and the metric scores `1` inside the range and `0` outside, which fails the run. `name:` defaults to the measure:
+
+```yaml
+metrics:
+  - measure: latency
+    max_value: 5
+  - measure: words
+    max_value: 60
+  - measure: turns
+    min_value: 2
+    max_value: 8
+```
+
+The built-in measures:
+
+| Measure          | What it measures                                                                                                                                                                                                  | Unit    |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `turns`          | The persona's turns in the conversation. A reply that only calls `end_call` is not a turn.                                                                                                                        | count   |
+| `duration`       | The conversation's length, from its first line to the hang-up.                                                                                                                                                    | seconds |
+| `words`          | The longest agent reply. Bounds every reply.                                                                                                                                                                      | words   |
+| `latency`        | The slowest agent reply. In text mode, from the persona's send to the reply's first LLM token; in audio mode, from the agent noticing the persona stop speaking to its first spoken sentence. Bounds every reply. | seconds |
+| `function_calls` | The function calls the agent made, checked against a `calls:` list instead of a range. See [below](#checking-tool-calls-with-function_calls).                                                                     | calls   |
+
+The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode `latency` is an LLM budget, not a listening budget: there is no speech for the agent to wait on.
+
+There is deliberately no interruptions measure. The persona causes interruptions; the agent cannot.
+
+### Checking tool calls with `function_calls`
+
+`measure: function_calls` takes a `calls:` list instead of a range: the calls the agent should make over the whole conversation, each a name or a `name:` with `args:`, in any order. `args:` is a subset check, so every listed key and value must appear in the call's arguments and extra arguments are ignored:
+
+```yaml
+metrics:
+  - measure: function_calls
+    calls:
+      - check_availability
+      - name: book_table
+        args: { party_size: 2 }
+```
+
+Every listed call must have happened, and any call not listed fails the metric. That makes `calls: []` the check for a caller who should be turned down: the agent must call nothing. A call the agent cancelled did not happen.
+
+## Limits and runs
+
+`max_turns:` caps the persona's turns (default 20) and `max_duration_s:` caps the run's wall clock (default 300 seconds). They are backstops against a conversation that never ends. A run they cut short has not succeeded, whatever the transcript says.
+
+`runs:` is how many times a [suite](/pipecat/evals/suites) runs the simulation (default 1), and every run must pass. A persona doesn't say the same thing twice, so one run is an anecdote and three are a check:
+
+```yaml
+max_turns: 8
+max_duration_s: 120
+runs: 3
+```
+
+`pipecat eval run` plays a simulation once whatever `runs:` says. A success rate over several runs is the suite's job, since each run needs a fresh agent. The suite's `--repeat` flag overrides `runs:` and turns the sweep into a measurement instead: rates are reported and the exit code stays `0`.
+
+`trigger_disconnect: true` fires the agent's `on_client_disconnected` handler when the run ends, as it does for a [scripted scenario](/pipecat/evals/scripted-scenarios#exercising-the-disconnect-path).
+
+## How a run ends and what passing means
+
+A run ends in one of these ways:
+
+| Ending         | Meaning                                                         |
+| -------------- | --------------------------------------------------------------- |
+| `end_call`     | The persona called its `end_call` tool.                         |
+| `bot`          | The agent ended the call by closing the connection.             |
+| `max_turns`    | The persona's turn cap was reached.                             |
+| `max_duration` | The run's wall-clock cap was reached.                           |
+| `error`        | The run did not complete: a failed connect, or a harness error. |
+
+A run **passes** when it completed, the judge said `success:` was met, and no metric with a threshold fell short. A run that ended in `error` is neither a goal success nor a goal failure: it is reported as an error and kept out of any pass rate, since a run that never connected says nothing about whether the agent did its job.
+
+## Running a simulation
+
+Start your agent with its eval transport, then run the file the same way as a scripted scenario. Pass `-v` to watch the conversation as it happens and read the judge's reasons at the end:
+
+```bash
+pipecat eval run book_table.yaml -v
+```
+
+```
+      user: Hi, I'd like to book a table for two tonight at 6 PM.
+      bot: I'd be happy to help. Could I get a name for the reservation?
+      user: It's Jamie Lee.
+      bot: Thanks, Jamie. And a phone number in case we need to reach you?
+      user: 555-0142.
+      bot: You're all set: a table for two tonight at 6 PM under Jamie Lee.
+      user: Perfect, thank you!
+
+      ended by end_call after 4 persona turn(s)
+
+    judge: the bot confirmed a reservation for two at 6 PM after calling book_table
+
+    metrics:
+      politeness: 1.00 (min 1.00) | 4/4 turns
+      latency: 1.00 | slowest reply 1.83 s, at most 5
+
+    persona: succeeded: The reservation was confirmed for two at 6 PM.
+
+  ✓ ws://localhost:7860 book_table end_call (14230ms)
+
+  1/1 passed  ·  14.2s
+```
+
+The line beside the ✓ or ✗ is how the run ended. A failed simulation carries the judge's verdict instead of a list of assertions, and a judged metric that failed lists the replies the judge said no to, with its reason for each:
+
+```
+  ✗ ws://localhost:7860 book_table end_call (16102ms)
+
+  Failures (1 of 1):
+  ✗ ws://localhost:7860 book_table
+      • politeness 0.75 below 1.00: turn 3: the reply is curt, a bare "No." end_call
+
+  0/1 passed, 1 failed  ·  16.1s
+```
+
+The failure is the first thing that gave way, in order: an error, then the goal ("goal not met: ..."), then the first failed metric. Every metric's score, value, and per-turn verdicts are in the decision trace at `<scenario>.eval.log`, and in `results.jsonl` when a suite ran it. The judge and the persona LLM's own logs are in `<scenario>.debug.log` under `-d`.
+
+## Writing good simulations
+
+- **Give the persona the facts the agent will ask for.** A caller who doesn't know their own phone number stalls, and the run fails for a reason that isn't the agent's.
+- **`success:` is the agent's side of the goal**, and may name tool calls. Anything the agent must do once belongs here, not in a metric.
+- **A judged metric is scored per reply.** Phrase it as a condition plus what a reply outside it does, so a rule about one situation doesn't fault every other reply.
+- **A measured metric bounds the worst reply.** Set `latency` and `words` for the slowest and longest reply you can accept, not the typical one.
+- **Use `function_calls` for what the judge can't see.** The judge reads calls, not results, and `calls: []` is the check for an agent that should call nothing.
+- **Run it more than once.** Set `runs: 3` and let the suite prove the flow holds, not just that it held once.
+
+### Simulate to discover, script to pin
+
+A failing simulation shows where the agent lost the caller. Reproduce that exchange as a [scripted scenario](/pipecat/evals/scripted-scenarios), fix the agent against it, and keep both: the script guards the fix on every edit, and the simulation keeps checking the whole flow.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Eval Suites"
+    icon="list-check"
+    iconType="duotone"
+    href="/pipecat/evals/suites"
+  >
+    List scripted and simulated scenarios in one manifest, run each simulation
+    its `runs:` times, and read `results.jsonl`.
+  </Card>
+
+  <Card
+    title="Using the Library"
+    icon="code"
+    iconType="duotone"
+    href="/pipecat/evals/library#running-a-simulation"
+  >
+    Run simulations from Python, inject your own persona LLM or judge, and read
+    per-metric scores.
+  </Card>
+</CardGroup>
+
 # Eval Suites
 Source: https://docs.pipecat.ai/pipecat/evals/suites.md
 
-Spawn agents and run many scenarios concurrently from a single manifest.
+Spawn agents and run many scripted and simulated scenarios concurrently from a single manifest with pipecat eval suite.
 
 `pipecat eval run` tests scenarios against an agent you started yourself. A **suite** goes one step further: you list agents and scenarios in a manifest, and `pipecat eval suite` spawns each agent with its eval transport on its own port, runs its scenarios, tears it down, and aggregates the results, several runs at a time.
 
-Suites are the right tool when you have more than one agent, more than a handful of scenarios, or want a single command for CI. Pipecat's own release evals are a manifest with 100+ example agents plus this command.
+Suites are the right tool when you have more than one agent, more than a handful of scenarios, or want a single command for CI. They are also how a [simulation](/pipecat/evals/simulated-scenarios) runs more than once: each run gets a fresh agent. Pipecat's own release evals are a manifest with 100+ example agents plus this command.
 
 ## The manifest
 
@@ -12263,12 +12838,16 @@ suite:
     scenarios: [greeting, capital_question, multi_turn]
   - bot: bots/sales-agent.py
     scenarios: [greeting, weather_function_call]
+  - bot: bots/booking-agent.py
+    scenarios: [greeting, simulated/book_table] # a simulation, listed the same way
   - bot: bots/vision-agent.py
     runner_body: scenarios/vision-body.json # optional --runner-body data
     scenarios: [vision_describe]
 ```
 
-Paths in the manifest (`bots_dir`, `scenarios_dir`, `runs_dir`, the `bot:` entries) resolve relative to the manifest file, so a manifest is portable: check it into your repo and run it from anywhere.
+Paths in the manifest (`bots_dir`, `scenarios_dir`, `runs_dir`, the `bot:` entries) resolve relative to the manifest file, so a manifest is portable: check it into your repo and run it from anywhere. A scenario name can include a subfolder (`simulated/book_table`), and a name ending in `.yaml` is a path relative to the manifest.
+
+Scripted and simulated scenarios are listed the same way, and the file says which it is: `turns:` makes it scripted, `persona:` makes it a simulation. Pipecat's release evals keep the two in `scenarios/scripted/` and `scenarios/simulated/` folders, which is a convention worth copying.
 
 Scenarios are reusable across agents. One `greeting` scenario can cover every agent in the suite.
 
@@ -12291,6 +12870,7 @@ Useful flags:
 ```bash
 pipecat eval suite manifest.yaml -p support       # only bots whose path contains "support"
 pipecat eval suite manifest.yaml -s greeting      # only the greeting scenario
+pipecat eval suite manifest.yaml -k simulation    # only simulations (or: -k script)
 pipecat eval suite manifest.yaml -c 8             # 8 runs at a time
 pipecat eval suite manifest.yaml -n nightly       # output to eval-runs/nightly/
 pipecat eval suite manifest.yaml -a               # record conversation audio
@@ -12316,7 +12896,9 @@ eval-runs/20260610_142200/
     bots_support-agent.py__greeting.wav        # conversation audio (record: true or -a)
 ```
 
-`results.jsonl` carries one line per run — its bot, scenario, attempt, outcome, duration, failures, per-turn results, and paths to its artifacts. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+`results.jsonl` carries one line per run, and every line names its `kind`, `script` or `simulation`. A scripted record carries the bot, scenario, attempt, outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, and per-turn verdicts, the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+
+Each run executes in its own process, so a harness that loads local audio models does so on its own, and one run's crash doesn't take the others with it.
 
 <Note>
   `results.jsonl` is written by `pipecat eval suite`. `pipecat eval run` doesn't
@@ -12338,6 +12920,17 @@ A directory expands to its `.yaml` and `.yml` files in filename order, non-recur
 
 By default the agent is left running afterward so it can serve more evals; pass `--stop-bot` to shut it down when the batch finishes.
 
+## Running a simulation more than once
+
+A persona doesn't say the same thing twice, so one run of a simulation is an anecdote. A simulation's own `runs:` field tells the suite how many times to run it, and every run must pass. The suite reports a pass rate per simulation with a ✓ or ✗ beside it, and exits `1` when any run failed:
+
+```
+  Pass rate:
+  bots/booking-agent.py  simulated/book_table      3/3 (100%)  ✓  ~12.4s each
+```
+
+A run that errored (the agent never came up, the persona's LLM failed) is reported but kept out of the rate: it says nothing about whether the agent did its job.
+
 ## Repeating a run
 
 A behavior with a race in it passes sometimes. `repeat:` in the manifest, or `--repeat` / `-r` on the command line, runs every (bot, scenario) pair N times and reports a pass rate per pair instead of a single verdict:
@@ -12358,6 +12951,8 @@ Attempts interleave across bots rather than running back to back, and artifact f
   unset for the CI gate below.
 </Warning>
 
+A `repeat` set anywhere, on the command line or in the manifest, decides every run's attempts, a simulation's included, even when it is `1`. That turns a simulation's `runs:` requirement into a measurement: rates are reported and the exit code stays `0`. Leave `repeat` unset to let each simulation run its own `runs:` and gate on them.
+
 ## Suites in CI
 
 The exit code makes suites CI-ready with no extra glue:
@@ -12368,29 +12963,36 @@ The exit code makes suites CI-ready with no extra glue:
   run: pipecat eval suite manifest.yaml
 ```
 
-For deterministic, key-free CI runs, prefer text-mode scenarios and an OpenAI-compatible judge endpoint you control. Audio-mode scenarios work in CI too, but need the harness's TTS and STT services available (local models by default, which also need more CPU).
+For deterministic, key-free CI runs, prefer text-mode scripted scenarios and an OpenAI-compatible judge endpoint you control. Simulations need the persona LLM's API key in the environment as well, and say something different each run by design, so give them `runs: 3` and expect them to take longer. `-k script` runs the scripted half alone when you want a fast gate on every push and the simulations on a schedule. Audio-mode scenarios work in CI too, but need the harness's TTS and STT services available (local models by default, which also need more CPU).
 
 # Using the Library
 Source: https://docs.pipecat.ai/pipecat/evals/library.md
 
-Run, build, and orchestrate evals from Python with the pipecat.evals API.
+Run scripted scenarios and simulations from Python with the pipecat.evals API: sessions, results, custom judges and persona LLMs, and suites.
 
-Everything the `pipecat eval` CLI does is available as a library under `pipecat.evals`. Use it to run evals from your own test runner (pytest, a CI script, a custom dashboard), to build scenarios in code instead of YAML, or to customize pieces like the judge LLM.
+Everything the `pipecat eval` CLI does is available as a library under `pipecat.evals`. Use it to run evals from your own test runner (pytest, a CI script, a custom dashboard), to build scenarios in code instead of YAML, or to customize pieces like the judge LLM or the persona LLM.
 
-## Running a scenario
+Each kind of scenario has its own session class: `EvalScriptSession` runs a [scripted scenario](/pipecat/evals/scripted-scenarios) and returns an `EvalScriptResult`, and `EvalSimulationSession` runs a [simulation](/pipecat/evals/simulated-scenarios) and returns an `EvalSimulationResult`. Both are built the same way and share one `on_progress` event.
 
-`load_scenario_file()` parses a scenario file of either kind (scripted or simulation), and `EvalSession.from_scenario()` builds a ready-to-run session for it, constructing the judge, user speech, and transcriber the scenario calls for:
+<Note>
+  `pipecat.evals` itself exports nothing. Import each name from the submodule
+  that defines it, as the examples below do.
+</Note>
+
+## Running a scripted scenario
+
+`EvalScriptScenario.load()` parses a scenario file, and `EvalScriptSession.from_scenario()` builds a ready-to-run session, constructing the judge, user speech, and transcriber the scenario calls for:
 
 ```python
 import asyncio
 
-from pipecat.evals.scenario import load_scenario_file
-from pipecat.evals.session import EvalSession
+from pipecat.evals.script import EvalScriptScenario
+from pipecat.evals.script_session import EvalScriptSession
 
 
 async def main():
-    scenario = load_scenario_file("scenarios/capital_question.yaml")
-    session = EvalSession.from_scenario(scenario, "ws://localhost:7860")
+    scenario = EvalScriptScenario.load("scenarios/capital_question.yaml")
+    session = EvalScriptSession.from_scenario(scenario, "ws://localhost:7860")
     result = await session.run()
 
     if result.passed:
@@ -12405,54 +13007,27 @@ asyncio.run(main())
 
 The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`.
 
-### Session params
-
-How a run behaves — timeouts, recording, caching, and teardown — is configured with `EvalSessionParams`:
-
-```python
-from pipecat.evals.session import EvalSession, EvalSessionParams
-
-params = EvalSessionParams(
-    default_timeout_ms=30000,  # 30s per-expectation budget
-    stop_bot=True,             # cancel the bot's pipeline on teardown
-    use_cache=False,           # re-synthesize user audio every run
-)
-session = EvalSession.from_scenario(scenario, "ws://localhost:7860", params=params)
-```
-
-Available parameters:
-
-| Parameter            | Default                        | Description                                                                         |
-| -------------------- | ------------------------------ | ----------------------------------------------------------------------------------- |
-| `connect_timeout_s`  | `5.0`                          | How long to wait for the bot to accept the WebSocket connection before giving up.   |
-| `default_timeout_ms` | `60000`                        | Latency budget for expectations without their own `within_ms` (scripted scenarios). |
-| `record_path`        | `None`                         | Where to save the conversation audio, or `None`.                                    |
-| `cache_dir`          | `<user-cache-dir>/pipecat/tts` | Directory for cached synthesized user audio.                                        |
-| `use_cache`          | `True`                         | When False, ignore cached user audio and force fresh synthesis.                     |
-| `stop_bot`           | `False`                        | When True, ask the bot to cancel its pipeline and exit on teardown.                 |
-| `trigger_disconnect` | `False`                        | When True, fire the bot's `on_client_disconnected` handler on disconnect.           |
-
 ### The result
 
-`run()` returns an `EvalScriptResult` for a scripted scenario or an `EvalSimulationResult` for a simulation. Both share the same base fields:
+`run()` returns an `EvalScriptResult`:
 
 | Field           | Description                                                                                         |
 | --------------- | --------------------------------------------------------------------------------------------------- |
 | `scenario_name` | Name of the scenario that ran.                                                                      |
 | `passed`        | Whether every assertion passed.                                                                     |
 | `failures`      | The failed assertions, each with the turn index, expectation index, event name, reason, and `kind`. |
-| `turns`         | One `EvalTurnResult` per scenario turn, in order. See below.                                        |
+| `turns`         | One `EvalScriptTurnResult` per scenario turn, in order. See below.                                  |
 | `duration_ms`   | Wall-clock time the run took.                                                                       |
 | `events_seen`   | Every semantic event observed, for diagnostics.                                                     |
 | `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).            |
 | `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.          |
 
-Each `EvalTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, and its `duration_ms`. `EvalResult.failures` is these turns' failures flattened, plus any that belong to no turn — a failed connect, say.
+Each `EvalScriptTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, and its `duration_ms`. `EvalScriptResult.failures` is these turns' failures flattened, plus any that belong to no turn — a failed connect, say.
 
 `not_run` is deliberately distinct from a pass, so a turn the scenario never reached doesn't inflate a rate:
 
 ```python
-result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
+result = await EvalScriptSession.from_scenario(scenario, "ws://localhost:7860").run()
 
 scored = [t for t in result.turns if t.status != "not_run"]
 print(f"{sum(1 for t in scored if t.status == 'passed')}/{len(scored)} turns")
@@ -12465,16 +13040,97 @@ This maps cleanly onto a pytest test:
 ```python
 import pytest
 
-from pipecat.evals.scenario import load_scenario_file
-from pipecat.evals.session import EvalSession
+from pipecat.evals.script import EvalScriptScenario
+from pipecat.evals.script_session import EvalScriptSession
 
 
 @pytest.mark.asyncio
 async def test_capital_question():
-    scenario = load_scenario_file("scenarios/capital_question.yaml")
-    result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
+    scenario = EvalScriptScenario.load("scenarios/capital_question.yaml")
+    result = await EvalScriptSession.from_scenario(scenario, "ws://localhost:7860").run()
     assert result.passed, "\n".join(str(f) for f in result.failures)
 ```
+
+## Running a simulation
+
+A simulation loads and runs the same way. `EvalSimulationSession.from_scenario()` builds the persona LLM from the file's `simulator:` block and the judge from its `judge:` block, plus the user TTS and the transcriber in audio mode:
+
+```python
+import asyncio
+
+from pipecat.evals.simulation import EvalSimulationScenario
+from pipecat.evals.simulation_session import EvalSimulationSession
+
+
+async def main():
+    simulation = EvalSimulationScenario.load("scenarios/simulated/book_table.yaml")
+    session = EvalSimulationSession.from_scenario(simulation, "ws://localhost:7860")
+    result = await session.run()
+
+    if result.passed:
+        print(f"PASS: {result.reason}")
+    else:
+        print(f"FAIL: {result.failure}")
+    for metric in result.metrics:
+        print(f"  {metric.name}: {metric.score} ({metric.reason})")
+
+
+asyncio.run(main())
+```
+
+A session runs the simulation once. The `runs:` field is honored by the [suite](#orchestrating-suites), which spawns a fresh agent for each run.
+
+### The result
+
+`run()` returns an `EvalSimulationResult`:
+
+| Field             | Description                                                                                                                                         |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `simulation_name` | Name of the simulation that ran.                                                                                                                    |
+| `passed`          | Whether the run completed, the judge said `success:` was met, and no metric with a threshold fell short.                                            |
+| `succeeded`       | The judge's verdict on `success:` alone.                                                                                                            |
+| `reason`          | The judge's reason for its verdict, or the error.                                                                                                   |
+| `failure`         | Why the run did not pass, or `None`: the error, then `goal not met: ...`, then the first failed metric.                                             |
+| `error`           | Set when the run did not complete (a failed connect, a harness error). Such a run is neither a goal success nor a goal failure.                     |
+| `metrics`         | One `EvalSimulationMetricScore` per metric, in the order the file lists them. See below.                                                            |
+| `messages`        | The conversation, the persona's turns as `user` messages and the agent's as `assistant`. The `assistant` messages are the turns the metrics scored. |
+| `turns`           | The persona's turn count.                                                                                                                           |
+| `ended_by`        | How the run ended: `end_call`, `bot`, `max_turns`, `max_duration`, or `error`.                                                                      |
+| `end_call`        | The persona's own `end_call` claim (`success`, `reason`) when it made one. Advisory: the judge decides `succeeded`.                                 |
+| `duration_ms`     | Wall-clock time the run took.                                                                                                                       |
+| `events_seen`     | Every semantic event observed, for diagnostics.                                                                                                     |
+| `debug_log`       | The harness's timestamped decision trace.                                                                                                           |
+
+Each `EvalSimulationMetricScore` carries the metric's `name`, its `score` (the share of turns the judge said yes to for a judged metric, `1.0` or `0.0` for a measured one, `None` when there was nothing to judge or measure), whether it `passed`, its `reason`, its `min_quality`, its measured `value` (the seconds, words, turns, or number of calls), and for a judged metric one `EvalSimulationTurnVerdict` per agent turn with the 1-based `turn`, whether it `passed`, and the judge's `reason`:
+
+```python
+bot_turns = [m["content"] for m in result.messages if m["role"] == "assistant"]
+for metric in result.metrics:
+    for verdict in metric.verdicts:
+        if not verdict.passed:
+            said = bot_turns[verdict.turn - 1]
+            print(f"{metric.name} turn {verdict.turn}: {said!r}: {verdict.reason}")
+```
+
+## Loading either kind
+
+`load_scenario_file()` reads a file as whichever kind it is, so a list mixing both kinds loads through one call. `EvalKind` names the two kinds:
+
+```python
+from pipecat.evals.scenario import EvalKind, load_scenario_file
+from pipecat.evals.script import EvalScriptScenario
+from pipecat.evals.script_session import EvalScriptSession
+from pipecat.evals.simulation_session import EvalSimulationSession
+
+
+async def run_any(path: str, bot_url: str):
+    scenario = load_scenario_file(path)
+    if isinstance(scenario, EvalScriptScenario):
+        return await EvalScriptSession.from_scenario(scenario, bot_url).run()
+    return await EvalSimulationSession.from_scenario(scenario, bot_url).run()
+```
+
+A file with both `turns:` and `persona:`, or neither, raises a `ValueError` naming the problem.
 
 ## Building scenarios in code
 
@@ -12485,7 +13141,6 @@ from pipecat.evals.script import EvalExpectation, EvalScriptScenario, EvalScript
 
 scenario = EvalScriptScenario(
     name="capital_question",
-    bot_audio=False,
     turns=[
         EvalScriptTurn(
             user="What is the capital of Germany?",
@@ -12506,15 +13161,38 @@ scenario = EvalScriptScenario(
   `response` only when you also configure audio judging).
 </Note>
 
-## Customizing the judge
+A simulation is built the same way. The `simulator` block is a plain mapping with the same shape as the YAML, and each metric is an `EvalSimulationMetric` with either a `criterion` or a `measure`:
 
-`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` works with any Pipecat LLM service backed by an OpenAI-compatible API:
+```python
+from pipecat.evals.simulation import EvalSimulationMetric, EvalSimulationScenario
+
+simulation = EvalSimulationScenario(
+    name="book_table",
+    simulator={"service": "openai", "model": "gpt-4o-mini"},
+    persona="Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number when asked.",
+    goal="Book a table for two at 6 PM, then end the call.",
+    success="the bot confirmed a reservation for two at 6 PM",
+    metrics=[
+        EvalSimulationMetric(
+            name="politeness",
+            criterion="the reply is courteous, never curt or dismissive",
+            min_quality=1.0,
+        ),
+        EvalSimulationMetric(name="latency", measure="latency", max_value=5.0),
+    ],
+    max_turns=8,
+)
+```
+
+## Customizing the judge and the persona
+
+`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` works with any Pipecat LLM service backed by an OpenAI-compatible API, and the same `judge=` argument exists on both session classes:
 
 ```python
 import os
 
 from pipecat.evals.judge import EvalJudge
-from pipecat.evals.session import EvalSession
+from pipecat.evals.script_session import EvalScriptSession
 from pipecat.services.openai.llm import OpenAILLMService
 
 llm = OpenAILLMService(
@@ -12522,23 +13200,84 @@ llm = OpenAILLMService(
     settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
 )
 
-session = EvalSession.from_scenario(
+session = EvalScriptSession.from_scenario(
     scenario,
     "ws://localhost:7860",
     judge=EvalJudge(llm),
 )
 ```
 
-The same injection points exist for the user's synthesized voice (`user_tts=`, a `CachingTTSService` wrapping any `TTSService`) and the transcriber used for the agent's spoken audio (`bot_stt=`, any `STTService`). The services can be local models or HTTP-based; WebSocket-streaming services are rejected, since they need a running pipeline to manage their connection lifecycle.
+A simulation session also takes `persona_llm=`, the LLM that plays the caller. It runs inside the harness's own pipeline, so it can be any Pipecat `LLMService` that supports function calling, which the persona needs to hang up with its `end_call` tool:
+
+```python
+session = EvalSimulationSession.from_scenario(
+    simulation,
+    "ws://localhost:7860",
+    persona_llm=OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+    ),
+    judge=EvalJudge(llm),
+)
+```
+
+Passing `judge=None` explicitly to the `EvalSimulationSession` constructor runs the conversation without a judge: measured metrics are still computed, and the run reports no verdict on the goal.
+
+### Custom audio services
+
+Both session classes take `user_tts=` for the user's synthesized voice and `bot_stt=` for transcribing the agent's spoken audio. `bot_stt` is any Pipecat `STTService`. `user_tts` is a `CachingTTSService`, which wraps a `TTSService` and caches its audio on disk so repeated turns don't re-synthesize; give it a `cache_key` that identifies the voice configuration:
+
+```python
+import os
+
+from pipecat.evals.tts import CachingTTSService
+from pipecat.services.fal.stt import FalSTTService
+from pipecat.services.rime.tts import RimeHttpTTSService
+
+user_tts = CachingTTSService(
+    RimeHttpTTSService(
+        api_key=os.environ["RIME_API_KEY"],
+        settings=RimeHttpTTSService.Settings(voice="luna"),
+        sample_rate=16000,
+    ),
+    cache_key="rime-luna-16000",
+)
+
+session = EvalScriptSession.from_scenario(
+    scenario,
+    "ws://localhost:7860",
+    user_tts=user_tts,
+    bot_stt=FalSTTService(api_key=os.environ["FAL_KEY"]),
+)
+```
+
+The wrapped services can be local models or HTTP-based; WebSocket-streaming services are rejected, since they need a running pipeline to manage their connection lifecycle. For the YAML-only route, the `factory:` escape hatch in the [scripted configuration reference](/pipecat/evals/scripted-scenarios#custom-services-with-factory) reaches the same services without code.
 
 ## Observing progress
 
-Register an `on_progress` event handler to receive notifications as each turn and expectation resolves:
+Both session classes emit an `on_progress` event as the conversation advances. A scripted session reports an `EvalScriptTurnProgress` as each turn and expectation resolves; a simulation session reports an `EvalSimulationProgress` for each line as it is spoken, with a `status` of `bot` or `user`, the `text`, and the persona's `turn` count so far, then one with a `status` of `ended` whose `text` says how the conversation ended:
 
 ```python
-from pipecat.evals.session import EvalSession
+from pipecat.evals.results import EvalSimulationProgress
+from pipecat.evals.simulation_session import EvalSimulationSession
 
-session = EvalSession.from_scenario(scenario, url)
+session = EvalSimulationSession.from_scenario(simulation, url)
+
+
+@session.event_handler("on_progress")
+async def on_progress(session, progress: EvalSimulationProgress):
+    if progress.status == "ended":
+        print(f"ended by {progress.text} after {progress.turn} turn(s)")
+    else:
+        print(f"{progress.status}: {progress.text}")
+```
+
+For a scripted session the record has `turn_index`, `status`, `event_name`, and `detail`:
+
+```python
+from pipecat.evals.script_session import EvalScriptSession
+
+session = EvalScriptSession.from_scenario(scenario, url)
 
 
 @session.event_handler("on_progress")
@@ -12553,13 +13292,13 @@ async def on_progress(session, progress):
 
 ## Orchestrating suites
 
-`EvalManifest` and `EvalSuite` are the library behind `pipecat eval suite`: the suite spawns each agent with its eval transport on its own port, runs its scenarios, and executes several runs concurrently:
+`EvalManifest` and `EvalSuite` are the library behind `pipecat eval suite`: the suite spawns each agent with its eval transport on its own port, runs its scenarios of either kind, each in its own process, and executes several runs concurrently:
 
 ```python
 import asyncio
 from pathlib import Path
 
-from pipecat.evals.session import EvalSessionParams
+from pipecat.evals.scenario import EvalKind
 from pipecat.evals.suite import EvalManifest, EvalSuite
 
 
@@ -12567,34 +13306,49 @@ async def main():
     manifest = EvalManifest.load("manifest.yaml")
     suite = EvalSuite(manifest)
 
-    # Optionally narrow the runs, like the CLI's -p / -s flags.
-    suite.filter(pattern="support")
+    # Optionally narrow the runs, like the CLI's -p / -s / -k flags.
+    suite.filter(pattern="support", kind=EvalKind.SIMULATION)
 
     @suite.event_handler("on_update")
     async def on_update(suite, run):
-        print(run.bot, run.scenario, run.status)
+        print(run.bot, run.scenario, run.kind, run.status)
 
-    params = EvalSessionParams(default_timeout_ms=30000, use_cache=True)
-    await suite.run(Path("eval-runs/logs"), params=params)
+    await suite.run(Path("eval-runs/logs"))
 
     for run in suite.runs:
         verdict = run.error or ("passed" if run.result and run.result.passed else "failed")
-        print(f"{run.bot} / {run.scenario}: {verdict}")
+        print(f"{run.bot} / {run.scenario} #{run.attempt}: {verdict}")
 
 
 asyncio.run(main())
 ```
 
-Each run is mutated in place as it executes (`status`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`.
+Each run is mutated in place as it executes (`status`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`. A run's `kind` is `script` or `simulation`, and its `result` is the matching result type. A simulation appears once per attempt: `attempts` is the manifest's `repeat`, or the simulation's own `runs`, and `sweep` says which. A sweep is a measurement, where a failure is data; a simulation's own runs are a requirement, where every attempt must pass.
 
 <Warning>
   The `on_update` callback parameter to `suite.run()` is deprecated since 1.9.0
-  and will be removed in 2.0.0. Use the `on_update` event handler instead. The
-  `use_cache` and `default_timeout_ms` keyword arguments are also deprecated
-  since 1.9.0. Use `params=EvalSessionParams(...)` instead.
+  and will be removed in 2.0.0. Use the `on_update` event handler instead.
 </Warning>
 
-`EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, and so on), mirroring the CLI flags.
+`EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, `repeat`, and so on), mirroring the CLI flags.
+
+## Migrating from 1.8
+
+Simulations arrived in 1.9.0 with a rename of the scripted API, so the two kinds sit side by side. The old names keep working until 2.0.0 and emit a `DeprecationWarning`:
+
+| Deprecated                    | Use instead                                      |
+| ----------------------------- | ------------------------------------------------ |
+| `pipecat.evals.harness`       | `pipecat.evals.script_session`                   |
+| `EvalSession`                 | `EvalScriptSession`                              |
+| `EvalScenario`                | `EvalScriptScenario` (in `pipecat.evals.script`) |
+| `EvalTurn`                    | `EvalScriptTurn`                                 |
+| `EvalResult`                  | `EvalScriptResult` (in `pipecat.evals.results`)  |
+| `EvalTurnResult`              | `EvalScriptTurnResult`                           |
+| `EvalTurnProgress`            | `EvalScriptTurnProgress`                         |
+| `RTVIEvalSerializer`          | `EvalSerializer`                                 |
+| `on_progress=` / `on_update=` | The `on_progress` / `on_update` event handlers   |
+
+`EvalSpeech` and `EvalTranscriber` are gone: pass `user_tts=` and `bot_stt=` as shown [above](#custom-audio-services). `SEND_CHUNK_MS` was removed with no replacement, since the harness now paces the user's audio through its own output transport.
 
 # The Eval Loop
 Source: https://docs.pipecat.ai/pipecat/evals/the-eval-loop.md
@@ -12607,10 +13361,10 @@ Think of it as a REPL for agent behavior: the assistant writes a change, evals i
 
 ## The loop
 
-1. **Describe the behavior as a scenario.** A scenario file is an executable specification: the conversation, the expected events, and the criteria a response must meet.
+1. **Describe the behavior as a scenario.** A scenario file is an executable specification. A [scripted scenario](/pipecat/evals/scripted-scenarios) is the conversation, the expected events, and the criteria a response must meet; a [simulation](/pipecat/evals/simulated-scenarios) is a caller with a goal, what counts as success, and the quality every reply must keep.
 2. **The assistant changes the agent.** A prompt edit, a new tool, a pipeline change.
 3. **The assistant runs the evals.** One command, either against a running agent (`pipecat eval run`) or letting the suite spawn the agent itself (`pipecat eval suite`).
-4. **The assistant reads the result.** A non-zero exit code, a per-assertion failure message ("turn 1 expectation 0 (llm_response): judge said no: ..."), and a full decision trace in `<scenario>.eval.log`.
+4. **The assistant reads the result.** A non-zero exit code, a per-assertion failure message ("turn 1 expectation 0 (llm_response): judge said no: ...") or a simulation's verdict ("goal not met: ..." or the metric that fell short, with the judge's reason for each reply it said no to), and a full decision trace in `<scenario>.eval.log`.
 5. **Repeat until green.**
 
 Steps 2 through 5 need no human in the loop. You review the final diff with the evidence that it works attached.
@@ -12624,6 +13378,7 @@ The framework was built to be driven by tools, not just humans:
 - **Actionable failures.** Failures name the turn, the expectation, and the reason, including what the judge said. The `.eval.log` decision trace shows every event the harness observed, so "why did this fail" is answerable from files.
 - **Suites are self-contained.** `pipecat eval suite` spawns the agents itself, so an autonomous loop doesn't need to manage processes: edit, run one command, read the result.
 - **Text mode is fast and cheap.** Iterating on prompts and logic skips STT and TTS entirely, so an assistant can afford to run the evals after every change.
+- **Simulations find, scripts pin.** A failing simulation shows where the agent lost the caller, with the conversation printed under `-v`. The assistant reproduces that exchange as a scripted scenario, fixes against it, and keeps both.
 
 ## Setting up your project
 
@@ -12632,17 +13387,21 @@ Keep scenarios in the repo next to the agent and tell your assistant how to run 
 ```markdown
 ## Behavioral evals
 
-Evals live in `scenarios/`. To verify any change to the agent's behavior:
+Evals live in `scenarios/`: scripted scenarios in `scenarios/scripted/`
+and simulations in `scenarios/simulated/`. To verify any change to the
+agent's behavior:
 
 1. Start the agent: `uv run bot.py -t eval` (serves ws://localhost:7860)
-2. Run the evals: `pipecat eval run scenarios/`
+2. Run the evals: `pipecat eval run scenarios/scripted/ scenarios/simulated/`
 
-The command exits non-zero on failure and prints each failed assertion.
-Each scenario writes a decision trace to `<scenario>.eval.log`; read it
-to understand a failure before changing code.
+The command exits non-zero on failure and prints each failed assertion,
+or for a simulation the judge's verdict. Pass `-v` to see a simulation's
+conversation. Each scenario writes a decision trace to
+`<scenario>.eval.log`; read it to understand a failure before changing code.
 
-When you add or change agent behavior, add or update a scenario in
-`scenarios/` to cover it.
+When you add or change agent behavior, add or update a scripted scenario
+to cover it. When a simulation fails, reproduce the exchange where the
+agent lost the caller as a scripted scenario and fix against that.
 ```
 
 With that in place, a request like this becomes fully verifiable:
@@ -12671,13 +13430,16 @@ turns:
 
 This is test-driven development for agent behavior, with the judge LLM absorbing the fuzziness that makes conversational output hard to assert on with string matching.
 
+A simulation works as an acceptance criterion for a whole flow. "A caller who wants a table for two at 6 PM gets one booked, every reply stays polite, and the agent calls `book_table`" is one file with a `persona:`, a `goal:`, a `success:`, and two `metrics:`, and "make this pass three runs in a row" is the task.
+
 ## Guardrails
 
 A few practices keep autonomous loops honest:
 
-- **Review scenario changes like code.** An assistant that can edit scenarios can also weaken them. Failing evals should usually be fixed in the agent, not in the scenario.
+- **Review scenario changes like code.** An assistant that can edit scenarios can also weaken them, by loosening an `eval:` criterion, a `success:`, or a metric's `min_quality`. Failing evals should usually be fixed in the agent, not in the scenario.
 - **Keep a regression set.** As behaviors accumulate, so should scenarios. Run the full set (or a suite) before merging, not just the scenario being worked on.
 - **Gate merges in CI.** `pipecat eval suite manifest.yaml` in CI makes "the evals pass" a property of the branch, whoever (or whatever) wrote it. See [Eval Suites](/pipecat/evals/suites).
+- **Run simulations more than once.** A persona says something different each run, so set `runs: 3` and let `pipecat eval suite` require every run to pass rather than trusting one.
 - **Use audio mode for the final check.** Iterate in text mode for speed, then run the audio variants before release to cover the full STT, LLM, and TTS path.
 
 ## Next steps
@@ -31863,7 +32625,6 @@ Speech-to-Text services receive and audio input and output transcriptions.
 | [Gradium](/api-reference/server/services/stt/gradium)           | `uv add "pipecat-ai[gradium]"`                                                | Pipecat    |
 | [Groq (Whisper)](/api-reference/server/services/stt/groq)       | `uv add "pipecat-ai[groq]"`                                                   | Pipecat    |
 | [Hakim](/api-reference/server/services/stt/hakim)               | `uv pip install git+https://github.com/tryHakimAI/hakim-pipecat.git`          | Community  |
-| [Meta](/api-reference/server/services/stt/meta)                 | `uv add "pipecat-ai[meta]"`                                                   | Pipecat    |
 | [Mistral](/api-reference/server/services/stt/mistral)           | `uv add "pipecat-ai[mistral]"`                                                | Pipecat    |
 | [Moonshine](/api-reference/server/services/stt/moonshine)       | `uv add "pipecat-ai[moonshine]"`                                              | Pipecat    |
 | [NVIDIA](/api-reference/server/services/stt/nvidia)             | `uv add "pipecat-ai[nvidia]"`                                                 | Pipecat    |
@@ -38081,11 +38842,9 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | ---------------------- | -------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`                | `str`                      | `"universal-3-5-pro"` | STT model identifier. Set to `"universal-3-5-pro"` or `"universal-3-6-pro"` (Universal-3 Pro models). `universal-3-6-pro` is `universal-3-5-pro` upgraded with the same feature set. _(Inherited from base STT settings.)_                                                                                                                                                                                     |
 | `language`             | `Language \| str`          | `Language.EN`         | Language for speech recognition. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                         |
-| `prompt`               | `str \| None`              | `None`                | A natural-language description of what the audio is about: the domain, the scenario, or details of the conversation. Prepended to the model's system prompt to guide transcription.                                                                                                                                                                                                                            |
+| `prompt`               | `str \| None`              | `None`                | Custom transcription instruction prepended to the model's system prompt. When set, `language` is ignored — state the language in the prompt instead.                                                                                                                                                                                                                                                           |
 | `keyterms_prompt`      | `List[str]`                | `None`                | Key terms or phrases to bias the decoder toward.                                                                                                                                                                                                                                                                                                                                                               |
 | `conversation_context` | `str \| List[str] \| None` | `None`                | Prior turns from the same conversation, oldest first, giving the model the surrounding dialogue for better continuity and proper-noun consistency across a multi-turn conversation. A single string is treated as one turn. Setting this explicitly turns off the service's automatic context buffer and sends exactly this value; leave it unset to let the service manage context (see `max_context_turns`). |
-| `language_codes`       | `List[Language] \| None`   | `None`                | Declared audio languages for multilingual or code-switching audio (e.g. `[Language.EN, Language.ES]`). A single-element list pins one language. Regional variants resolve to their base code and duplicates are dropped, preserving declaration order. Bound in preference to the single `language` setting when both are set. Defaults to unset (the single `language` is used).                              |
-| `timestamps`           | `bool \| None`             | `None`                | Whether to compute per-word `start`/`end` timestamps, returned on the `words` of the transcription result, at a small added latency. Left unset by default, so the API default of `False` (no timestamps) applies.                                                                                                                                                                                             |
 
 ## Usage
 
@@ -41944,195 +42703,6 @@ Tested with Pipecat v1.5.0. Check the [source
 repository](https://github.com/tryHakimAI/hakim-pipecat) for the latest tested
 version and changelog.
 
-# Meta Speech-to-Text
-Source: https://docs.pipecat.ai/api-reference/server/services/stt/meta.md
-
-Streaming STT with MetaSTTService: Muse Voice realtime transcription with 25 language support and three segmentation modes.
-
-## Overview
-
-`MetaSTTService` provides real-time speech-to-text using Meta's Muse Voice WebSocket API. The service streams audio to Meta's realtime transcription endpoint and emits interim and final transcription frames.
-
-The API key is sent in the handshake frame rather than an HTTP header, and the session's configuration is fixed once the server accepts the handshake, so a settings change triggers a reconnection.
-
-<CardGroup cols={2}>
-  <Card
-    title="Meta STT API Reference"
-    icon="code"
-    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.meta.stt.html"
-  >
-    Pipecat's API methods for Meta STT
-  </Card>
-  <Card
-    title="Voice Example"
-    icon="play"
-    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-meta.py"
-  >
-    Complete voice bot example with Meta STT
-  </Card>
-  <Card
-    title="Transcription Example"
-    icon="play"
-    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/transcription/transcription-meta.py"
-  >
-    Transcription-only example with Meta STT
-  </Card>
-  <Card
-    title="Meta Voice API Documentation"
-    icon="book"
-    href="https://dev.meta.ai/docs/api-reference/voice/realtime"
-  >
-    Official Meta Muse Voice API documentation
-  </Card>
-</CardGroup>
-
-## Installation
-
-```bash
-uv add "pipecat-ai[meta]"
-```
-
-## Prerequisites
-
-Before using `MetaSTTService`, you need:
-
-1. **Meta Account**: Access to the Meta Model API
-2. **API Key**: A Meta Model API key for authentication
-
-### Required Environment Variables
-
-- `META_API_KEY`: Your Meta Model API key
-
-## Configuration
-
-<ParamField path="api_key" type="str" required>
-  Meta Model API key, sent as a Bearer token in the handshake.
-</ParamField>
-
-<ParamField path="url" type="str" default="wss://api.meta.ai/v1/asr/realtime">
-  WebSocket endpoint URL for the Meta STT API.
-</ParamField>
-
-<ParamField path="sample_rate" type="int" default="None">
-  Audio sample rate in Hz. When `None`, uses the pipeline's configured sample
-  rate. Audio at anything other than 24000 is resampled to 16000, the only other
-  rate the API accepts.
-</ParamField>
-
-<ParamField path="settings" type="MetaSTTService.Settings" default="None">
-  Runtime-updatable settings overriding defaults. See [Settings](#settings)
-  below.
-</ParamField>
-
-<ParamField path="ttfs_p99_latency" type="float" default="META_TTFS_P99">
-  P99 latency from speech end to final transcript in seconds. Override for your
-  deployment. See https://github.com/pipecat-ai/stt-benchmark
-</ParamField>
-
-## Settings
-
-Runtime-configurable settings passed via the `settings` constructor argument using `MetaSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
-
-| Parameter             | Type              | Default                       | Description                                                                                                                                                  |
-| --------------------- | ----------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `model`               | `str`             | `"muse-voice-transcribe-1.0"` | Meta model to use. _(Inherited from base STT settings.)_                                                                                                     |
-| `language`            | `Language \| str` | `Language.EN`                 | Single language to bias recognition toward. Replaced by `language_bias` when set. Leave both unset for auto-detection. _(Inherited from base STT settings.)_ |
-| `language_bias`       | `list[Language]`  | `None`                        | Languages to bias recognition toward, for speech that switches between them. Replaces the single `language` bias when set.                                   |
-| `mode`                | `str`             | `"ENDPOINTING"`               | Segmentation mode: `"ENDPOINTING"` for model-driven turn boundaries, `"PUSH_TO_TALK"` for client-driven turns, or `"DIARIZATION"` for speaker attribution.   |
-| `keywords`            | `list[str]`       | `None`                        | Terms to bias recognition toward. Biasing raises the odds a term is recognized but doesn't guarantee its spelling.                                           |
-| `emit_audio_progress` | `bool`            | `False`                       | Whether the server reports progress for every processed audio chunk.                                                                                         |
-| `zdr_override`        | `bool \| None`    | `None`                        | Forces metadata-only logging when `True`, or allows content retention when `False`. Leave unset to use the account's setting.                                |
-
-### Supported Languages
-
-Meta STT supports 25 languages for recognition biasing:
-
-Arabic, Bengali, German, English, Spanish, French, Hebrew, Hindi, Indonesian, Italian, Japanese, Kannada, Korean, Marathi, Malay, Dutch, Polish, Portuguese, Tamil, Telugu, Thai, Tagalog, Turkish, Vietnamese, Mandarin Chinese
-
-## Usage
-
-### Basic Setup
-
-```python
-from pipecat.services.meta.stt import MetaSTTService
-import os
-
-stt = MetaSTTService(
-    api_key=os.getenv("META_API_KEY"),
-)
-```
-
-### With Custom Settings
-
-```python
-from pipecat.services.meta.stt import MetaSTTService
-from pipecat.transcriptions.language import Language
-import os
-
-stt = MetaSTTService(
-    api_key=os.getenv("META_API_KEY"),
-    settings=MetaSTTService.Settings(
-        language=Language.ES,
-        keywords=["Pipecat", "AI"],
-    ),
-)
-```
-
-### Multilingual Mode
-
-For speech that switches between languages, use `language_bias`:
-
-```python
-from pipecat.services.meta.stt import MetaSTTService
-from pipecat.transcriptions.language import Language
-import os
-
-stt = MetaSTTService(
-    api_key=os.getenv("META_API_KEY"),
-    settings=MetaSTTService.Settings(
-        language_bias=[Language.EN, Language.ES, Language.FR],
-    ),
-)
-```
-
-### Push-to-Talk Mode
-
-For client-controlled turn boundaries:
-
-```python
-from pipecat.services.meta.stt import MetaSTTService
-import os
-
-stt = MetaSTTService(
-    api_key=os.getenv("META_API_KEY"),
-    settings=MetaSTTService.Settings(
-        mode="PUSH_TO_TALK",
-    ),
-)
-```
-
-## Notes
-
-- **Endpointing modes**: In the default `ENDPOINTING` mode, the server marks turn boundaries itself, emitting `speechStart`, cumulative partial transcripts, `speechEnd`, and finally `speechComplete` with post-processed text. Those boundaries segment transcripts only — Pipecat's own VAD and turn strategies still decide when the user's turn ends. In `PUSH_TO_TALK` mode, the client controls turn boundaries. In `DIARIZATION` mode, turns are attributed to speakers.
-- **Audio resampling**: The API accepts only 16 kHz or 24 kHz audio. Audio at 24 kHz is sent unchanged; any other sample rate is resampled to 16 kHz automatically.
-- **Settings updates**: Any settings change triggers a reconnection because Meta fixes the session's configuration when it accepts the handshake.
-- **Session duration**: Sessions are capped at 60 minutes. The server closes the socket when a session reaches that limit, and the base class reconnects into a fresh one.
-- **Language biasing**: Meta biases recognition on English language names (e.g., `"English"`, `"Mandarin Chinese"`) rather than codes. An unmapped or unrecognized language degrades to auto-detection.
-
-## Event Handlers
-
-Supports the standard [service connection events](/api-reference/server/events/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`).
-
-```python
-@stt.event_handler("on_connected")
-async def on_connected(service):
-    print(f"Connected to Meta STT")
-
-@stt.event_handler("on_disconnected")
-async def on_disconnected(service):
-    print(f"Disconnected from Meta STT")
-```
-
 # Mistral Speech-to-Text
 Source: https://docs.pipecat.ai/api-reference/server/services/stt/mistral.md
 
@@ -45554,15 +46124,15 @@ Before using xAI STT services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `XAISTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter         | Type              | Default       | Description                                                                                                                                                 |
-| ----------------- | ----------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`           | `str`             | `None`        | Not applicable for xAI STT. _(Inherited from base STT settings.)_                                                                                           |
-| `language`        | `Language \| str` | `Language.EN` | Recognition language. Supports: AR, BN, DE, EN, ES, FR, HI, ID, IT, JA, KO, PT, RU, TR, VI, ZH. _(Inherited from base STT settings.)_                       |
-| `interim_results` | `bool`            | `True`        | When True, partial transcripts are emitted approximately every 500ms.                                                                                       |
-| `endpointing`     | `int \| None`     | `None`        | Silence duration in milliseconds that triggers the speech-final event carrying the utterance's `TranscriptionFrame`. Range 0-5000. Server default is 400ms. |
-| `multichannel`    | `bool \| None`    | `None`        | When True, transcribes each interleaved channel independently. Requires `channels` >= 2.                                                                    |
-| `channels`        | `int \| None`     | `None`        | Number of interleaved channels (2-8). Required when `multichannel` is True.                                                                                 |
-| `diarize`         | `bool \| None`    | `None`        | When True, the server attaches a `speaker` field to each word identifying the detected speaker.                                                             |
+| Parameter         | Type              | Default       | Description                                                                                                                           |
+| ----------------- | ----------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`           | `str`             | `None`        | Not applicable for xAI STT. _(Inherited from base STT settings.)_                                                                     |
+| `language`        | `Language \| str` | `Language.EN` | Recognition language. Supports: AR, BN, DE, EN, ES, FR, HI, ID, IT, JA, KO, PT, RU, TR, VI, ZH. _(Inherited from base STT settings.)_ |
+| `interim_results` | `bool`            | `True`        | When True, partial transcripts are emitted approximately every 500ms.                                                                 |
+| `endpointing`     | `int \| None`     | `None`        | Silence duration in milliseconds that triggers a speech-final event. Range 0-5000. Server default is 10ms.                            |
+| `multichannel`    | `bool \| None`    | `None`        | When True, transcribes each interleaved channel independently. Requires `channels` >= 2.                                              |
+| `channels`        | `int \| None`     | `None`        | Number of interleaved channels (2-8). Required when `multichannel` is True.                                                           |
+| `diarize`         | `bool \| None`    | `None`        | When True, the server attaches a `speaker` field to each word identifying the detected speaker.                                       |
 
 ## Usage
 
@@ -45613,7 +46183,7 @@ stt = XAISTTService(
 
 ## Notes
 
-- **Connection management**: The WebSocket connection is persistent and automatically reconnects if it drops mid-session. Audio is streamed continuously and the server emits `transcript.partial` events with `is_final` and `speech_final` flags. Interim results (`is_final=false`) and chunk finals (`is_final=true, speech_final=false`) are pushed as `InterimTranscriptionFrame`. Only the utterance final (`speech_final=true`) is pushed as `TranscriptionFrame`, because it restates the entire utterance, including the text of every earlier chunk final.
+- **Connection management**: The WebSocket connection is persistent and automatically reconnects if it drops mid-session. Audio is streamed continuously and the server emits `transcript.partial` events with `is_final` and `speech_final` flags to mark utterance boundaries.
 - **Language support**: xAI STT accepts two-letter language codes. When set, the server applies Inverse Text Normalization for improved accuracy.
 - **Audio encoding**: Supports PCM (signed 16-bit LE), μ-law, and A-law encoding formats. PCM is recommended for best quality.
 - **Settings updates**: Changing settings requires reconnecting to the WebSocket. The service automatically handles disconnect and reconnect when settings are updated via `STTUpdateSettingsFrame`.
@@ -46769,7 +47339,7 @@ Before using Crusoe LLM services, you need:
 
 1. **Crusoe Account**: Sign up at [Crusoe Cloud](https://crusoe.ai/)
 2. **API Key**: Generate an API key from your account dashboard
-3. **Model Selection**: Choose from available models (default: `openai/gpt-oss-120b`)
+3. **Model Selection**: Choose from available models (default: `zai/GLM-5.2`)
 
 ### Required Environment Variables
 
@@ -46797,14 +47367,14 @@ Before using Crusoe LLM services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `CrusoeLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter           | Type    | Default                 | Description                                                                            |
-| ------------------- | ------- | ----------------------- | -------------------------------------------------------------------------------------- |
-| `model`             | `str`   | `"openai/gpt-oss-120b"` | Crusoe model identifier. Check Crusoe Cloud for available models.                      |
-| `temperature`       | `float` | `NOT_GIVEN`             | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher are creative. |
-| `max_tokens`        | `int`   | `NOT_GIVEN`             | Maximum tokens to generate.                                                            |
-| `top_p`             | `float` | `NOT_GIVEN`             | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                   |
-| `frequency_penalty` | `float` | `NOT_GIVEN`             | Penalty for frequent tokens (-2.0 to 2.0). Positive values discourage repetition.      |
-| `presence_penalty`  | `float` | `NOT_GIVEN`             | Penalty for new topics (-2.0 to 2.0). Positive values encourage new topics.            |
+| Parameter           | Type    | Default         | Description                                                                            |
+| ------------------- | ------- | --------------- | -------------------------------------------------------------------------------------- |
+| `model`             | `str`   | `"zai/GLM-5.2"` | Crusoe model identifier. Check Crusoe Cloud for available models.                      |
+| `temperature`       | `float` | `NOT_GIVEN`     | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher are creative. |
+| `max_tokens`        | `int`   | `NOT_GIVEN`     | Maximum tokens to generate.                                                            |
+| `top_p`             | `float` | `NOT_GIVEN`     | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                   |
+| `frequency_penalty` | `float` | `NOT_GIVEN`     | Penalty for frequent tokens (-2.0 to 2.0). Positive values discourage repetition.      |
+| `presence_penalty`  | `float` | `NOT_GIVEN`     | Penalty for new topics (-2.0 to 2.0). Positive values encourage new topics.            |
 
 <Note>
   `NOT_GIVEN` values are omitted from the API request entirely, letting the
@@ -46834,7 +47404,7 @@ from pipecat.services.crusoe.llm import CrusoeLLMService
 llm = CrusoeLLMService(
     api_key=os.getenv("CRUSOE_API_KEY"),
     settings=CrusoeLLMService.Settings(
-        model="openai/gpt-oss-120b",
+        model="zai/GLM-5.2",
         temperature=0.7,
         max_tokens=1000,
     ),
@@ -88324,7 +88894,7 @@ The GeminiLiveWebSocketTransport implements the various [PipecatClient event han
     horizontal
     title="Demo"
     icon="play"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/gemini-live-websocket-transport-v1.5.8/examples/directToLLMTransports"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/examples/directToLLMTransports"
   >
     Gemini Live Basic Demo
   </Card>
@@ -88333,7 +88903,7 @@ The GeminiLiveWebSocketTransport implements the various [PipecatClient event han
     horizontal
     title="Source"
     icon="github"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/gemini-live-websocket-transport-v1.5.8/transports/gemini-live-websocket-transport"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/transports/gemini-live-websocket-transport"
   >
     `GeminiLiveWebsocketTransport`
   </Card>
@@ -88473,7 +89043,7 @@ The transport implements the various [`PipecatClient` event handlers](/api-refer
     horizontal
     title="Demo"
     icon="play"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/openai-realtime-webrtc-transport-v1.5.8/examples/directToLLMTransports"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/examples/directToLLMTransports"
   >
     OpenAI Realtime Basic Demo
   </Card>
@@ -88482,7 +89052,7 @@ The transport implements the various [`PipecatClient` event handlers](/api-refer
     horizontal
     title="Source"
     icon="github"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/openai-realtime-webrtc-transport-v1.5.8/transports/openai-realtime-webrtc-transport"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/transports/openai-realtime-webrtc-transport"
   >
     `OpenAIRealTimeWebRTCTransport`
   </Card>
@@ -93344,17 +93914,19 @@ The generated `README.md` includes a **"Building with an AI coding agent"** sect
 # pipecat eval
 Source: https://docs.pipecat.ai/api-reference/cli/eval.md
 
-pipecat eval runs scenario-based behavioral evals against a running Pipecat agent, individually or as a suite from the CLI.
+pipecat eval runs scripted and simulated behavioral evals against a running Pipecat agent, individually or as a suite from the CLI.
 
-Run scenario-based behavioral evals. `pipecat eval run` tests scenarios against an already-running agent; `pipecat eval suite` spawns the agents listed in a manifest and runs their scenarios concurrently. Both exit `0` when everything passes and `1` otherwise.
+Run scenario-based behavioral evals. `pipecat eval run` tests scenarios, scripted or simulated, against an already-running agent; `pipecat eval suite` spawns the agents listed in a manifest and runs their scenarios concurrently. Both exit `0` when everything passes and `1` otherwise.
 
 If `pipecat-ai[cli]` is a dependency of your project, run these commands with `uv run pipecat eval`. They're also available as `python -m pipecat.evals`.
 
-See the [Pipecat Evals guide](/pipecat/evals/overview) for concepts, the scenario format, and manifests.
+Before running, `pipecat eval` loads the nearest `.env` file, walking up from the working directory, so a simulation's persona LLM and a hosted judge find their credentials the way your agent does. Variables already set in the shell win.
+
+See the [Pipecat Evals guide](/pipecat/evals/overview) for concepts, the [scripted](/pipecat/evals/scripted-scenarios) and [simulated](/pipecat/evals/simulated-scenarios) scenario formats, and [manifests](/pipecat/evals/suites).
 
 ## eval run
 
-Run one or more scenarios against an already-running agent (started with `-t eval`).
+Run one or more scenarios against an already-running agent (started with `-t eval`). A simulation runs once here, whatever its `runs:` field says; a success rate over several runs is the suite's job, since each run needs a fresh agent.
 
 **Usage:**
 
@@ -93365,8 +93937,9 @@ pipecat eval run [OPTIONS] SCENARIOS...
 **Arguments:**
 
 <ParamField path="SCENARIOS..." type="path" required>
-  One or more scenario YAML files, or directories of them. A directory expands
-  to its `.yaml` and `.yml` files in filename order, non-recursively.
+  One or more scenario YAML files, scripted or simulated, or directories of
+  them. A directory expands to its `.yaml` and `.yml` files in filename order,
+  non-recursively, skipping `!include` fragments (files with no `name:`).
 </ParamField>
 
 **Options:**
@@ -93376,7 +93949,8 @@ pipecat eval run [OPTIONS] SCENARIOS...
 </ParamField>
 
 <ParamField path="--verbose / -v" type="flag">
-  Print a line for each turn and expectation as it resolves.
+  Print a line for each turn and expectation as it resolves. For a simulation,
+  print the conversation as it happens and the judge's reasons at the end.
 </ParamField>
 
 <ParamField path="--audio / -a" type="flag">
@@ -93397,8 +93971,9 @@ pipecat eval run [OPTIONS] SCENARIOS...
 </ParamField>
 
 <ParamField path="--timeout / -t" type="integer" default="60">
-  Default per-expectation timeout in seconds, for expectations without their own
-  `within_ms`.
+  Default per-expectation timeout in seconds, for scripted expectations without
+  their own `within_ms`. A simulation is bounded by its own `max_turns` and
+  `max_duration_s` instead.
 </ParamField>
 
 <ParamField path="--logs-dir" type="string" default=".">
@@ -93423,7 +93998,7 @@ pipecat eval run [OPTIONS] SCENARIOS...
 
 ## eval suite
 
-Spawn the agents in a manifest and run their scenarios concurrently. Everything except the `suite:` list can be set in the manifest or overridden on the command line (the command line wins).
+Spawn the agents in a manifest and run their scenarios concurrently. A manifest lists scripted and simulated scenarios side by side, and the file says which it is. A simulation runs as many times as its `runs:` field says, and every run must pass. Everything except the `suite:` list can be set in the manifest or overridden on the command line (the command line wins).
 
 **Usage:**
 
@@ -93445,6 +94020,10 @@ pipecat eval suite [OPTIONS] MANIFEST_PATH
 
 <ParamField path="--scenario / -s" type="string">
   Only run this scenario name.
+</ParamField>
+
+<ParamField path="--kind / -k" type="string">
+  Only run scenarios of this kind: `script` or `simulation`.
 </ParamField>
 
 <ParamField path="--name / -n" type="string">
@@ -93470,8 +94049,10 @@ pipecat eval suite [OPTIONS] MANIFEST_PATH
 
 <ParamField path="--repeat / -r" type="integer">
   Override the manifest's `repeat` — how many times to run each (bot, scenario)
-  pair. Must be at least 1. Above 1, the suite reports a pass rate per pair and
-  always exits `0`, since a rate is neither a pass nor a fail.
+  pair, to measure flakiness. Must be at least 1. A repeat set here or in the
+  manifest also runs each simulation this many times instead of its own `runs:`
+  (`1` included). A repeated sweep reports a pass rate per pair and always exits
+  `0`, since a rate is neither a pass nor a fail.
 </ParamField>
 
 <ParamField path="--base-port" type="integer">
@@ -93488,8 +94069,8 @@ pipecat eval suite [OPTIONS] MANIFEST_PATH
 </ParamField>
 
 <ParamField path="--timeout / -t" type="integer" default="60">
-  Default per-expectation timeout in seconds, for expectations without their own
-  `within_ms`.
+  Default per-expectation timeout in seconds, for scripted expectations without
+  their own `within_ms`.
 </ParamField>
 
 <ParamField path="--spawn" type="string">
@@ -93518,8 +94099,14 @@ pipecat eval run scenarios/capital_question.yaml
 # Run every scenario in a directory, verbosely
 pipecat eval run scenarios/ -v
 
+# Run a simulation once and watch the conversation
+pipecat eval run scenarios/simulated/book_table.yaml -v
+
 # Run a full suite
 pipecat eval suite manifest.yaml
+
+# Only the simulations, each as many times as its file says
+pipecat eval suite manifest.yaml -k simulation
 
 # Only the support agent, 8 runs at a time, named output dir
 pipecat eval suite manifest.yaml -p support -c 8 -n nightly

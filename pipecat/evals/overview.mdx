@@ -1,10 +1,12 @@
 ---
 title: "Pipecat Evals"
 sidebarTitle: "Overview"
-description: "Behavioral testing for your agents: scripted conversations, semantic assertions, and an LLM judge."
+description: "Behavioral testing for your agents: scripted scenarios that pin a behavior, simulated callers with a persona and a goal, and an LLM judge."
 ---
 
 Pipecat Evals is the framework's built-in system for testing agent behavior. You describe a conversation and the behavior you expect, and Pipecat runs it against your real agent (the same pipeline, the same services, the same code) and tells you whether the expectation still holds.
+
+There are two ways to describe that conversation. A **scripted** scenario writes the user's turns out and asserts on what the agent does after each one:
 
 ```yaml capital_question.yaml
 name: capital_question
@@ -16,8 +18,29 @@ turns:
         eval: "the response says the capital of Germany is Berlin"
 ```
 
+A **simulated** scenario hands the user's side to an LLM with a persona and a goal, and a judge decides from the whole conversation whether the agent got the job done and how well:
+
+```yaml book_table.yaml
+name: book_table
+
+simulator: { service: openai, model: gpt-4o-mini }
+
+persona: |
+  Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number
+  when asked (Jamie Lee, 555-0142). Polite, answers one question at a time.
+goal: "Book a table for two at 6 PM, then end the call."
+success: "the bot confirmed a reservation for two at 6 PM"
+
+metrics:
+  - name: politeness
+    criterion: "the reply is courteous, never curt or dismissive"
+    min_quality: 1
+```
+
+Both run with the same command:
+
 ```bash
-pipecat eval run capital_question.yaml
+pipecat eval run capital_question.yaml book_table.yaml
 ```
 
 ## Why evals matter
@@ -29,9 +52,43 @@ Evals make agent behavior testable the way unit tests make code testable:
 - **Regression safety**: run your scenarios after every prompt, model, or pipeline change and catch breakage before users do.
 - **Fast iteration**: text-mode evals skip STT and TTS entirely, so a full conversation test runs in seconds with no audio service cost.
 - **Semantic assertions**: an LLM judge checks meaning ("the response says the capital is Berlin"), not exact strings, so tests don't break when wording changes.
+- **Whole-flow coverage**: a simulated caller pursues a goal in its own words, so you learn whether the agent finishes the job, not just whether one scripted path still works.
 - **A feedback signal for AI coding assistants**: evals give a coding assistant a command it can run and a pass/fail result it can read, closing the loop between writing agent code and verifying it. See [The Eval Loop](/pipecat/evals/the-eval-loop).
 
-Pipecat itself relies on this framework: before every release, an eval suite drives 100+ example agents end to end.
+Pipecat itself relies on this framework: before every release, an eval suite drives 100+ example agents end to end, with scripted scenarios and simulations side by side.
+
+## Two kinds of scenario
+
+Every scenario has a **kind**, decided by its top-level key: `turns:` makes it scripted, `persona:` makes it simulated.
+
+| Kind          | You write                                                                                                                                     | Best for                                                                                                                                                                     |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scripted**  | The user's turns, each with the events expected back: `text_contains`, a `function_call` with its args, `within_ms`, or an `eval:` criterion. | Pinning one behavior. The same input every run, so a failure is reproducible and you fix from the assertion. Prompts, tool calls, multi-turn context, barge-in.              |
+| **Simulated** | A `persona:`, a `goal:`, a `success:` criterion, and `metrics:`. An LLM plays the caller and hangs up when done.                              | Proving the agent reaches a goal against a caller who phrases things their own way, and scoring conversation-level quality: politeness, brevity, latency, the calls it made. |
+
+The two complement each other. A script walks one path through a flow; a simulation covers the flow end to end but says something different each run. **Simulate to discover, script to pin**: when a simulation fails, reproduce the exchange where the agent lost the caller as a scripted scenario, fix the agent against it, and keep both.
+
+<CardGroup cols={2}>
+  <Card
+    title="Scripted Scenarios"
+    icon="file-pen"
+    iconType="duotone"
+    href="/pipecat/evals/scripted-scenarios"
+  >
+    Turns, events, and assertions: `eval:`, `text_contains:`, function calls,
+    latency budgets, DTMF, vision, and interruptions.
+  </Card>
+
+  <Card
+    title="Simulated Scenarios"
+    icon="user-headset"
+    iconType="duotone"
+    href="/pipecat/evals/simulated-scenarios"
+  >
+    A persona and a goal, a success criterion, judged and measured metrics,
+    and runs.
+  </Card>
+</CardGroup>
 
 ## How it works
 
@@ -39,38 +96,48 @@ Pipecat Evals has two halves:
 
 1. **The eval transport.** Your agent runs unchanged with the eval transport. If your agent uses `create_transport()` and the development runner, this is already built in: start it with `-t eval` and it hosts a local WebSocket server speaking RTVI, instead of connecting to Daily, WebRTC, or telephony.
 
-2. **The eval harness.** The harness connects to that transport as an RTVI client, plays the scenario's user turns (as text, or as synthesized speech in audio mode), collects the events your agent emits, and asserts on them in order: transcriptions, LLM responses, spoken output, function calls, and timing.
+2. **The eval harness.** The harness connects to that transport as an RTVI client and plays the user's side of the conversation: a scripted scenario's turns, or a persona LLM's replies. It collects the events your agent emits (transcriptions, LLM responses, spoken output, function calls, and timing) and either asserts on them in order, for a script, or hands the whole transcript to a judge, for a simulation.
 
-When a scenario asserts on meaning rather than exact text, a **judge LLM** evaluates the agent's response against a natural-language criterion. The judge runs locally with [Ollama](https://ollama.com) by default, or against OpenAI or any OpenAI-compatible endpoint.
+When a scenario asserts on meaning rather than exact text, a **judge LLM** evaluates the agent's output against a natural-language criterion: each `eval:` assertion in a scripted scenario, and the `success:` criterion plus every judged metric in a simulation. The judge runs locally with [Ollama](https://ollama.com) by default, or against OpenAI or any OpenAI-compatible endpoint.
 
 ### Text and audio modes
 
-Every scenario runs in one of two modes:
+Every scenario of either kind also has a **modality**:
 
 | Mode               | User input                                               | Agent output                                                    | Best for                                                        |
 | ------------------ | -------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------- |
 | **Text** (default) | Sent as text, bypassing the STT                          | LLM text; TTS is skipped automatically                          | Fast, cheap iteration on prompts, logic, and function calling   |
 | **Audio**          | Synthesized by a TTS the harness runs (local by default) | Real synthesized speech, transcribed by an STT the harness runs | True end-to-end coverage of the full STT, LLM, and TTS pipeline |
 
-Text mode exercises your agent's actual pipeline and context handling while skipping the audio services, so it costs nothing in TTS or STT usage and runs fast. Audio mode synthesizes the user's voice, streams it through your agent's real STT, and transcribes the agent's actual spoken audio for judging, catching issues that only surface with real speech (turn detection, homophones, barge-in).
+Text mode exercises your agent's actual pipeline and context handling while skipping the audio services, so it costs nothing in TTS or STT usage and runs fast. Audio mode synthesizes the user's voice (a scripted turn or a persona's reply), streams it through your agent's real STT, and transcribes the agent's actual spoken audio for judging, catching issues that only surface with real speech (turn detection, homophones, barge-in). A speech-to-speech agent has no separate text LLM step, so it is evaluated in audio mode only.
+
+Kind and modality are independent, which gives four ways to run a scenario:
+
+|               | Text                                                                                                 | Audio                                                                                                                                        |
+| ------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scripted**  | The inner loop: prompts, tool calls and their args, multi-turn context, barge-in. Run it constantly. | One behavior on the real speech path: how numbers, names, and accents transcribe; turn-taking and VAD timing; how the agent's speech sounds. |
+| **Simulated** | A flow end to end, against a caller who phrases things their own way. Conversation-level quality.    | What a real caller experiences. The pre-ship pass, and the only option for speech-to-speech agents.                                          |
 
 ## What you can test
 
 - **Response content**: substring checks (`text_contains`) or semantic judging (`eval`) of the agent's replies.
 - **Multi-turn context**: verify the agent remembers earlier turns.
-- **Function calling**: assert that specific tools were called, with specific arguments.
+- **Function calling**: assert that specific tools were called, with specific arguments, in a scripted turn or across a whole simulated conversation.
 - **Interruptions**: barge in mid-response and verify the agent recovers (`send_after`).
-- **Latency**: per-event budgets with `within_ms`.
+- **Latency**: per-event budgets with `within_ms`, or the slowest reply of a simulation with the `latency` measure.
+- **Goals and outcomes**: whether a simulated caller got what they came for, or was turned down correctly when they shouldn't.
+- **Conversation quality**: per-reply criteria such as politeness or brevity, scored across every reply of a simulation.
 - **Vision**: serve an image when the agent requests one and judge its description.
 
 ## YAML or Python
 
-Scenarios are YAML files, so they're easy to write, review, and share. Everything is also available as a library: load and run scenarios programmatically, build them in code, inject a custom judge, or orchestrate whole suites from your own tooling. See [Using the Library](/pipecat/evals/library).
+Scenarios are YAML files, so they're easy to write, review, and share. Everything is also available as a library: load and run scenarios of either kind programmatically, build them in code, inject a custom judge or persona LLM, or orchestrate whole suites from your own tooling. See [Using the Library](/pipecat/evals/library).
 
 ## Requirements
 
 - **Pipecat CLI**: the `pipecat eval` commands ship with the CLI extra: `uv tool install "pipecat-ai[cli]"`. If you've added `pipecat-ai[cli]` to your project instead, run them with `uv run pipecat eval` (just like `uv run bot.py`). The same commands are also available as `python -m pipecat.evals`.
-- **A judge LLM** (for `eval:` assertions): Ollama by default (`ollama pull gemma4:12b`), or point the scenario's `judge:` block at OpenAI or any OpenAI-compatible endpoint.
+- **A judge LLM** (for `eval:` assertions, and for every simulation): Ollama by default (`ollama pull gemma4:12b`), or point the scenario's `judge:` block at OpenAI or any OpenAI-compatible endpoint.
+- **A persona LLM** (simulations only): the `simulator:` block names an OpenAI, Ollama, or OpenAI-compatible model that supports function calling. `pipecat eval` loads the nearest `.env` before it runs, so the persona LLM finds its API key the way your agent does.
 - **Audio services** (audio mode only): the harness needs a TTS to synthesize the user's voice and an STT to transcribe the agent's speech. Both can be local models or HTTP-based services; the defaults are local (Kokoro and Moonshine or Whisper, installed with `uv add "pipecat-ai[kokoro,moonshine]"` or `uv add "pipecat-ai[kokoro,whisper]"`), which download once on first use and run with no keys and no per-run cost. WebSocket-streaming services aren't supported here, which keeps the harness simple.
 - **Your agent's own credentials**: the agent under test is your real agent, so it needs the same service API keys it normally would.
 
@@ -78,8 +145,8 @@ Scenarios are YAML files, so they're easy to write, review, and share. Everythin
 
 Pipecat Evals is built for development: fast, local, repeatable, and run on every change. Once your agent is deployed, third-party evaluation platforms complement it with testing and monitoring at production scale:
 
-- **Simulations**: scripted or AI-driven test calls over API, WebSocket, or telephony, exercising multi-turn flows, edge cases, and real phone-network conditions before they reach users.
-- **Observability**: continuous evaluation of live traffic, with automated quality scoring of calls and transcripts, and metrics tracked over time to catch quality drift.
+- **Testing over the deployed path**: test calls over API, WebSocket, or telephony, with varied caller populations, real phone-network conditions, and load, exercising the transport your users actually hit.
+- **Observability**: continuous evaluation of live traffic, with automated quality scoring of calls and transcripts, audio-signal metrics, and trends tracked over time to catch quality drift.
 
 <CardGroup cols={2}>
   <Card
@@ -148,13 +215,32 @@ Pipecat's other building blocks feed into any evaluation workflow: [Metrics](/pi
 
 <CardGroup cols={2}>
   <Card
-    title="Writing Scenarios"
-    icon="file-pen"
+    title="Quickstart"
+    icon="rocket"
     iconType="duotone"
-    href="/pipecat/evals/scenarios"
+    href="/pipecat/evals/quickstart"
   >
-    The full scenario format: turns, expectations, modalities, and the judge.
+    Run a scripted scenario and a simulation against an existing agent in a
+    few minutes.
   </Card>
+
+<Card
+  title="Scripted Scenarios"
+  icon="file-pen"
+  iconType="duotone"
+  href="/pipecat/evals/scripted-scenarios"
+>
+  The full scripted format: turns, expectations, modalities, and the judge.
+</Card>
+
+<Card
+  title="Simulated Scenarios"
+  icon="user-headset"
+  iconType="duotone"
+  href="/pipecat/evals/simulated-scenarios"
+>
+  Personas, goals, success criteria, judged and measured metrics, and runs.
+</Card>
 
 <Card
   title="Eval Suites"
@@ -162,7 +248,8 @@ Pipecat's other building blocks feed into any evaluation workflow: [Metrics](/pi
   iconType="duotone"
   href="/pipecat/evals/suites"
 >
-  Spawn multiple agents and run many scenarios concurrently from a manifest.
+  Spawn multiple agents and run many scenarios of both kinds concurrently from a
+  manifest.
 </Card>
 
   <Card

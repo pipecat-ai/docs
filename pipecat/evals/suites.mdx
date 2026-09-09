@@ -1,11 +1,11 @@
 ---
 title: "Eval Suites"
-description: "Spawn agents and run many scenarios concurrently from a single manifest."
+description: "Spawn agents and run many scripted and simulated scenarios concurrently from a single manifest with pipecat eval suite."
 ---
 
 `pipecat eval run` tests scenarios against an agent you started yourself. A **suite** goes one step further: you list agents and scenarios in a manifest, and `pipecat eval suite` spawns each agent with its eval transport on its own port, runs its scenarios, tears it down, and aggregates the results, several runs at a time.
 
-Suites are the right tool when you have more than one agent, more than a handful of scenarios, or want a single command for CI. Pipecat's own release evals are a manifest with 100+ example agents plus this command.
+Suites are the right tool when you have more than one agent, more than a handful of scenarios, or want a single command for CI. They are also how a [simulation](/pipecat/evals/simulated-scenarios) runs more than once: each run gets a fresh agent. Pipecat's own release evals are a manifest with 100+ example agents plus this command.
 
 ## The manifest
 
@@ -23,12 +23,16 @@ suite:
     scenarios: [greeting, capital_question, multi_turn]
   - bot: bots/sales-agent.py
     scenarios: [greeting, weather_function_call]
+  - bot: bots/booking-agent.py
+    scenarios: [greeting, simulated/book_table] # a simulation, listed the same way
   - bot: bots/vision-agent.py
     runner_body: scenarios/vision-body.json # optional --runner-body data
     scenarios: [vision_describe]
 ```
 
-Paths in the manifest (`bots_dir`, `scenarios_dir`, `runs_dir`, the `bot:` entries) resolve relative to the manifest file, so a manifest is portable: check it into your repo and run it from anywhere.
+Paths in the manifest (`bots_dir`, `scenarios_dir`, `runs_dir`, the `bot:` entries) resolve relative to the manifest file, so a manifest is portable: check it into your repo and run it from anywhere. A scenario name can include a subfolder (`simulated/book_table`), and a name ending in `.yaml` is a path relative to the manifest.
+
+Scripted and simulated scenarios are listed the same way, and the file says which it is: `turns:` makes it scripted, `persona:` makes it a simulation. Pipecat's release evals keep the two in `scenarios/scripted/` and `scenarios/simulated/` folders, which is a convention worth copying.
 
 Scenarios are reusable across agents. One `greeting` scenario can cover every agent in the suite.
 
@@ -51,6 +55,7 @@ Useful flags:
 ```bash
 pipecat eval suite manifest.yaml -p support       # only bots whose path contains "support"
 pipecat eval suite manifest.yaml -s greeting      # only the greeting scenario
+pipecat eval suite manifest.yaml -k simulation    # only simulations (or: -k script)
 pipecat eval suite manifest.yaml -c 8             # 8 runs at a time
 pipecat eval suite manifest.yaml -n nightly       # output to eval-runs/nightly/
 pipecat eval suite manifest.yaml -a               # record conversation audio
@@ -76,7 +81,9 @@ eval-runs/20260610_142200/
     bots_support-agent.py__greeting.wav        # conversation audio (record: true or -a)
 ```
 
-`results.jsonl` carries one line per run — its bot, scenario, attempt, outcome, duration, failures, per-turn results, and paths to its artifacts. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+`results.jsonl` carries one line per run, and every line names its `kind`, `script` or `simulation`. A scripted record carries the bot, scenario, attempt, outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, and per-turn verdicts, the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+
+Each run executes in its own process, so a harness that loads local audio models does so on its own, and one run's crash doesn't take the others with it.
 
 <Note>
   `results.jsonl` is written by `pipecat eval suite`. `pipecat eval run` doesn't
@@ -98,6 +105,17 @@ A directory expands to its `.yaml` and `.yml` files in filename order, non-recur
 
 By default the agent is left running afterward so it can serve more evals; pass `--stop-bot` to shut it down when the batch finishes.
 
+## Running a simulation more than once
+
+A persona doesn't say the same thing twice, so one run of a simulation is an anecdote. A simulation's own `runs:` field tells the suite how many times to run it, and every run must pass. The suite reports a pass rate per simulation with a ✓ or ✗ beside it, and exits `1` when any run failed:
+
+```
+  Pass rate:
+  bots/booking-agent.py  simulated/book_table      3/3 (100%)  ✓  ~12.4s each
+```
+
+A run that errored (the agent never came up, the persona's LLM failed) is reported but kept out of the rate: it says nothing about whether the agent did its job.
+
 ## Repeating a run
 
 A behavior with a race in it passes sometimes. `repeat:` in the manifest, or `--repeat` / `-r` on the command line, runs every (bot, scenario) pair N times and reports a pass rate per pair instead of a single verdict:
@@ -118,6 +136,8 @@ Attempts interleave across bots rather than running back to back, and artifact f
   unset for the CI gate below.
 </Warning>
 
+A `repeat` set anywhere, on the command line or in the manifest, decides every run's attempts, a simulation's included, even when it is `1`. That turns a simulation's `runs:` requirement into a measurement: rates are reported and the exit code stays `0`. Leave `repeat` unset to let each simulation run its own `runs:` and gate on them.
+
 ## Suites in CI
 
 The exit code makes suites CI-ready with no extra glue:
@@ -128,4 +148,4 @@ The exit code makes suites CI-ready with no extra glue:
   run: pipecat eval suite manifest.yaml
 ```
 
-For deterministic, key-free CI runs, prefer text-mode scenarios and an OpenAI-compatible judge endpoint you control. Audio-mode scenarios work in CI too, but need the harness's TTS and STT services available (local models by default, which also need more CPU).
+For deterministic, key-free CI runs, prefer text-mode scripted scenarios and an OpenAI-compatible judge endpoint you control. Simulations need the persona LLM's API key in the environment as well, and say something different each run by design, so give them `runs: 3` and expect them to take longer. `-k script` runs the scripted half alone when you want a fast gate on every push and the simulations on a schedule. Audio-mode scenarios work in CI too, but need the harness's TTS and STT services available (local models by default, which also need more CPU).

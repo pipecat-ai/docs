@@ -1,0 +1,374 @@
+---
+title: "Simulated Scenarios"
+sidebarTitle: "Simulated"
+description: "The simulated scenario file format: a persona and goal an LLM plays against your agent, a success criterion, judged and measured metrics, and runs."
+---
+
+A simulated scenario, a simulation for short, describes a caller rather than a script: who they are, what they want, and how the outcome is judged. An LLM plays that caller and holds the whole conversation with your agent on its own, in text or over synthesized speech, and hangs up once it has what it came for. A judge then reads the transcript, the agent's tool calls in place, and decides whether the agent did its job and how every reply scored against your metrics.
+
+```yaml book_table.yaml
+name: book_table
+
+simulator:
+  service: openai
+  model: gpt-4o-mini
+
+persona: |
+  Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number
+  when asked (Jamie Lee, 555-0142). Polite, answers one question at a time.
+
+goal: "Book a table for two at 6 PM, then end the call."
+
+success: "the bot confirmed a reservation for two at 6 PM (a booking tool was called)"
+
+metrics:
+  - name: politeness
+    criterion: "the reply is courteous, never curt or dismissive"
+    min_quality: 1
+  - measure: latency
+    max_value: 5
+
+runs: 3
+```
+
+```bash
+pipecat eval run book_table.yaml -v
+```
+
+A file with a top-level `persona:` is a simulation; one with `turns:` is a [scripted scenario](/pipecat/evals/scripted-scenarios). A scripted scenario walks one path through a flow and pins it. A simulation proves the agent reaches a goal against a caller who phrases things their own way, and checks conversation-level quality along the way. Both run with the same commands, sit side by side in a [suite manifest](/pipecat/evals/suites), and share the `user:` and `judge:` blocks.
+
+## Anatomy of a simulation
+
+```yaml
+name: book_table # required: the simulation's name
+
+simulator: # required: the LLM that plays the caller
+  service: openai
+  model: gpt-4o-mini
+
+user: # optional: how the caller's turns reach the agent (default text)
+  modality: text
+
+judge: # optional: judge modality and LLM (defaults shown)
+  modality: text
+  eval:
+    service: ollama
+    model: gemma4:12b
+    extra: { reasoning_effort: none }
+
+persona: | # required: who the caller is
+  Jamie, booking dinner for two tonight at 6 PM. ...
+
+goal: "Book a table for two at 6 PM, then end the call." # required
+
+success: "the bot confirmed a reservation for two at 6 PM" # required
+
+metrics: # optional: judged criteria and measured bounds
+  - name: politeness
+    criterion: "the reply is courteous, never curt or dismissive"
+    min_quality: 1
+  - measure: latency
+    max_value: 5
+
+max_turns: 20 # optional: cap on the caller's turns (default 20)
+max_duration_s: 300 # optional: cap on the run's wall clock (default 300)
+runs: 1 # optional: how many times a suite runs it (default 1)
+trigger_disconnect: false # optional: fire on_client_disconnected at the end
+```
+
+The rest of this page covers each part:
+
+<CardGroup cols={2}>
+  <Card title="The caller" icon="user-headset" href="#the-caller">
+    The persona, its goal, and the LLM that plays it.
+  </Card>
+  <Card title="Text and audio" icon="waveform" href="#text-and-audio-modes">
+    Drive the agent with text or synthesized speech, and judge text or real
+    audio.
+  </Card>
+  <Card title="Judging the outcome" icon="gavel" href="#judging-the-outcome">
+    The `success:` criterion, and what the judge sees.
+  </Card>
+  <Card title="Metrics" icon="chart-simple" href="#metrics">
+    Judged criteria scored per reply, and the built-in measures.
+  </Card>
+</CardGroup>
+
+## The caller
+
+### Persona and goal
+
+`persona:` says who the caller is and `goal:` what they want from the call. Both go verbatim into the persona LLM's instructions, which tell it to stay in character, reply with one short spoken turn at a time, ask for or give one thing at a time, and end the call once the goal is achieved or clearly out of reach:
+
+```yaml
+persona: |
+  Casey, calling to book a table for tonight. Polite but constrained: gives the
+  party size and the time when asked, one detail per turn. Can only make 7 PM
+  or 8 PM; asks for the other one if the first is unavailable, and if neither
+  works, thanks the assistant and ends the call without booking anything.
+
+goal: "Book a table for two tonight at 7 PM or 8 PM; if neither is available, end the call without a reservation."
+```
+
+Give the persona every fact the agent will ask for: a name, a phone number, a party size, a date of birth. Without them the persona invents details or stalls, and the run fails for a reason that isn't the agent's. The goal can include what to do when the agent can't help, as above, so the persona gives up gracefully rather than looping.
+
+The persona ends the call by calling an `end_call` tool, reporting whether it thinks it succeeded and why. That claim is advisory: it's shown in verbose output and recorded in the result, but the [judge](#judging-the-outcome) decides the outcome.
+
+<Note>
+  The persona listens first. It answers each finished response of the agent, so
+  the agent has to open the conversation, as most do with a greeting on connect.
+  An agent that waits for the user to speak leaves the persona waiting too, and
+  the run ends on `max_duration_s`.
+</Note>
+
+### The persona LLM with `simulator:`
+
+`simulator:` configures the LLM that plays the caller. It has the same shape as the `judge.eval:` block: a `service` (`openai` or `ollama`), a `model`, and an optional `endpoint:` for any OpenAI-compatible API and `extra:` mapping forwarded as request parameters:
+
+```yaml
+simulator:
+  service: openai
+  model: gpt-4o-mini
+```
+
+The model must support function calling, since the persona hangs up through its `end_call` tool. `pipecat eval` loads the nearest `.env` file, walking up from the working directory, before it runs, so the persona LLM finds its API key the same way your agent does. Variables already set in the shell win.
+
+<Tip>
+  Share one `simulator:` block across a directory of simulations with
+  `!include`, resolved relative to the scenario file, just as scripted scenarios
+  share their `user:` and `judge:` blocks: `simulator: !include
+  ../simulator.yaml`.
+</Tip>
+
+## Text and audio modes
+
+A simulation takes the same top-level `user:` and `judge:` blocks as a scripted scenario, with the same defaults, so the [scripted configuration reference](/pipecat/evals/scripted-scenarios#configuration) applies here: `user.modality` and `user.speech` decide whether the persona's turns reach the agent as text or as synthesized speech, and `judge.modality`, `judge.transcription`, and `judge.eval` decide whether the agent speaks and which LLM judges the outcome. `factory:` and `!include` work the same way.
+
+With neither block, a simulation runs entirely in text mode: the persona's replies are sent to the agent as text, the agent's TTS is skipped, and the persona hears the LLM's text output. This is the fast way to check a flow end to end and to iterate on prompts and tools.
+
+In audio mode every persona turn is synthesized, so `user.modality: audio` requires a `user.speech:` block naming the TTS service and voice. The agent's real VAD, STT, and turn taking run against an autonomous caller, and the persona hears the agent's transcribed speech:
+
+```yaml
+simulator: !include ../simulator.yaml
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+judge:
+  modality: audio
+  transcription:
+    service: moonshine
+    model: small-streaming
+```
+
+Interruptions aren't scripted in a simulation. The persona is a caller: when the agent keeps talking over it, its speech is cut off the way a real caller's would be, and the conversation carries on from there. A speech-to-speech agent has no separate text LLM step, so for it both audio blocks are required rather than an escalation.
+
+## Judging the outcome
+
+### The `success:` criterion
+
+`success:` says what counts as the agent having done its job, judged once over the whole conversation. Write it as prose, as long as it needs to be. It is the agent's side of the `goal:`: usually that the caller got what they asked for, but where the right outcome is to refuse, to qualify, or to escalate, it says so:
+
+```yaml
+goal: "Book a table for two tonight at 7 PM or 8 PM; if neither is available, end the call without a reservation."
+
+success: "the bot said neither 7 PM nor 8 PM was available, offered other times, and did not book a table at a time the caller had not accepted; the call ended without a reservation"
+```
+
+Anything the agent must do once, like reading the order back or calling `complete_order`, belongs in `success:`, not in a metric. Metrics are scored on every reply.
+
+### What the judge sees
+
+The judge reads the whole transcript in one call, with each of the agent's function calls placed before the reply it preceded, by name and arguments. A completed call is stronger evidence of an action than the agent saying it did it, and the judge is told so. The judge does not see a call's result. So:
+
+- Whether the agent made a call at all is a [`function_calls` measure](#checking-tool-calls-with-function_calls), no judge needed.
+- If a reply must match backend data, write the expected value into the criterion ("the reply says the appointment is on Tuesday September fifteenth") and keep your mocks deterministic so it stays true across runs.
+
+The same judge call also scores every judged metric on every agent reply, so a simulation costs one judge call however many metrics it has. The judge LLM comes from the `judge.eval:` block, Ollama with `gemma4:12b` by default.
+
+## Metrics
+
+`metrics:` is a list of quality checks. Each is either **judged**, a `criterion:` the judge decides on every agent reply, or **measured**, a `measure:` the harness computes from the run with no judge involved. A metric fails the run only when it has a threshold: `min_quality:` for a judged metric, a range or a `calls:` list for a measured one. Without one, it is reported and never fails anything.
+
+### Judged metrics with `criterion:`
+
+A criterion says what every reply of the agent should be. The judge decides it for each agent turn, in the light of the conversation before it and the tool calls the agent had made by then, with a yes or a no, never a partial score. The metric's score is the share of turns that got a yes: `0.80` is four replies in five.
+
+```yaml
+metrics:
+  - name: politeness
+    criterion: "the reply is courteous and helpful, never curt or dismissive"
+    min_quality: 1
+  - name: recovery
+    criterion: "when the reply turns down a requested time, it offers concrete alternative times; a reply that turns down no time passes"
+    min_quality: 1
+  - name: brevity
+    criterion: "the reply is at most three sentences, with no monologue"
+```
+
+`min_quality:` is the share of turns that must pass, in `0..1`: `1` means every reply, `0.8` allows one slip in five. The `brevity` metric above has none, so its score is reported but never fails the run.
+
+Phrase a rule as a condition plus what a reply outside it does. The judge is told that a criterion which forbids something or applies only in a situation is satisfied by a reply that doesn't do the forbidden thing or isn't in that situation, but spelling it out ("a reply that turns down no time passes") keeps a bare "never" from being read as "always".
+
+A turn the judge leaves out of its verdicts counts as a no. A run in which the agent said nothing has no turns to score, so a judged metric is unscored and passes.
+
+### Measured metrics with `measure:`
+
+A measured metric names one of the built-in measures and bounds it with `min_value:` and/or `max_value:`, both inclusive. The harness computes the value from the run, and the metric scores `1` inside the range and `0` outside, which fails the run. `name:` defaults to the measure:
+
+```yaml
+metrics:
+  - measure: latency
+    max_value: 5
+  - measure: words
+    max_value: 60
+  - measure: turns
+    min_value: 2
+    max_value: 8
+```
+
+The built-in measures:
+
+| Measure          | What it measures                                                                                                                                                                                                  | Unit    |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `turns`          | The persona's turns in the conversation. A reply that only calls `end_call` is not a turn.                                                                                                                        | count   |
+| `duration`       | The conversation's length, from its first line to the hang-up.                                                                                                                                                    | seconds |
+| `words`          | The longest agent reply. Bounds every reply.                                                                                                                                                                      | words   |
+| `latency`        | The slowest agent reply. In text mode, from the persona's send to the reply's first LLM token; in audio mode, from the agent noticing the persona stop speaking to its first spoken sentence. Bounds every reply. | seconds |
+| `function_calls` | The function calls the agent made, checked against a `calls:` list instead of a range. See [below](#checking-tool-calls-with-function_calls).                                                                     | calls   |
+
+The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode `latency` is an LLM budget, not a listening budget: there is no speech for the agent to wait on.
+
+There is deliberately no interruptions measure. The persona causes interruptions; the agent cannot.
+
+### Checking tool calls with `function_calls`
+
+`measure: function_calls` takes a `calls:` list instead of a range: the calls the agent should make over the whole conversation, each a name or a `name:` with `args:`, in any order. `args:` is a subset check, so every listed key and value must appear in the call's arguments and extra arguments are ignored:
+
+```yaml
+metrics:
+  - measure: function_calls
+    calls:
+      - check_availability
+      - name: book_table
+        args: { party_size: 2 }
+```
+
+Every listed call must have happened, and any call not listed fails the metric. That makes `calls: []` the check for a caller who should be turned down: the agent must call nothing. A call the agent cancelled did not happen.
+
+## Limits and runs
+
+`max_turns:` caps the persona's turns (default 20) and `max_duration_s:` caps the run's wall clock (default 300 seconds). They are backstops against a conversation that never ends. A run they cut short has not succeeded, whatever the transcript says.
+
+`runs:` is how many times a [suite](/pipecat/evals/suites) runs the simulation (default 1), and every run must pass. A persona doesn't say the same thing twice, so one run is an anecdote and three are a check:
+
+```yaml
+max_turns: 8
+max_duration_s: 120
+runs: 3
+```
+
+`pipecat eval run` plays a simulation once whatever `runs:` says. A success rate over several runs is the suite's job, since each run needs a fresh agent. The suite's `--repeat` flag overrides `runs:` and turns the sweep into a measurement instead: rates are reported and the exit code stays `0`.
+
+`trigger_disconnect: true` fires the agent's `on_client_disconnected` handler when the run ends, as it does for a [scripted scenario](/pipecat/evals/scripted-scenarios#exercising-the-disconnect-path).
+
+## How a run ends and what passing means
+
+A run ends in one of these ways:
+
+| Ending         | Meaning                                                         |
+| -------------- | --------------------------------------------------------------- |
+| `end_call`     | The persona called its `end_call` tool.                         |
+| `bot`          | The agent ended the call by closing the connection.             |
+| `max_turns`    | The persona's turn cap was reached.                             |
+| `max_duration` | The run's wall-clock cap was reached.                           |
+| `error`        | The run did not complete: a failed connect, or a harness error. |
+
+A run **passes** when it completed, the judge said `success:` was met, and no metric with a threshold fell short. A run that ended in `error` is neither a goal success nor a goal failure: it is reported as an error and kept out of any pass rate, since a run that never connected says nothing about whether the agent did its job.
+
+## Running a simulation
+
+Start your agent with its eval transport, then run the file the same way as a scripted scenario. Pass `-v` to watch the conversation as it happens and read the judge's reasons at the end:
+
+```bash
+pipecat eval run book_table.yaml -v
+```
+
+```
+      user: Hi, I'd like to book a table for two tonight at 6 PM.
+      bot: I'd be happy to help. Could I get a name for the reservation?
+      user: It's Jamie Lee.
+      bot: Thanks, Jamie. And a phone number in case we need to reach you?
+      user: 555-0142.
+      bot: You're all set: a table for two tonight at 6 PM under Jamie Lee.
+      user: Perfect, thank you!
+
+      ended by end_call after 4 persona turn(s)
+
+    judge: the bot confirmed a reservation for two at 6 PM after calling book_table
+
+    metrics:
+      politeness: 1.00 (min 1.00) | 4/4 turns
+      latency: 1.00 | slowest reply 1.83 s, at most 5
+
+    persona: succeeded: The reservation was confirmed for two at 6 PM.
+
+  ✓ ws://localhost:7860 book_table end_call (14230ms)
+
+  1/1 passed  ·  14.2s
+```
+
+The line beside the ✓ or ✗ is how the run ended. A failed simulation carries the judge's verdict instead of a list of assertions, and a judged metric that failed lists the replies the judge said no to, with its reason for each:
+
+```
+  ✗ ws://localhost:7860 book_table end_call (16102ms)
+
+  Failures (1 of 1):
+  ✗ ws://localhost:7860 book_table
+      • politeness 0.75 below 1.00: turn 3: the reply is curt, a bare "No." end_call
+
+  0/1 passed, 1 failed  ·  16.1s
+```
+
+The failure is the first thing that gave way, in order: an error, then the goal ("goal not met: ..."), then the first failed metric. Every metric's score, value, and per-turn verdicts are in the decision trace at `<scenario>.eval.log`, and in `results.jsonl` when a suite ran it. The judge and the persona LLM's own logs are in `<scenario>.debug.log` under `-d`.
+
+## Writing good simulations
+
+- **Give the persona the facts the agent will ask for.** A caller who doesn't know their own phone number stalls, and the run fails for a reason that isn't the agent's.
+- **`success:` is the agent's side of the goal**, and may name tool calls. Anything the agent must do once belongs here, not in a metric.
+- **A judged metric is scored per reply.** Phrase it as a condition plus what a reply outside it does, so a rule about one situation doesn't fault every other reply.
+- **A measured metric bounds the worst reply.** Set `latency` and `words` for the slowest and longest reply you can accept, not the typical one.
+- **Use `function_calls` for what the judge can't see.** The judge reads calls, not results, and `calls: []` is the check for an agent that should call nothing.
+- **Run it more than once.** Set `runs: 3` and let the suite prove the flow holds, not just that it held once.
+
+### Simulate to discover, script to pin
+
+A failing simulation shows where the agent lost the caller. Reproduce that exchange as a [scripted scenario](/pipecat/evals/scripted-scenarios), fix the agent against it, and keep both: the script guards the fix on every edit, and the simulation keeps checking the whole flow.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Eval Suites"
+    icon="list-check"
+    iconType="duotone"
+    href="/pipecat/evals/suites"
+  >
+    List scripted and simulated scenarios in one manifest, run each simulation
+    its `runs:` times, and read `results.jsonl`.
+  </Card>
+
+  <Card
+    title="Using the Library"
+    icon="code"
+    iconType="duotone"
+    href="/pipecat/evals/library#running-a-simulation"
+  >
+    Run simulations from Python, inject your own persona LLM or judge, and read
+    per-metric scores.
+  </Card>
+</CardGroup>
