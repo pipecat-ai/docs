@@ -1,54 +1,222 @@
 ---
 title: "State Management"
-description: "Share data across Pipecat Flows nodes with FlowManager state and global functions for stateful conversations."
+description: "Share data across Pipecat Flows nodes: FlowManager state, prompt placeholders, initialization, and global functions."
 ---
 
 ## Initialization
 
-Initialize your flow by creating a `FlowManager` instance and calling `initialize()` to start the conversation.
+Initialize your flow by creating a `FlowManager` instance and calling `initialize()` with the node the conversation starts in.
 
-First, create the FlowManager:
+<Tabs>
+  <Tab title="Declarative">
+
+Load the config, join it to your handlers, and let the `Flow` supply both the starting node and the global functions:
 
 ```python
+import handlers
+
+from pipecat.flows import Flow, FlowConfig, FlowManager
+
+config = FlowConfig.from_file("flow.yaml")
+flow = Flow(config, handlers=handlers)
+
+flow_manager = FlowManager(
+    worker=worker,                          # PipelineWorker
+    llm=llm,                                # LLMService
+    context_aggregator=context_aggregator,  # Context aggregator
+    transport=transport,                    # Transport
+    global_functions=flow.global_functions,
+)
+
+
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    logger.info("Client connected")
+    # Kick off the conversation in the node the config named.
+    await flow_manager.initialize(flow.initial_node)
+```
+
+  </Tab>
+  <Tab title="Programmatic">
+
+Build the first node in code and pass it in:
+
+```python
+from pipecat.flows import FlowManager
+
 flow_manager = FlowManager(
     worker=worker,                          # PipelineWorker
     llm=llm,                                # LLMService
     context_aggregator=context_aggregator,  # Context aggregator
     transport=transport,                    # Transport
 )
-```
 
-Then, initialize by passing the first `NodeConfig` into the `initialize()` method:
 
-```python
 @transport.event_handler("on_client_connected")
 async def on_client_connected(transport, client):
-    logger.info(f"Client connected")
+    logger.info("Client connected")
     # Kick off the conversation.
     await flow_manager.initialize(create_initial_node())
 ```
+
+  </Tab>
+</Tabs>
 
 ## Cross-Node State
 
 Pipecat Flows supports cross-node state through the `flow_manager.state` dictionary. This persistent storage lets you share data across nodes throughout the entire conversation:
 
-```python
-async def record_favorite_color_and_set_next_node(
-    args: FlowArgs, flow_manager: FlowManager
-) -> tuple[str, NodeConfig]:
-    """Function handler that records the color then sets the next node.
+<Tabs>
+  <Tab title="Declarative">
 
-    Here "record" means print to the console, but any logic could go here;
-    Write to a database, make an API call, etc.
+```python handlers.py
+async def collect_party_size(flow_manager: FlowManager, size: int):
+    """Record the number of people in the party.
+
+    Args:
+        size (int): Number of people in the party. Must be between 1 and 12.
     """
-    flow_manager.state["color"] = args["color"]  # Cross-node state setting
-    print(f"Your favorite color is: {args['color']}")
-    return args["color"], create_end_node()
+    flow_manager.state["party_size"] = size  # Cross-node state setting
+    return {"size": size}, TRANSITION_IN_YAML
 ```
+
+  </Tab>
+  <Tab title="Programmatic">
+
+```python
+async def record_favorite_color(
+    flow_manager: FlowManager,
+    color: str,
+) -> tuple[str, NodeConfig]:
+    """Record the color the user said is their favorite.
+
+    Args:
+        color: The user's favorite color.
+    """
+    flow_manager.state["color"] = color  # Cross-node state setting
+    print(f"Your favorite color is: {color}")
+    return color, create_end_node()
+```
+
+  </Tab>
+</Tabs>
+
+State is also where you put the facts a session starts with — a caller's name, a tenant's restaurant, a practice's details — by writing them before `initialize()`.
+
+## Placeholders
+
+A node's prompt text can read from state with `{{ key }}` placeholders. `FlowManager` fills them in each time it enters the node, so a value a handler stored earlier in the conversation can appear in a later prompt, including after a context reset.
+
+Placeholders are rendered in three places:
+
+- a node's `role_message`
+- the `content` of each of its `task_messages`
+- the `text` of a `tts_say` action
+
+Because the manager does the rendering, placeholders work the same way in a flow config and in a `NodeConfig` built in code.
+
+### Session Facts
+
+Write the facts before initializing, and every node's prompts can refer to them:
+
+```python
+flow_manager.state.update(
+    {
+        "practice_name": os.getenv("PRACTICE_NAME", "Tri-County Health Services"),
+        "patient_name": os.getenv("PATIENT_NAME", "Chad Bailey"),
+    }
+)
+
+await flow_manager.initialize(flow.initial_node)
+```
+
+```yaml
+role_message: >
+  You are Jessica, an agent for {{ practice_name }}, on the phone with a
+  patient.
+```
+
+### Values a Handler Stored
+
+A placeholder is filled on every entry, not once at load, so a prompt sees whatever handlers have stored by the time the node is reached. The [insurance quote example](https://github.com/pipecat-ai/pipecat/tree/main/examples/flows/yaml/insurance_quote) turns on this: each quote handler stores the figures in state, and the results node reads them back.
+
+```python handlers.py
+async def update_coverage(flow_manager: FlowManager, coverage_amount: int, deductible: int):
+    """Recalculate quote with new coverage options.
+
+    Args:
+        coverage_amount (int): The desired coverage amount in dollars.
+        deductible (int): The desired deductible amount in dollars.
+    """
+    monthly_premium = (coverage_amount / 250000) * 100
+    if deductible > 1000:
+        monthly_premium *= 0.9  # 10% discount for a higher deductible
+
+    # Store each figure formatted the way the prompt reads it aloud.
+    flow_manager.state["quote"] = {
+        "monthly_premium": f"{monthly_premium:.2f}",
+        "coverage_amount": f"{coverage_amount:,}",
+        "deductible": f"{deductible:,}",
+    }
+    return {"monthly_premium": monthly_premium}, TRANSITION_IN_YAML
+```
+
+```yaml
+quote_results:
+  task_messages:
+    - role: developer
+      content: >-
+        The current quote is {{ quote.monthly_premium }} dollars a month for
+        {{ quote.coverage_amount }} dollars of coverage with a
+        {{ quote.deductible }} dollar deductible. Tell the customer the
+        premium, coverage, and deductible in one sentence, then ask if they'd
+        like to change the coverage or deductible.
+  functions:
+    - name: update_coverage
+      transition_to: quote_results
+```
+
+`update_coverage` leads back to `quote_results`, so re-entering the node renders it again with the new figures. That is a loop with no code behind it.
+
+### Dotted Paths, Escaping, and Missing Keys
+
+- **Dotted paths** walk into a stored mapping: `{{ quote.monthly_premium }}` reads `state["quote"]["monthly_premium"]`. Values are rendered with `str()`.
+- **Escaping**: to show the LLM a literal `{{ key }}`, write `\{{ key }}`.
+- **A missing key raises.** If a placeholder names a key that isn't in state when the node is entered, Flows raises a `FlowError`. There is no silent empty string — a prompt with a hole in it is a bug worth failing on.
+
+<Tip>
+  Store values in state already formatted for speech, as `update_coverage` does
+  above. The placeholder is substituted verbatim, so `"81.00"` reads better than
+  the `81.0` a raw float would produce.
+</Tip>
 
 ## Global Functions
 
-Pipecat Flows supports defining functions that are available across all nodes in your flow. They're defined in the same way as node-specific functions, but are passed into the FlowManager at initialization:
+Pipecat Flows supports defining functions that are available across all nodes in your flow. They're defined the same way as node-specific functions, and are passed into the `FlowManager` at initialization:
+
+<Tabs>
+  <Tab title="Declarative">
+
+List them at the top level of the config, then hand `flow.global_functions` to the manager:
+
+```yaml
+global_functions:
+  - name: get_delivery_estimate
+```
+
+```python
+flow_manager = FlowManager(
+    worker=worker,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    global_functions=flow.global_functions,  # Cross-node functions
+)
+```
+
+A global function is written like any other entry, so it can transition too. Its name can't also be used by a node's `functions`.
+
+  </Tab>
+  <Tab title="Programmatic">
 
 ```python
 flow_manager = FlowManager(
@@ -56,30 +224,9 @@ flow_manager = FlowManager(
     llm=llm,
     context_aggregator=context_aggregator,
     transport=transport,
-    global_functions=[global_function_1, global_function_2], # Cross-node functions
+    global_functions=[global_function_1, global_function_2],  # Cross-node functions
 )
 ```
 
-## Usage Example
-
-Here's an example that ties together all the concepts covered in the guides:
-
-```python
-def create_initial_node() -> NodeConfig:
-    """Create the initial node of the flow.
-
-    Define the bot's role and task for the node, plus the function it can call.
-    The function provides its result to Pipecat and transitions to the next node.
-    """
-    return NodeConfig(
-        name="initial",
-        role_message="You are an inquisitive child. Use very simple language. Ask simple questions. You must ALWAYS use one of the available functions to progress the conversation. Your responses will be converted to audio. Avoid outputting special characters and emojis.",
-        task_messages=[
-            {
-                "role": "developer",
-                "content": "Say 'Hello world' and ask what is the user's favorite color.",
-            }
-        ],
-        functions=[record_favorite_color],
-    )
-```
+  </Tab>
+</Tabs>
