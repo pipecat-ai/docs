@@ -1,28 +1,26 @@
 ---
 title: "Evals Quickstart"
 sidebarTitle: "Quickstart"
-description: "Run your first Pipecat behavioral eval against an existing agent with pipecat eval and a simple scenario."
+description: "Run your first Pipecat behavioral evals against an existing agent: a scripted scenario, then a simulated caller with a goal."
 ---
 
-This guide takes an existing agent, starts it with the eval transport, and runs a two-turn scenario against it. Total time: a few minutes.
+This guide takes an existing agent, starts it with the eval transport, runs a two-turn scripted scenario against it, and then lets a simulated caller hold a conversation with it. Total time: a few minutes.
 
 ## Prerequisites
 
 - A working Pipecat agent that uses `create_transport()` and the development runner (the standard pattern from the [quickstart](/pipecat/get-started/quickstart) and all Pipecat examples), with its usual service API keys in `.env`.
 - The Pipecat CLI: `uv tool install "pipecat-ai[cli]"` (or add `pipecat-ai[cli]` to your project and run the commands below with `uv run pipecat eval`).
-- A judge LLM. Either:
-  - **Ollama** (local, the default): install [Ollama](https://ollama.com) and run `ollama pull gemma4:12b`, or
-  - **OpenAI**: set `OPENAI_API_KEY` and point the scenario's `judge:` block at it (shown below).
+- [Ollama](https://ollama.com), with `ollama pull gemma4:12b`. It runs the judge, and in the last step the simulated caller, locally with no API key. (It's the default; any other LLM works through a `factory:`, see [Scenario Configuration](/pipecat/evals/configuration#judging-with-judge).)
 
 <Steps>
   <Step title="Run your agent with the eval transport">
     If your agent uses `create_transport()`, it supports the eval transport with a one-line addition to its `transport_params`:
 
     ```python
-    from pipecat.transports.websocket.server import SingleClientWebsocketServerParams
+    from pipecat.evals.transport import EvalTransportParams
 
     transport_params = {
-        "eval": lambda: SingleClientWebsocketServerParams(
+        "eval": lambda: EvalTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
         ),
@@ -51,57 +49,32 @@ This guide takes an existing agent, starts it with the eval transport, and runs 
 
   </Step>
 
-  <Step title="Write a scenario">
-    A scenario is a YAML file describing a scripted conversation and the behavior you expect. Save this as `scenarios/capital_question.yaml`:
+  <Step title="Write a scripted scenario">
+    A scripted scenario is a YAML file that writes the user's turns out, each with the behavior you expect back. Save this as `scenarios/capital_question.yaml`:
 
-    <Tabs>
-      <Tab title="Ollama judge (default)">
-        ```yaml
-        name: capital_question
+    ```yaml
+    name: capital_question
 
-        turns:
-          # The agent greets on connect; wait for the greeting before speaking.
-          - expect:
-              - event: response
-                eval: "the bot opens the conversation with a greeting or an offer to help"
+    turns:
+      # The agent greets on connect; wait for the greeting before speaking.
+      - expect:
+          - event: response
+            eval: "the bot opens the conversation with a greeting or an offer to help"
 
-          - user: "What is the capital of Germany?"
-            expect:
-              - event: response
-                eval: "the response says the capital of Germany is Berlin"
-        ```
-      </Tab>
-      <Tab title="OpenAI judge">
-        ```yaml
-        name: capital_question
-
-        judge:
-          eval:
-            service: openai
-            model: gpt-4o-mini
-
-        turns:
-          # The agent greets on connect; wait for the greeting before speaking.
-          - expect:
-              - event: response
-                eval: "the bot opens the conversation with a greeting or an offer to help"
-
-          - user: "What is the capital of Germany?"
-            expect:
-              - event: response
-                eval: "the response says the capital of Germany is Berlin"
-        ```
-      </Tab>
-    </Tabs>
+      - user: "What is the capital of Germany?"
+        expect:
+          - event: response
+            eval: "the response says the capital of Germany is Berlin"
+    ```
 
     Each turn optionally sends a user utterance and lists the events expected in response. The `eval:` field is a natural-language criterion checked by the judge LLM, so the test passes whether the agent says "Berlin is the capital of Germany" or "That would be Berlin!".
 
     This scenario runs in **text mode** (the default): the user turn is sent as text and the agent's TTS is skipped automatically, so the whole conversation costs nothing in audio services and finishes in seconds.
 
     <Note>
-      Ollama with `gemma4:12b` is the default judge, which is why the first tab
-      has no `judge:` block. To use a different judge LLM, add a `judge.eval:`
-      block as in the OpenAI tab.
+      Ollama with `gemma4:12b` is the default judge, which is why there is no
+      `judge:` block. To judge with another LLM, see [Scenario
+      Configuration](/pipecat/evals/configuration#judging-with-judge).
     </Note>
 
   </Step>
@@ -146,10 +119,69 @@ This guide takes an existing agent, starts it with the eval transport, and runs 
     A failing eval tells you which turn, which expectation, and why. That message (plus the `.eval.log` trace) is what you, or your AI coding assistant, iterate against.
 
   </Step>
+
+  <Step title="Let a simulated caller talk to it">
+    A scripted scenario walks one path. A **simulated** scenario hands the user's side to an LLM with a persona and a goal, and a judge decides from the whole conversation whether the agent did its job. Save this as `scenarios/capital_curious.yaml`:
+
+    ```yaml
+    name: capital_curious
+
+    persona: |
+      A friendly, curious traveler planning a trip to Europe. Polite and concise:
+      asks one question at a time, and thanks the assistant once satisfied.
+
+    goal: "Find out what the capital of Germany is, then end the call."
+
+    success: "the bot told the caller that the capital of Germany is Berlin"
+
+    metrics:
+      - name: politeness
+        criterion: "the reply is courteous and helpful, never curt or dismissive"
+        min_score: 1
+      - measure: words
+        max_value: 60
+
+    max_turns: 6
+    ```
+
+    There are no turns to write. `persona:` and `goal:` tell the LLM playing the caller who it is and what it wants, and `success:` tells the judge what the agent must have done. The caller runs on the same local Ollama model as the judge, so this needs no API key; a `simulator:` block would name another LLM. The `politeness` metric is judged on every reply, and `words` bounds the longest one.
+
+    Run it with `-v` to watch the conversation as it happens:
+
+    ```bash
+    pipecat eval run scenarios/capital_curious.yaml -v
+    ```
+
+    ```
+          bot: Hello! How can I help you today?
+          user: Hi! I'm planning a trip to Europe. Could you tell me what the capital of Germany is?
+          bot: The capital of Germany is Berlin.
+          user: Great, thank you so much!
+          bot: You're welcome! Enjoy your trip.
+
+          ended by end_call after 2 persona turn(s)
+
+        judge: the bot told the caller the capital of Germany is Berlin
+
+        metrics:
+          politeness: 1.00 (min 1.00) | 3/3 turns
+          words: 1.00 | longest reply 7 words, at most 60
+
+        persona: succeeded: I learned that the capital of Germany is Berlin.
+
+      ✓ ws://localhost:7860 capital_curious end_call (9814ms)
+
+      1/1 passed  ·  9.8s
+    ```
+
+    The caller says something different every run, which is the point: it checks that the agent gets a real caller to the goal, without you writing a scenario for every way the conversation could go. When you need exact control over what the user says and what the agent must do in return, write a scripted scenario instead.
+
+  </Step>
 </Steps>
 
 ## Where to go next
 
-- Learn the full scenario format, including multi-turn conversations, function call assertions, interruptions, latency budgets, and text vs audio modes, in [Writing Scenarios](/pipecat/evals/scenarios).
+- Learn the full scripted format, including multi-turn conversations, function call assertions, interruptions, latency budgets, and text vs audio modes, in [Scripted Scenarios](/pipecat/evals/scripted-scenarios).
+- Learn how personas, success criteria, judged and measured metrics, and `runs:` work in [Simulated Scenarios](/pipecat/evals/simulated-scenarios).
 - Have many scenarios or agents? Let Pipecat spawn the agents for you with [Eval Suites](/pipecat/evals/suites).
 - Want your coding assistant to run these for you? See [The Eval Loop](/pipecat/evals/the-eval-loop).
