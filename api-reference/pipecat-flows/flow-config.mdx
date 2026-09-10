@@ -1,0 +1,382 @@
+---
+title: "FlowConfig and Flow"
+"og:title": "FlowConfig - Pipecat Flows"
+description: "Define conversation flows as YAML or JSON with FlowConfig: nodes, tools, transitions, branch tables, and template placeholders."
+---
+
+## Overview
+
+`FlowConfig` describes a conversation flow as data: the nodes, what each one says, which tools each node offers, and where each tool leads. It loads from YAML, JSON, or a plain dict and is validated structurally on load.
+
+`Flow` joins a `FlowConfig` to the application's handlers: the config's nodes turned into runnable `NodeConfig` dicts with every tool reference resolved to a Flows direct function, every `transition_only` function built from the config alone, and every transition wired to the node the config names.
+
+This seam lets a bot load its flow at runtime — fetch the config from a database or CMS per session, construct a `Flow` from it and the module holding your direct functions and action handlers, and hand that to `FlowManager`.
+
+<Card title="YAML Flow Examples" icon="code" href="https://github.com/pipecat-ai/pipecat/tree/main/examples/flows">
+  Five flows examples have YAML twins: `hello_world_yaml/`, `food_ordering_yaml/`, `restaurant_reservation_yaml/`, `patient_intake_yaml/`, `podcast_interview_yaml/`
+</Card>
+
+## FlowConfig
+
+Configuration for a complete conversation flow loaded from YAML, JSON, or a dict.
+
+### Loading
+
+<ParamField path="from_file" type="classmethod">
+  Load a config from a `.yaml`, `.yml`, or `.json` file. YAML files may use `!include` with paths relative to the file's directory.
+
+```python
+config = FlowConfig.from_file("flow.yaml")
+```
+</ParamField>
+
+<ParamField path="from_yaml" type="classmethod">
+  Load a config from YAML text.
+
+```python
+config = FlowConfig.from_yaml(yaml_text, base_dir=Path("."))
+```
+
+| Parameter  | Type   | Default | Description                                                                 |
+| ---------- | ------ | ------- | --------------------------------------------------------------------------- |
+| `text`     | `str`  |         | The YAML document.                                                          |
+| `base_dir` | `Path` | `None`  | Directory that `!include` paths resolve against. When omitted, `!include` is unavailable. |
+</ParamField>
+
+<ParamField path="from_json" type="classmethod">
+  Load a config from JSON text.
+
+```python
+config = FlowConfig.from_json(json_text)
+```
+</ParamField>
+
+### Configuration
+
+<ParamField path="initial_node" type="str" required>
+  Name of the node the flow starts in.
+</ParamField>
+
+<ParamField path="nodes" type="dict[str, FlowConfig.Node]" required>
+  The flow's nodes, keyed by name. Each node is a `FlowConfig.Node` (see below).
+</ParamField>
+
+<ParamField path="global_functions" type="list[FlowConfig.Function]">
+  Tools offered at every node.
+</ParamField>
+
+### Node Configuration
+
+Each entry in `nodes` is a `FlowConfig.Node`:
+
+<ParamField path="task_messages" type="list[FlowConfig.Message]" required>
+  What the LLM should do at this node. Each message is `{"role": "developer", "content": "..."}`.
+</ParamField>
+
+<ParamField path="role_message" type="str">
+  The bot's role or personality, sent as the LLM's system instruction on entering this node. It persists across transitions until another node sets its own. May contain `{{ key }}` placeholders.
+</ParamField>
+
+<ParamField path="functions" type="list[FlowConfig.Function]">
+  Tools offered at this node, in addition to `global_functions`.
+</ParamField>
+
+<ParamField path="pre_actions" type="list[FlowConfig.Action]">
+  Actions run before the LLM responds at this node.
+</ParamField>
+
+<ParamField path="post_actions" type="list[FlowConfig.Action]">
+  Actions run after the LLM responds at this node.
+</ParamField>
+
+<ParamField path="context_strategy" type="'append' | 'reset'">
+  How the LLM context is updated on entering this node. Defaults to the `FlowManager`'s strategy.
+</ParamField>
+
+<ParamField path="respond_immediately" type="bool" default="True">
+  Whether the LLM responds as soon as the node is entered.
+</ParamField>
+
+### Function Configuration
+
+Each function entry is a `FlowConfig.Function`:
+
+<ParamField path="name" type="str" required>
+  The tool's name, as the LLM sees it. For an ordinary entry, also the name of the direct function in the handlers.
+</ParamField>
+
+<ParamField path="transition_only" type="bool" default="False">
+  Whether the tool is defined here rather than in code. Requires `description` and a `transition_to` that names a node.
+</ParamField>
+
+<ParamField path="description" type="str">
+  What the tool is for, for the LLM. Only a `transition_only` entry has one; a direct function describes itself in its docstring.
+</ParamField>
+
+<ParamField path="transition_to" type="str | FlowConfig.Branch">
+  Node to transition to after the tool completes, or a branch table. Omitted for tools that stay on the current node.
+</ParamField>
+
+### Branch Configuration
+
+A branch chooses the next node by a field of the tool's result:
+
+<ParamField path="field" type="str" required>
+  Key of the tool's result whose value selects the case.
+</ParamField>
+
+<ParamField path="cases" type="dict[str, str]" required>
+  Result value to node name. Keys may be strings, booleans, or numbers; they match the result value by its canonical string.
+</ParamField>
+
+<ParamField path="default" type="str">
+  Node to transition to when the value matches no case. When omitted, an unmatched value stays on the current node.
+</ParamField>
+
+### Action Configuration
+
+Each action entry is a `FlowConfig.Action`:
+
+<ParamField path="type" type="str" required>
+  Action type identifier. Built-in types: `tts_say`, `end_conversation`, `function`.
+</ParamField>
+
+<ParamField path="handler" type="str">
+  Name of the handler in the handlers a `Flow` is constructed with. Required for `function`, optional for custom types, not allowed on `tts_say` or `end_conversation`.
+</ParamField>
+
+Additional fields pass through to the handler. The `text` of a `tts_say` action may contain `{{ key }}` placeholders.
+
+### Prompt Placeholders
+
+Prompt text may refer to the manager's state with `{{ key }}` placeholders: a node's `role_message`, the `content` of its `task_messages`, and the `text` of a `tts_say` action. `FlowManager` fills them from `flow_manager.state` each time it enters the node.
+
+- `{{ order.size }}` walks into a stored mapping
+- Values are rendered with `str()`
+- A key that is not in state raises `FlowError` when the node is entered
+- To show the LLM a literal `{{ key }}`, escape it as `\{{ key }}`
+
+### Example YAML
+
+```yaml
+initial_node: greet
+
+nodes:
+  greet:
+    role_message: You are a friendly order-taking assistant for {{ restaurant_name }}.
+    task_messages:
+      - role: developer
+        content: Greet the caller and ask whether they want pizza or sushi.
+    pre_actions:
+      - type: function
+        handler: check_kitchen_status
+    functions:
+      - name: choose_pizza
+        transition_only: true
+        description: The caller wants to order pizza.
+        transition_to: pizza
+      - name: choose_sushi
+        transition_only: true
+        description: The caller wants to order sushi.
+        transition_to: sushi
+
+  pizza:
+    task_messages:
+      - role: developer
+        content: Take a pizza order.
+    functions:
+      - name: select_pizza_order
+        transition_to:
+          field: status
+          cases:
+            ok: confirm
+            unavailable: pizza
+          default: confirm
+
+  confirm:
+    task_messages:
+      - role: developer
+        content: Read the order back and ask if they want anything else.
+    functions:
+      - name: complete_order
+        transition_only: true
+        description: The caller confirms the order is correct.
+        transition_to: end
+      - name: revise_order
+        transition_only: true
+        description: The caller wants to make changes.
+        transition_to: greet
+
+  end:
+    task_messages:
+      - role: developer
+        content: Thank the caller.
+    post_actions:
+      - type: tts_say
+        text: Thank you, {{ caller }}!
+      - type: end_conversation
+
+global_functions:
+  - name: get_delivery_estimate
+```
+
+## Flow
+
+A `FlowConfig` joined to the application's handlers.
+
+### Construction
+
+```python
+Flow(config: FlowConfig, *, handlers: Mapping[str, Callable] | Sequence[Mapping[str, Callable] | Any] | Any)
+```
+
+| Parameter  | Type                                                                      | Description                                                                                                                                                                                                                                                                   |
+| ---------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config`   | `FlowConfig`                                                              | The flow config.                                                                                                                                                                                                                                                              |
+| `handlers` | `Mapping[str, Callable]` \| `Sequence[...]` \| `Any` | The Python behind the config: the direct functions that implement its tools and the callables that implement its actions. A mapping of names to callables, or any object whose attributes are the callables, typically a module. A list or tuple of those lets tools and action handlers live in separate modules. |
+
+**Raises:** `FlowReferenceError` if a referenced tool or handler is missing or ambiguous, or a tool is not a valid direct function. Every such problem is collected and reported together.
+
+```python
+import handlers  # module with direct functions and action handlers
+
+config = FlowConfig.from_file("flow.yaml")
+flow = Flow(config, handlers=handlers)
+```
+
+### Properties
+
+<ParamField path="config" type="FlowConfig">
+  The config this flow was constructed from.
+</ParamField>
+
+<ParamField path="initial_node" type="NodeConfig">
+  The node config the flow starts in.
+</ParamField>
+
+<ParamField path="global_functions" type="list[FlowsFunctionSchema | FlowsDirectFunction]">
+  Tools available at every node, for `FlowManager(global_functions=...)`. A fresh list each time, so the caller may extend it.
+</ParamField>
+
+### Methods
+
+<ParamField path="node" type="method">
+  The node config for a given name.
+
+```python
+flow.node(name: str) -> NodeConfig
+```
+
+**Raises:** `FlowError` if the config has no such node.
+</ParamField>
+
+## Usage
+
+```python
+from pipecat.flows import Flow, FlowConfig, FlowManager
+import handlers  # direct functions: select_pizza_order, ...; action handlers
+
+config = FlowConfig.from_file("flow.yaml")
+flow = Flow(config, handlers=handlers)
+
+flow_manager = FlowManager(
+    worker=worker,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    global_functions=flow.global_functions,
+)
+
+# Session facts the prompts refer to as {{ key }}
+flow_manager.state.update({"restaurant_name": "Luigi's", "caller": "friend"})
+
+await flow_manager.initialize(flow.initial_node)
+```
+
+### Handlers Module
+
+Tools stay in Python and return `(result, TRANSITION_IN_YAML)`; a function that only moves the conversation is written in the config alone, as a `transition_only` entry with a `description`.
+
+```python
+# handlers.py
+from pipecat.flows import TRANSITION_IN_YAML, FlowManager
+
+async def select_pizza_order(flow_manager: FlowManager, size: str, pizza_type: str):
+    """Record the pizza order details.
+
+    Args:
+        size: One of "small", "medium", or "large".
+        pizza_type: The kind of pizza.
+    """
+    flow_manager.state["order"] = {"size": size, "pizza_type": pizza_type}
+    # Let the config decide the next node
+    return {"size": size, "type": pizza_type, "status": "ok"}, TRANSITION_IN_YAML
+
+async def get_delivery_estimate(flow_manager: FlowManager):
+    """Get a delivery estimate."""
+    return {"time": "30 minutes"}, TRANSITION_IN_YAML
+
+async def check_kitchen_status(action: dict, flow_manager: FlowManager) -> None:
+    """Pre-action handler."""
+    print("Kitchen is open")
+```
+
+### Transition-Only Functions
+
+A function that only moves the conversation needs no Python:
+
+```yaml
+functions:
+  - name: revise_order
+    transition_only: true
+    description: The caller wants to make changes to their order.
+    transition_to: greet
+```
+
+### Branch Transitions
+
+When a transition depends on logic, keep the business logic flow-agnostic and write a thin tool that reports the outcome as a field for the config to branch on:
+
+```yaml
+functions:
+  - name: check_availability
+    transition_to:
+      field: status
+      cases:
+        available: confirm
+        unavailable: no_availability
+```
+
+```python
+async def check_availability(flow_manager: FlowManager, time: str, party_size: int):
+    """Check availability for requested time.
+
+    Args:
+        time: Requested reservation time.
+        party_size: Number of people.
+    """
+    is_available, alternative_times = await reservation_system.check(party_size, time)
+    return {
+        "status": "available" if is_available else "unavailable",
+        "time": time,
+        "alternative_times": alternative_times,
+    }, TRANSITION_IN_YAML
+```
+
+## YAML Include
+
+YAML configs can keep long prompts in their own files with `!include`:
+
+```yaml
+# flow.yaml
+nodes:
+  greet:
+    task_messages: !include prompts/greeting.yaml
+```
+
+```yaml
+# prompts/greeting.yaml
+- role: developer
+  content: Greet the caller warmly and ask how you can help them today.
+```
+
+Paths resolve relative to the config file's directory. Nested includes work.
