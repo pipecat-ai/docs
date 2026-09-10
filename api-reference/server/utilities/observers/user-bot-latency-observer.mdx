@@ -4,7 +4,7 @@ sidebarTitle: "Latency Observer"
 description: "Measure response time between user speech and bot responses in Pipecat"
 ---
 
-The `UserBotLatencyObserver` measures the time between when a user stops speaking and when the bot starts responding, emitting events for custom handling and optional OpenTelemetry tracing integration. It also tracks first-bot-speech latency and provides detailed per-service latency breakdowns when metrics are enabled.
+The `UserBotLatencyObserver` measures the time between when a user stops speaking and when the bot starts responding, emitting events for custom handling and optional OpenTelemetry tracing integration. It also tracks first-bot-speech latency and provides detailed latency breakdowns when metrics are enabled, including per-service metrics and contributions that name every part of the interval.
 
 ## Features
 
@@ -12,6 +12,7 @@ The `UserBotLatencyObserver` measures the time between when a user stops speakin
 - Measures bot response latency from the actual moment the user started speaking
 - Measures first bot speech latency (client connection to first speech)
 - Provides detailed latency breakdown with per-service TTFB, text aggregation, user turn duration, and function call metrics
+- Provides contributions timeline that names every part of the user-to-bot interval, including time no service measures
 - Emits `on_latency_measured` events for custom processing
 - Emits `on_latency_breakdown` events with detailed per-service metrics
 - Emits `on_first_bot_speech_latency` event for greeting latency measurement
@@ -50,9 +51,9 @@ latency_observer = UserBotLatencyObserver()
 
 @latency_observer.event_handler("on_latency_breakdown")
 async def on_latency_breakdown(observer, breakdown):
-    print(f"Latency breakdown ({len(breakdown.chronological_events())} events):")
-    for event in breakdown.chronological_events():
-        print(f"  {event}")
+    # Each line names one part of the turn and they sum to the total latency
+    for line in breakdown.turn_contribution_lines():
+        print(f"  {line}")
 
 worker = PipelineWorker(
     pipeline,
@@ -76,7 +77,7 @@ The observer tracks conversation flow through these key events:
 3. **User stops speaking** (`VADUserStoppedSpeakingFrame`) → Records timestamp, accounting for VAD `stop_secs` delay
 4. **Bot starts speaking** (`BotStartedSpeakingFrame`) → Calculates latency and emits `on_latency_measured` and `on_latency_breakdown` events
 
-When `enable_metrics=True` in `PipelineParams`, the observer also collects per-service metrics (TTFB, text aggregation, function call latency) from `MetricsFrame` instances and includes them in the latency breakdown.
+When `enable_metrics=True` in `PipelineParams`, the observer also collects per-service metrics (TTFB, text aggregation, function call latency) from `MetricsFrame` instances and builds a contributions timeline that names every part of the user-to-bot interval, including the parts no service measures (VAD silence, turn detection, turn-completion markers).
 
 ## Event Handlers
 
@@ -99,22 +100,46 @@ Called alongside `on_latency_measured` with detailed per-service metrics collect
 @latency_observer.event_handler("on_latency_breakdown")
 async def on_latency_breakdown(observer, breakdown):
     # breakdown is a LatencyBreakdown object
-    logger.info("Latency breakdown:")
-    for event in breakdown.chronological_events():
-        logger.info(f"  {event}")
+    for line in breakdown.turn_contribution_lines():
+        logger.info(f"  {line}")
+    # Output:
+    #   0.200s  endpointing wait     [config: VAD stop_secs]
+    #   0.125s  transcription        [DeepgramSTTService#0]
+    #   0.336s  LLM inference        [OpenAILLMService#0]
+    #   0.359s  speech synthesis     [CartesiaTTSService#0]
+    #   1.020s  TOTAL
 ```
 
 **LatencyBreakdown fields:**
 
-| Field                  | Type                                        | Description                                                                                  |
-| ---------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `ttfb`                 | `List[TTFBBreakdownMetrics]`                | Time-to-first-byte metrics from each service                                                 |
-| `text_aggregation`     | `Optional[TextAggregationBreakdownMetrics]` | First text aggregation measurement (sentence aggregation latency)                            |
-| `user_turn_start_time` | `Optional[float]`                           | Unix timestamp when user turn started (adjusted for VAD stop_secs)                           |
-| `user_turn_secs`       | `Optional[float]`                           | User turn duration including VAD silence detection, STT finalization, and turn analyzer wait |
-| `function_calls`       | `List[FunctionCallMetrics]`                 | Latency for each function call executed during the cycle                                     |
+| Field                  | Type                                        | Description                                                                                                     |
+| ---------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `contributions`        | `List[LatencyContribution]`                 | Named parts of the interval in chronological order, summing to the measured latency                             |
+| `measured_from`        | `Optional[MeasuredFrom]`                    | Where the interval was anchored: `USER_SILENCE` for turns, `CLIENT_CONNECTED` for greetings                    |
+| `total_secs`           | `float`                                     | The measured interval that the contributions sum to                                                             |
+| `ttfb`                 | `List[TTFBBreakdownMetrics]`                | Time-to-first-byte metrics from each service                                                                    |
+| `text_aggregation`     | `Optional[TextAggregationBreakdownMetrics]` | First text aggregation measurement (sentence aggregation latency)                                               |
+| `user_turn_start_time` | `Optional[float]`                           | Unix timestamp when user turn started (adjusted for VAD stop_secs)                                              |
+| `user_turn_secs`       | `Optional[float]`                           | User turn duration including VAD silence detection, STT finalization, and turn analyzer wait                    |
+| `function_calls`       | `List[FunctionCallMetrics]`                 | Latency for each function call executed during the cycle                                                        |
 
-The `breakdown.chronological_events()` method returns a human-readable list of all metrics sorted by start time, useful for logging and debugging.
+**LatencyContribution fields:**
+
+Each contribution names one part of the user-to-bot interval:
+
+| Field            | Type                | Description                                                                                      |
+| ---------------- | ------------------- | ------------------------------------------------------------------------------------------------ |
+| `key`            | `str`               | Stable identifier for this part (safe to group on, survives label rewording)                     |
+| `label`          | `str`               | What the time was spent on                                                                       |
+| `owner`          | `str`               | What spent it — a processor name or a `config:` tag naming the setting that governs it           |
+| `owner_kind`     | `LatencyOwnerKind`  | What kind of thing the owner is: `SERVICE`, `SETTING`, `BOT`, or `PIPELINE`                      |
+| `start_time`     | `float`             | Unix timestamp when it started                                                                   |
+| `duration_secs`  | `float`             | How long it took in seconds                                                                      |
+
+**Methods:**
+
+- `turn_contribution_lines(by_cost=False)` — Format contributions for logging, one per line plus a total. Pass `by_cost=True` to order by duration rather than chronologically.
+- `chronological_events()` — **Deprecated since 1.9.0.** Use `turn_contribution_lines()` instead, which names every part of the interval. Will be removed in 2.0.0.
 
 ### on_first_bot_speech_latency
 
@@ -139,6 +164,17 @@ async def on_first_bot_speech_latency(observer, latency):
 <ParamField path="max_frames" type="int" default="100">
   Maximum number of frame IDs to keep in history for duplicate detection.
   Prevents unbounded memory growth in long conversations.
+</ParamField>
+
+<ParamField path="min_contribution_secs" type="float" default="0.005">
+  Contributions shorter than this are rolled into the single pipeline entry
+  rather than listed separately. Pass `0` to list every contribution, including
+  individual frame hops.
+</ParamField>
+
+<ParamField path="time_source" type="Callable[[], float]" default="time.time">
+  Reads the current time in seconds. Supplying one lets a test drive a cycle
+  without waiting out the intervals it describes.
 </ParamField>
 
 ## Limitations
