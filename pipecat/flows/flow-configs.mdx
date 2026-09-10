@@ -1,0 +1,321 @@
+---
+title: "Flow Configs"
+description: "Write a Pipecat Flows conversation as data with FlowConfig: the document format, loading, validation, and joining a config to handlers."
+---
+
+A **flow config** describes a conversation as data: the nodes, what each one says, which tools each node offers, and where each tool leads. It contains no Python. The tools it names live in your code and are resolved when the config is joined to your handlers.
+
+Writing the flow this way puts a seam between the graph and the bot. One deployed bot can run whichever flow a session calls for, loaded from a file, a database, or a CMS, and someone who is not an engineer can change what the bot says or where a step leads without a deploy.
+
+## The Document
+
+A config has an `initial_node`, a map of `nodes` keyed by name, and an optional list of `global_functions`. Here is the food-ordering example in full:
+
+```yaml flow.yaml
+initial_node: initial
+
+nodes:
+  initial:
+    role_message: >
+      You are an order-taking assistant for {{ restaurant_name }}. You must
+      ALWAYS use the available functions to progress the conversation. This is
+      a phone conversation and your responses will be converted to audio. Keep
+      the conversation friendly, casual, and polite.
+    task_messages:
+      - role: developer
+        content: >
+          Greet the caller briefly and ask whether they'd like pizza or sushi,
+          then wait for them to use a function to choose.
+    pre_actions:
+      - type: function
+        handler: check_kitchen_status
+    functions:
+      - name: choose_pizza
+        transition_only: true
+        description: The caller wants to order pizza.
+        transition_to: choose_pizza
+      - name: choose_sushi
+        transition_only: true
+        description: The caller wants to order sushi.
+        transition_to: choose_sushi
+
+  choose_pizza:
+    task_messages:
+      - role: developer
+        content: >
+          Your only job on this step is to get the pizza's size and type and
+          call select_pizza_order with them.
+    functions:
+      - name: select_pizza_order
+        transition_to: confirm
+
+  choose_sushi:
+    task_messages:
+      - role: developer
+        content: >
+          Your only job on this step is to get the roll count and type and
+          call select_sushi_order with them.
+    functions:
+      - name: select_sushi_order
+        transition_to: confirm
+
+  confirm:
+    task_messages:
+      - role: developer
+        content: >
+          Say the order back once with the total and ask if that's right.
+    functions:
+      - name: complete_order
+        transition_only: true
+        description: The caller confirms the order is correct.
+        transition_to: end
+      - name: revise_order
+        transition_only: true
+        description: The caller wants to make changes to their order.
+        transition_to: initial
+
+  end:
+    task_messages:
+      - role: developer
+        content: Thank the caller for the order and say goodbye.
+    post_actions:
+      - type: end_conversation
+
+global_functions:
+  - name: get_delivery_estimate
+```
+
+<Info>
+  The full example, with its complete prompts and its `handlers.py`, is in
+  [`examples/flows/yaml/food_ordering/`](https://github.com/pipecat-ai/pipecat/tree/main/examples/flows/yaml/food_ordering).
+</Info>
+
+### Top-Level Keys
+
+<ParamField path="initial_node" type="str" required>
+  Name of the node the flow starts in. Must be a key of `nodes`.
+</ParamField>
+
+<ParamField path="nodes" type="dict[str, Node]" required>
+  The flow's nodes, keyed by name. The key is the node's name — it is what
+  `initial_node` and every `transition_to` refer to. At least one is required.
+</ParamField>
+
+<ParamField path="global_functions" type="list[Function]">
+  Tools offered at every node, written the same way as a node's `functions`. A
+  name used here can't also appear in a node's `functions`.
+</ParamField>
+
+### Node Keys
+
+<ParamField path="task_messages" type="list[Message]" required>
+  What the LLM should do at this node. Each entry has a `role` (such as
+  `developer` or `system`) and a `content` string.
+</ParamField>
+
+<ParamField path="role_message" type="str">
+  The bot's role or personality, sent as the LLM's system instruction on
+  entering this node. It persists across transitions until another node sets its
+  own.
+</ParamField>
+
+<ParamField path="functions" type="list[Function]">
+  Tools offered at this node, in addition to the config's `global_functions`.
+  See [Functions](/pipecat/flows/functions) for the entry format,
+  `transition_only`, and branch tables.
+</ParamField>
+
+<ParamField path="pre_actions" type="list[Action]">
+  Actions run before the LLM responds at this node. See
+  [Actions](/pipecat/flows/actions).
+</ParamField>
+
+<ParamField path="post_actions" type="list[Action]">
+  Actions run after the LLM responds at this node.
+</ParamField>
+
+<ParamField path="context_strategy" type='"append" | "reset"'>
+  How the LLM context is updated on entering this node. Defaults to the
+  `FlowManager`'s strategy. See [Context
+  Strategies](/pipecat/flows/context-strategies).
+</ParamField>
+
+<ParamField path="respond_immediately" type="bool" default="true">
+  Whether the LLM responds as soon as the node is entered.
+</ParamField>
+
+`role_message` and each task message's `content` may contain `{{ key }}` placeholders, filled from the manager's state each time the node is entered. See [Placeholders](/pipecat/flows/state-management#placeholders).
+
+## Loading a Config
+
+| Source                             | Loader                            |
+| ---------------------------------- | --------------------------------- |
+| A `.yaml`, `.yml`, or `.json` file | `FlowConfig.from_file(path)`      |
+| YAML text                          | `FlowConfig.from_yaml(text)`      |
+| JSON text                          | `FlowConfig.from_json(text)`      |
+| An already-parsed dict             | `FlowConfig.model_validate(data)` |
+
+```python
+from pipecat.flows import FlowConfig
+
+config = FlowConfig.from_file("flow.yaml")
+```
+
+`FlowConfig` is a Pydantic model, so `model_validate` is the loader for a dict you built or fetched yourself.
+
+### Splitting Out Long Prompts
+
+A YAML config loaded with `from_file` can pull text in from another file with `!include`, resolved relative to the config's own directory. This keeps a long prompt out of the graph:
+
+```yaml
+nodes:
+  initial:
+    role_message: !include prompts/agent_role.txt
+    task_messages: !include prompts/greeting.yaml
+```
+
+`!include` is available with `from_file`, and with `from_yaml` when you pass `base_dir`. It is not available in JSON.
+
+## Validation
+
+A config is checked in two stages, and between them everything is checked.
+
+**On load**, its structure: the top level is a mapping, `initial_node` names a defined node, every `transition_to` names a defined node, tool names are unique within a node and across `global_functions`, a `transition_only` entry has both a `description` and a plain node name to transition to, an ordinary entry has no `description`, and every action is well-formed. A failure raises a Pydantic `ValidationError`.
+
+**When the `Flow` is constructed**, its references into your code: every tool it names exists in the handlers, is callable, and is a valid direct function; every action `handler` it names exists. These are collected and reported together as a single [`FlowReferenceError`](/api-reference/pipecat-flows/exceptions#flowreferenceerror), rather than stopping at the first, so one run surfaces every miss.
+
+```
+flow config has 2 problems:
+- node 'confirm' references tool 'complete_ordr', which is not in the handlers
+- node 'initial' pre_actions references action handler 'check_kitchen', which is not in the handlers
+```
+
+Each problem is also available on the exception as a [`FlowProblem`](/api-reference/pipecat-flows/exceptions#flowproblem) with a stable `code`, so you can handle them programmatically.
+
+<Tip>
+  Because both stages run before the first call comes in, starting the bot once
+  is a complete check of the flow.
+</Tip>
+
+## Joining a Config to Code
+
+A `Flow` is a config joined to the Python it names:
+
+```python
+import handlers
+
+from pipecat.flows import Flow, FlowConfig
+
+config = FlowConfig.from_file("flow.yaml")
+flow = Flow(config, handlers=handlers)
+```
+
+`handlers` can be:
+
+- **A module**, as above — the usual case. Its top-level functions are looked up by name.
+- **A mapping** of names to callables, when you want to build the namespace yourself or expose a tool under a different name than the function has.
+- **A list or tuple** of either, when tools and action handlers live in separate modules.
+
+Only the names the config actually references are looked up, so an unrelated function in the module is ignored. With a list, a name that resolves to _different_ callables in more than one entry is an error rather than a silent choice; the same callable reachable through two of them is fine.
+
+The flow then hands three things to the `FlowManager`:
+
+<ParamField path="flow.initial_node" type="NodeConfig">
+  The node the flow starts in, ready to pass to `FlowManager.initialize()`.
+</ParamField>
+
+<ParamField path="flow.global_functions" type="list">
+  The config's global functions, ready to pass to
+  `FlowManager(global_functions=...)`. A fresh list each time, so you can extend
+  it with tools defined in code.
+</ParamField>
+
+<ParamField path="flow.node(name)" type="NodeConfig">
+  Any node by name, for the rare case where code needs to jump into the graph
+  directly. Raises `FlowError` if the config has no such node.
+</ParamField>
+
+```python
+flow_manager = FlowManager(
+    worker=worker,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    transport=transport,
+    global_functions=flow.global_functions,
+)
+
+await flow_manager.initialize(flow.initial_node)
+```
+
+## Loading a Flow Per Session
+
+Because the config is just a document, the bot doesn't have to ship with it. Fetch the flow a session calls for, seed the facts its prompts refer to, and initialize:
+
+```python
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    # ... build the pipeline, worker, and runner ...
+
+    # The flow for this session, fetched at connect time.
+    tenant = runner_args.body["tenant_id"]
+    config = FlowConfig.from_json(await fetch_flow_config(tenant))
+    flow = Flow(config, handlers=handlers)
+
+    flow_manager = FlowManager(
+        worker=worker,
+        llm=llm,
+        context_aggregator=context_aggregator,
+        transport=transport,
+        global_functions=flow.global_functions,
+    )
+
+    # Session facts the config's prompts refer to as {{ key }}.
+    flow_manager.state.update(
+        {
+            "restaurant_name": await fetch_restaurant_name(tenant),
+            "caller_name": runner_args.body.get("caller_name", "there"),
+        }
+    )
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        await flow_manager.initialize(flow.initial_node)
+```
+
+The handlers stay the same across every flow the bot can run. What changes per session is the document: which nodes exist, what they say, and where each tool leads.
+
+<Warning>
+  A config fetched from outside your codebase can still name a tool your
+  handlers don't have. Construct the `Flow` where you can catch
+  `FlowReferenceError` and fail the session cleanly, rather than mid-call.
+</Warning>
+
+## Tooling
+
+The config format's JSON Schema is published in the Pipecat repository at [`src/pipecat/flows/flow_config.schema.json`](https://github.com/pipecat-ai/pipecat/blob/main/src/pipecat/flows/flow_config.schema.json). Point your editor at it for completion and inline validation while writing a config, or vendor it into a tool that generates one.
+
+The [Pipecat Flows Visual Editor](https://flows.pipecat.ai/) lets you design a flow visually rather than by hand.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Functions" icon="code" href="/pipecat/flows/functions">
+    Tool entries, transition-only functions, and branch tables
+  </Card>
+  <Card
+    title="State Management"
+    icon="database"
+    href="/pipecat/flows/state-management"
+  >
+    Placeholders, cross-node state, and global functions
+  </Card>
+  <Card title="Actions" icon="bolt" href="/pipecat/flows/actions">
+    Built-in and custom actions in a config
+  </Card>
+  <Card
+    title="FlowConfig Reference"
+    icon="book"
+    href="/api-reference/pipecat-flows/flow-config"
+  >
+    Every field, loader, and validation rule
+  </Card>
+</CardGroup>
