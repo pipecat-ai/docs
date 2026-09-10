@@ -1,6 +1,6 @@
 ---
 title: "Functions"
-description: "Define function calls and handlers in Pipecat Flows to drive node transitions and collect structured data."
+description: "Define Pipecat Flows tools: node and edge functions, transition_only entries, branch tables, and the direct-function handler contract."
 ---
 
 Functions in Pipecat Flows serve two key purposes:
@@ -17,13 +17,176 @@ For example, if your node's job is to collect a user's favorite color:
 1. The LLM asks the question
 2. The user provides their answer
 3. The LLM calls the function with the answer
-4. The function processes the data and determines the next node
+4. The function processes the data and the conversation moves on
 
-## Defining a Function
+A function is one of two kinds, in either form of flow:
 
-The preferred way to define a function is with a **direct function**: a single async function that is _both_ the handler (the code that runs) and the schema (what is advertised to the LLM). Flows auto-derives the function's metadata — name, description, parameter properties (with their descriptions), and which parameters are required — from the function's signature and docstring.
+- A **node function** does work within the current conversation state without switching nodes.
+- An **edge function** transitions to another conversation state, optionally doing work first.
 
-The first parameter is always `flow_manager` (a [`FlowManager`](/api-reference/pipecat-flows/flow-manager)); the function's own parameters follow. Document each parameter in a Google-style docstring.
+What differs between the two forms is _who decides_ which kind a function is. In a [flow config](/pipecat/flows/flow-configs) the entry decides: an entry with `transition_to` is an edge function. In code the handler decides, by returning the next node or not.
+
+## Declarative
+
+A `functions` entry names a tool and, optionally, where it leads:
+
+```yaml
+functions:
+  - name: select_pizza_order
+    transition_to: confirm
+```
+
+<ParamField path="name" type="str" required>
+  The tool's name, as the LLM sees it, and the name of the direct function in
+  the handlers. The config carries no description or parameters for an ordinary
+  entry — those come from the function's signature and docstring.
+</ParamField>
+
+<ParamField path="transition_to" type="str | Branch">
+  The node to transition to after the tool completes, or a [branch
+  table](#branch-tables). Omit it for a node function, which stays put.
+</ParamField>
+
+<ParamField path="transition_only" type="bool" default="false">
+  Whether the tool is defined here rather than in code. See
+  [below](#transition-only-functions).
+</ParamField>
+
+<ParamField path="description" type="str">
+  What the tool is for, for the LLM. Only a `transition_only` entry takes one;
+  an ordinary entry describes itself in its docstring, and giving it a
+  description here is an error.
+</ParamField>
+
+### The Handler Contract
+
+The Python behind an ordinary entry is a **direct function**: a single async function that is _both_ the handler and the schema. Flows derives the tool's description, parameter properties, and which parameters are required from the signature and a Google-style docstring. The first parameter is always `flow_manager`; the function's own parameters follow.
+
+```python handlers.py
+from pipecat.flows import TRANSITION_IN_YAML, FlowManager
+
+
+async def select_pizza_order(flow_manager: FlowManager, size: str, pizza_type: str):
+    """Record the pizza order details.
+
+    Args:
+        size (str): Size of the pizza. Must be one of "small", "medium", or "large".
+        pizza_type (str): Type of pizza. Must be one of "pepperoni", "cheese", "supreme", or "vegetarian".
+    """
+    price = {"small": 10.00, "medium": 15.00, "large": 20.00}[size]
+    flow_manager.state["order"] = {"size": size, "type": pizza_type, "price": price}
+    return {"size": size, "type": pizza_type, "price": price}, TRANSITION_IN_YAML
+```
+
+A handler in a declarative flow returns `(result, TRANSITION_IN_YAML)`. The result is any JSON-serializable value, or `None`, and is given to the LLM as context. `TRANSITION_IN_YAML` is a sentinel meaning "the config decides" — it is what keeps transitions out of your Python.
+
+<Warning>
+  Returning anything else in the next-node slot raises a `FlowError` at call
+  time. A node name string, a `NodeConfig`, or `None` are all rejected: in a
+  declarative flow the config owns transitions, so there is nothing for the
+  handler to decide. Return `TRANSITION_IN_YAML` even from a node function that
+  stays put — the config's missing `transition_to` is what makes it stay.
+</Warning>
+
+To leave the bot silent after the tool finishes, rather than responding immediately, return `(result, NO_RESPONSE)`. That passes through to the manager unchanged.
+
+### Transition-Only Functions
+
+A function that only moves the conversation needs no Python. Mark the entry `transition_only: true` and give it a `description` for the LLM and a node name to transition to:
+
+```yaml
+functions:
+  - name: choose_pizza
+    transition_only: true
+    description: The caller wants to order pizza.
+    transition_to: pizza
+```
+
+It takes no parameters and runs no code. A `transition_only` entry must have both a `description` and a `transition_to` that names a node — a branch table needs a result to branch on, and there is none.
+
+### Branch Tables
+
+When the destination depends on the tool's outcome, `transition_to` can be a **branch table** that routes on a field of the result:
+
+```yaml
+functions:
+  - name: check_availability
+    transition_to:
+      field: status
+      cases:
+        available: confirm
+        unavailable: no_availability
+```
+
+<ParamField path="field" type="str" required>
+  Key of the tool's result whose value selects the case. The result must be a
+  mapping with that key, or the call raises a `FlowError`.
+</ParamField>
+
+<ParamField path="cases" type="dict[str, str]" required>
+  Result value to node name. At least one entry.
+</ParamField>
+
+<ParamField path="default" type="str">
+  Node to transition to when the value matches no case. When omitted, an
+  unmatched value stays on the current node.
+</ParamField>
+
+Case keys may be written as strings, booleans, or numbers. They are matched against the result value by a canonical string, so `true:` in YAML matches a Python `True`, and `"True":` matches it too:
+
+```yaml
+functions:
+  - name: verify_birthday
+    transition_to:
+      field: verified
+      cases:
+        true: get_prescriptions
+```
+
+### The Shim Pattern
+
+A branch table routes on a field, not on arbitrary logic — and that is the point. Keep the business logic flow-agnostic, wrap it in a thin tool that reports the outcome as a named field, and let the config route on that field.
+
+`check_availability` in the [restaurant reservation example](https://github.com/pipecat-ai/pipecat/tree/main/examples/flows/yaml/restaurant_reservation) is the shape:
+
+```python handlers.py
+class MockReservationSystem:
+    """Business logic. Knows nothing about the flow."""
+
+    async def check_availability(
+        self, party_size: int, requested_time: str
+    ) -> tuple[bool, list[str]]:
+        ...
+
+
+reservation_system = MockReservationSystem()
+
+
+async def check_availability(flow_manager: FlowManager, time: str, party_size: int):
+    """Check availability for requested time.
+
+    Args:
+        time (str): Requested reservation time in "HH:MM AM/PM" format. Must be between 5 PM and 10 PM.
+        party_size (int): Number of people in the party.
+    """
+    is_available, alternative_times = await reservation_system.check_availability(
+        party_size, time
+    )
+
+    # The business logic answered with a bool. Report it as a named status so
+    # the config can branch on it; the config, not this tool, picks the node.
+    return {
+        "status": "available" if is_available else "unavailable",
+        "time": time,
+        "alternative_times": alternative_times,
+    }, TRANSITION_IN_YAML
+```
+
+The reservation system stays reusable and testable on its own, the tool stays a few lines, and where "unavailable" leads is a config change.
+
+## Programmatic
+
+In a flow built in code, the handler returns the next node itself. A direct function is written the same way — `flow_manager` first, then its own parameters, documented in a Google-style docstring:
 
 ```python
 async def record_favorite_color(
@@ -54,40 +217,18 @@ node_config = NodeConfig(
   pattern.
 </Note>
 
-## Return Values
+### Return Values
 
-A function can return any JSON-serializable value (string, dict, list, etc.) that gets passed to the LLM. To also specify the next node, return a tuple:
+A function returns a tuple:
 
 - **Result**: Data provided to the LLM for context in subsequent completions, or `None`. Any JSON-serializable value is accepted.
 - **Next Node**: The `NodeConfig` for Flows to transition to next, or `None`.
 
-A function that doesn't need to change conversational state can return `None` for the next node. One that _only_ changes conversational state, without doing other work, can return `None` for the result.
+A node function returns `None` for the next node. One that _only_ changes conversational state, without doing other work, can return `None` for the result. Returning `NO_RESPONSE` in the next-node slot keeps the bot silent after the call.
 
-## Per-Function Call Options
+### Advanced: Defining a Function with `FlowsFunctionSchema`
 
-By default, a function is not cancelled when the user interrupts, and it uses the LLM service's global timeout. To override either, decorate the function with `@flows_tool_options`:
-
-```python
-from pipecat.flows import flows_tool_options
-
-# This lookup is only useful for the current turn, so cancel it if the user
-# interrupts and the conversation moves on.
-@flows_tool_options(cancel_on_interruption=True)
-async def check_weather(
-    flow_manager: FlowManager,
-    city: str,
-) -> tuple[dict, None]:
-    """Look up the current weather for a city.
-
-    Args:
-        city: The city to look up.
-    """
-    return {"weather": await get_weather(city)}, None
-```
-
-## Advanced: Defining a Function with `FlowsFunctionSchema`
-
-Direct functions cover most cases. Reach for `FlowsFunctionSchema` when you need explicit control over the schema — for example a strict `enum` constraint or a numeric `minimum`/`maximum` — that a direct function can't yet express.
+Direct functions cover most cases. Reach for `FlowsFunctionSchema` when you need explicit control over the schema — for example a strict `enum` constraint or a numeric `minimum`/`maximum` — that a direct function can't yet express. This is one of the reasons to write a flow in code rather than a config.
 
 A `FlowsFunctionSchema` spells out the function's name, description, and parameters by hand, and takes the `handler` that runs when the LLM calls the function:
 
@@ -119,4 +260,26 @@ node_config = NodeConfig(
 )
 ```
 
-The `handler` is required. It receives the LLM-supplied arguments and returns the same [result and next-node values](#return-values) as a direct function. To override its call options, decorate it with `@flows_tool_options`, the same decorator direct functions use.
+The `handler` is required. It receives the LLM-supplied arguments and returns the same [result and next-node values](#return-values) as a direct function.
+
+## Per-Function Call Options
+
+By default, a function is not cancelled when the user interrupts, and it uses the LLM service's global timeout. To override either, decorate the handler with `@flows_tool_options`. This works the same in both forms — it is a property of the Python, so a declarative flow's handlers take it too:
+
+```python
+from pipecat.flows import TRANSITION_IN_YAML, flows_tool_options
+
+# This lookup is only useful for the current turn, so cancel it if the user
+# interrupts and the conversation moves on.
+@flows_tool_options(cancel_on_interruption=True)
+async def check_weather(
+    flow_manager: FlowManager,
+    city: str,
+):
+    """Look up the current weather for a city.
+
+    Args:
+        city: The city to look up.
+    """
+    return {"weather": await get_weather(city)}, TRANSITION_IN_YAML
+```
