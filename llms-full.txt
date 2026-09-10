@@ -12379,17 +12379,17 @@ Everything the `pipecat eval` CLI does is available as a library under `pipecat.
 
 ## Running a scenario
 
-`EvalScenario.load()` parses a scenario file, and `EvalSession.from_scenario()` builds a ready-to-run session, constructing the judge, user speech, and transcriber the scenario calls for:
+`load_scenario_file()` parses a scenario file of either kind (scripted or simulation), and `EvalSession.from_scenario()` builds a ready-to-run session for it, constructing the judge, user speech, and transcriber the scenario calls for:
 
 ```python
 import asyncio
 
-from pipecat.evals.script_session import EvalSession
-from pipecat.evals.scenario import EvalScenario
+from pipecat.evals.scenario import load_scenario_file
+from pipecat.evals.session import EvalSession
 
 
 async def main():
-    scenario = EvalScenario.load("scenarios/capital_question.yaml")
+    scenario = load_scenario_file("scenarios/capital_question.yaml")
     session = EvalSession.from_scenario(scenario, "ws://localhost:7860")
     result = await session.run()
 
@@ -12405,9 +12405,36 @@ asyncio.run(main())
 
 The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`.
 
+### Session params
+
+How a run behaves — timeouts, recording, caching, and teardown — is configured with `EvalSessionParams`:
+
+```python
+from pipecat.evals.session import EvalSession, EvalSessionParams
+
+params = EvalSessionParams(
+    default_timeout_ms=30000,  # 30s per-expectation budget
+    stop_bot=True,             # cancel the bot's pipeline on teardown
+    use_cache=False,           # re-synthesize user audio every run
+)
+session = EvalSession.from_scenario(scenario, "ws://localhost:7860", params=params)
+```
+
+Available parameters:
+
+| Parameter            | Default                        | Description                                                                         |
+| -------------------- | ------------------------------ | ----------------------------------------------------------------------------------- |
+| `connect_timeout_s`  | `5.0`                          | How long to wait for the bot to accept the WebSocket connection before giving up.   |
+| `default_timeout_ms` | `60000`                        | Latency budget for expectations without their own `within_ms` (scripted scenarios). |
+| `record_path`        | `None`                         | Where to save the conversation audio, or `None`.                                    |
+| `cache_dir`          | `<user-cache-dir>/pipecat/tts` | Directory for cached synthesized user audio.                                        |
+| `use_cache`          | `True`                         | When False, ignore cached user audio and force fresh synthesis.                     |
+| `stop_bot`           | `False`                        | When True, ask the bot to cancel its pipeline and exit on teardown.                 |
+| `trigger_disconnect` | `False`                        | When True, fire the bot's `on_client_disconnected` handler on disconnect.           |
+
 ### The result
 
-`run()` returns an `EvalResult`:
+`run()` returns an `EvalScriptResult` for a scripted scenario or an `EvalSimulationResult` for a simulation. Both share the same base fields:
 
 | Field           | Description                                                                                         |
 | --------------- | --------------------------------------------------------------------------------------------------- |
@@ -12438,13 +12465,13 @@ This maps cleanly onto a pytest test:
 ```python
 import pytest
 
-from pipecat.evals.script_session import EvalSession
-from pipecat.evals.scenario import EvalScenario
+from pipecat.evals.scenario import load_scenario_file
+from pipecat.evals.session import EvalSession
 
 
 @pytest.mark.asyncio
 async def test_capital_question():
-    scenario = EvalScenario.load("scenarios/capital_question.yaml")
+    scenario = load_scenario_file("scenarios/capital_question.yaml")
     result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
     assert result.passed, "\n".join(str(f) for f in result.failures)
 ```
@@ -12454,12 +12481,13 @@ async def test_capital_question():
 Scenarios are plain dataclasses, so you can construct them programmatically, generating turns from a dataset, parameterizing a template, or skipping YAML entirely:
 
 ```python
-from pipecat.evals.scenario import EvalExpectation, EvalScenario, EvalTurn
+from pipecat.evals.script import EvalExpectation, EvalScriptScenario, EvalScriptTurn
 
-scenario = EvalScenario(
+scenario = EvalScriptScenario(
     name="capital_question",
+    bot_audio=False,
     turns=[
-        EvalTurn(
+        EvalScriptTurn(
             user="What is the capital of Germany?",
             expect=[
                 EvalExpectation(
@@ -12485,8 +12513,8 @@ scenario = EvalScenario(
 ```python
 import os
 
-from pipecat.evals.script_session import EvalSession
 from pipecat.evals.judge import EvalJudge
+from pipecat.evals.session import EvalSession
 from pipecat.services.openai.llm import OpenAILLMService
 
 llm = OpenAILLMService(
@@ -12501,14 +12529,14 @@ session = EvalSession.from_scenario(
 )
 ```
 
-The same injection points exist for the user's synthesized voice (`speech=`, wrapping any `TTSService` in an `EvalSpeech`) and the transcriber used for the agent's spoken audio (`transcriber=`, wrapping any `STTService` in an `EvalTranscriber`). The wrapped services can be local models or HTTP-based; WebSocket-streaming services are rejected, since they need a running pipeline to manage their connection lifecycle.
+The same injection points exist for the user's synthesized voice (`user_tts=`, a `CachingTTSService` wrapping any `TTSService`) and the transcriber used for the agent's spoken audio (`bot_stt=`, any `STTService`). The services can be local models or HTTP-based; WebSocket-streaming services are rejected, since they need a running pipeline to manage their connection lifecycle.
 
 ## Observing progress
 
 Register an `on_progress` event handler to receive notifications as each turn and expectation resolves:
 
 ```python
-from pipecat.evals.script_session import EvalSession
+from pipecat.evals.session import EvalSession
 
 session = EvalSession.from_scenario(scenario, url)
 
@@ -12531,6 +12559,7 @@ async def on_progress(session, progress):
 import asyncio
 from pathlib import Path
 
+from pipecat.evals.session import EvalSessionParams
 from pipecat.evals.suite import EvalManifest, EvalSuite
 
 
@@ -12545,7 +12574,8 @@ async def main():
     async def on_update(suite, run):
         print(run.bot, run.scenario, run.status)
 
-    await suite.run(Path("eval-runs/logs"))
+    params = EvalSessionParams(default_timeout_ms=30000, use_cache=True)
+    await suite.run(Path("eval-runs/logs"), params=params)
 
     for run in suite.runs:
         verdict = run.error or ("passed" if run.result and run.result.passed else "failed")
@@ -12559,7 +12589,9 @@ Each run is mutated in place as it executes (`status`, `result`, `error`, `durat
 
 <Warning>
   The `on_update` callback parameter to `suite.run()` is deprecated since 1.9.0
-  and will be removed in 2.0.0. Use the `on_update` event handler instead.
+  and will be removed in 2.0.0. Use the `on_update` event handler instead. The
+  `use_cache` and `default_timeout_ms` keyword arguments are also deprecated
+  since 1.9.0. Use `params=EvalSessionParams(...)` instead.
 </Warning>
 
 `EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, and so on), mirroring the CLI flags.
@@ -88290,7 +88322,7 @@ The GeminiLiveWebSocketTransport implements the various [PipecatClient event han
     horizontal
     title="Demo"
     icon="play"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/examples/directToLLMTransports"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/gemini-live-websocket-transport-v1.5.8/examples/directToLLMTransports"
   >
     Gemini Live Basic Demo
   </Card>
@@ -88299,7 +88331,7 @@ The GeminiLiveWebSocketTransport implements the various [PipecatClient event han
     horizontal
     title="Source"
     icon="github"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/transports/gemini-live-websocket-transport"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/gemini-live-websocket-transport-v1.5.8/transports/gemini-live-websocket-transport"
   >
     `GeminiLiveWebsocketTransport`
   </Card>
@@ -88439,7 +88471,7 @@ The transport implements the various [`PipecatClient` event handlers](/api-refer
     horizontal
     title="Demo"
     icon="play"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/examples/directToLLMTransports"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/openai-realtime-webrtc-transport-v1.5.8/examples/directToLLMTransports"
   >
     OpenAI Realtime Basic Demo
   </Card>
@@ -88448,7 +88480,7 @@ The transport implements the various [`PipecatClient` event handlers](/api-refer
     horizontal
     title="Source"
     icon="github"
-    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/main/transports/openai-realtime-webrtc-transport"
+    href="https://github.com/pipecat-ai/pipecat-client-web-transports/tree/openai-realtime-webrtc-transport-v1.5.8/transports/openai-realtime-webrtc-transport"
   >
     `OpenAIRealTimeWebRTCTransport`
   </Card>
