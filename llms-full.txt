@@ -39811,6 +39811,16 @@ The server drives turn boundaries with the `ink-2` model, pushing structured eve
   watchdog_min_timeout)`.
 </ParamField>
 
+<ParamField path="enable_eager_end_of_turn" type="bool" default="False">
+  Whether to answer the server's predicted end of turn (`turn.eager_end`) ahead
+  of the committed one, so the gap between the two is spent generating a
+  response rather than waiting. The response is held until the turn is
+  confirmed, and discarded if the user resumes speaking or the committed
+  transcript differs from the predicted one. Requests `EagerUserTurnStrategies`
+  in place of `ExternalUserTurnStrategies` when enabled. See [User Turn
+  Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
+</ParamField>
+
 <ParamField path="extra_headers" type="dict[str, str] | None" default="None">
   Optional additional HTTP headers to send with the WebSocket handshake.
 </ParamField>
@@ -39933,23 +39943,24 @@ Transcripts are cumulative per turn. There is no `is_final` flag and no `finaliz
 - **English-only**: The ink-2 model family supports English transcription only at launch.
 - **No runtime model switching**: Unlike the v1 API, the ink-2 model does not support runtime model or language switching. However, `keyterm` and the turn detection thresholds (`turn_start_threshold`, `turn_eager_end_threshold`, `turn_end_threshold`, `turn_end_timeout_ms`) can be updated at runtime via `STTUpdateSettingsFrame`, which triggers a reconnect.
 - **Watchdog for dangling turns**: If audio stops flowing after a `turn.start`, the service sends silence to prevent the turn from hanging indefinitely. Configure the threshold with `watchdog_min_timeout`.
-- **Server-driven turns**: The server controls turn boundaries and automatically requests `ExternalUserTurnStrategies`, so you don't need to configure turn strategies manually. Pass your own `user_turn_strategies` only to override this. There is no client-side `finalize` command.
+- **Server-driven turns**: The server controls turn boundaries and automatically requests `ExternalUserTurnStrategies` (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on), so you don't need to configure turn strategies manually. Pass your own `user_turn_strategies` only to override this. There is no client-side `finalize` command.
+- **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers the server's predicted end of turn (`turn.eager_end` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`turn.resume` event) or the committed transcript differs from the eager one.
 - **Interruption support**: `should_interrupt` (default `True`) decides whether the bot is interrupted when the user starts speaking. See [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) if you pass your own `user_turn_strategies`.
 
 ### Event Handlers
 
 Cartesia Turns STT supports the following event handlers:
 
-| Event                 | Handler Signature                     | Description                              |
-| --------------------- | ------------------------------------- | ---------------------------------------- |
-| `on_connected`        | `async def(service)`                  | Connected to Cartesia WebSocket          |
-| `on_disconnected`     | `async def(service)`                  | Disconnected from Cartesia WebSocket     |
-| `on_connection_error` | `async def(service, error_msg)`       | Connection error occurred                |
-| `on_turn_start`       | `async def(service, transcript: str)` | Server detected start of a turn          |
-| `on_turn_update`      | `async def(service, transcript: str)` | Incremental transcript update            |
-| `on_turn_eager_end`   | `async def(service, transcript: str)` | Server eagerly predicted end of turn     |
-| `on_turn_resume`      | `async def(service)`                  | User resumed speaking after an eager end |
-| `on_turn_end`         | `async def(service, transcript: str)` | Final transcript for the completed turn  |
+| Event                 | Handler Signature                     | Description                                                                             |
+| --------------------- | ------------------------------------- | --------------------------------------------------------------------------------------- |
+| `on_connected`        | `async def(service)`                  | Connected to Cartesia WebSocket                                                         |
+| `on_disconnected`     | `async def(service)`                  | Disconnected from Cartesia WebSocket                                                    |
+| `on_connection_error` | `async def(service, error_msg)`       | Connection error occurred                                                               |
+| `on_turn_start`       | `async def(service, transcript: str)` | Server detected start of a turn                                                         |
+| `on_turn_update`      | `async def(service, transcript: str)` | Incremental transcript update                                                           |
+| `on_turn_eager_end`   | `async def(service, transcript: str)` | Server eagerly predicted end of turn (only emitted when `enable_eager_end_of_turn`)     |
+| `on_turn_resume`      | `async def(service)`                  | User resumed speaking after an eager end (only emitted when `enable_eager_end_of_turn`) |
+| `on_turn_end`         | `async def(service, transcript: str)` | Final transcript for the completed turn                                                 |
 
 Example:
 
@@ -40269,6 +40280,16 @@ Supports the standard [service connection events](/api-reference/server/events/s
   watchdog_min_timeout)`, adapting automatically to the audio chunk size in use.
 </ParamField>
 
+<ParamField path="enable_eager_end_of_turn" type="bool" default="False">
+  Whether to answer Flux's predicted end of turn ahead of the committed one, so
+  the gap between the two is spent generating a response rather than waiting.
+  The response is held until the turn is confirmed, and discarded if the user
+  resumes speaking or the committed transcript differs from the predicted one.
+  Requests `EagerUserTurnStrategies` in place of `ExternalUserTurnStrategies`
+  when enabled. See [User Turn
+  Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
+</ParamField>
+
 ### Settings
 
 Runtime-configurable settings passed via the `settings` constructor argument using `DeepgramFluxSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
@@ -40368,24 +40389,24 @@ This sends a `Configure` message to Deepgram over the existing WebSocket connect
 
 ### Notes
 
-- **Turn management**: Flux provides its own turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
+- **Turn management**: Flux provides its own turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on) to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
 - **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`) in your transport is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
 - **Settings updates**: The `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, `profanity_filter`, and `language_hints` settings are sent as `Configure` messages over the existing connection without reconnecting. The `model`, `numerals`, and `redact` settings trigger a reconnection since Flux only reads them from the connection URL; reconnection waits until the user stops speaking to avoid audio loss. The `min_confidence` setting is applied locally without connection changes.
 - **Connection error handling**: When a connection cannot be established (for example, if the endpoint rejects a setting), the service fails with an error instead of hanging indefinitely. Connection establishment is bounded by a 10-second timeout.
-- **EagerEndOfTurn**: Enabling `eager_eot_threshold` provides faster response times by predicting end-of-turn before it is confirmed. EagerEndOfTurn transcripts are pushed as `InterimTranscriptionFrame`s. If the user resumes speaking, a `TurnResumed` event is fired.
+- **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers Flux's predicted end of turn (`EagerEndOfTurn` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`TurnResumed` event) or the committed transcript differs from the eager one. Flux emits no interim transcriptions; subscribe to the `on_update` event for incremental transcript text.
 - **Multilingual support**: Use the `flux-general-multi` model with `language_hints` to bias transcription toward specific languages (EN, ES, FR, DE, HI, RU, PT, JA, IT, NL). `TranscriptionFrame.language` reflects the detected language for each turn. Omit hints for auto-detection or pass a subset to bias toward expected languages.
 
 ### Event Handlers
 
 Supports the standard [service connection events](/api-reference/server/events/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`), plus turn-level events for more granular conversation tracking:
 
-| Event                  | Description                          |
-| ---------------------- | ------------------------------------ |
-| `on_start_of_turn`     | Start of a new turn detected         |
-| `on_turn_resumed`      | A previously paused turn has resumed |
-| `on_end_of_turn`       | End of turn detected                 |
-| `on_eager_end_of_turn` | Early end-of-turn prediction         |
-| `on_update`            | Transcript updated                   |
+| Event                  | Description                                                                         |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| `on_start_of_turn`     | Start of a new turn detected                                                        |
+| `on_turn_resumed`      | A previously paused turn has resumed (only emitted when `enable_eager_end_of_turn`) |
+| `on_end_of_turn`       | End of turn detected                                                                |
+| `on_eager_end_of_turn` | Early end-of-turn prediction (only emitted when `enable_eager_end_of_turn`)         |
+| `on_update`            | Transcript updated                                                                  |
 
 ```python
 @stt.event_handler("on_start_of_turn")
@@ -40540,6 +40561,16 @@ Supports the standard [service connection events](/api-reference/server/events/s
   watchdog_min_timeout)`, adapting automatically to the audio chunk size in use.
 </ParamField>
 
+<ParamField path="enable_eager_end_of_turn" type="bool" default="False">
+  Whether to answer Flux's predicted end of turn ahead of the committed one, so
+  the gap between the two is spent generating a response rather than waiting.
+  The response is held until the turn is confirmed, and discarded if the user
+  resumes speaking or the committed transcript differs from the predicted one.
+  Requests `EagerUserTurnStrategies` in place of `ExternalUserTurnStrategies`
+  when enabled. See [User Turn
+  Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
+</ParamField>
+
 <ParamField
   path="settings"
   type="DeepgramFluxSageMakerSTTService.Settings"
@@ -40626,11 +40657,11 @@ await worker.queue_frame(
 
 ### Notes
 
-- **Turn management**: Flux provides native turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
+- **Turn management**: Flux provides native turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on) to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
 - **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`) in your transport is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
 - **Settings updates**: The `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, `profanity_filter`, and `language_hints` settings are sent as `Configure` messages over the existing connection without reconnecting. The `model`, `numerals`, and `redact` settings trigger a reconnection since Flux only reads them from the connection URL; reconnection waits until the user stops speaking to avoid audio loss. The `min_confidence` setting is applied locally without connection changes.
 - **Connection error handling**: When a SageMaker session or Flux connection cannot be established (for example, if the endpoint rejects a setting), the service fails with an error instead of hanging indefinitely. Session establishment and connection confirmation are each bounded by a 10-second timeout.
-- **EagerEndOfTurn**: Enabling `eager_eot_threshold` provides faster response times by predicting end-of-turn before it is confirmed. EagerEndOfTurn transcripts are pushed as `InterimTranscriptionFrame`s. If the user resumes speaking, a `TurnResumed` event is fired.
+- **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers Flux's predicted end of turn (`EagerEndOfTurn` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`TurnResumed` event) or the committed transcript differs from the eager one. Flux emits no interim transcriptions; subscribe to the `on_update` event for incremental transcript text.
 - **Multilingual support**: Use the `flux-general-multi` model with `language_hints` to bias transcription toward specific languages (EN, ES, FR, DE, HI, RU, PT, JA, IT, NL). `TranscriptionFrame.language` reflects the detected language for each turn. Omit hints for auto-detection or pass a subset to bias toward expected languages.
 - **SageMaker deployment**: Requires a Deepgram Flux model deployed to an AWS SageMaker endpoint. Unlike Nova models, Flux provides native turn detection and does not require external VAD.
 - **No KeepAlive needed**: The Flux protocol uses a dynamic watchdog mechanism that sends silence when needed to maintain the connection (threshold: `max(chunk_duration * 2, watchdog_min_timeout)`), so manual KeepAlive messages are not required.
@@ -78895,6 +78926,51 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
   a warning naming both fixes when it spots this.
 </Warning>
 
+## EagerUserTurnStrategies
+
+Strategies for a service that predicts the end of a turn before committing. Answers the prediction while the turn is still open, so the gap before the committed end of turn is spent generating a response instead of waiting for one. The response is discarded if the user resumes speaking or the committed transcript differs from the eager one. See [`EagerUserTurnStopStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstopstrategy).
+
+The response is held by the LLM service until the turn is confirmed, so no extra processor is needed in the pipeline.
+
+The service owns turn detection here, so this replaces the detector chain rather than extending it: a local detector running alongside would trigger a second inference for the same turn.
+
+```python
+from pipecat.turns.user_turn_strategies import EagerUserTurnStrategies
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=EagerUserTurnStrategies(),
+    ),
+)
+```
+
+### Constructor Parameters
+
+<ParamField
+  path="match_policy"
+  type="EagerEndOfTurnMatchPolicy"
+  default="NormalizedMatch"
+>
+  Decides whether the committed transcript is close enough to the eager one to
+  keep the speculative response. Defaults to `NormalizedMatch`, since services
+  commonly format the transcript they commit (capitalization, punctuation) while
+  leaving the eager one raw. Pass `ExactMatch` to require the two to be
+  identical.
+</ParamField>
+
+<ParamField path="speculation_timeout" type="float" default="3.0">
+  Seconds a prediction may go unresolved before it is withdrawn and the turn
+  falls back to answering the committed transcript. Guards against a service
+  that stops sending turn signals mid-speculation, which would otherwise leave
+  the response held and the bot silent.
+</ParamField>
+
+<ParamField path="enable_interruptions" type="bool" default="True">
+  Whether to broadcast an interruption when a proposal starts a turn. Services
+  route their `should_interrupt` setting here, so the two are the same knob.
+</ParamField>
+
 ## FilterIncompleteUserTurnStrategies
 
 A convenience class that preconfigures `UserTurnStrategies` for LLM-gated turn completion. It wraps your detector chain with `deferred(...)` and appends an `LLMTurnCompletionUserTurnStopStrategy`, so the public `on_user_turn_stopped` event fires only when the LLM confirms the turn is complete (`●`). Detector strategies still drive LLM inference via `on_user_turn_inference_triggered`.
@@ -79691,18 +79767,33 @@ async def on_user_turn_started(aggregator, strategy):
 
 Fired when a stop strategy has enough signal to start LLM inference for the current turn. For the default strategies this fires together with `on_user_turn_stopped`. When a strategy gates finalization on a separate signal — for example [`FilterIncompleteUserTurnStrategies`](/api-reference/server/utilities/turn-management/filter-incomplete-turns), where the public stop event waits for the LLM's `●` verdict — this event fires first (and may fire multiple times in one turn) while `on_user_turn_stopped` is deferred.
 
+With [`EagerUserTurnStrategies`](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies), this event may fire speculatively from a predicted end of turn before the turn has ended. The `UserTurnController` adds a third parameter, `speculation`, carrying the turn text the inference was run against when the turn is still open. Handlers registered on `LLMUserAggregator` or `UserTurnProcessor` remain unchanged and do not receive this parameter.
+
 ```python
 @user_aggregator.event_handler("on_user_turn_inference_triggered")
 async def on_user_turn_inference_triggered(aggregator, strategy):
     print(f"Inference triggered by {strategy}")
 ```
 
+For `UserTurnController`, the handler signature is:
+
+```python
+@controller.event_handler("on_user_turn_inference_triggered")
+async def on_user_turn_inference_triggered(controller, strategy, speculation):
+    if speculation:
+        print(f"Speculative inference from predicted turn: {speculation.text}")
+    else:
+        print(f"Confirmed inference triggered by {strategy}")
+```
+
 **Parameters:**
 
-| Parameter    | Type                       | Description                               |
-| ------------ | -------------------------- | ----------------------------------------- |
-| `aggregator` | `LLMUserAggregator`        | The user aggregator instance              |
-| `strategy`   | `BaseUserTurnStopStrategy` | The strategy that triggered the inference |
+| Parameter     | Type                          | Description                                                                                           |
+| ------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `aggregator`  | `LLMUserAggregator`           | The user aggregator instance (for handlers on the aggregator)                                         |
+| `controller`  | `UserTurnController`          | The turn controller instance (for handlers on the controller)                                         |
+| `strategy`    | `BaseUserTurnStopStrategy`    | The strategy that triggered the inference                                                             |
+| `speculation` | `UserTurnSpeculation \| None` | Set when the inference answers a turn that hasn't ended yet, carrying the turn text (controller only) |
 
 <Note>
   Bind `on_user_turn_inference_triggered` to react when inference starts, and
@@ -82339,6 +82430,26 @@ A partial, in-progress transcription. These frames update frequently while the u
   Raw result object from the STT service.
 </ParamField>
 
+#### EagerTranscriptionFrame
+
+Transcript of a turn a service predicts has ended, before it commits. Some STT services emit a provisional end of turn ahead of the real one, so a response can be generated during the gap. The prediction may be withdrawn (`EagerEndOfTurnCancelFrame`) and the committed transcript may differ from this one, so nothing produced from it may reach the user or the context until it is confirmed. See [`EagerUserTurnStopStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstopstrategy).
+
+<ParamField path="user_id" type="str" required>
+  Identifier for the user who spoke.
+</ParamField>
+
+<ParamField path="timestamp" type="str" required>
+  When the eager end of turn occurred.
+</ParamField>
+
+<ParamField path="language" type="Language | None" default="None">
+  Detected or specified language of the speech.
+</ParamField>
+
+<ParamField path="result" type="Any | None" default="None">
+  Raw result object from the STT service.
+</ParamField>
+
 #### TranslationFrame
 
 A translated transcription, typically placed in the transport's receive queue when a participant speaks in a different language.
@@ -82618,9 +82729,17 @@ These frames bracket LLM output, letting downstream processors (aggregators, TTS
 
 Marks the beginning of an LLM response. Followed by one or more `TextFrame`s and terminated by `LLMFullResponseEndFrame`.
 
+<ParamField path="skip_tts" type="bool | None" default="None">
+  Whether the response should be skipped by the TTS service.
+</ParamField>
+
 ### LLMFullResponseEndFrame
 
 Marks the end of an LLM response.
+
+<ParamField path="skip_tts" type="bool | None" default="None">
+  Whether the response should be skipped by the TTS service.
+</ParamField>
 
 ### VisionFullResponseStartFrame
 
@@ -83055,7 +83174,13 @@ Indicates that a user turn has begun. By this point, transcriptions are usually 
 
 ### UserStoppedSpeakingFrame
 
-Marks the end of a user turn. The bot's response is triggered separately by the turn detection system.
+Marks the end of a user turn. A `SpeculationGate` releases whatever speculative response it is holding on this frame, since the turn that response answers has now ended.
+
+### EagerEndOfTurnCancelFrame
+
+Withdraws an eager end of turn. Emitted when a service reports the user resumed speaking after an eager end of turn, or when the committed transcript doesn't match the eager one. The LLM service stops generating, and its `SpeculationGate` discards what it was holding — which is everything the response produced, so nothing further down the pipeline has anything to undo.
+
+A system frame so it overtakes the speculative output it cancels.
 
 ### ProposedUserStartedSpeakingFrame
 
@@ -83436,6 +83561,13 @@ Inherits directly from `Frame` (not `DataFrame`, `ControlFrame`, or `SystemFrame
 
 <ParamField path="context" type="LLMContext" required>
   The LLM context containing messages, tools, and configuration.
+</ParamField>
+
+<ParamField path="speculation" type="bool" default="False">
+  Whether this inference is speculative, run from a provisional context that is
+  not part of the conversation. Its response must not reach the user or the
+  context until the turn is confirmed, and the service must not execute tool
+  calls for it.
 </ParamField>
 
 ## Function Calling Helper Dataclasses
