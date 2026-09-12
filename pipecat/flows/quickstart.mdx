@@ -1,22 +1,24 @@
 ---
 title: "Pipecat Flows Quickstart"
 sidebarTitle: "Quickstart"
-description: "Build your first Pipecat Flows conversation: a two-node Hello World flow with a function call recording the user's answer."
+description: "Build your first Pipecat Flows conversation: a two-node Hello World flow written as a flow config with one Python handler."
 ---
 
 This guide walks through the Hello World example — a two-node conversation flow where the bot asks for a favorite color, records the answer, and says goodbye.
 
+The flow is **declarative**: the graph lives in `flow.yaml`, the one tool it calls lives in `handlers.py`, and `bot.py` loads the config and joins the two.
+
 <Card
   title="Hello World Example"
   icon="rocket"
-  href="https://github.com/pipecat-ai/pipecat/blob/main/examples/flows/hello_world.py"
+  href="https://github.com/pipecat-ai/pipecat/tree/main/examples/flows/yaml/hello_world"
 >
   View the full source code on GitHub
 </Card>
 
 ## Prerequisites
 
-Pipecat Flows is included with Pipecat. Install Pipecat with the services used in this example:
+Install Pipecat with the services used in this example:
 
 ```bash
 uv add "pipecat-ai[daily,google,cartesia,silero]"
@@ -29,92 +31,104 @@ export CARTESIA_API_KEY=...
 export GOOGLE_API_KEY=...
 ```
 
-## Define the Nodes
+## The Flow
 
-A flow is a graph of nodes. Each node gives the LLM a task and the functions it needs. This example has two nodes: one to ask a question and one to end the conversation.
+`flow.yaml` is the whole graph: two nodes, one tool, and the transition between them.
 
-### Initial Node
+```yaml flow.yaml
+initial_node: initial
 
-The initial node sets the bot's personality via `role_message`, gives it a task via `task_messages`, and lists the function the LLM will call when the user answers:
+nodes:
+  initial:
+    role_message: >
+      You are an inquisitive child. Use very simple language. Ask simple
+      questions. You must ALWAYS use one of the available functions to progress
+      the conversation. Your responses will be converted to audio. Avoid
+      outputting special characters and emojis.
+    task_messages:
+      - role: developer
+        content: >-
+          Say 'Hello world' and ask what is the user's favorite color. Wait for
+          the user to answer; call record_favorite_color only with the color
+          they tell you.
+    functions:
+      - name: record_favorite_color
+        transition_to: end
 
-```python
-from pipecat.flows import FlowManager, NodeConfig
-
-def create_initial_node() -> NodeConfig:
-    return NodeConfig(
-        name="initial",
-        role_message="You are an inquisitive child. Use very simple language. Ask simple questions. You must ALWAYS use one of the available functions to progress the conversation. Your responses will be converted to audio. Avoid outputting special characters and emojis.",
-        task_messages=[
-            {
-                "role": "developer",
-                "content": "Say 'Hello world' and ask what is the user's favorite color.",
-            }
-        ],
-        functions=[record_favorite_color],
-    )
+  end:
+    task_messages:
+      - role: developer
+        content: Thank the user for answering and end the conversation
+    post_actions:
+      - type: end_conversation
 ```
 
-### End Node
+Key by key:
 
-The end node thanks the user and ends the conversation via the `end_conversation` post-action:
+- `initial_node` names the node the conversation starts in.
+- `nodes` holds the flow's nodes, keyed by name. The key _is_ the node's name, so `initial` and `end` are what `transition_to` refers to.
+- `role_message` sets the bot's personality. It is sent as the LLM's system instruction and persists across transitions until another node sets its own.
+- `task_messages` say what the LLM should do at this node.
+- `functions` lists the tools the node offers. Here, one entry names `record_favorite_color` and says that when it completes, the conversation moves to the `end` node.
+- `post_actions` run after the LLM responds. `end_conversation` gracefully terminates the call.
 
-```python
-def create_end_node() -> NodeConfig:
-    return NodeConfig(
-        name="end",
-        task_messages=[
-            {
-                "role": "developer",
-                "content": "Thank the user for answering and end the conversation",
-            }
-        ],
-        post_actions=[{"type": "end_conversation"}],
-    )
-```
+Note what the config does _not_ contain: no description or parameters for `record_favorite_color`. Those come from the Python.
 
-<Tip>
-  Nodes can be defined as plain dicts or as `NodeConfig` objects — both work
-  identically.
-</Tip>
+## The Handler
 
-## Write the Function
+`handlers.py` holds the Python the config names.
 
-When the LLM calls the function, it processes the result and returns the next node. `record_favorite_color` is a **direct function**: its first parameter is `flow_manager`, the rest (here, `color`) become the function's parameters, and Flows derives the schema (advertised to the LLM) from the signature and docstring:
+```python handlers.py
+from pipecat.flows import TRANSITION_IN_YAML, FlowManager
 
-```python
-async def record_favorite_color(
-    flow_manager: FlowManager,
-    color: str,
-) -> tuple[str, NodeConfig]:
+
+async def record_favorite_color(flow_manager: FlowManager, color: str):
     """Record the color the user said is their favorite.
+
+    Here "record" means print to the console, but any logic could go here:
+    write to a database, make an API call, etc.
 
     Args:
         color: The user's favorite color.
     """
     print(f"Your favorite color is: {color}")
-    return color, create_end_node()
+    return color, TRANSITION_IN_YAML
 ```
 
-The function returns a tuple of `(result, next_node)`. The result is provided to the LLM as context, and the next node is where the conversation transitions to.
+`record_favorite_color` is a **direct function**: its first parameter is `flow_manager`, the rest — here, `color` — become the tool's parameters, and Flows derives the schema the LLM sees from the signature and the Google-style docstring.
 
-## Build the Pipeline and FlowManager
+It returns a tuple of `(result, TRANSITION_IN_YAML)`. The result is given to the LLM as context. `TRANSITION_IN_YAML` says the handler is not choosing where the conversation goes — the config's `transition_to` decides that. Keeping transitions out of the Python is what lets the graph change without touching code.
 
-Set up a standard Pipecat pipeline, then create a `FlowManager` and initialize it when a client connects:
+## The Bot
 
-```python
+`bot.py` is a standard Pipecat pipeline plus four lines of Flows wiring:
+
+```python bot.py
+from pathlib import Path
+
+import handlers
+
+from pipecat.flows import Flow, FlowConfig, FlowManager
+
+FLOW_CONFIG_PATH = Path(__file__).with_name("flow.yaml")
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    stt = CartesiaSTTService(api_key=os.getenv("CARTESIA_API_KEY"))
+    stt = CartesiaSTTService(api_key=os.getenv("CARTESIA_API_KEY", ""))
     tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="32b3f3c5-7171-46aa-abe7-b598964aa793",
+        api_key=os.getenv("CARTESIA_API_KEY", ""),
+        settings=CartesiaTTSService.Settings(
+            voice="32b3f3c5-7171-46aa-abe7-b598964aa793",
+        ),
     )
-    llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"))
+    llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY", ""))
 
     context = LLMContext()
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
+            filter_incomplete_user_turns=True,
         ),
     )
 
@@ -132,43 +146,58 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     worker = PipelineWorker(pipeline)
 
-    # Initialize flow manager
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.add_workers(worker)
+
+    # The flow is data: load it, then join it to the tool it names.
+    config = FlowConfig.from_file(FLOW_CONFIG_PATH)
+    flow = Flow(config, handlers=handlers)
+
     flow_manager = FlowManager(
         worker=worker,
         llm=llm,
         context_aggregator=context_aggregator,
         transport=transport,
+        global_functions=flow.global_functions,
     )
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        await flow_manager.initialize(create_initial_node())
+        await flow_manager.initialize(flow.initial_node)
 
-    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-    await runner.add_workers(worker)
     await runner.run()
 ```
 
-That's it! When a user connects, the bot greets them, asks for their favorite color, records the answer, thanks them, and ends the conversation.
+The four Flows lines:
 
-<Info>
-  See the [full source
-  code](https://github.com/pipecat-ai/pipecat/blob/main/examples/flows/hello_world.py)
-  for the complete runnable example.
-</Info>
+- `FlowConfig.from_file` reads and validates the YAML.
+- `Flow(config, handlers=handlers)` joins the config to the module holding the Python it names. `handlers` here is the imported module; a mapping of names to callables, or a list of modules, works too.
+- `global_functions=flow.global_functions` passes along the tools the config makes available at every node. This flow has none, so the list is empty, but wiring it up now means adding one later is a config-only change.
+- `initialize(flow.initial_node)` starts the conversation in the node the config named.
+
+<Tip>
+  The config is validated as it loads, and constructing the `Flow` checks every
+  reference it makes into your code. Starting the bot once is a complete check
+  of the flow: a typo in a node name or a tool that doesn't exist fails
+  immediately, before any call comes in.
+</Tip>
+
+## The Same Flow in Code
+
+The same bot, written as a [programmatic flow](/pipecat/flows/introduction#programmatic), is in [`examples/flows/python/hello_world.py`](https://github.com/pipecat-ai/pipecat/blob/main/examples/flows/python/hello_world.py). Read the two side by side to see what moves between the config and the Python.
 
 ## Next Steps
 
 <CardGroup cols={2}>
   <Card
-    title="Nodes & Messages"
-    icon="diagram-project"
-    href="/pipecat/flows/nodes-and-messages"
+    title="Flow Configs"
+    icon="file-code"
+    href="/pipecat/flows/flow-configs"
   >
-    Learn about node configuration and message types
+    The full config format, loading, and validation
   </Card>
   <Card title="Functions" icon="code" href="/pipecat/flows/functions">
-    Understand node and edge functions
+    Node functions, edge functions, and branch tables
   </Card>
   <Card title="Examples" icon="rocket" href="/pipecat/flows/examples">
     Explore more complex examples

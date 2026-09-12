@@ -1,0 +1,224 @@
+---
+title: "FlowConfig"
+"og:title": "FlowConfig - Pipecat Flows"
+description: "FlowConfig reference for Pipecat Flows: the declarative flow document, its node and function models, loaders, and validation rules."
+---
+
+## Overview
+
+A `FlowConfig` describes a conversation flow as data: the nodes, what each one says, which tools each node offers, and where each tool leads. It contains no Python callables. Every tool it references is a Flows direct function that lives in your code and is resolved by name when the config is joined to your handlers by constructing a [`Flow`](/api-reference/pipecat-flows/flow).
+
+```python
+from pipecat.flows import FlowConfig
+
+config = FlowConfig.from_file("flow.yaml")
+```
+
+`FlowConfig` is a Pydantic model. It rejects unknown keys, and every model below does the same except `Action`, which passes extra keys through to its handler.
+
+<Tip>
+  For a walkthrough of the format rather than a field list, see the [Flow
+  Configs guide](/pipecat/flows/flow-configs).
+</Tip>
+
+## Fields
+
+<ParamField path="initial_node" type="str" required>
+  Name of the node the flow starts in. Must be a key of `nodes`.
+</ParamField>
+
+<ParamField path="nodes" type="dict[str, FlowConfig.Node]" required>
+  The flow's nodes, keyed by name. At least one entry.
+</ParamField>
+
+<ParamField
+  path="global_functions"
+  type="list[FlowConfig.Function]"
+  default="[]"
+>
+  Tools offered at every node. Names must be unique among themselves and must
+  not collide with any node's `functions`.
+</ParamField>
+
+## Loaders
+
+### from_file
+
+```python
+FlowConfig.from_file(path: str | Path) -> FlowConfig
+```
+
+Load a config from a `.yaml`, `.yml`, or `.json` file. A file with any suffix other than `.json` is parsed as YAML, and may use `!include` with paths relative to the file's own directory.
+
+### from_yaml
+
+```python
+FlowConfig.from_yaml(text: str, *, base_dir: Path | None = None) -> FlowConfig
+```
+
+Load a config from YAML text. `base_dir` is the directory `!include` paths resolve against; when it is omitted, `!include` is unavailable.
+
+### from_json
+
+```python
+FlowConfig.from_json(text: str) -> FlowConfig
+```
+
+Load a config from JSON text.
+
+### model_validate
+
+```python
+FlowConfig.model_validate(data: dict) -> FlowConfig
+```
+
+Pydantic's own loader, for a dict that is already parsed.
+
+## Models
+
+### FlowConfig.Node
+
+One node of the flow. Its key under `nodes` is its name.
+
+<ParamField path="task_messages" type="list[FlowConfig.Message]" required>
+  What the LLM should do at this node.
+</ParamField>
+
+<ParamField path="role_message" type="str | None" default="None">
+  The bot's role or personality, sent as the LLM's system instruction on
+  entering this node. It persists across transitions until another node sets its
+  own. May contain `{{ key }}` placeholders.
+</ParamField>
+
+<ParamField path="functions" type="list[FlowConfig.Function]" default="[]">
+  Tools offered at this node, in addition to the config's `global_functions`.
+  Names must be unique within the node.
+</ParamField>
+
+<ParamField path="pre_actions" type="list[FlowConfig.Action]" default="[]">
+  Actions run before the LLM responds at this node.
+</ParamField>
+
+<ParamField path="post_actions" type="list[FlowConfig.Action]" default="[]">
+  Actions run after the LLM responds at this node.
+</ParamField>
+
+<ParamField
+  path="context_strategy"
+  type='"append" | "reset" | None'
+  default="None"
+>
+  How the LLM context is updated on entering this node. Defaults to the
+  `FlowManager`'s strategy. `RESET_WITH_SUMMARY` is not available here.
+</ParamField>
+
+<ParamField path="respond_immediately" type="bool" default="True">
+  Whether the LLM responds as soon as the node is entered.
+</ParamField>
+
+### FlowConfig.Message
+
+One message in a node's `task_messages`.
+
+<ParamField path="role" type="str" required>
+  Message role, e.g. `developer` or `system`.
+</ParamField>
+
+<ParamField path="content" type="str" required>
+  Message text. May contain `{{ key }}` placeholders.
+</ParamField>
+
+### FlowConfig.Function
+
+A tool offered at a node, or globally.
+
+<ParamField path="name" type="str" required>
+  The tool's name, as the LLM sees it. For an ordinary entry, also the name of
+  the direct function in the handlers.
+</ParamField>
+
+<ParamField path="transition_only" type="bool" default="False">
+  Whether the tool is defined here rather than in code. Such a tool takes no
+  parameters, runs no code, and moves the conversation to `transition_to` when
+  the LLM calls it. Requires `description` and a `transition_to` that names a
+  node.
+</ParamField>
+
+<ParamField path="description" type="str | None" default="None">
+  What the tool is for, for the LLM. Only a `transition_only` entry has one; a
+  direct function describes itself in its docstring, and setting this on an
+  ordinary entry is a validation error.
+</ParamField>
+
+<ParamField
+  path="transition_to"
+  type="str | FlowConfig.Branch | None"
+  default="None"
+>
+  Node to transition to after the tool completes, or a branch table. Omitted for
+  tools that stay on the current node.
+</ParamField>
+
+### FlowConfig.Branch
+
+A transition chosen by a field of the tool's result.
+
+<ParamField path="field" type="str" required>
+  Key of the tool's result whose value selects the case. If the result is not a
+  mapping, or has no such key, the call raises `FlowError`.
+</ParamField>
+
+<ParamField path="cases" type="dict[str, str]" required>
+  Result value to node name. At least one entry. Keys may be written as strings,
+  booleans, or numbers; they are matched against the result value by its
+  canonical string, so `true:` matches a result of Python `True`.
+</ParamField>
+
+<ParamField path="default" type="str | None" default="None">
+  Node to transition to when the value matches no case. When omitted, an
+  unmatched value stays on the current node.
+</ParamField>
+
+### FlowConfig.Action
+
+A pre- or post-action on a node. Unlike the other models, this one allows extra keys, which pass through to the handler on the `action` dict.
+
+<ParamField path="type" type="str" required>
+  Action type identifier. The built-in types are `tts_say`, `end_conversation`,
+  and `function`.
+</ParamField>
+
+<ParamField path="handler" type="str | None" default="None">
+  Name of the handler in the handlers the `Flow` is constructed with. Required
+  for `function`, optional for a custom type, and not allowed on `tts_say` or
+  `end_conversation`.
+</ParamField>
+
+A custom type with no `handler` must be registered in code with `FlowManager.register_action`.
+
+## Placeholders
+
+Prompt text may refer to the manager's state with `{{ key }}` placeholders: a node's `role_message`, the `content` of its `task_messages`, and the `text` of a `tts_say` action. [`FlowManager`](/api-reference/pipecat-flows/flow-manager) fills them from `flow_manager.state` each time it enters the node, so a value stored by a handler earlier in the conversation can appear in a later prompt.
+
+- `{{ order.size }}` walks into a stored mapping.
+- Values are rendered with `str()`.
+- A key that is not in state raises `FlowError` when the node is entered.
+- To show the LLM a literal `{{ key }}`, escape it as `\{{ key }}`.
+
+## Validation
+
+Loading validates the config's structure. A failure raises a Pydantic `ValidationError`.
+
+- The top level is a mapping.
+- `initial_node` names a defined node.
+- Every `transition_to`, including every case and default of a branch, names a defined node.
+- Function names are unique within a node and within `global_functions`, and a node's function name does not collide with a global one.
+- A `transition_only` entry has a `description` and a `transition_to` that is a plain node name.
+- An ordinary entry has no `description`.
+- A `function` action has a `handler`; `tts_say` and `end_conversation` do not.
+
+References into your code are checked separately, when the [`Flow`](/api-reference/pipecat-flows/flow) is constructed.
+
+## Schema
+
+The format's JSON Schema is published in the Pipecat repository at [`src/pipecat/flows/flow_config.schema.json`](https://github.com/pipecat-ai/pipecat/blob/main/src/pipecat/flows/flow_config.schema.json), for editors and other tools to vendor.

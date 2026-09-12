@@ -1,0 +1,109 @@
+---
+title: "Flow"
+"og:title": "Flow - Pipecat Flows"
+description: "Flow reference for Pipecat Flows: join a FlowConfig to your handlers, resolve tool references, and feed nodes to FlowManager."
+---
+
+## Overview
+
+A `Flow` is a [`FlowConfig`](/api-reference/pipecat-flows/flow-config) joined to the code it names: the config's nodes turned into runnable `NodeConfig` dicts, with every tool reference resolved to a Flows direct function, every `transition_only` function built from the config alone, and every transition wired to the node the config names.
+
+```python
+import handlers
+
+from pipecat.flows import Flow, FlowConfig, FlowManager
+
+config = FlowConfig.from_file("flow.yaml")
+flow = Flow(config, handlers=handlers)
+
+flow_manager = FlowManager(
+    worker=worker,
+    llm=llm,
+    context_aggregator=context_aggregator,
+    global_functions=flow.global_functions,
+)
+await flow_manager.initialize(flow.initial_node)
+```
+
+## Constructor
+
+```python
+Flow(config: FlowConfig, *, handlers)
+```
+
+<ParamField path="config" type="FlowConfig" required>
+  The flow config.
+</ParamField>
+
+<ParamField path="handlers" type="Mapping | module | Sequence" required>
+  The Python behind the config: the direct functions that implement its tools
+  and the callables that implement its actions. A mapping of names to callables,
+  or any object whose attributes are the callables, typically a module. A list
+  or tuple of those lets tools and action handlers live in separate modules.
+  Only the names the config references are looked up.
+</ParamField>
+
+A name that resolves to different callables in more than one of the handlers is an error rather than a silent choice. The same callable reachable through two of them is one tool, not a conflict.
+
+## Properties
+
+### config
+
+```python
+flow.config -> FlowConfig
+```
+
+The config this flow was constructed from.
+
+### initial_node
+
+```python
+flow.initial_node -> NodeConfig
+```
+
+The node config the flow starts in, ready to pass to `FlowManager.initialize()`.
+
+### global_functions
+
+```python
+flow.global_functions -> list[FlowsFunctionSchema | FlowsDirectFunction]
+```
+
+Tools available at every node, for `FlowManager(global_functions=...)`. A fresh list each time, so the caller may extend it with tools defined in code.
+
+## Methods
+
+### node
+
+```python
+flow.node(name: str) -> NodeConfig
+```
+
+The node config for `name`.
+
+<ParamField path="name" type="str" required>
+  A node name from the config.
+</ParamField>
+
+**Raises** [`FlowError`](/api-reference/pipecat-flows/exceptions#flowerror) if the config has no such node.
+
+## Validation
+
+Constructing a flow validates the references the config could not: each tool exists in the handlers, is callable, and has a valid direct-function signature; each `function` action names a callable. Building continues past each problem so all of them are found, then a single [`FlowReferenceError`](/api-reference/pipecat-flows/exceptions#flowreferenceerror) is raised carrying every [`FlowProblem`](/api-reference/pipecat-flows/exceptions#flowproblem).
+
+`Flow` also logs a warning when a tool's return annotation mentions `NodeConfig`, including `NodeConfig | None` and the `ConsolidatedFunctionResult` alias. Such an annotation says the tool was written for a flow built in Python, where the handler picks the next node.
+
+## Call-Time Contract
+
+Tool return values are checked when the tool is called, not when the flow is built. A tool a config names must return one of:
+
+| Return value                   | Meaning                                                            |
+| ------------------------------ | ------------------------------------------------------------------ |
+| `(result, TRANSITION_IN_YAML)` | The config's `transition_to` for that entry decides the next node. |
+| `(result, NO_RESPONSE)`        | Stay on the node, and leave the bot silent rather than responding. |
+
+Anything else raises [`FlowError`](/api-reference/pipecat-flows/exceptions#flowerror): a node name string, a `NodeConfig`, `None`, or a value that isn't a two-element tuple at all. In a flow built from a config, the config owns transitions.
+
+When the entry's `transition_to` is a branch table, the destination is chosen from the named field of `result`. A result that is not a mapping, or has no such field, raises `FlowError`. A value matching no case and no `default` stays on the current node.
+
+`{{ key }}` placeholders in prompts are left in place by the flow; [`FlowManager`](/api-reference/pipecat-flows/flow-manager) fills them from its state when it enters the node.
