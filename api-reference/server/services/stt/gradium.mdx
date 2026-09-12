@@ -10,6 +10,8 @@ description: "GradiumSTTService streams real-time STT over Gradium's WebSocket A
 
 Transcribes English by default. Set `settings.language` to one of the other supported languages (German, Spanish, French, Portuguese), or to `"any"` to have Gradium detect the language.
 
+By default the pipeline's VAD closes each utterance. With `enable_turn_detection=True` the server's end-pointing signal drives turns instead: the service broadcasts `ProposedUserStartedSpeakingFrame` and `ProposedUserStoppedSpeakingFrame`, and recommends `ExternalUserTurnStrategies` to resolve them.
+
 <CardGroup cols={2}>
   <Card
     title="Gradium STT API Reference"
@@ -24,6 +26,13 @@ Transcribes English by default. Set `settings.language` to one of the other supp
     href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-gradium.py"
   >
     Complete example with interruption handling
+  </Card>
+  <Card
+    title="Turn Detection Example"
+    icon="waveform-lines"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-gradium-turns.py"
+  >
+    Server-side turn detection example
   </Card>
   <Card
     title="Gradium Documentation"
@@ -101,6 +110,14 @@ Before using Gradium STT services, you need:
   in favor of `params`.
 </ParamField>
 
+<ParamField path="enable_turn_detection" type="bool" default="False">
+  Whether the server's end-pointing signal decides when user turns start and
+  end, instead of the pipeline's VAD. When on, the service proposes turn
+  boundaries (`ProposedUserStartedSpeakingFrame` and
+  `ProposedUserStoppedSpeakingFrame`) and recommends `ExternalUserTurnStrategies`
+  to the user aggregator.
+</ParamField>
+
 <ParamField path="settings" type="GradiumSTTService.Settings" default="None">
   Runtime-configurable settings for the STT service. See [Settings](#settings)
   below.
@@ -115,11 +132,16 @@ Before using Gradium STT services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `GradiumSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter         | Type              | Default       | Description                                                                                                                                                                                                                                      |
-| ----------------- | ----------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `model`           | `str`             | `"default"`   | STT model identifier. _(Inherited from base STT settings.)_                                                                                                                                                                                      |
-| `language`        | `Language \| str` | `Language.EN` | Expected language of the audio. _(Inherited from base STT settings.)_ Helps ground the model to a specific language and improve transcription quality. Defaults to `Language.EN`; `"any"` asks Gradium to detect the language.                   |
-| `delay_in_frames` | `int`             | `12`          | Server-side delay in audio frames (80ms each) before text is generated. Higher delays allow more context but increase latency. Allowed values: 7, 8, 10, 12, 14, 16, 20, 24, 36, 48. Default is 12 (960ms). Sent to Gradium API via json_config. |
+The turn detection settings (`eot_horizon_s`, `eot_threshold`, `post_flush_cooldown_frames`) are `None` unless the service is constructed with `enable_turn_detection=True`, which gives them their defaults.
+
+| Parameter                        | Type              | Default       | Description                                                                                                                                                                                                                                                                                                                                                               |
+| -------------------------------- | ----------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                          | `str`             | `"default"`   | STT model identifier. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                               |
+| `language`                       | `Language \| str` | `Language.EN` | Expected language of the audio. _(Inherited from base STT settings.)_ Helps ground the model to a specific language and improve transcription quality. Defaults to `Language.EN`; `"any"` asks Gradium to detect the language.                                                                                                                                            |
+| `delay_in_frames`                | `int`             | `12`          | Server-side delay in audio frames (80ms each) before text is generated. Higher delays allow more context but increase latency. Allowed values: 7, 8, 10, 12, 14, 16, 20, 24, 36, 48. Default is 12 (960ms). Sent to Gradium API via json_config.                                                                                                                          |
+| `eot_horizon_s`                  | `float \| None`   | `3.0`         | Which end-pointing horizon drives turn decisions; the step entry with the closest `horizon_s` is used. _(Only set when `enable_turn_detection=True`.)_                                                                                                                                                                                                                    |
+| `eot_threshold`                  | `float \| None`   | `0.5`         | Inactivity probability on that horizon at or above which an open turn ends, and below which a turn opens once the signal has read inactive. _(Only set when `enable_turn_detection=True`.)_                                                                                                                                                                               |
+| `post_flush_cooldown_frames`     | `int \| None`     | `8`           | Number of step messages to ignore after a flush completes before the next turn may start or end. A flush feeds the model `delay_in_frames` of silence, and the end-pointing signal is unreliable on the frames that follow: it can dip as if speech resumed, then fire again on the first real frames. _(Only set when `enable_turn_detection=True`.)_ |
 
 ## Usage
 
@@ -148,10 +170,26 @@ stt = GradiumSTTService(
 )
 ```
 
+### With Server-Side Turn Detection
+
+```python
+from pipecat.services.gradium.stt import GradiumSTTService
+
+stt = GradiumSTTService(
+    api_key=os.getenv("GRADIUM_API_KEY"),
+    enable_turn_detection=True,
+    settings=GradiumSTTService.Settings(
+        eot_horizon_s=3.0,
+        eot_threshold=0.5,
+    ),
+)
+```
+
 ## Notes
 
 - **Supported languages**: German, English, Spanish, French, and Portuguese.
 - **Audio format**: Configurable via `encoding` and `sample_rate` parameters. Defaults to PCM with the pipeline's sample rate. Supported PCM rates: 8000, 16000, and 24000 Hz. Audio is sent in 80ms chunks.
+- **Turn detection**: With `enable_turn_detection=True`, the server's end-pointing signal decides when user turns start and end. The service broadcasts `ProposedUserStartedSpeakingFrame` when a turn opens and `ProposedUserStoppedSpeakingFrame` when it closes, then flushes the server. The final `TranscriptionFrame` follows once the flush is acknowledged. Local VAD frames are ignored. The service recommends `ExternalUserTurnStrategies`, which resolve the proposals into user turn frames and hold the turn open until the transcript arrives.
 
 <Tip>
   The `InputParams` / `params=` pattern is deprecated as of v0.0.105. Use
@@ -163,13 +201,23 @@ stt = GradiumSTTService(
 
 Gradium STT supports the standard [service connection events](/api-reference/server/events/service-events):
 
-| Event             | Description                         |
-| ----------------- | ----------------------------------- |
-| `on_connected`    | Connected to Gradium WebSocket      |
-| `on_disconnected` | Disconnected from Gradium WebSocket |
+| Event             | Description                                                        |
+| ----------------- | ------------------------------------------------------------------ |
+| `on_connected`    | Connected to Gradium WebSocket                                     |
+| `on_disconnected` | Disconnected from Gradium WebSocket                                |
+| `on_turn_start`   | The end-pointing signal opened a turn _(turn detection only)_      |
+| `on_turn_end`     | The end-pointing signal closed the turn _(turn detection only)_    |
 
 ```python
 @stt.event_handler("on_connected")
 async def on_connected(service):
     print("Connected to Gradium")
+
+@stt.event_handler("on_turn_start")
+async def on_turn_start(service):
+    print("Turn started")
+
+@stt.event_handler("on_turn_end")
+async def on_turn_end(service):
+    print("Turn ended")
 ```
