@@ -3,34 +3,83 @@ title: "Scripted Scenarios"
 description: "The scripted scenario file format: user turns, expected events, eval and text_contains assertions, function calls, latency budgets, and modalities."
 ---
 
-A scripted scenario is a YAML file that writes the user's turns out, each with the events you expect your agent to emit in response. A file with a top-level `turns:` key is scripted; one with a `persona:` key is a [simulated scenario](/pipecat/evals/simulated-scenarios), where an LLM plays the user instead. This page covers the full scripted format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
+A scripted scenario is a YAML file that writes the user's turns out, each with the events you expect your agent to emit in response. A scenario with `turns:` is scripted; one with a `persona:` is a [simulated scenario](/pipecat/evals/simulated-scenarios), where an LLM plays the user instead. This page covers the full scripted format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
 
 Use a scripted scenario when you want exact control over the user's side. You know what the user says on every turn, so you can assert exactly what the agent must do: call this tool with these arguments, say this, answer within this budget, recover from this interruption. The input is the same every run, so a failure is easy to reproduce and fix. Use a simulation when you want to check a goal instead, and let the caller adapt to the agent.
 
 ## Anatomy of a scenario
 
-```yaml
-name: multi_turn # required: the eval's name
+A scenario file holds one or more scenarios under `scenarios:`, each with a `name:`. Most files hold one scenario; several scenarios per file suit testing one behavior through many short conversations. Any configuration a scenario can have (like `judge:` or `context:`) may also sit at the file's top level as the default for all scenarios:
 
-judge: # optional: judge modality and LLM (defaults shown below)
+```yaml
+name: multi_turn # file name, used when scenarios share a name or have none
+
+judge: # shared by all scenarios in this file
   eval:
     service: ollama
     model: gemma4:12b
     extra: { reasoning_effort: none }
 
-turns: # required: the conversation, in order
-  - user: "My name is Alex, and I'm planning a trip to Italy."
-    expect:
-      - event: response
-        eval: "acknowledges the user's message (the name Alex and/or the trip to Italy)"
+scenarios:
+  - name: multi_turn # the scenario's name
+    turns: # the conversation, in order
+      - user: "My name is Alex, and I'm planning a trip to Italy."
+        expect:
+          - event: response
+            eval: "acknowledges the user's message (the name Alex and/or the trip to Italy)"
 
-  - user: "Remind me, what's my name and where am I going?"
-    expect:
-      - event: response
-        eval: "recalls that the user's name is Alex and the destination is Italy"
+      - user: "Remind me, what's my name and where am I going?"
+        expect:
+          - event: response
+            eval: "recalls that the user's name is Alex and the destination is Italy"
 ```
 
-Each turn optionally sends a user utterance (`user:`) and lists the events expected in response (`expect:`). Expected events must arrive in the order listed, but the agent may emit other events in between, so you don't have to enumerate everything it does.
+Each scenario is named `<file>/<scenario>`, so the example above is `multi_turn/multi_turn`. Each turn optionally sends a user utterance (`user:`) and lists the events expected in response (`expect:`). Expected events must arrive in the order listed, but the agent may emit other events in between, so you don't have to enumerate everything it does.
+
+Two common shapes for multiple scenarios per file:
+
+**The same turns, judged differently.** The turns are written once at the file level, and each scenario names its own judge or modality. Every judge sees exactly the same conversation:
+
+```yaml
+name: interruption
+turns:
+  - user: "Tell me a long story about Paris."
+    expect:
+      - event: llm_started
+  - user: "Actually, what's the capital of Japan?"
+    send_after: { event: llm_started, delay_ms: 2000 }
+    expect:
+      - event: response
+        eval: "says Tokyo instead of continuing the story"
+
+scenarios:
+  - name: text
+    judge: !include ../judge_text.yaml
+  - name: audio
+    user: !include ../user_audio.yaml
+    judge: !include ../judge_audio.yaml
+```
+
+**Short cases of one behavior.** Each scenario is a self-contained check. For example, testing turn-completion markers:
+
+```yaml
+name: turn_completion
+judge: !include ../judge_text.yaml
+
+scenarios:
+  - name: short_answer
+    turns:
+      - user: "Japan."
+        expect:
+          - event: response
+  - name: cutoff
+    turns:
+      - user: "I'd go to Japan because"
+        expect:
+          - event: response
+            absent: true
+            within_ms: 3000
+```
 
 The rest of this page is in four parts:
 
@@ -53,6 +102,8 @@ The rest of this page is in four parts:
 ## Configuration
 
 The `user:` and `judge:` blocks, `factory:`, `!include`, running scenarios back to back, and the disconnect path are shared with [simulated scenarios](/pipecat/evals/simulated-scenarios) and documented once, on [Scenario Configuration](/pipecat/evals/scenario-configuration). A scenario with none of those blocks runs entirely in [text mode](/pipecat/evals/scenario-configuration#text-and-audio-modes) with the default judge, which is the fastest way to start.
+
+Any key a scenario can have may also sit at the top of the file as the default for all scenarios. A scenario that sets the same key replaces the whole value; nothing is merged, so a `context:` is written out in full.
 
 Two fields are scripted-only, since a simulation has no scripted turns to seed or to score:
 
