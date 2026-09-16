@@ -12931,7 +12931,7 @@ Scenarios assert on a small set of semantic events, mapped from the RTVI message
 
 ### LLM markers
 
-`llm_marker` is a sideband marker the bot's LLM emitted, such as the turn-completion markers of [filter incomplete user turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns). The `marker:` field names which one: `complete` (the turn was finished and the bot answers), `short` (the user was cut off and the bot waits), `long` (the user asked for time), or `incomplete` (either of the last two). A bare `llm_marker` asserts only that a marker arrived.
+`llm_marker` is the sideband marker the bot's LLM emitted in a response, such as the turn-completion markers of [filter incomplete user turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns). It arrives when the response ends. The `marker:` field names which one: `complete` (the turn was finished and the bot answers), `short` (the user was cut off and the bot waits), `long` (the user asked for time), or `incomplete` (either of the last two). A bare `llm_marker` asserts only that the bot read a response.
 
 Markers never reach clients by default; a scenario that asserts on one asks the bot to report them:
 
@@ -12947,6 +12947,18 @@ turns:
         marker: complete # ... and answered this one
       - event: response
         eval: "engages with the user's answer about Japan"
+```
+
+The event also carries the response's raw text, as the LLM produced it before the bot held anything back, so a scenario can check how well the LLM follows the protocol: `marker_first` (nothing before the marker), `markers` (how many markers the text holds), and `text_after` (whether text follows the first marker, which a complete turn should have and an incomplete one should not):
+
+```yaml
+- user: "I'd go to Japan because"
+  expect:
+    - event: llm_marker
+      marker: short
+      marker_first: true
+      markers: 1
+      text_after: false
 ```
 
 ## Assertions
@@ -12970,7 +12982,7 @@ The judge handles interim replies gracefully: if the agent says "Let me check on
 
 `eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`).
 
-### Substring checks with `text_contains:`
+### Substring checks with `text_contains:` and `text_excludes:`
 
 For exact content, `text_contains:` does a substring check, ignoring whitespace differences:
 
@@ -12983,15 +12995,33 @@ For exact content, `text_contains:` does a substring check, ignoring whitespace 
 
 On `response`, `llm_response`, and `tts_response`, the harness accumulates successive segments and re-checks on each new segment until the check passes. On `user_transcription`, it accumulates the STT's final transcription segments within the turn, so an STT that finalizes an utterance in pieces can still satisfy a phrase that spans them.
 
-### Marker checks with `marker:`
+`text_excludes:` is the mirror: the event's text must not hold the given substring. This is useful when checking that a marker the LLM should keep out of its reply stayed out:
 
-For an `llm_marker` event, `marker:` asserts what the marker means: `complete`, `short`, `long`, or `incomplete` (which accepts either `short` or `long`). This checks the marker's `kind` field, not its text, so it works regardless of the configured marker characters:
+```yaml
+- user: "What is the capital of Germany?"
+  expect:
+    - event: llm_response
+      text_contains: Berlin
+      text_excludes: "●"
+```
+
+### Marker checks
+
+For an `llm_marker` event, several fields check the marker itself and how the LLM's raw response was laid out:
+
+- `marker:` asserts what the marker means: `complete`, `short`, `long`, or `incomplete` (which accepts either `short` or `long`). This checks the marker's `kind` field, not its text, so it works regardless of the configured marker characters.
+- `marker_first:` (true/false) checks whether the first marker in the response's raw text comes before any text.
+- `markers:` (integer) checks how many markers the response's raw text holds.
+- `text_after:` (true/false) checks whether text follows the first marker in the raw text.
 
 ```yaml
 - user: "Let me think about it, hmmm"
   expect:
     - event: llm_marker
       marker: incomplete
+      marker_first: true
+      markers: 1
+      text_after: false
 ```
 
 ### Latency budgets with `within_ms:`
@@ -13756,9 +13786,23 @@ suite:
     scenarios: [greeting, weather_function_call]
   - bot: bots/booking-agent.py
     scenarios: [greeting, simulated/book_table] # a simulation, listed the same way
+  - bot: bots/voice-agent.py
+    concurrency: 2 # this bot's own cap
+    scenarios: [greeting, interruption]
   - bot: bots/vision-agent.py
-    runner_body: scenarios/vision-body.json # optional --runner-body data
+    runner_body:
+      path: scenarios/vision-body.yaml # optional --runner-body data
     scenarios: [vision_describe]
+  - bot: bots/turns-agent.py
+    name: openai/gpt-4o-mini # this entry's label
+    runner_body:
+      data: { model: gpt-4o-mini } # written to a file for the bot
+    scenarios: [turn_completion]
+  - bot: bots/turns-agent.py
+    name: groq/llama-3.3-70b
+    runner_body:
+      data: { model: llama-3.3-70b }
+    scenarios: [turn_completion]
 ```
 
 Paths in the manifest (`bots_dir`, `scenarios_dir`, `runs_dir`, the `bot:` entries) resolve relative to the manifest file, so a manifest is portable: check it into your repo and run it from anywhere. A scenario name can include a subfolder (`simulated/book_table`), and a name ending in `.yaml` is a path relative to the manifest.
@@ -13769,11 +13813,11 @@ When a scenario file holds multiple scenarios under `scenarios:`, each runs on i
 
 Scenarios are reusable across agents. One `greeting` scenario can cover every agent in the suite.
 
-<Note>
-  An optional `runner_body:` points at a JSON file passed to the agent as
-  `--runner-body`. It supplies session data the agent would normally receive in
-  a `/start` request body (for example, a vision agent's image path).
-</Note>
+An optional `runner_body:` supplies runner-args data the agent would normally receive in a `/start` request body (e.g. a vision agent's image path), passed to it as `--runner-body`. It holds either `path:`, a YAML or JSON file resolved relative to the manifest, or `data:`, the body itself as a mapping, which the suite writes to a file among the run's logs. A bot given a file runs with the file's directory as its working directory, so relative paths inside the body (like an image) resolve next to the file; a body that holds such paths belongs in a file for that reason.
+
+An entry's `name:` is its label: what the display, the `-p` filter, the results records and the artifact file names use. It defaults to the `bot:` path, so it is only needed when several entries share a bot, as when sweeping a model with `runner_body:`; two entries may not run the same scenario under the same label.
+
+An entry may set its own `concurrency:` to cap the runs of that bot below the suite's, for a provider that rate-limits concurrent connections.
 
 ## Running a suite
 
@@ -13786,7 +13830,7 @@ In a terminal, a live dashboard shows each run's status, a running tally, and to
 Useful flags:
 
 ```bash
-pipecat eval suite manifest.yaml -p support       # only bots whose path contains "support"
+pipecat eval suite manifest.yaml -p support       # only entries whose name or bot path contains "support"
 pipecat eval suite manifest.yaml -s greeting      # only the greeting scenario
 pipecat eval suite manifest.yaml -k simulation    # only simulations (or: -k script)
 pipecat eval suite manifest.yaml -c 8             # 8 runs at a time
@@ -13814,7 +13858,7 @@ eval-runs/20260610_142200/
     bots_support-agent.py__greeting.wav        # conversation audio (record: true or -a)
 ```
 
-`results.jsonl` carries one line per run, and every line names its `kind`, `script` or `simulation`. A scripted record carries the bot, scenario, attempt, outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+`results.jsonl` carries one line per run, and every line names its `kind`, `script` or `simulation`. A scripted record carries the bot, scenario, attempt, outcome, duration, failures (each with a `kind`), per-turn results with what each of its expectations matched (the marker an `llm_marker` saw, a function call's signature, a reply's text), and paths to its artifacts. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
 
 Each run executes in its own process, so a harness that loads local audio models does so on its own, and a crash in one run doesn't stop the others.
 
@@ -82708,10 +82752,10 @@ worker = PipelineWorker(
 </ParamField>
 
 <ParamField path="bot_llm_marker_enabled" default="False">
-  Indicates if the sideband markers the bot's LLM emits (`LLMMarkerFrame`, e.g.
-  the turn-completion markers of `filter_incomplete_user_turns`) should be sent.
-  Markers are meant for the conversation context, not for clients, so this is
-  off by default.
+  Indicates if the bot's LLM marker reports (`LLMMarkerResponseFrame`, e.g. from
+  `filter_incomplete_user_turns`) should be sent. A report carries the marker
+  the LLM emitted and the raw text of the whole response, which is meant for
+  evaluation, not for clients, so this is off by default.
 </ParamField>
 
 <ParamField path="bot_tts_enabled" default="True">
@@ -82885,7 +82929,7 @@ The observer maps Pipecat's internal frames to RTVI protocol messages:
 | `LLMFullResponseStartFrame`   | `RTVIBotLLMStartedMessage`                  |
 | `LLMFullResponseEndFrame`     | `RTVIBotLLMStoppedMessage`                  |
 | `LLMTextFrame`                | `RTVIBotLLMTextMessage`                     |
-| `LLMMarkerFrame`              | `bot-llm-marker` (when enabled)             |
+| `LLMMarkerResponseFrame`      | `bot-llm-marker` (when enabled)             |
 | **TTS Events**                |
 | `TTSStartedFrame`             | `RTVIBotTTSStartedMessage`                  |
 | `TTSStoppedFrame`             | `RTVIBotTTSStoppedMessage`                  |
@@ -83450,6 +83494,31 @@ Inherits from `DataFrame`.
   What the marker means, in the emitter's vocabulary, for consumers that should
   not depend on the marker text (which is configurable). The turn-completion
   mixin uses `"complete"`, `"short"` and `"long"`.
+</ParamField>
+
+### LLMMarkerResponseFrame
+
+What a marker-reading LLM service made of one whole response. Pushed when the response ends, after `LLMMarkerFrame` and the spoken text: the marker found, what it meant, and the raw text the LLM produced before anything was held back. A diagnostic, for consumers that check how well the LLM follows the marker protocol; it plays no part in the conversation.
+
+Inherits from `DataFrame`.
+
+<ParamField path="raw" type="str" required>
+  The response text as the LLM produced it, markers included.
+</ParamField>
+
+<ParamField path="marker" type="str | None" default="None">
+  The marker found, or `None` when the response carried none.
+</ParamField>
+
+<ParamField path="kind" type="str | None" default="None">
+  What the marker meant, in the emitter's own vocabulary, for consumers that
+  should not depend on the marker text (which is configurable). The
+  turn-completion mixin uses `"complete"`, `"short"` and `"long"`.
+</ParamField>
+
+<ParamField path="markers" type="list[str]" default="[]">
+  Every marker the emitter recognizes, so a consumer can find them in `raw`
+  without knowing the emitter's configuration.
 </ParamField>
 
 ### AggregatedTextFrame
