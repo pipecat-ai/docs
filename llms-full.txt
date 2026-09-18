@@ -7479,7 +7479,7 @@ When a [user turn start strategy](/api-reference/server/utilities/turn-managemen
     [SystemFrame](/api-reference/server/frames/system-frames), so each processor
     handles it immediately instead of waiting behind queued frames. Each
     processor cancels its processing task and discards queued `DataFrame`s and
-    `ControlFrame`s. Frames marked uninterruptible (like
+    `ControlFrame`s. Frames with `interruptible=False` (like
     `FunctionCallResultFrame` and `EndFrame`) are preserved and still processed.
   </Step>
   <Step title="The LLM stops generating">
@@ -84852,6 +84852,14 @@ Every frame has these properties set automatically:
   supports multiple output tracks.
 </ParamField>
 
+<ParamField path="interruptible" type="bool" default="True">
+  Whether an interruption may drop this frame from a processor's queue or cancel
+  its processing. True by default. A frame class such as `EndFrame` declares
+  `interruptible: bool = field(default=False, init=False)` to be uninterruptible
+  by default. Set it on a frame before pushing it to decide for that frame
+  alone.
+</ParamField>
+
 ## Frame Direction
 
 Frames flow through the pipeline in one of two directions:
@@ -84908,16 +84916,32 @@ Mixins add cross-cutting behavior or shared data fields to frames without changi
 
 ### UninterruptibleFrame
 
-Occasionally a `DataFrame` or `ControlFrame` is too important to discard during an interruption. Adding the `UninterruptibleFrame` mixin protects it: the frame stays in internal queues and any task processing it will not be cancelled.
+<Warning>
+  **Deprecated.** Use the `interruptible` field with `default=False` instead.
+  `UninterruptibleFrame` will be removed in 2.0.0.
+</Warning>
+
+Occasionally a `DataFrame` or `ControlFrame` is too important to discard during an interruption. To protect a frame, declare the `interruptible` field with `default=False` in the frame class:
 
 ```python
+from dataclasses import dataclass, field
+
 @dataclass
-class FunctionCallResultFrame(DataFrame, UninterruptibleFrame):
+class FunctionCallResultFrame(DataFrame):
     """Must be delivered even if the user interrupts."""
-    ...
+    interruptible: bool = field(default=False, init=False)
+    # ... other fields
 ```
 
-Examples: `EndFrame`, `StopFrame`, `FunctionCallResultFrame`, `FunctionCallInProgressFrame`
+You can also set the field on an individual frame to override the class default:
+
+```python
+frame = TextFrame(text="Important")
+frame.interruptible = False  # This specific frame survives interruption
+await self.push_frame(frame)
+```
+
+Examples of uninterruptible frames: `EndFrame`, `StopFrame`, `FunctionCallResultFrame`, `FunctionCallInProgressFrame`
 
 ### AudioRawFrame
 
@@ -84966,7 +84990,7 @@ Frames are plain Python dataclasses, so you can define your own by subclassing o
 ```python
 from dataclasses import dataclass
 
-from pipecat.frames.frames import DataFrame, UninterruptibleFrame
+from pipecat.frames.frames import DataFrame
 
 
 @dataclass
@@ -84976,11 +85000,16 @@ class AsteriskCommandFrame(DataFrame):
     command: str
 ```
 
-Your frame travels the pipeline like any built-in frame, in the direction you push it (see [Frame Direction](#frame-direction)). If the frame must survive a user interruption, add the [`UninterruptibleFrame`](#uninterruptibleframe) mixin:
+Your frame travels the pipeline like any built-in frame, in the direction you push it (see [Frame Direction](#frame-direction)). If the frame must survive a user interruption, declare `interruptible` with `default=False`:
 
 ```python
+from dataclasses import dataclass, field
+
 @dataclass
-class AsteriskCommandFrame(DataFrame, UninterruptibleFrame):
+class AsteriskCommandFrame(DataFrame):
+    """A custom command sent downstream to a telephony transport."""
+
+    interruptible: bool = field(default=False, init=False)
     command: str
 ```
 
@@ -85567,7 +85596,7 @@ Configures how the LLM produces output. Useful for scenarios where you want the 
 
 Contains the result of a completed function call execution.
 
-Inherits from `UninterruptibleFrame` to ensure the result always reaches the context aggregator.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`) to ensure the result always reaches the context aggregator.
 
 <ParamField path="function_name" type="str" required>
   Name of the function that was executed.
@@ -85608,7 +85637,7 @@ Source: https://docs.pipecat.ai/api-reference/server/frames/control-frames.md
 
 Reference for ControlFrame types: pipeline lifecycle, response boundaries, service settings, and runtime configuration
 
-ControlFrames signal boundaries, state changes, and configuration updates within the pipeline. They are queued and processed in order alongside DataFrames. ControlFrames are cancelled on `InterruptionFrame` unless combined with `UninterruptibleFrame`. See the [frames overview](/api-reference/server/frames/overview) for base class details and the full frame hierarchy.
+ControlFrames signal boundaries, state changes, and configuration updates within the pipeline. They are queued and processed in order alongside DataFrames. ControlFrames are cancelled on `InterruptionFrame` unless their `interruptible` field is False. See the [frames overview](/api-reference/server/frames/overview) for base class details and the full frame hierarchy.
 
 ## Pipeline Lifecycle
 
@@ -85616,7 +85645,7 @@ ControlFrames signal boundaries, state changes, and configuration updates within
 
 Signals graceful pipeline shutdown. `EndFrame` is queued with other non-SystemFrames, which allows FrameProcessors to be shut down in order, allowing queued frames ahead of the `EndFrame` to be processed first.
 
-Inherits from `UninterruptibleFrame`, meaning it cannot be cancelled by `InterruptionFrame`.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`), so it cannot be cancelled by `InterruptionFrame`.
 
 <ParamField path="reason" type="Any | None" default="None">
   Optional reason for the shutdown, passed along for logging or inspection.
@@ -85626,7 +85655,7 @@ Inherits from `UninterruptibleFrame`, meaning it cannot be cancelled by `Interru
 
 Stops the pipeline but keeps processors in a running state. Like `EndFrame`, `StopFrame` is queued with other non-SystemFrames allowing frames preceding it to be processed first. Useful when you need to halt frame flow without tearing down the entire processor graph.
 
-Inherits from `UninterruptibleFrame`.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`).
 
 ### OutputTransportReadyFrame
 
@@ -85748,7 +85777,7 @@ Internal request from the aggregator to the LLM service, asking it to produce a 
 
 The LLM's summarization result, sent back to the aggregator.
 
-Inherits from `UninterruptibleFrame` to ensure the result is never dropped.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`) to ensure the result is never dropped.
 
 <ParamField path="request_id" type="str">
   Matches the originating request.
@@ -85799,7 +85828,7 @@ Marks the end of LLM extended thinking content.
 
 Indicates that a function call is currently executing.
 
-Inherits from `UninterruptibleFrame`, ensuring it reaches downstream processors even during interruption.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`), ensuring it reaches downstream processors even during interruption.
 
 <ParamField path="function_name" type="str">
   Name of the function being called.
@@ -85862,7 +85891,7 @@ Runtime settings updates for LLM, TTS, STT, and other services. These let you ch
 
 Base frame for runtime service settings updates.
 
-Inherits from `UninterruptibleFrame`.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`).
 
 <ParamField path="settings" type="Mapping[str, Any]" default="{}" deprecated>
   Dictionary of settings to update. _Deprecated in v0.0.104. Use `delta` with a
@@ -85903,13 +85932,13 @@ Update STT service settings at runtime. Inherits from `ServiceUpdateSettingsFram
 
 Instructs `AudioBufferProcessor` to start recording audio. This frame can be pushed through the pipeline to start recording on demand. Alternatively, use `AudioBufferProcessor.start_recording()` or enable `auto_start_recording` in the constructor.
 
-Inherits from `UninterruptibleFrame`.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`).
 
 ### AudioBufferStopRecordingFrame
 
 Instructs `AudioBufferProcessor` to stop recording and flush any buffered audio. After flushing, triggers the `on_recording_stopped` event.
 
-Inherits from `UninterruptibleFrame`.
+This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`).
 
 ### VADParamsUpdateFrame
 
@@ -85991,7 +86020,7 @@ Base frame for worker control.
 
 ### EndWorkerFrame
 
-Request graceful pipeline shutdown. The pipeline worker converts this into an `EndFrame` and pushes it downstream. Inherits from `WorkerFrame` and `UninterruptibleFrame`.
+Request graceful pipeline shutdown. The pipeline worker converts this into an `EndFrame` and pushes it downstream. Inherits from `WorkerFrame` and is uninterruptible (`interruptible: bool = field(default=False, init=False)`).
 
 <ParamField path="reason" type="Any | None">
   Optional reason for the shutdown request.
@@ -85999,7 +86028,7 @@ Request graceful pipeline shutdown. The pipeline worker converts this into an `E
 
 ### StopWorkerFrame
 
-Request pipeline stop while keeping processors alive. Converted to a `StopFrame` downstream. Inherits from `WorkerFrame` and `UninterruptibleFrame`.
+Request pipeline stop while keeping processors alive. Converted to a `StopFrame` downstream. Inherits from `WorkerFrame` and is uninterruptible (`interruptible: bool = field(default=False, init=False)`).
 
 # System Frames
 Source: https://docs.pipecat.ai/api-reference/server/frames/system-frames.md
