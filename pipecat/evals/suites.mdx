@@ -22,22 +22,20 @@ suite:
   - bot: bots/support-agent.py
     scenarios: [greeting, capital_question, multi_turn]
   - bot: bots/sales-agent.py
+    concurrency: 2 # this entry may hold two slots at once
     scenarios: [greeting, weather_function_call]
   - bot: bots/booking-agent.py
     scenarios: [greeting, simulated/book_table] # a simulation, listed the same way
-  - bot: bots/voice-agent.py
-    concurrency: 2 # this bot's own cap
-    scenarios: [greeting, interruption]
   - bot: bots/vision-agent.py
     runner_body:
-      path: scenarios/vision-body.yaml # optional --runner-body data
+      path: scenarios/vision-body.yaml # optional --runner-body data, as a file
     scenarios: [vision_describe]
-  - bot: bots/turns-agent.py
-    name: openai/gpt-4o-mini # this entry's label
+  - bot: bots/turn-agent.py
+    name: openai/gpt-4o-mini # the entry's label, since two entries share this bot
     runner_body:
-      data: { model: gpt-4o-mini } # written to a file for the bot
+      data: { model: gpt-4o-mini } # or written inline
     scenarios: [turn_completion]
-  - bot: bots/turns-agent.py
+  - bot: bots/turn-agent.py
     name: groq/llama-3.3-70b
     runner_body:
       data: { model: llama-3.3-70b }
@@ -46,17 +44,22 @@ suite:
 
 Paths in the manifest (`bots_dir`, `scenarios_dir`, `runs_dir`, the `bot:` entries) resolve relative to the manifest file, so a manifest is portable: check it into your repo and run it from anywhere. A scenario name can include a subfolder (`simulated/book_table`), and a name ending in `.yaml` is a path relative to the manifest.
 
-Scripted and simulated scenarios are listed the same way, and the file says which it is: `turns:` makes it scripted, `persona:` makes it a simulation. Pipecat's release evals keep the two in `scenarios/scripted/` and `scenarios/simulated/` folders, which is a convention worth copying.
-
-When a scenario file holds multiple scenarios under `scenarios:`, each runs on its own against its own agent, named `<file>/<scenario>`. The suite's `-s` filter accepts that name or either half: `-s book_table` selects every scenario in `book_table.yaml`, and `-s book_table/available` selects only the `available` scenario from that file.
+A `scenarios:` entry names a [scenario file](/pipecat/evals/scenario-configuration#scenario-files), and the file contributes one run per scenario it holds, named `<file>/<scenario>` after the file's `name:` and the scenario's own. Scripted scenarios and simulations are listed the same way, and each scenario says which it is: `turns:` makes it scripted, `persona:` makes it a simulation. Pipecat's release evals keep the two in `scenarios/scripted/` and `scenarios/simulated/` folders, which is a convention worth copying.
 
 Scenarios are reusable across agents. One `greeting` scenario can cover every agent in the suite.
 
-An optional `runner_body:` supplies runner-args data the agent would normally receive in a `/start` request body (e.g. a vision agent's image path), passed to it as `--runner-body`. It holds either `path:`, a YAML or JSON file resolved relative to the manifest, or `data:`, the body itself as a mapping, which the suite writes to a file among the run's logs. A bot given a file runs with the file's directory as its working directory, so relative paths inside the body (like an image) resolve next to the file; a body that holds such paths belongs in a file for that reason.
+### Entry options
 
-An entry's `name:` is its label: what the display, the `-p` filter, the results records and the artifact file names use. It defaults to the `bot:` path, so it is only needed when several entries share a bot, as when sweeping a model with `runner_body:`; two entries may not run the same scenario under the same label.
+An entry can carry three optional keys beside `bot:` and `scenarios:`:
 
-Each entry's runs go one after another on a single slot, so its scenarios finish as a block and a slow provider holds no more than one slot. An entry may set its own `concurrency:` to hold more than one slot.
+- **`runner_body:`** supplies session data the agent would normally receive in a `/start` request body, passed to it as `--runner-body`. It holds either `path:`, a YAML or JSON file resolved relative to the manifest, or `data:`, the body itself as a mapping, which the suite writes to a file among the run's logs. An agent given a file runs with the file's directory as its working directory, so a relative path inside the body (a vision agent's image, say) resolves next to the file. A body that holds such paths belongs in a file for that reason.
+- **`name:`** is the entry's label: what the dashboard, the `-p` filter, `results.jsonl`, and the artifact file names use. It defaults to the `bot:` path, so it is only needed when several entries share a bot and differ in their `runner_body:`, as when sweeping a model. Two entries may not run the same scenario under one label.
+- **`concurrency:`** is how many of the suite's slots the entry may hold at once, one by default. See [Concurrency](#concurrency).
+
+<Note>
+  A bare `runner_body: <file>` is deprecated since 1.11.0 and will be removed in
+  2.0.0. Write `runner_body: { path: <file> }` instead.
+</Note>
 
 ## Running a suite
 
@@ -66,15 +69,12 @@ pipecat eval suite manifest.yaml
 
 In a terminal, a live dashboard shows each run's status, a running tally, and total time. When piped (in CI, or driven by a coding assistant), it streams one plain result line per run instead. The command exits `0` only if every run passes.
 
-### Concurrency and dispatch order
-
-Each entry's scenarios run one after another on the slot it holds, so a slow or rate-limited provider never holds more than that one slot and its scenarios finish as a block. Queues take free slots in manifest order, every entry's first attempt before any entry's second. An entry with its own `concurrency:` holds that many slots across its attempts and runs its queues that wide.
-
 Useful flags:
 
 ```bash
 pipecat eval suite manifest.yaml -p support       # only entries whose name or bot path contains "support"
-pipecat eval suite manifest.yaml -s greeting      # only the greeting scenario
+pipecat eval suite manifest.yaml -s greeting      # every scenario in the greeting file
+pipecat eval suite manifest.yaml -s book_table/available  # one scenario of a file
 pipecat eval suite manifest.yaml -k simulation    # only simulations (or: -k script)
 pipecat eval suite manifest.yaml -c 8             # 8 runs at a time
 pipecat eval suite manifest.yaml -n nightly       # output to eval-runs/nightly/
@@ -83,7 +83,13 @@ pipecat eval suite manifest.yaml -d               # save full per-pipeline debug
 pipecat eval suite manifest.yaml -r 5             # run each pair 5 times
 ```
 
+`-s` takes a run's full `<file>/<scenario>` name or either half of it, so a file's name selects every scenario it holds, and a scenario's name selects it in whichever file it appears.
+
 Everything except the `suite:` list can live in the manifest or be passed on the command line (the command line wins), so a manifest can be as minimal as a `suite:` list.
+
+### Concurrency
+
+`concurrency:` is how many runs execute at once. Each entry's runs go one after another on a single slot, so its scenarios finish as a block and a slow or rate-limited provider holds no more than one slot, whatever the suite's figure. An entry that can take more sets its own `concurrency:`, the number of slots it may hold at once, and runs that many of its scenarios side by side. Entries take free slots in manifest order, and the suite's figure, or `--concurrency`, bounds the whole.
 
 ## Run output
 
@@ -91,17 +97,18 @@ Each invocation writes to `<runs_dir>/<name>/` (a timestamp when `-n` is omitted
 
 ```
 eval-runs/20260610_142200/
+  results.jsonl                                          # one line per run
   logs/
-  results.jsonl                                # one line per run
-  logs/
-    bots_support-agent.py__greeting.log        # the agent process output
-    bots_support-agent.py__greeting.eval.log   # the harness's decision trace
-    bots_support-agent.py__greeting.debug.log  # per-pipeline harness logs (-d only)
+    bots_support-agent.py__greeting__greeting.log        # the agent process output
+    bots_support-agent.py__greeting__greeting.eval.log   # the harness's decision trace
+    bots_support-agent.py__greeting__greeting.debug.log  # per-pipeline harness logs (-d only)
   recordings/
-    bots_support-agent.py__greeting.wav        # conversation audio (record: true or -a)
+    bots_support-agent.py__greeting__greeting.wav        # conversation audio (record: true or -a)
 ```
 
-`results.jsonl` carries one line per run, and every line names its `kind`, `script` or `simulation`. A scripted record carries the bot, scenario, attempt, outcome, duration, failures (each with a `kind`), per-turn results with what each of its expectations matched (the marker an `llm_marker` saw, a function call's signature, a reply's text), and paths to its artifacts. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+An artifact's name is the bot path, then the entry's `name:` when it has one, then the scenario's `<file>/<scenario>` name with its slash written as a double underscore, so `bots/turn-agent.py` under the label `openai/gpt-4o-mini` running `turn_completion/short_answer` writes `bots_turn-agent.py__openai_gpt-4o-mini__turn_completion__short_answer.log`.
+
+`results.jsonl` carries one line per run, and every line names its `bot`, its entry's `name`, its `scenario`, its `attempt`, and its `kind`, `script` or `simulation`. A scripted record carries the outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. Each turn lists its `expectations`, one per expectation the turn resolved, with whether it `passed` and what it `matched`: the marker of an `llm_marker`, a function call's signature, a reply's text. What a passed run matched is only recorded here. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
 
 Each run executes in its own process, so a harness that loads local audio models does so on its own, and a crash in one run doesn't stop the others.
 
@@ -131,7 +138,7 @@ A persona doesn't say the same thing twice, so one run of a simulation proves li
 
 ```
   Pass rate:
-  bots/booking-agent.py  simulated/book_table      3/3 (100%)  ✓  ~12.4s each
+  bots/booking-agent.py  book_table/available      3/3 (100%)  ✓  ~12.4s each
 ```
 
 A run that errored (the agent never came up, the persona's LLM failed, the judge gave no verdict on the goal) is reported but kept out of the rate: it says nothing about whether the agent did its job.
@@ -148,7 +155,7 @@ suite:
     scenarios: [interruption]
 ```
 
-Attempts run attempt-major (every entry's first attempt before any entry's second), and artifact filenames gain an attempt suffix (`__001`) only when `repeat` is above 1, so a single pass keeps the filenames it always had.
+A repeated sweep is attempt-major: every entry's first attempt runs before any entry's second, each entry's scenarios as a block, so every bot meets the same machine conditions in the same stretch and a transient slowdown shows as a band across all of them rather than a regression in one. Artifact filenames gain an attempt suffix (`__001`) only when `repeat` is above 1, so a single pass keeps the filenames it always had.
 
 <Warning>
   A repeated sweep always exits `0`. A pass rate isn't a pass or a fail, so the
