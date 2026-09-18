@@ -1,28 +1,26 @@
 ---
 title: "Scripted Scenarios"
-description: "The scripted scenario file format: user turns, expected events, eval and text_contains assertions, function calls, latency budgets, and modalities."
+description: "The scripted scenario format: user turns, expected events, eval, text_contains and llm_marker assertions, function calls, and latency budgets."
 ---
 
-A scripted scenario is a YAML file that writes the user's turns out, each with the events you expect your agent to emit in response. A scenario with `turns:` is scripted; one with a `persona:` is a [simulated scenario](/pipecat/evals/simulated-scenarios), where an LLM plays the user instead. This page covers the full scripted format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
+A scripted scenario writes the user's turns out, each with the events you expect your agent to emit in response. It lives in a [scenario file](/pipecat/evals/scenario-configuration#scenario-files)'s `scenarios:` list. A scenario with a `turns:` key is scripted; one with a `persona:` key is a [simulated scenario](/pipecat/evals/simulated-scenarios), where an LLM plays the user instead. This page covers the full scripted format. If you haven't run a scenario yet, start with the [quickstart](/pipecat/evals/quickstart).
 
 Use a scripted scenario when you want exact control over the user's side. You know what the user says on every turn, so you can assert exactly what the agent must do: call this tool with these arguments, say this, answer within this budget, recover from this interruption. The input is the same every run, so a failure is easy to reproduce and fix. Use a simulation when you want to check a goal instead, and let the caller adapt to the agent.
 
 ## Anatomy of a scenario
 
-A scenario file holds one or more scenarios under `scenarios:`, each with a `name:`. Most files hold one scenario; several scenarios per file suit testing one behavior through many short conversations. Any configuration a scenario can have (like `judge:` or `context:`) may also sit at the file's top level as the default for all scenarios:
-
 ```yaml
-name: multi_turn # file name, used when scenarios share a name or have none
+name: multi_turn # required: the file's name
 
-judge: # shared by all scenarios in this file
+judge: # optional: judge modality and LLM (defaults shown below)
   eval:
     service: ollama
     model: gemma4:12b
     extra: { reasoning_effort: none }
 
-scenarios:
-  - name: multi_turn # the scenario's name
-    turns: # the conversation, in order
+scenarios: # required: the scenarios the file holds
+  - name: multi_turn # required: this scenario's name
+    turns: # required: the conversation, in order
       - user: "My name is Alex, and I'm planning a trip to Italy."
         expect:
           - event: response
@@ -34,52 +32,9 @@ scenarios:
             eval: "recalls that the user's name is Alex and the destination is Italy"
 ```
 
-Each scenario is named `<file>/<scenario>`, so the example above is `multi_turn/multi_turn`. Each turn optionally sends a user utterance (`user:`) and lists the events expected in response (`expect:`). Expected events must arrive in the order listed, but the agent may emit other events in between, so you don't have to enumerate everything it does.
+Each turn optionally sends a user utterance (`user:`) and lists the events expected in response (`expect:`). Expected events must arrive in the order listed, but the agent may emit other events in between, so you don't have to enumerate everything it does.
 
-Two common shapes for multiple scenarios per file:
-
-**The same turns, judged differently.** The turns are written once at the file level, and each scenario names its own judge or modality. Every judge sees exactly the same conversation:
-
-```yaml
-name: interruption
-turns:
-  - user: "Tell me a long story about Paris."
-    expect:
-      - event: llm_started
-  - user: "Actually, what's the capital of Japan?"
-    send_after: { event: llm_started, delay_ms: 2000 }
-    expect:
-      - event: response
-        eval: "says Tokyo instead of continuing the story"
-
-scenarios:
-  - name: text
-    judge: !include ../judge_text.yaml
-  - name: audio
-    user: !include ../user_audio.yaml
-    judge: !include ../judge_audio.yaml
-```
-
-**Short cases of one behavior.** Each scenario is a self-contained check. For example, testing turn-completion markers:
-
-```yaml
-name: turn_completion
-judge: !include ../judge_text.yaml
-
-scenarios:
-  - name: short_answer
-    turns:
-      - user: "Japan."
-        expect:
-          - event: response
-  - name: cutoff
-    turns:
-      - user: "I'd go to Japan because"
-        expect:
-          - event: response
-            absent: true
-            within_ms: 3000
-```
+The scenario runs as `multi_turn/multi_turn`, its file's name and then its own. A file can hold several scenarios, and any scenario key at the top of the file, like the `judge:` above, is the default for all of them. See [Several scenarios in one file](#several-scenarios-in-one-file).
 
 The rest of this page is in four parts:
 
@@ -101,11 +56,9 @@ The rest of this page is in four parts:
 
 ## Configuration
 
-The `user:` and `judge:` blocks, `factory:`, `!include`, running scenarios back to back, and the disconnect path are shared with [simulated scenarios](/pipecat/evals/simulated-scenarios) and documented once, on [Scenario Configuration](/pipecat/evals/scenario-configuration). A scenario with none of those blocks runs entirely in [text mode](/pipecat/evals/scenario-configuration#text-and-audio-modes) with the default judge, which is the fastest way to start.
+The file format, the `user:` and `judge:` blocks, `factory:`, `!include`, running scenarios back to back, and the disconnect path are shared with [simulated scenarios](/pipecat/evals/simulated-scenarios) and documented once, on [Scenario Configuration](/pipecat/evals/scenario-configuration). A scenario with none of those blocks runs entirely in [text mode](/pipecat/evals/scenario-configuration#text-and-audio-modes) with the default judge, which is the fastest way to start.
 
-Any key a scenario can have may also sit at the top of the file as the default for all scenarios. A scenario that sets the same key replaces the whole value; nothing is merged, so a `context:` is written out in full.
-
-Two fields are scripted-only, since a simulation has no scripted turns to seed or to score:
+Two fields are scripted-only, since a simulation has no scripted turns to seed or to score. Like any scenario key, both may sit on the scenario or at the top of the file as a default for [every scenario in it](#several-scenarios-in-one-file):
 
 ### Seeding the context with `context:`
 
@@ -129,12 +82,14 @@ By default the first turn with a failed assertion ends the scenario, since a con
 name: intent_benchmark
 stop_on_failure: false
 
-turns:
-  - user: "Book me a flight to Tokyo."
-    expect:
-      - event: function_call
-        within_ms: 15000
-        calls: [{ name: book_flight }]
+scenarios:
+  - name: intent_benchmark
+    turns:
+      - user: "Book me a flight to Tokyo."
+        expect:
+          - event: function_call
+            within_ms: 15000
+            calls: [{ name: book_flight }]
 ```
 
 <Warning>
@@ -277,20 +232,23 @@ A `send_after:` with no `event:` and a zero `delay_ms` is rejected as a no-op: g
 
 Scenarios assert on a small set of semantic events, mapped from the RTVI messages the agent emits:
 
-| Event                   | Meaning                                                                                                                                                                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `response`              | The agent's reply. In audio mode this is a transcription of the agent's actual synthesized speech; in text mode it resolves to `llm_response`. Prefer this for content checks.                                                      |
-| `llm_response`          | The LLM's text output for the turn. Available in both modes.                                                                                                                                                                        |
-| `llm_marker`            | A sideband marker the bot's LLM emitted, such as the turn-completion markers of [filter incomplete user turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns). Sent only when the scenario asks for them. |
-| `tts_response`          | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                                                                          |
-| `llm_started`           | The LLM began generating a response.                                                                                                                                                                                                |
-| `bot_started_speaking`  | The agent reported itself as speaking (emitted by the pipeline).                                                                                                                                                                    |
-| `bot_stopped_speaking`  | The agent reported itself as quiet (emitted by the pipeline).                                                                                                                                                                       |
-| `function_call`         | The LLM called a function.                                                                                                                                                                                                          |
-| `function_call_stopped` | A function call ended. Its `args` carry `tool_call_id` and `cancelled`, so a scenario can tell work that was stopped from work that finished on its own.                                                                            |
-| `user_transcription`    | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-keypresses-with-dtmf), where the aggregated keys become a transcription in either mode.                                        |
-| `user_started_speaking` | The agent's VAD detected the start of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                                                         |
-| `user_stopped_speaking` | The agent's VAD detected the end of user speech. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                                                           |
+| Event                       | Meaning                                                                                                                                                                                                                                                                                |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `response`                  | The agent's reply. In audio mode this is a transcription of the agent's actual synthesized speech; in text mode it resolves to `llm_response`. Prefer this for content checks.                                                                                                         |
+| `llm_response`              | The LLM's text output for the turn. Available in both modes.                                                                                                                                                                                                                           |
+| `tts_response`              | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                                                                                                                             |
+| `llm_started`               | The LLM began generating a response.                                                                                                                                                                                                                                                   |
+| `llm_marker`                | The turn-completion marker the agent's LLM produced, reported when the response ends. Only sent when a scenario asks for it. See [Turn-completion markers](#turn-completion-markers-with-llm_marker).                                                                                  |
+| `bot_started_speaking`      | The agent reported itself as speaking (emitted by the pipeline).                                                                                                                                                                                                                       |
+| `bot_stopped_speaking`      | The agent reported itself as quiet (emitted by the pipeline).                                                                                                                                                                                                                          |
+| `bot_interrupted`           | The agent's reply was cut off by the user, as an anchor for a barge-in test.                                                                                                                                                                                                           |
+| `function_call`             | The LLM called a function.                                                                                                                                                                                                                                                             |
+| `function_call_stopped`     | A function call ended. Its `args` carry `tool_call_id` and `cancelled`, so a scenario can tell work that was stopped from work that finished on its own.                                                                                                                               |
+| `user_transcription`        | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-keypresses-with-dtmf), where the aggregated keys become a transcription in either mode.                                                                                           |
+| `user_started_speaking`     | The agent's turn detection reported the start of a user turn. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                                                                                                 |
+| `user_stopped_speaking`     | The agent's turn detection reported the end of a user turn. Audio mode, or a [DTMF turn](#dtmf-keypresses-with-dtmf) in either mode.                                                                                                                                                   |
+| `vad_user_started_speaking` | The raw VAD signal that user speech started, ungated by turn detection. Audio mode only.                                                                                                                                                                                               |
+| `vad_user_stopped_speaking` | The raw VAD signal that user speech stopped, ungated by turn detection. A timing anchor when a turn-detection strategy defers `user_stopped_speaking`, as [filtering incomplete turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns) does. Audio mode only. |
 
 <Tip>
   Use `response` for the agent's reply unless you have a reason not to. It's
@@ -298,45 +256,13 @@ Scenarios assert on a small set of semantic events, mapped from the RTVI message
   transcription of real spoken audio in audio mode, so one file covers both.
 </Tip>
 
-### LLM markers
-
-`llm_marker` is the sideband marker the bot's LLM emitted in a response, such as the turn-completion markers of [filter incomplete user turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns). It arrives when the response ends. The `marker:` field names which one: `complete` (the turn was finished and the bot answers), `short` (the user was cut off and the bot waits), `long` (the user asked for time), or `incomplete` (either of the last two). A bare `llm_marker` asserts only that the bot read a response.
-
-Markers never reach clients by default; a scenario that asserts on one asks the bot to report them:
-
-```yaml
-turns:
-  - user: "Let me think about it, hmmm"
-    expect:
-      - event: llm_marker
-        marker: incomplete # the bot held the turn open
-  - user: "I think I'd go to Japan."
-    expect:
-      - event: llm_marker
-        marker: complete # ... and answered this one
-      - event: response
-        eval: "engages with the user's answer about Japan"
-```
-
-The event also carries the response's raw text, as the LLM produced it before the bot held anything back, so a scenario can check how well the LLM follows the protocol: `marker_first` (nothing before the marker), `markers` (how many markers the text holds), and `text_after` (whether text follows the first marker, which a complete turn should have and an incomplete one should not):
-
-```yaml
-- user: "I'd go to Japan because"
-  expect:
-    - event: llm_marker
-      marker: short
-      marker_first: true
-      markers: 1
-      text_after: false
-```
-
 ## Assertions
 
 Each entry in `expect:` names an event and, optionally, asserts on its content or timing.
 
 ### Semantic judging with `eval:`
 
-The `eval:` field is a natural-language criterion that the event must satisfy, decided by the [judge LLM](/pipecat/evals/scenario-configuration#judging-with-judge):
+The `eval:` field is a natural-language criterion that the event's text must satisfy, decided by the [judge LLM](/pipecat/evals/scenario-configuration#judging-with-judge):
 
 ```yaml
 - user: "What's 2 plus 2?"
@@ -349,28 +275,9 @@ The judge sees the whole conversation so far, so it can resolve terse or context
 
 The judge handles interim replies gracefully: if the agent says "Let me check on that." before the real answer, the harness keeps accumulating response text and re-judges until the criterion is met or the time budget runs out.
 
-#### Text events
+`eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`).
 
-`eval:` on the agent's text output (`response`, `llm_response`, `tts_response`) judges the content of the reply.
-
-#### Function calls
-
-`eval:` on a `function_call` event judges each matched call by its name and arguments, which is how a scenario checks what `args:` cannot match verbatim:
-
-```yaml
-- user: "Submit a session suggestion about OpenTelemetry tracing for Jennifer Smith."
-  expect:
-    - event: function_call
-      calls:
-        - name: submit_session_suggestion
-      eval: "a session about OpenTelemetry tracing, submitted for Jennifer Smith"
-```
-
-Each call that matches the `name:` and `args:` is then put to the judge. The first call the judge rejects fails the expectation. The judge sees the conversation so far as context, but the verdict is about the call itself.
-
-A `function_call_stopped` event carries no arguments (only how the call ended), so it cannot take an `eval:`.
-
-### Substring checks with `text_contains:` and `text_excludes:`
+### Substring checks with `text_contains:`
 
 For exact content, `text_contains:` does a substring check, ignoring whitespace differences:
 
@@ -383,33 +290,26 @@ For exact content, `text_contains:` does a substring check, ignoring whitespace 
 
 On `response`, `llm_response`, and `tts_response`, the harness accumulates successive segments and re-checks on each new segment until the check passes. On `user_transcription`, it accumulates the STT's final transcription segments within the turn, so an STT that finalizes an utterance in pieces can still satisfy a phrase that spans them.
 
-`text_excludes:` is the mirror: the event's text must not hold the given substring. This is useful when checking that a marker the LLM should keep out of its reply stayed out:
+`text_excludes:` is the mirror: the event's text must not hold the substring. It fails with the kind `text_present`. Its use is a marker the LLM let slip into its reply, which would reach the user:
 
 ```yaml
 - user: "What is the capital of Germany?"
   expect:
     - event: llm_response
-      text_contains: Berlin
+      text_contains: "Berlin"
       text_excludes: "●"
 ```
 
-### Marker checks
+### Asserting nothing arrives with `absent:`
 
-For an `llm_marker` event, several fields check the marker itself and how the LLM's raw response was laid out:
-
-- `marker:` asserts what the marker means: `complete`, `short`, `long`, or `incomplete` (which accepts either `short` or `long`). This checks the marker's `kind` field, not its text, so it works regardless of the configured marker characters.
-- `marker_first:` (true/false) checks whether the first marker in the response's raw text comes before any text.
-- `markers:` (integer) checks how many markers the response's raw text holds.
-- `text_after:` (true/false) checks whether text follows the first marker in the raw text.
+`absent: true` inverts an expectation: no event of that type may arrive before its `within_ms` budget expires. It matches on the event type alone, so it can't be combined with `text_contains:`, `eval:`, or `calls:`. Set `within_ms` explicitly, since the default budget makes the quiet window a full minute. A `response` that continues the reply an earlier expectation matched is not a new one; only a reply the agent began after that match counts. This is the check for a duplicate reply, or for an agent that should hold its turn:
 
 ```yaml
-- user: "Let me think about it, hmmm"
+- user: "I'd go to Japan because"
   expect:
-    - event: llm_marker
-      marker: incomplete
-      marker_first: true
-      markers: 1
-      text_after: false
+    - event: response
+      absent: true # the agent waits for the user to finish
+      within_ms: 3000
 ```
 
 ### Latency budgets with `within_ms:`
@@ -449,12 +349,12 @@ A `function_call` expectation asserts that the turn invoked one or more tools. L
 
 Arguments take part in the matching, so the turn is satisfied by any call matching both the name and the arguments. A call the model gets wrong and immediately repeats correctly still passes. When nothing matches, the failure names the arguments that did arrive.
 
-#### Judging function calls with `eval:`
+#### Judging a call with `eval:`
 
-When argument values can't be matched verbatim — for example, checking that a generated session description is about the right topic — add an `eval:` to judge each matched call:
+`args:` matches verbatim, which is no use for an argument the model phrases in its own words. A `function_call` expectation can carry an `eval:` instead, or as well: each call the expectation matches is put to the [judge LLM](/pipecat/evals/scenario-configuration#judging-with-judge) by name and arguments, over the conversation so far, under a judge prompt of its own. A rejected call fails the turn with the kind `judge_no`:
 
 ```yaml
-- user: "Submit a session suggestion about OpenTelemetry tracing for Jennifer Smith."
+- user: "I'd like to propose a talk on OpenTelemetry tracing. I'm Jennifer Smith."
   expect:
     - event: function_call
       calls:
@@ -462,7 +362,7 @@ When argument values can't be matched verbatim — for example, checking that a 
       eval: "a session about OpenTelemetry tracing, submitted for Jennifer Smith"
 ```
 
-Each call that passes the `name:` and `args:` checks is then put to the judge. The first call the judge rejects fails the expectation. See [Semantic judging with `eval:`](#semantic-judging-with-eval) for details.
+A `function_call_stopped` carries no arguments, only how the call ended, so it takes no `eval:`.
 
 `function_call_stopped` takes the same `calls:` shape and reports a call ending, which is how a scenario asserts that a [cancellable tool](/pipecat/learn/function-calling#async-function-call-cancellation) was actually stopped:
 
@@ -475,19 +375,96 @@ Each call that passes the `name:` and `args:` checks is then put to the judge. T
           args: { cancelled: true }
 ```
 
-### Absence checks with `absent: true`
+### Turn-completion markers with `llm_marker`
 
-Set `absent: true` to invert the expectation: assert that no event of this type arrives before the `within_ms` budget expires. This matches on event type only, so it cannot be combined with `text_contains:`, `eval:`, or `calls:`. Used for duplicate-output regressions:
+An agent that [filters incomplete user turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns) has its LLM open every response with a marker saying whether the user's turn was complete. The `llm_marker` event reports the marker the LLM produced when the response ends, and `marker:` names its meaning: `complete` (the turn was finished and the agent answers), `short` (the user was cut off and the agent waits), `long` (the user asked for time), or `incomplete` for either of the last two. It checks the marker's meaning, not its text, so a scenario holds whatever marker characters the agent configured. A bare `llm_marker` asserts only that the agent read a marker:
+
+```yaml
+turns:
+  - user: "Let me think about it, hmmm"
+    expect:
+      - event: llm_marker
+        marker: incomplete # the agent held the turn open
+
+  - user: "I think I'd go to Japan."
+    expect:
+      - event: llm_marker
+        marker: complete # ... and answered this one
+      - event: response
+        eval: "engages with the user's answer about Japan"
+```
+
+Markers never reach clients by default. A scenario that asserts on one asks the agent to report them, so no other client ever sees them. An agent that doesn't use turn-completion markers never emits the event, and the expectation times out.
+
+The event also carries the response's raw text, as the LLM produced it before the agent held anything back, so a scenario can check how well the LLM follows the marker protocol. `marker_first:` asserts that nothing comes before the marker, `markers:` how many markers the text holds, and `text_after:` whether text follows the first marker, which a complete turn should have and an incomplete one should not:
 
 ```yaml
 - user: "I'd go to Japan because"
   expect:
-    - event: response
-      absent: true
-      within_ms: 3000 # assert the bot waits rather than answering the incomplete turn
+    - event: llm_marker
+      marker: short
+      marker_first: true
+      markers: 1
+      text_after: false
 ```
 
-For `response` events, a response that continues the reply an earlier expectation matched is not a new one. Only a reply the bot began after that match counts, so a later segment of the same response does not fail an absence check.
+A marker the LLM lets slip into its reply reaches the user, so pair this with a [`text_excludes:`](#substring-checks-with-text_contains) on the reply. In audio mode, anchor the follow-up turn on `vad_user_stopped_speaking` rather than `user_stopped_speaking`, since turn detection defers the latter while the turn is held open.
+
+A run's result records what each expectation matched, the marker an `llm_marker` saw included, so a passed run keeps the marker it read. See [`results.jsonl`](/pipecat/evals/suites#run-output).
+
+## Several scenarios in one file
+
+A file's `scenarios:` list can hold several scripted scenarios, and any key at the top of the file is the default for all of them. That suits testing one behavior through many short conversations: the file sets the `judge:` and the `context:` once, and each scenario is a conversation of a few turns. Each runs on its own, against its own bot, as `turn_completion/short_answer` and `turn_completion/cutoff` here, and a suite's `-s turn_completion` runs them all:
+
+```yaml turn_completion.yaml
+name: turn_completion
+judge: !include ../judge_text.yaml
+context:
+  - role: system
+    content: "You are a travel assistant."
+
+scenarios:
+  - name: short_answer
+    turns:
+      - user: "Japan."
+        expect:
+          - event: llm_marker
+            marker: complete
+  - name: cutoff
+    turns:
+      - user: "I'd go to Japan because"
+        expect:
+          - event: llm_marker
+            marker: short
+```
+
+Every scripted key can sit at the top of the file this way: `turns:`, `context:`, and `stop_on_failure:`, and the shared `user:`, `judge:`, and `trigger_disconnect:`. A scenario that sets the same key replaces the whole value, so a scenario's own `context:` is written out in full, never added to the file's.
+
+Sharing `turns:` is for a file whose scenarios hold the same conversation and differ in one thing only. With `turns:` at the top and one scenario per judge or modality, every judge sees exactly the same conversation, which is how Pipecat's `interruption` scenario runs in text and in audio:
+
+```yaml interruption.yaml
+name: interruption
+
+turns:
+  - user: "Tell me a long, detailed story about the history of Paris."
+    expect:
+      - event: llm_started
+  - user: "Actually, never mind that. What's the capital of Japan?"
+    send_after: { event: llm_started, delay_ms: 2000 }
+    expect:
+      - event: bot_interrupted
+      - event: response
+        eval: "says Tokyo instead of continuing the Paris story"
+
+scenarios:
+  - name: text
+    judge: !include ../judge_text.yaml
+  - name: audio
+    user: !include ../user_audio.yaml
+    judge: !include ../judge_audio.yaml
+```
+
+The full rules, and a simulation's side of them, are on [Scenario files](/pipecat/evals/scenario-configuration#scenario-files).
 
 ## Next steps
 

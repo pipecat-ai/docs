@@ -1,11 +1,102 @@
 ---
 title: "Scenario Configuration"
-description: "The user: and judge: blocks shared by scripted and simulated scenarios: text and audio modes, TTS and STT services, the judge LLM, factory:, and !include."
+description: "Scenario files for scripted and simulated scenarios: the scenarios: list, file defaults, user: and judge: blocks, factory:, and !include."
 ---
 
-Scripted and simulated scenarios share the same top-level configuration. The `user:` block sets how the user's side reaches the agent. The `judge:` block sets what the judge hears and which LLM it is. `factory:` and `!include` work the same way in both. This page covers those shared blocks. The fields that belong to one kind alone are on the [scripted](/pipecat/evals/scripted-scenarios#configuration) and [simulated](/pipecat/evals/simulated-scenarios#anatomy-of-a-simulation) pages.
+Scripted and simulated scenarios share the same file format and the same configuration. A file lists its scenarios under `scenarios:`, and any key can sit at the top of the file as the default for all of them. The `user:` block sets how the user's side reaches the agent. The `judge:` block sets what the judge hears and which LLM it is. `factory:` and `!include` work the same way in both. This page covers the file format and those shared blocks. The fields that belong to one kind alone are on the [scripted](/pipecat/evals/scripted-scenarios#configuration) and [simulated](/pipecat/evals/simulated-scenarios#anatomy-of-a-simulation) pages.
 
-Everything here is optional. A scenario with no configuration blocks runs entirely in [text mode](#text-and-audio-modes) with the default judge, which is the fastest way to start.
+Everything here is optional apart from `name:` and the `scenarios:` list. A scenario with no configuration blocks runs entirely in [text mode](#text-and-audio-modes) with the default judge, which is the fastest way to start.
+
+## Scenario files
+
+A scenario file has a `name:` and a `scenarios:` list. Each entry is one scenario, with a `name:` of its own, and its keys say which kind it is: `turns:` makes it [scripted](/pipecat/evals/scripted-scenarios), `persona:` makes it a [simulation](/pipecat/evals/simulated-scenarios). Most files hold one scenario:
+
+```yaml capital_question.yaml
+name: capital_question
+
+scenarios:
+  - name: capital_question
+    turns:
+      - user: "What is the capital of Germany?"
+        expect:
+          - event: response
+            eval: "the response says the capital of Germany is Berlin"
+```
+
+A file holds several when they test one behavior through many short conversations. Each scenario runs on its own, against its own bot, and is named `<file>/<scenario>`, so the file above runs as `capital_question/capital_question` and the one below as `turn_completion/short_answer` and `turn_completion/cutoff`. Scripted scenarios and simulations can share a file.
+
+```yaml turn_completion.yaml
+name: turn_completion
+judge: !include ../judge_text.yaml
+
+scenarios:
+  - name: short_answer
+    turns:
+      - user: "Japan."
+        expect:
+          - event: response
+  - name: cutoff
+    turns:
+      - user: "I'd go to Japan because"
+        expect:
+          - event: response
+            absent: true
+            within_ms: 3000
+```
+
+### File-level defaults
+
+Any key a scenario can have may also sit at the top of the file. There it is the default for every scenario in the file, which is what `judge:` does above. A scenario that sets the same key replaces the whole value. Nothing is merged, so a scenario's `context:` is written out in full, never added to.
+
+This is not a fixed list: every scenario key works this way, and it decides the kind too, so a file with `persona:` at the top holds simulations unless a scenario sets `turns:` instead. The only exception is `name:`, which at the top of the file names the file.
+
+- **Either kind**: `user:`, `judge:`, `trigger_disconnect:`.
+- **Scripted**: `turns:`, `context:`, `stop_on_failure:`.
+- **Simulated**: `persona:`, `goal:`, `success:`, `metrics:`, `simulator:`, `max_turns:`, `max_duration_s:`, `max_silence_s:`, `runs:`.
+
+`turns:` and `persona:` are the ones to share when a file's scenarios hold the same conversation and differ in one thing only. With `turns:` at the top and one scenario per judge or modality, every judge sees exactly the same conversation:
+
+```yaml interruption.yaml
+name: interruption
+
+turns:
+  - user: "Tell me a long, detailed story about the history of Paris."
+    expect:
+      - event: llm_started
+  - user: "Actually, never mind that. What's the capital of Japan?"
+    send_after: { event: llm_started, delay_ms: 2000 }
+    expect:
+      - event: response
+        eval: "says Tokyo instead of continuing the Paris story"
+
+scenarios:
+  - name: text
+    judge: !include ../judge_text.yaml
+  - name: audio
+    user: !include ../user_audio.yaml
+    judge: !include ../judge_audio.yaml
+```
+
+With `persona:` at the top and a `goal:` per scenario, the same caller goes on different errands:
+
+```yaml diner.yaml
+name: diner
+persona: "Jamie, calling a restaurant. Friendly and to the point."
+success: "the bot did what the caller asked and confirmed it"
+
+scenarios:
+  - name: book
+    goal: "Book a table for two at 6 PM tonight, then end the call."
+  - name: cancel
+    goal: "Cancel tonight's booking under the name Jamie, then end the call."
+```
+
+<Note>
+  Before 1.11.0 a file held one scenario, with its `turns:` or `persona:` at the
+  top level and no `scenarios:` list. Such a file still loads, as one scenario
+  under the file's `name:`, with a `DeprecationWarning`, and will stop loading
+  in 2.0.0. Wrap the scenario in a `scenarios:` list with its own `name:`.
+</Note>
 
 ## Text and audio modes
 
@@ -42,8 +133,8 @@ user:
   speech:
     service: kokoro # local TTS, no API key, no per-run cost
     voice: af_heart
-    speed: 1.0 # optional; Kokoro's rate (0.5 to 2.0, default 1.0)
     sample_rate: 16000
+    speed: 1.0 # optional: Kokoro's rate multiplier, 0.5 to 2.0
 ```
 
 <Note>
@@ -52,7 +143,7 @@ user:
   deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0.
 </Note>
 
-Both the `speech:` and `judge.transcription:` blocks take an optional `language`, so a non-English agent can be driven and judged in the language it speaks. The `speech:` block also accepts an optional `speed` (Kokoro's rate multiplier, 0.5 to 2.0, default 1.0), which scales both the speech rate and pauses:
+Both the `speech:` and `judge.transcription:` blocks take an optional `language`, so a non-English agent can be driven and judged in the language it speaks:
 
 ```yaml
 user:
@@ -61,10 +152,11 @@ user:
     service: kokoro
     voice: zf_xiaobei # voices are language-specific, so match the language
     language: zh
-    speed: 1.2 # optional; makes the caller speak 20% faster
 ```
 
 It accepts a code like `zh` or a `Language`, and an unrecognized code raises a `ValueError` naming it. Omitting it leaves the service's own default, which is English. Voices are not selected for you: `af_heart` speaks US English whatever `language` says.
+
+`speech.speed:` makes the synthesized user talk faster or slower. It is Kokoro's rate multiplier, `1.0` by default, and pauses scale with it, so a faster rate also shortens the silences at commas. Cached user audio is keyed by the speed too, so changing it re-synthesizes the turns.
 
 <Tip>
   Prefer `whisper` over `moonshine` for transcribing a non-English agent.
@@ -185,18 +277,20 @@ name: capital_question
 user: !include user_audio.yaml
 judge: !include judge_audio.yaml
 
-turns:
-  - user: "What is the capital of Germany?"
-    expect:
-      - event: response
-        eval: "the response says the capital of Germany is Berlin"
+scenarios:
+  - name: capital_question
+    turns:
+      - user: "What is the capital of Germany?"
+        expect:
+          - event: response
+            eval: "the response says the capital of Germany is Berlin"
 ```
 
-A scenario file has a `name:`; an included fragment has none, which is how a directory run tells the two apart.
+A scenario file has a `name:`; an included fragment has none, which is how a directory run tells the two apart. An `!include` at the top of the file is a [file-level default](#file-level-defaults), so one scenario can still override it, as the `interruption` example above does per modality.
 
 ## Running scenarios back to back
 
-By default the bot keeps running between scenarios. When a scenario ends its eval connection closes, but the eval transport suppresses the bot's `on_client_disconnected` handler, so the pipeline stays up to serve the next scenario. This is what lets `pipecat eval run a.yaml b.yaml c.yaml` drive a whole list, scripted scenarios and simulations mixed, against one bot instance with no reboot between them, which keeps a run fast.
+By default the bot keeps running between scenarios. When a scenario ends its eval connection closes, but the eval transport suppresses the bot's `on_client_disconnected` handler, so the pipeline stays up to serve the next scenario. This is what lets `pipecat eval run a.yaml b.yaml c.yaml` drive a whole list, scripted scenarios and simulations mixed, against one bot instance with no reboot between them, which keeps a run fast. A file that holds several scenarios runs them the same way, one after another on the same bot.
 
 The trade-off is that anything the bot accumulated in one scenario is still there for the next. For results to be independent, each scenario has to start from a clean slate, and clearing that state is split between the harness and your bot:
 
@@ -211,15 +305,17 @@ Some bots do meaningful work in `on_client_disconnected`, like a goodbye message
 
 ```yaml
 name: test_goodbye_on_disconnect
-trigger_disconnect: true
 
-turns:
-  - user: "Thanks for your help!"
-    expect:
-      - event: response
-        eval: "the agent acknowledges the thanks"
-  # on_client_disconnected fires after this turn, so the agent can
-  # send a goodbye message or clean up resources.
+scenarios:
+  - name: goodbye
+    trigger_disconnect: true
+    turns:
+      - user: "Thanks for your help!"
+        expect:
+          - event: response
+            eval: "the agent acknowledges the thanks"
+      # on_client_disconnected fires after this turn, so the agent can
+      # send a goodbye message or clean up resources.
 ```
 
 Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with `trigger_disconnect: true` usually ends the bot process. Treat it as a terminal run, last in a list.

@@ -14,31 +14,31 @@ A **session** is one conversation with a bot, driven to a result. `EvalSession.f
 
 ## Running a scripted scenario
 
-`EvalScriptScenario.load()` parses a scenario file, and `EvalSession.from_scenario()` builds a ready-to-run session, constructing the judge, user speech, and transcriber the scenario calls for:
+`EvalScenarioFile.load()` reads a [scenario file](/pipecat/evals/scenario-configuration#scenario-files) and holds every scenario in it, and `EvalSession.from_scenario()` builds a ready-to-run session for one of them, constructing the judge, user speech, and transcriber the scenario calls for:
 
 ```python
 import asyncio
 
-from pipecat.evals.script import EvalScriptScenario
+from pipecat.evals.scenario import EvalScenarioFile
 from pipecat.evals.session import EvalSession
 
 
 async def main():
-    scenario = EvalScriptScenario.load("scenarios/capital_question.yaml")
-    session = EvalSession.from_scenario(scenario, "ws://localhost:7860")
-    result = await session.run()
+    for scenario in EvalScenarioFile.load("scenarios/capital_question.yaml"):
+        session = EvalSession.from_scenario(scenario, "ws://localhost:7860")
+        result = await session.run()
 
-    if result.passed:
-        print(f"PASS ({result.duration_ms}ms)")
-    else:
-        for failure in result.failures:
-            print(f"  {failure}")
+        if result.passed:
+            print(f"{scenario.name}: PASS ({result.duration_ms}ms)")
+        else:
+            for failure in result.failures:
+                print(f"  {failure}")
 
 
 asyncio.run(main())
 ```
 
-The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`. `from_scenario()` is typed by the scenario it is given: a type checker sees a session built from an `EvalScriptScenario` as an `EvalScriptSession`, with no narrowing needed. `EvalScriptSession.from_scenario()` from `pipecat.evals.script_session` takes the same arguments.
+The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`. `from_scenario()` is typed by the scenario it is given: a type checker sees a session built from an `EvalScriptScenario` as an `EvalScriptSession`, with no narrowing needed. `EvalScriptSession.from_scenario()` from `pipecat.evals.script_session` takes the same arguments. See [Loading a scenario file](#loading-a-scenario-file) for picking one scenario out of a file.
 
 ### The result
 
@@ -55,7 +55,9 @@ The agent must already be running with its eval transport (`python bot.py -t eva
 | `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).            |
 | `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.          |
 
-Each `EvalScriptTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, and its `duration_ms`. `EvalScriptResult.failures` is these turns' failures flattened, plus any that belong to no turn, such as a failed connect.
+Each `EvalScriptTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, its `expectations`, and its `duration_ms`. `EvalScriptResult.failures` is these turns' failures flattened, plus any that belong to no turn, such as a failed connect.
+
+`expectations` is one `EvalExpectationResult` per expectation the turn resolved, in order, up to the one that timed out: its `expectation_index`, `event_name`, whether it `passed`, and what it `matched` when it did, in short. That is the marker of an `llm_marker`, a function call's signature, or the text of a reply or transcript, and it is empty for an event that carries no text. What a passed run matched is only recorded here; a failure's reason is in the turn's `failures`.
 
 `not_run` is deliberately distinct from a pass, so a turn the scenario never reached doesn't inflate a rate:
 
@@ -73,13 +75,14 @@ This maps cleanly onto a pytest test:
 ```python
 import pytest
 
-from pipecat.evals.script import EvalScriptScenario
+from pipecat.evals.scenario import EvalScenarioFile
 from pipecat.evals.session import EvalSession
 
 
 @pytest.mark.asyncio
 async def test_capital_question():
-    scenario = EvalScriptScenario.load("scenarios/capital_question.yaml")
+    file = EvalScenarioFile.load("scenarios/capital_question.yaml")
+    scenario = file["capital_question/capital_question"]
     result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
     assert result.passed, "\n".join(str(f) for f in result.failures)
 ```
@@ -91,12 +94,13 @@ A simulation loads and runs the same way. For a simulation, `EvalSession.from_sc
 ```python
 import asyncio
 
+from pipecat.evals.scenario import EvalScenarioFile
 from pipecat.evals.session import EvalSession
-from pipecat.evals.simulation import EvalSimulationScenario
 
 
 async def main():
-    simulation = EvalSimulationScenario.load("scenarios/simulated/book_table.yaml")
+    file = EvalScenarioFile.load("scenarios/simulated/book_table.yaml")
+    simulation = file["book_table/available"]
     session = EvalSession.from_scenario(simulation, "ws://localhost:7860")
     result = await session.run()
 
@@ -145,25 +149,37 @@ for metric in result.metrics:
             print(f"{metric.name} turn {verdict.turn}: {said!r}: {verdict.reason}")
 ```
 
-## Loading either kind
+## Loading a scenario file
 
-`load_scenario_file()` reads a file as whichever kind it is, and `EvalSession.from_scenario()` builds the matching session, so a list mixing both kinds runs through one call each:
+`EvalScenarioFile.load()`, from `pipecat.evals.scenario`, reads a file and parses each scenario in its `scenarios:` list as whichever kind it is, with the file's top-level keys applied as defaults. The result holds the file's `name`, its `path`, and its `scenarios` in file order, each an `EvalScriptScenario` or an `EvalSimulationScenario` named `<file>/<scenario>`. Iterate over it, take its `len()`, or index it by a scenario's full name. `EvalSession.from_scenario()` builds the matching session for each, so a file mixing both kinds runs through one call per scenario:
 
 ```python
 from pipecat.evals.results import EvalScriptResult
-from pipecat.evals.scenario import load_scenario_file
+from pipecat.evals.scenario import EvalScenarioFile
 from pipecat.evals.session import EvalSession
 
 
-async def run_any(path: str, bot_url: str) -> bool:
-    scenario = load_scenario_file(path)
-    result = await EvalSession.from_scenario(scenario, bot_url).run()
-    if isinstance(result, EvalScriptResult):
-        return result.passed and result.skipped is None
-    return result.passed
+async def run_file(path: str, bot_url: str) -> bool:
+    passed = True
+    for scenario in EvalScenarioFile.load(path):
+        result = await EvalSession.from_scenario(scenario, bot_url).run()
+        if isinstance(result, EvalScriptResult):
+            passed &= result.passed and result.skipped is None
+        else:
+            passed &= result.passed
+    return passed
 ```
 
-A file with both `turns:` and `persona:`, or neither, raises a `ValueError` naming the problem. `EvalKind`, from `pipecat.evals.scenario`, names the two kinds, `script` and `simulation`, as a suite run or a results record reports them.
+`load()` raises a `ValueError` naming the problem for a file with no `name:`, an empty `scenarios:` list, a scenario without a `name:` or with a duplicate one, or a scenario with both `turns:` and `persona:` or neither. Indexing a name the file doesn't hold raises a `KeyError` listing the names it does. A file in the pre-1.11.0 shape, with `turns:` or `persona:` at the top level and no `scenarios:`, loads as that one scenario under the file's `name:` and emits a `DeprecationWarning`.
+
+`EvalKind`, from the same module, names the two kinds, `script` and `simulation`, as a suite run or a results record reports them.
+
+<Warning>
+  `EvalScriptScenario.load()`, `EvalSimulationScenario.load()`, and
+  `load_scenario_file()` are deprecated since 1.11.0 and will be removed in
+  2.0.0. Each returns one scenario, so it raises a `ValueError` on a file that
+  holds several. Use `EvalScenarioFile.load()`.
+</Warning>
 
 ## Run parameters
 
@@ -286,6 +302,8 @@ session = EvalSession.from_scenario(
 
 Passing `judge=None` explicitly to the `EvalSimulationSession` constructor runs the conversation without a judge: measured metrics are still computed, and the run reports no verdict on the goal.
 
+The judge keeps the conversation it judges. A scripted session feeds it each user turn and agent reply, a simulation session each line and tool call as they happen, and asks it for a verdict with `evaluate()` for a reply, `evaluate_call()` for a function call's [`eval:`](/pipecat/evals/scripted-scenarios#judging-a-call-with-eval), and `evaluate_run(criteria, success)` for a whole simulation. Code driving an `EvalJudge` by hand fills it with `add_user_message()`, `add_assistant_message()`, and `add_tool_call()` before asking.
+
 ### Custom audio services
 
 `from_scenario()` also takes `user_tts=` for the user's synthesized voice and `bot_stt=` for transcribing the agent's spoken audio, for either kind. `bot_stt` is any Pipecat `STTService`. `user_tts` is a `CachingTTSService`, which wraps a `TTSService` and caches its audio on disk so repeated turns don't re-synthesize; give it a `cache_key` that identifies the voice configuration:
@@ -378,19 +396,19 @@ async def main():
 
     @suite.event_handler("on_update")
     async def on_update(suite, run):
-        print(run.bot, run.scenario, run.kind, run.status)
+        print(run.label, run.scenario, run.kind, run.status)
 
     await suite.run(Path("eval-runs/logs"), params=EvalSessionParams(use_cache=False))
 
     for run in suite.runs:
         verdict = run.error or ("passed" if run.result and run.result.passed else "failed")
-        print(f"{run.bot} / {run.scenario} #{run.attempt}: {verdict}")
+        print(f"{run.label} / {run.scenario} #{run.attempt}: {verdict}")
 
 
 asyncio.run(main())
 ```
 
-Each run is mutated in place as it executes (`status`, `stopping`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`. A run's `kind` is `script` or `simulation`, and its `result` is the matching result type. A simulation appears once per attempt: `attempts` is the manifest's `repeat`, or the simulation's own `runs`, and `sweep` says which. A sweep is a measurement, where a failure is data; a simulation's own runs are a requirement, where every attempt must pass.
+Each run is mutated in place as it executes (`status`, `stopping`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`. A run's `scenario` is its `<file>/<scenario>` name, and `suite.filter(scenario=...)` accepts that or either half of it. Its `bot` is the manifest entry's bot path, `name` the entry's `name:` if it has one, and `label` whichever of the two the display uses; `suite.filter(pattern=...)` matches either. A run's `kind` is `script` or `simulation`, and its `result` is the matching result type. A simulation appears once per attempt: `attempts` is the manifest's `repeat`, or the simulation's own `runs`, and `sweep` says which. A sweep is a measurement, where a failure is data; a simulation's own runs are a requirement, where every attempt must pass.
 
 <Warning>
   The `on_update` callback parameter to `suite.run()` is deprecated since 1.9.0
@@ -400,6 +418,19 @@ Each run is mutated in place as it executes (`status`, `stopping`, `result`, `er
 </Warning>
 
 `EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, `repeat`, and so on), mirroring the CLI flags.
+
+## Migrating from 1.10
+
+A scenario file holds a list of scenarios since 1.11.0, so the loaders that returned one scenario per file, and the judge API that took a transcript, are deprecated. The old names keep working until 2.0.0 and emit a `DeprecationWarning`:
+
+| Deprecated                                                   | Use instead                                                                                                                        |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `EvalScriptScenario.load()`, `EvalSimulationScenario.load()` | `EvalScenarioFile.load()` (in `pipecat.evals.scenario`), which holds every scenario in the file                                    |
+| `load_scenario_file()`                                       | `EvalScenarioFile.load()`                                                                                                          |
+| `turns:` or `persona:` at a file's top level                 | A `scenarios:` list, each entry with its own `name:`; see [Scenario files](/pipecat/evals/scenario-configuration#scenario-files)   |
+| `EvalJudge.evaluate_run(transcript, criteria, success)`      | Feed the judge with `add_user_message()`, `add_assistant_message()`, and `add_tool_call()`, then `evaluate_run(criteria, success)` |
+| `EvalSimulationDriver.transcript()`                          | No replacement: the judge keeps the conversation it judges                                                                         |
+| A manifest entry's bare `runner_body: <file>`                | `runner_body: { path: <file> }`; see [Entry options](/pipecat/evals/suites#entry-options)                                          |
 
 ## Migrating from 1.8
 
