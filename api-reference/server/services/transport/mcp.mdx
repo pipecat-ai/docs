@@ -1,0 +1,130 @@
+---
+title: "MCP Transport"
+sidebarTitle: "MCP"
+description: "pipecat-mcp-transport serves a Pipecat bot as an MCP server, so any agent with an MCP client talks to it."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Softcery"
+  maintainerUrl="https://github.com/softcery"
+  repo="https://github.com/softcery/pipecat-mcp-transport"
+/>
+
+## Overview
+
+`pipecat-mcp-transport` serves your Pipecat bot as an MCP server, so any agent with an MCP client, for example Claude Code, talks to the bot. The bot keeps its pipeline, its tools and its history. This is the server side of MCP. To call MCP tools from a bot, see [MCPClient](/api-reference/server/utilities/mcp/mcp). The server exposes two tools, `start` and `chat`, over Streamable HTTP. `start` runs your bot function and returns a session handle. `chat` appends a line to that session's context, runs the LLM, and returns the whole reply as one text block.
+
+One handle is one session: one pipeline, one context, one history. The transport pushes `LLMConfigureOutputFrame(skip_tts=True)` when the pipeline starts, so every turn costs no TTS request and a voice bot needs no second code path.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/softcery/pipecat-mcp-transport"
+  >
+    Transport, server, example bot and tests
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-mcp-transport/"
+  >
+    The `pipecat-mcp-transport` package on PyPI
+  </Card>
+  <Card
+    title="Streamable HTTP"
+    icon="book"
+    href="https://modelcontextprotocol.io/specification/basic/transports"
+  >
+    The MCP transport this server speaks
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+pip install pipecat-mcp-transport
+```
+
+## Prerequisites
+
+### MCP client
+
+Any client that speaks MCP over Streamable HTTP, for example Claude Code. The transport needs no account and no API key of its own.
+
+### Required Environment Variables
+
+None for the transport. The services in your bot keep their own keys, for example `OPENAI_API_KEY` for the OpenAI services in the example bot.
+
+## Configuration
+
+`McpBotServer` takes your bot function and serves it.
+
+| parameter            | default           | meaning                                                                                     |
+| -------------------- | ----------------- | ------------------------------------------------------------------------------------------- |
+| `name`               | `pipecat`         | Name the server reports to the client.                                                      |
+| `host`               | `127.0.0.1`       | Bind address. The default binds localhost only.                                             |
+| `port`               | `7870`            | Bind port.                                                                                  |
+| `path`               | `/mcp`            | Path of the Streamable HTTP endpoint.                                                       |
+| `params`             | `TransportParams` | Builds the transport parameters of one session.                                             |
+| `transport_security` | `None`            | A `TransportSecuritySettings` of the MCP SDK. `None` takes the loopback setting of the SDK. |
+| `sessions`           | `32`              | Cap on open sessions. A `start` call over it returns a tool error.                          |
+| `handle_seconds`     | `300`             | Seconds a session lives with no `chat` call.                                                |
+| `sweep_seconds`      | `30`              | Seconds between two sweeps of the session table.                                            |
+
+## Usage
+
+Your bot takes its transport from the runner arguments. That branch is the only line the transport adds.
+
+```python
+from pipecat_mcp_transport import McpBotServer, McpRunnerArguments
+
+
+async def bot(runner_args):
+    if isinstance(runner_args, McpRunnerArguments):
+        transport = runner_args.transport
+    else:
+        transport = await create_transport(runner_args, {"webrtc": voice_params})
+
+    pipeline = Pipeline([...])
+    worker = PipelineWorker(
+        pipeline, idle_timeout_secs=runner_args.pipeline_idle_timeout_secs
+    )
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.add_workers(worker)
+    await runner.run()
+
+
+if __name__ == "__main__":
+    McpBotServer(bot).run()
+```
+
+Point a client at the URL the server prints:
+
+```bash
+claude mcp add --transport http pipecat http://127.0.0.1:7870/mcp
+```
+
+## Tools
+
+| tool    | arguments        | returns                          |
+| ------- | ---------------- | -------------------------------- |
+| `start` | none             | the handle of a new conversation |
+| `chat`  | `handle`, `line` | the whole reply to that line     |
+
+An empty `line` starts no turn and returns the reply of the turn in flight. A turn that one call read is gone, so the next empty `line` returns an empty block.
+
+## Limitations
+
+- The reply arrives as one text block after the turn, with no token streaming.
+- A `chat` call carries no audio block and no image block.
+- A session lives in one process. A second replica needs sticky routing on the handle.
+- The server binds `127.0.0.1` by default and the handle is a bearer secret. Put an authenticating proxy in front of an open bind.
+
+The [README](https://github.com/softcery/pipecat-mcp-transport#readme) states the turn end rule, the session lifetime, the `transport_security` setting and the full list of limits.
+
+## Compatibility
+
+Tested with pipecat 1.10.0 and mcp 2.2.0 on Python 3.12, 3.13 and 3.14.
