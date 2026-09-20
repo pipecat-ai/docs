@@ -1,0 +1,160 @@
+---
+title: "Memcode Memory"
+sidebarTitle: "Memcode"
+description: "Add OAuth-backed, cross-session Memcode memory to Pipecat voice agents with separate recall and finalized-turn capture processors."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Memcode"
+  maintainerUrl="https://memcode.in"
+  repo="https://github.com/vivekgupta-memcode/pipecat-memcode"
+/>
+
+## Overview
+
+`pipecat-memcode` gives a Pipecat voice agent personal, cross-session memory
+backed by [Memcode](https://memcode.in). One `MemcodeMemoryService` owns two
+coordinated processors:
+
+- `recall_processor()` runs after the user context aggregator and before the
+  application LLM. It searches under a strict latency budget and injects a
+  bounded, reference-only context block.
+- `capture_processor()` runs after the assistant context aggregator. It stores
+  only the finalized user/assistant pair in a tracked background task.
+
+Recall and capture both fail open, so a memory timeout, authentication error,
+or service failure never prevents the voice response.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/vivekgupta-memcode/pipecat-memcode"
+  >
+    Package source, foundational example, changelog, and issues
+  </Card>
+  <Card
+    title="Memcode Guide"
+    icon="book"
+    href="https://memcode.in/docs?product=pipecat"
+  >
+    OAuth setup, pipeline placement, and runtime behavior
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add pipecat-memcode
+```
+
+The first release targets Python 3.11+ and Pipecat 1.10.x.
+
+## Authentication
+
+Connect each signed-in participant to Memcode with Authorization Code, S256
+PKCE, and dynamic client registration. Registration happens once per
+deployment; authorization is completed once per Memcode account. Store rotating
+refresh tokens in an encrypted server-side store, replace each token set
+atomically, and implement the SDK token store's `refresh_lease(key)` with a
+distributed lock or transaction shared by every worker. The lease must cover
+token reload, refresh, and save so concurrent workers cannot reuse a rotated
+refresh token. Supply the resulting user-bound `AsyncAccessTokenProvider` to
+the service.
+
+The OAuth token subject determines the personal memory account. The integration
+does not accept or send a `user_id`.
+
+<Note>
+  Complete interactive authorization during application bootstrap or account
+  setup, not while processing a voice turn. Use one service and token context
+  per authenticated participant. The application owns the token provider: close
+  `AsyncMemcodeOAuthClient` and, when used, its `DelegatingMemoryTokenProvider`
+  during connection or application cleanup.
+</Note>
+
+## Configuration
+
+### `MemcodeMemoryService`
+
+<ParamField path="client" type="AsyncMemcodeClient" default="None">
+  Existing per-user asynchronous Memcode client. Supply either this or
+  `access_token_provider`.
+</ParamField>
+
+<ParamField
+  path="access_token_provider"
+  type="AsyncAccessTokenProvider"
+  default="None"
+>
+  Async provider that resolves and refreshes a user-bound bearer token.
+</ParamField>
+
+<ParamField path="api_url" type="str" default='"https://memory.memcode.in"'>
+  Memcode Memory API origin used when the service owns the SDK client.
+</ParamField>
+
+<ParamField path="session_id" type="str" default="generated">
+  Stable, non-secret call or room ID used to derive retry-safe idempotency keys.
+</ParamField>
+
+<ParamField
+  path="config"
+  type="MemcodeMemoryConfig"
+  default="MemcodeMemoryConfig()"
+>
+  Recall, context, ingest, and shutdown policy.
+</ParamField>
+
+Important `MemcodeMemoryConfig` defaults are `search_top_k=5`,
+`search_timeout_seconds=1.5`, `ingest_timeout_seconds=5.0`,
+`shutdown_timeout_seconds=2.0`, and `max_context_characters=4000`.
+
+## Usage
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat_memcode import MemcodeMemoryConfig, MemcodeMemoryService
+
+memory = MemcodeMemoryService(
+    api_url="https://memory.memcode.in",
+    access_token_provider=token_provider,
+    session_id=call_id,
+    config=MemcodeMemoryConfig(
+        search_top_k=5,
+        search_timeout_seconds=1.5,
+    ),
+)
+
+context = LLMContext([{"role": "developer", "content": "Be helpful."}])
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        memory.recall_processor(),
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+        memory.capture_processor(),
+    ]
+)
+```
+
+Recall uses Memcode `search_v2` with memory results only. Capture submits
+`ingest_v2` with a deterministic idempotency key and waits only for the durable
+ingest receipt; Memcode's asynchronous extraction does not block the pipeline.
+On `EndFrame`, pending writes receive a bounded flush window. On cancellation
+or cleanup, remaining owned tasks and clients are released idempotently.
+
+## Compatibility
+
+This community package is maintained by Memcode outside Pipecat core. Consult
+its changelog for the exact latest tested Pipecat and `memcode-sdk` versions.
