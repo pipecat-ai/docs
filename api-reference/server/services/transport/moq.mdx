@@ -101,12 +101,12 @@ Extends [`TransportParams`](/api-reference/server/services/transport/transport-p
 
 **Connection**
 
-| Parameter            | Type          | Default | Description                                                                                               |
-| -------------------- | ------------- | ------- | --------------------------------------------------------------------------------------------------------- |
-| `relay_url`          | `str \| None` | `None`  | Full relay URL. When unset, composed from the constructor's host/port/path. Ignored in serve mode         |
-| `serve`              | `bool`        | `False` | Bind a local UDP socket and accept sessions instead of dialing a relay                                    |
-| `bind`               | `str \| None` | `None`  | Serve mode: the listen address, defaulting to `[::]:<port>`. Client mode: the source address to dial from |
-| `connection_timeout` | `float`       | `30.0`  | Seconds to wait for the peer's broadcast to be announced                                                  |
+| Parameter            | Type          | Default | Description                                                                                                                                                                                                                                                                                           |
+| -------------------- | ------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `relay_url`          | `str \| None` | `None`  | Full relay URL, query string included (e.g. `https://relay.example.com:4080/moq?jwt=…`). When unset, composed from the constructor's host/port/path. Ignored in serve mode                                                                                                                           |
+| `serve`              | `bool`        | `False` | Bind a local UDP socket and accept sessions instead of dialing a relay                                                                                                                                                                                                                                |
+| `bind`               | `str \| None` | `None`  | Serve mode: the listen address, defaulting to `[::]:<port>`. Client mode: the source address to dial from                                                                                                                                                                                             |
+| `connection_timeout` | `float`       | `60.0`  | How long, in seconds, the peer may be missing before the transport gives up on it. Bounds the wait for the peer to join and, in client mode, an outage during which the transport redials the relay with backoff. When it expires, the transport fires `on_client_disconnected` for a peer it had seen |
 
 **Paths**
 
@@ -186,8 +186,13 @@ transport = MOQTransport(
 )
 
 @transport.event_handler("on_client_connected")
-async def on_client_connected(transport, client):
+async def on_client_connected(transport):
     await worker.queue_frames([context_aggregator.user().get_context_frame()])
+
+@transport.event_handler("on_client_disconnected")
+async def on_client_disconnected(transport):
+    # In client mode the transport redials, so end the call here
+    await runner.cancel()
 ```
 
 With the [development runner](/api-reference/server/utilities/runner/guide), `create_transport` builds this for you:
@@ -200,9 +205,9 @@ transport_params = {
 
 ## Runner options
 
-| Flag                      | Default                           | Description                                                     |
-| ------------------------- | --------------------------------- | --------------------------------------------------------------- |
-| `--moq-connect URL`       | unset                             | Relay to dial. Passing it selects client mode                   |
+| Flag                      | Default                           | Description                                                                           |
+| ------------------------- | --------------------------------- | ------------------------------------------------------------------------------------- |
+| `--moq-connect URL`       | unset                             | Full relay URL to dial, query string included. Passing it selects client mode         |
 | `--moq-bind ADDR:PORT`    | `[::]:4080` in serve mode         | Serve: listen address. Client: source address to dial from      |
 | `--moq-serve`             | on when `--moq-connect` is absent | Force serve mode                                                |
 | `--moq-namespace NAME`    | `pipecat` serving, random dialing | Pin a well-known room instead of a per-session namespace        |
@@ -217,17 +222,18 @@ The `/start` response carries a `moq` block — `relayUrl`, `certHash`, `serve`,
 
 ## Event Handlers
 
-| Event                    | Description                           |
-| ------------------------ | ------------------------------------- |
-| `on_connected`           | Connection to the relay established   |
-| `on_disconnected`        | Connection lost or closed             |
-| `on_client_connected`    | The peer's broadcast was announced    |
-| `on_client_disconnected` | The peer's broadcast went away        |
-| `on_track_subscribed`    | A remote track subscription succeeded |
-| `on_error`               | An error in the underlying transport  |
+| Event                    | Description                                                                                                                 |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `on_connected`           | A MOQ session is established: the serve bind, or each session with the relay, the first and every redialed one              |
+| `on_disconnected`        | An established session ends, or the transport stops without ever having had one. Client mode redials after it               |
+| `on_client_connected`    | The peer's broadcast was announced                                                                                          |
+| `on_client_disconnected` | The peer is gone: its broadcast went away, or the session could not be re-established in time                               |
+| `on_track_subscribed`    | A remote track subscription succeeded                                                                                       |
+| `on_error`               | An error in the underlying transport, with the message, exception, error category (when known), and whether it is permanent |
 
 ## Notes
 
+- **Client-mode reconnect**: when the relay session drops, the transport redials with backoff for as long as `connection_timeout` allows. The bot's broadcast persists across dials, and the peer is only reported gone when that time is up. End the call from `on_client_disconnected`, which fires once the peer is gone; `on_connected` and `on_disconnected` fire for each relay session.
 - **RTVI over MoQ**: the `transcript_track` is a lossless, ordered JSON stream carrying RTVI messages in both directions, so MoQ is a full RTVI transport on par with Daily or WebSocket rather than an audio-only path.
 - **Audio**: a single Opus track each way. The library resamples to the nearest Opus-supported rate before encoding, so `audio_out_sample_rate` doesn't have to be one of them.
 - **Latency**: `audio_in_max_latency_ms` trades interactivity against resilience — lower waits less for a late frame, at the cost of more drops on a poor network.
