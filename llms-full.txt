@@ -75349,6 +75349,593 @@ await worker.queue_frame(MixerEnableFrame(True))   # Enable mixing
 - Volume can be adjusted in real-time
 - Mixing can be enabled/disabled on demand
 
+# Classifiers
+Source: https://docs.pipecat.ai/api-reference/server/utilities/classifiers/overview.md
+
+Answer typed questions about state with BaseClassifier, JevClassifier, and LLMClassifier
+
+## Overview
+
+A classifier answers typed questions about some state. A question is a `YesNoQuestion`, a `ChoiceQuestion` among options, or a `ScoreQuestion` on a scale. Questions are asked by name, several about one state at once.
+
+Classifiers are plain objects that live outside the pipeline. Whoever needs answers creates one, keeps it, and calls it. No frames flow into a classifier.
+
+## Question Types
+
+### YesNoQuestion
+
+Whether the state meets a condition.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]">
+  What is being checked for, as a yes or no question. Text, or structured data
+  holding the question in one field and what it refers to in others.
+</ParamField>
+
+<ParamField
+  path="yes"
+  type="str | dict[str, Any] | list[Any] | None"
+  default="None"
+>
+  What counts as a yes, when the question alone leaves it open.
+</ParamField>
+
+<ParamField
+  path="no"
+  type="str | dict[str, Any] | list[Any] | None"
+  default="None"
+>
+  What counts as a no.
+</ParamField>
+
+### ChoiceQuestion
+
+Which of several options fits the state.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]">
+  What is being decided.
+</ParamField>
+
+<ParamField
+  path="options"
+  type="dict[str, str | dict[str, Any] | list[Any] | None]"
+>
+  The options to choose from, each mapped to a description of when it applies,
+  or `None` when the option itself says enough.
+</ParamField>
+
+### ScoreQuestion
+
+Where the state falls on an ordered scale.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]">
+  What is being rated.
+</ParamField>
+
+<ParamField path="levels" type="list[str | dict[str, Any] | list[Any]]">
+  The levels of the scale in order, lowest first, each described in a few words
+  or as structured data. At least two.
+</ParamField>
+
+## Result Types
+
+### YesNoResult
+
+Answer to a `YesNoQuestion`.
+
+<ParamField path="probability" type="float">
+  How likely the answer is yes, from 0 to 1.
+</ParamField>
+
+**Properties:**
+
+- `is_yes: bool` — Whether yes is the likelier answer. Callers that need more certainty compare `probability` with a threshold of their own.
+
+### ChoiceResult
+
+Answer to a `ChoiceQuestion`.
+
+<ParamField path="choice" type="str">
+  The option that fits best.
+</ParamField>
+
+<ParamField path="probabilities" type="dict[str, float]">
+  How likely each option is, keyed by option.
+</ParamField>
+
+<ParamField path="confidence" type="float">
+  How sure the classifier is of `choice`, from 0 to 1.
+</ParamField>
+
+### ScoreResult
+
+Answer to a `ScoreQuestion`.
+
+<ParamField path="score" type="float">
+  Where the state falls on the scale, as a position from 0 (the first level) to
+  one less than the number of levels. It is the probability-weighted position,
+  so it may fall between two levels.
+</ParamField>
+
+<ParamField path="levels" type="list[ScoreLevel]">
+  How likely each level is, in the question's order. Each `ScoreLevel` has a
+  `level` (as the question gave it) and a `probability` from 0 to 1.
+</ParamField>
+
+<ParamField path="confidence" type="float">
+  How sure the classifier is of `score`, from 0 to 1.
+</ParamField>
+
+**Methods:**
+
+- `probability(level) -> float` — How likely one level is. Raises `KeyError` if the scale has no such level.
+
+## BaseClassifier
+
+Base class for all classifiers. Subclasses implement `_ask()` to answer questions.
+
+### Methods
+
+#### ask()
+
+Answer several questions about one state.
+
+```python
+results = await classifier.ask(state, questions)
+```
+
+**Parameters:**
+
+| Parameter   | Type                                 | Description                  |
+| ----------- | ------------------------------------ | ---------------------------- |
+| `state`     | `str \| dict[str, Any] \| list[Any]` | What the questions are about |
+| `questions` | `Mapping[str, ClassifierQuestion]`   | The questions, by name       |
+
+**Returns:** `dict[str, ClassifierResult]` — One result per question, by the same names, each of the type its question calls for.
+
+**Raises:** `ClassifierError` — If the answers could not be produced.
+
+#### yes_no()
+
+Ask whether the state meets each condition.
+
+```python
+results = await classifier.yes_no(state, questions)
+```
+
+**Returns:** `dict[str, YesNoResult]` — How likely each answer is yes, by the same names.
+
+#### choice()
+
+Ask which option fits the state, for each question.
+
+```python
+results = await classifier.choice(state, questions)
+```
+
+**Returns:** `dict[str, ChoiceResult]` — The option that fits and how likely each one is, by the same names.
+
+#### score()
+
+Ask where the state falls on each scale.
+
+```python
+results = await classifier.score(state, questions)
+```
+
+**Returns:** `dict[str, ScoreResult]` — The position on each scale and how likely each level is, by the same names.
+
+## Event Handlers
+
+Classifiers emit the following events:
+
+### on_metrics
+
+Called after every call with its metrics: the time it took and, when the classifier knows it, the tokens it used.
+
+```python
+@classifier.event_handler("on_metrics")
+async def on_metrics(classifier, data: list[MetricsData]):
+    await self.push_frame(MetricsFrame(data=data))
+```
+
+A classifier cannot push frames, so the owner puts the metrics in a `MetricsFrame`.
+
+**Parameters:**
+
+| Parameter    | Type                | Description                  |
+| ------------ | ------------------- | ---------------------------- |
+| `classifier` | `BaseClassifier`    | The classifier instance      |
+| `data`       | `list[MetricsData]` | Time and token usage metrics |
+
+## Usage
+
+An owner that runs inside a worker calls `setup()` with its task manager before the first question, and `cleanup()` when done.
+
+```python
+await self._classifier.setup(self.task_manager)
+
+@self._classifier.event_handler("on_metrics")
+async def on_metrics(classifier, data: list[MetricsData]):
+    await self.push_frame(MetricsFrame(data=data))
+```
+
+## Example
+
+```python
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+results = await classifier.choice(
+    "I'd like to book a table for, um",
+    {
+        "turn": ChoiceQuestion(
+            instructions="is the user's turn over?",
+            options={
+                "complete": "the user finished",
+                "short": "a brief pause",
+                "long": "asked for time",
+            },
+        )
+    },
+)
+results["turn"].choice  # "short"
+```
+
+# Jev Classifier
+Source: https://docs.pipecat.ai/api-reference/server/utilities/classifiers/jev.md
+
+Answer classifier questions with JevClassifier and JevClient backed by TypeSafe's hosted classification model
+
+## Overview
+
+`JevClassifier` answers questions by asking Jev, TypeSafe's hosted classification model. Jev's probabilities are calibrated.
+
+Build one with an API key to get a client of its own, or pass a `JevClient` to share one between several classifiers.
+
+## Installation
+
+```bash
+uv add "pipecat-ai[jev]"
+```
+
+## Prerequisites
+
+A Jev API key from [TypeSafe](https://typesafe.ai).
+
+```bash
+export TYPESAFE_API_KEY=your_api_key
+```
+
+## Configuration
+
+### JevClassifier
+
+<ParamField path="api_key" type="str | None" default="None">
+  Jev API key, when the classifier should have a client of its own. One of
+  `api_key` and `client` is required.
+</ParamField>
+
+<ParamField path="client" type="JevClient | None" default="None">
+  A client to share. One of `api_key` and `client` is required.
+</ParamField>
+
+### JevClient
+
+<ParamField path="api_key" type="str">
+  Jev API key.
+</ParamField>
+
+<ParamField path="base_url" type="str" default='"https://api.typesafe.ai"'>
+  Where the API is served.
+</ParamField>
+
+<ParamField path="model" type="str" default='"jev-1.13.0"'>
+  The Jev model to ask. Pinned so thresholds tuned against it keep holding;
+  `jev-latest` follows TypeSafe's newest release.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="10.0">
+  Seconds to wait for a reply before giving up.
+</ParamField>
+
+<ParamField path="max_retries" type="int" default="3">
+  How many times to retry a request Jev refused because it was busy.
+</ParamField>
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.classifiers.jev.classifier import JevClassifier
+from pipecat.classifiers.base_classifier import YesNoQuestion
+
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+results = await classifier.yes_no(
+    "Please leave a message",
+    {"answer": YesNoQuestion(instructions="is this a voicemail greeting?")},
+)
+results["answer"].probability  # 0.95
+```
+
+### Sharing a Client
+
+```python
+from pipecat.classifiers.jev.client import JevClient
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+client = JevClient(api_key=os.getenv("TYPESAFE_API_KEY"))
+turn_classifier = JevClassifier(client=client)
+voicemail_classifier = JevClassifier(client=client)
+
+# Both classifiers share one HTTP/2 connection pool
+```
+
+### Connection Management
+
+```python
+# Open the connection ahead of the first question
+await classifier.setup(task_manager)
+
+# Close the connection when done
+await classifier.cleanup()
+```
+
+A connection that cannot be opened at setup is only a warning: the first question opens it itself.
+
+## Properties
+
+### client
+
+The `JevClient` this classifier asks through.
+
+### model
+
+The Jev model the questions go to.
+
+## JevClient
+
+One `JevClient` holds one HTTP/2 connection pool, adds the auth header, retries when Jev is busy, and counts the tokens every request used. Several `JevClassifier` instances can share one.
+
+### Properties
+
+#### model
+
+The Jev model the questions go to.
+
+#### usage
+
+Tokens used so far, over every request. A `JevUsage` object with `input_tokens` and `output_tokens` counts.
+
+### Methods
+
+#### connect()
+
+Open the connection to Jev.
+
+```python
+await client.connect()
+```
+
+Lists the models, the cheapest request there is, so the first question finds the connection already open. Connects once: a client shared by several classifiers is asked by each of them, and only the first call sends anything.
+
+**Raises:** `ClassifierError` — If Jev could not be reached or refused the request.
+
+#### close()
+
+Close the connection pool.
+
+```python
+await client.close()
+```
+
+## Notes
+
+- A client the classifier created is closed in `cleanup()`; a shared one is left to whoever made it.
+- The client retries with exponential backoff when Jev answers 429 or 529 (busy), up to `max_retries` attempts.
+- Idle connections are kept open for 240 seconds between questions, so a gap between them does not cost a new TLS handshake.
+
+## Example
+
+```python
+import os
+from pipecat.classifiers.jev.classifier import JevClassifier
+from pipecat.classifiers.base_classifier import (
+    YesNoQuestion,
+    ChoiceQuestion,
+    ScoreQuestion,
+)
+
+classifier = JevClassifier(api_key=os.environ["TYPESAFE_API_KEY"])
+
+# Yes/no question
+yes_no = (
+    await classifier.yes_no(
+        "Hi, you've reached Sam. Leave a message.",
+        {"answer": YesNoQuestion(instructions="is this a voicemail greeting?")},
+    )
+)["answer"]
+yes_no.is_yes  # True
+yes_no.probability  # 0.95
+
+# Choice question
+choice = (
+    await classifier.choice(
+        "I'd like to book a table for, um",
+        {
+            "turn": ChoiceQuestion(
+                instructions="is the user's turn over?",
+                options={
+                    "complete": "the user finished",
+                    "short": "a brief pause",
+                    "long": "asked for time",
+                },
+            )
+        },
+    )
+)["turn"]
+choice.choice  # "short"
+choice.confidence  # 0.88
+
+# Score question
+score = (
+    await classifier.score(
+        "This is the third time I call and nobody helps me!",
+        {
+            "mood": ScoreQuestion(
+                instructions="how upset is the user?",
+                levels=["calm", "impatient", "frustrated", "asking for a person"],
+            )
+        },
+    )
+)["mood"]
+score.score  # 2.1 (between "impatient" and "frustrated")
+score.confidence  # 0.85
+```
+
+# LLM Classifier
+Source: https://docs.pipecat.ai/api-reference/server/utilities/classifiers/llm.md
+
+Answer classifier questions with LLMClassifier backed by any Pipecat LLM service
+
+## Overview
+
+`LLMClassifier` answers questions by asking an LLM for a JSON object. Every question about a state goes to the LLM in one out-of-pipeline call, through the service's `run_inference()`. The LLM is asked for one JSON object with an answer per question, and the object is parsed into results.
+
+The probabilities are whatever the LLM wrote, so they are not calibrated. Any service that implements `run_inference()` can back a classifier; realtime services cannot.
+
+## Configuration
+
+<ParamField path="llm" type="LLMService[Any]">
+  The LLM that answers the questions.
+</ParamField>
+
+<ParamField path="instructions" type="str | None" default="None">
+  System instructions for the LLM. The default asks for one JSON object with an
+  answer per question.
+</ParamField>
+
+<ParamField path="max_tokens" type="int | None" default="None">
+  Cap on the reply's length, for services that take one.
+</ParamField>
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.classifiers.base_classifier import YesNoQuestion
+from pipecat.services.openai.llm import OpenAILLMService
+
+classifier = LLMClassifier(llm=OpenAILLMService(model="gpt-4o-mini"))
+results = await classifier.yes_no(
+    "Hi, you've reached Dana. Leave a message.",
+    {"voicemail": YesNoQuestion(instructions="is this a voicemail greeting?")},
+)
+results["voicemail"].is_yes  # True
+results["voicemail"].probability  # 0.97
+```
+
+### With Custom Instructions
+
+```python
+classifier = LLMClassifier(
+    llm=OpenAILLMService(model="gpt-4o-mini"),
+    instructions="You are a classifier specialized in conversation analysis.",
+    max_tokens=500,
+)
+```
+
+## Properties
+
+### llm
+
+The LLM service that answers the questions.
+
+### model
+
+The LLM service's model, as a string, or `None` if the model is not a string.
+
+## How It Works
+
+### Question Rendering
+
+Each question is rendered as text with its options and the expected answer shape. For example:
+
+```
+Input:
+Hi, you've reached Dana. Leave a message.
+
+Question "voicemail": is this a voicemail greeting?
+Answer shape: {"probability": <probability that the answer is yes>}
+
+Reply with one JSON object of this shape: {"voicemail": <answer to "voicemail">}
+```
+
+### Reply Parsing
+
+The LLM's reply is parsed as JSON. Fences and prose around the object are ignored, so the LLM can say "Here's the answer: `json...`" and the classifier will extract the object.
+
+Where the service supports a reply schema, the reply's shape is enforced by the provider. Otherwise, the prompt asks for the shape and the reply is parsed.
+
+## Notes
+
+- The classifier does not report token usage through metrics: the `on_metrics` event includes only the processing time, not an `LLMUsageMetricsData` entry.
+- A lone answer often comes back without its name around it. The classifier accepts `{"probability": 0.9}` when one yes/no question was asked.
+- For score questions, probabilities that do not sum to 1 are scaled to sum to 1. A probability distribution that sums to 0 is an error.
+- The classifier clamps probabilities to the [0, 1] range, so an LLM that writes 1.2 or -0.1 is treated as 1.0 or 0.0.
+
+## Example
+
+```python
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.classifiers.base_classifier import (
+    YesNoQuestion,
+    ChoiceQuestion,
+    ScoreQuestion,
+)
+from pipecat.services.openai.llm import OpenAILLMService
+
+llm = OpenAILLMService(
+    api_key=os.environ["OPENAI_API_KEY"],
+    settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+)
+classifier = LLMClassifier(llm=llm)
+
+# All three question types in one call
+results = await classifier.ask(
+    "I was charged twice for March. This is the third time I'm calling.",
+    {
+        "refund": YesNoQuestion(
+            instructions="Does the customer want money back?",
+            yes="asks for a refund, a credit, or a charge to be reversed",
+            no="anything else",
+        ),
+        "department": ChoiceQuestion(
+            instructions="Which team should take this call?",
+            options={
+                "billing": "invoices, payments, refunds",
+                "technical": "bugs, outages, errors",
+                "sales": "pricing, new contracts",
+                "other": None,
+            },
+        ),
+        "mood": ScoreQuestion(
+            instructions="How upset is the customer?",
+            levels=["calm", "frustrated", "angry"],
+        ),
+    },
+)
+
+refund = results["refund"]  # YesNoResult
+refund.is_yes  # True
+
+department = results["department"]  # ChoiceResult
+department.choice  # "billing"
+
+mood = results["mood"]  # ScoreResult
+mood.score  # 1.2 (between "calm" and "frustrated")
+```
+
 # LLMContextSummarizer
 Source: https://docs.pipecat.ai/api-reference/server/utilities/context-summarization.md
 
@@ -85957,6 +86544,13 @@ Update TTS service settings at runtime. Inherits from `ServiceUpdateSettingsFram
 ### STTUpdateSettingsFrame
 
 Update STT service settings at runtime. Inherits from `ServiceUpdateSettingsFrame`.
+
+<Note>
+  To read a service's current settings, use the read-only `settings` property on
+  the service instance: `service.settings.model`. Settings are changed through a
+  `ServiceUpdateSettingsFrame`, which applies the change and keeps the service's
+  metrics in sync.
+</Note>
 
 ## Audio Processing
 
