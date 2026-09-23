@@ -37727,14 +37727,14 @@ Tested with pipecat 1.10.0 and mcp 2.2.0 on Python 3.12, 3.13 and 3.14.
 # Media over QUIC Transport
 Source: https://docs.pipecat.ai/api-reference/server/services/transport/moq.md
 
-Real-time audio over Media over QUIC with MOQTransport and MOQParams: serve mode, relay client mode, and TLS.
+Real-time audio over Media over QUIC with MOQTransport and MOQParams: serve mode, relay client mode with reconnect, and TLS.
 
 ## Overview
 
 `MOQTransport` carries a session over [Media over QUIC](https://quic.video), moving audio and RTVI messages over QUIC instead of a WebRTC stack. It runs in two modes:
 
 - **Serve mode** (the default) — the bot binds its own UDP socket and the browser dials it. No relay process to run, and a self-signed certificate is minted for local development.
-- **Client mode** — the bot and the browser both dial a relay and rendezvous there. Neither side needs a reachable address, so this works when the bot is behind NAT.
+- **Client mode** — the bot and the browser both dial a relay and rendezvous there. Neither side needs a reachable address, so this works when the bot is behind NAT. A dropped relay session is redialed rather than treated as the end of the call (see [Reconnect and errors](#reconnect-and-errors)).
 
 <CardGroup cols={2}>
   <Card
@@ -37826,12 +37826,12 @@ Extends [`TransportParams`](/api-reference/server/services/transport/transport-p
 
 **Connection**
 
-| Parameter            | Type          | Default | Description                                                                                                                                                                                                                                                                                            |
-| -------------------- | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `relay_url`          | `str \| None` | `None`  | Full relay URL, query string included (e.g. `https://relay.example.com:4080/moq?jwt=…`). When unset, composed from the constructor's host/port/path. Ignored in serve mode                                                                                                                             |
-| `serve`              | `bool`        | `False` | Bind a local UDP socket and accept sessions instead of dialing a relay                                                                                                                                                                                                                                 |
-| `bind`               | `str \| None` | `None`  | Serve mode: the listen address, defaulting to `[::]:<port>`. Client mode: the source address to dial from                                                                                                                                                                                              |
-| `connection_timeout` | `float`       | `60.0`  | How long, in seconds, the peer may be missing before the transport gives up on it. Bounds the wait for the peer to join and, in client mode, an outage during which the transport redials the relay with backoff. When it expires, the transport fires `on_client_disconnected` for a peer it had seen |
+| Parameter            | Type          | Default | Description                                                                                                                                                                              |
+| -------------------- | ------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `relay_url`          | `str \| None` | `None`  | Full relay URL, dialed as given, query string included, so a relay token such as `?jwt=…` rides along. When unset, composed from the constructor's host/port/path. Ignored in serve mode |
+| `serve`              | `bool`        | `False` | Bind a local UDP socket and accept sessions instead of dialing a relay                                                                                                                   |
+| `bind`               | `str \| None` | `None`  | Serve mode: the listen address, defaulting to `[::]:<port>`. Client mode: the source address to dial from                                                                                |
+| `connection_timeout` | `float`       | `60.0`  | How long the peer may be missing: the wait for it to join, and in client mode an outage, counted from the session dropping until the peer's data flows again, across every redial        |
 
 **Paths**
 
@@ -37885,6 +37885,24 @@ Extends [`TransportParams`](/api-reference/server/services/transport/transport-p
   client mode.
 </Warning>
 
+## Reconnect and errors
+
+In client mode a dropped relay session is redialed rather than reported as the peer leaving. Each dial announces the bot's broadcast afresh on the same path, with the transcript so far replayed into it, so the peer sees the same session return, and the transport retries with a delay that doubles from 0.5 s up to 2 s. `connection_timeout` bounds the whole outage: it counts from the session dropping until the peer's data flows again, and a redial that succeeds does not restart it, because a relay keeps announcing a path whose route has died, so an announcement alone is not the peer being back. A relay that vanishes without closing the session is noticed by a traffic-stall watchdog, well before QUIC's idle timeout would report it. Only when the time is up does the transport fire `on_client_disconnected` for a peer it had seen, so the usual handler ends the call.
+
+Each relay session is a connect and a disconnect of its own: `on_connected` fires for the first session and every redialed one, and `on_disconnected` when a session ends. A redial therefore shows up as a disconnect followed by a connect, so a bot ends the call from `on_client_disconnected`, which fires only once the peer is gone. Set `connection_timeout` longer than a load balancer in front of the relays takes to fail a dead one out, since until then redials can be pinned to the dead target.
+
+Each side appends a `session-ending` marker to its transcript stream before it leaves. The peer's tracks ending after that marker is a hangup, and the transport reports the client gone at once. Ending without it is also what a failed relay between the peers looks like, so the transport redials and gives the peer `connection_timeout` to appear on the new session, reporting it gone only if it does not. A client that closes without sending the marker, a tab killed outright for instance, is reported gone within `connection_timeout` of its broadcast disappearing.
+
+A relay that refuses the token is not retried. The relay accepts the QUIC connection first and then closes the session as unauthorized, so a forged token fails on the first session and an expired one ends the call at its expiry, both without redials.
+
+Failures reach the pipeline as an `ErrorFrame` from the input transport, in addition to the `on_error` event: a refused token carries an authentication or authorization category, and a relay that could not be reached within `connection_timeout` carries a connectivity category marked permanent. Either leaves the transport unable to do its job, and the pipeline worker's [`processor_unusable_policy`](/pipecat/fundamentals/error-handling#deciding-what-the-pipeline-does) decides whether the pipeline ends. The default, `CONTINUE`, only logs, so a bot that should exit on a dead relay sets the policy to `END` or `CANCEL`, or acts on `on_error` itself.
+
+### Transcript records
+
+Each transcript track is a single group that a subscriber reads from its first record, so a reconnect on either side replays the whole log. Every record the transport writes is the RTVI message plus two fields: `seq`, the record's position in the log, counting across reconnects, and `epoch`, an opaque string identifying this transport instance. On subscribe the transport drops records at or below the last `seq` it accepted for the current `epoch`, treats a different `epoch` as a new peer whose count starts over, and strips both fields before the message enters the pipeline. A record without `seq` is delivered unchanged, so a client that predates the fields keeps working.
+
+[`@pipecat-ai/moq-transport`](/api-reference/client/js/transports/moq) implements the same format. Another client on this stream should too; otherwise a reconnect redelivers `client-ready` and the bot greets again.
+
 ## Properties
 
 ### cert_fingerprints
@@ -37928,6 +37946,17 @@ transport_params = {
 }
 ```
 
+`MOQRunnerArguments` takes either a `host` and `port` to compose the relay URL from, or a full `relay_url`, query string included, which `create_transport` passes through unchanged. A host that hands the bot a relay URL with a token in it uses the second form:
+
+```python
+from pipecat.runner.types import MOQRunnerArguments
+
+args = MOQRunnerArguments(
+    relay_url="https://relay.example.com/?jwt=…",
+    namespace="pcc/session-id",
+)
+```
+
 ## Runner options
 
 | Flag                      | Default                           | Description                                                                   |
@@ -37947,18 +37976,17 @@ The `/start` response carries a `moq` block — `relayUrl`, `certHash`, `serve`,
 
 ## Event Handlers
 
-| Event                    | Description                                                                                                                 |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `on_connected`           | A MOQ session is established: the serve bind, or each session with the relay, the first and every redialed one              |
-| `on_disconnected`        | An established session ends, or the transport stops without ever having had one. Client mode redials after it               |
-| `on_client_connected`    | The peer's broadcast was announced                                                                                          |
-| `on_client_disconnected` | The peer is gone: its broadcast went away, or the session could not be re-established in time                               |
-| `on_track_subscribed`    | A remote track subscription succeeded                                                                                       |
-| `on_error`               | An error in the underlying transport, with the message, exception, error category (when known), and whether it is permanent |
+| Event                    | Description                                                                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `on_connected`           | A session with the relay is established, the first and every redialed one, or the serve-mode bind is up                                                |
+| `on_disconnected`        | A session ended, or the transport stopped without ever having one. Client mode redials after it, so end the call from `on_client_disconnected` instead |
+| `on_client_connected`    | The peer's broadcast was announced                                                                                                                     |
+| `on_client_disconnected` | The peer is gone: it said goodbye, or it stayed missing for `connection_timeout`                                                                       |
+| `on_track_subscribed`    | A remote track subscription succeeded                                                                                                                  |
+| `on_error`               | An error in the underlying transport. Receives the message and the exception; the pipeline also gets an `ErrorFrame`                                   |
 
 ## Notes
 
-- **Client-mode reconnect**: when the relay session drops, the transport redials with backoff for as long as `connection_timeout` allows. The bot's broadcast persists across dials, and the peer is only reported gone when that time is up. End the call from `on_client_disconnected`, which fires once the peer is gone; `on_connected` and `on_disconnected` fire for each relay session.
 - **RTVI over MoQ**: the `transcript_track` is a lossless, ordered JSON stream carrying RTVI messages in both directions, so MoQ is a full RTVI transport on par with Daily or WebSocket rather than an audio-only path.
 - **Audio**: a single Opus track each way. The library resamples to the nearest Opus-supported rate before encoding, so `audio_out_sample_rate` doesn't have to be one of them.
 - **Latency**: `audio_in_max_latency_ms` trades interactivity against resilience — lower waits less for a late frame, at the cost of more drops on a poor network.
@@ -92525,6 +92553,12 @@ client subscribes  <namespace>/<botId>
 ```
 
 Audio track names within a broadcast come from the bot's catalog, so they aren't configured here. The transcript track is the exception — it's a JSON stream rather than a media rendition, so the catalog doesn't describe it and both sides agree on the name by convention.
+
+### Transcript records
+
+Each transcript track is a single group that a subscriber reads from its first record, so a reconnect on either side, including the automatic one from `@moq/net`, replays the whole log. Every record the transport sends is the RTVI message plus `seq`, its position in the connection's log, and `epoch`, an id minted per connection. Incoming records at or below the last `seq` accepted for the bot's current `epoch` are dropped, a different `epoch` is a new bot whose count starts over, and both fields are removed before the message reaches `PipecatClient`. A record without `seq` is delivered unchanged, so a bot that predates the fields keeps working. The bot side of the same format is described with the [server transport](/api-reference/server/services/transport/moq#transcript-records); `acceptTranscriptRecord` and the `TranscriptRecord` type are exported for other implementations of the stream.
+
+Each side also sends a `session-ending` marker on its transcript before it leaves. The bot's tracks ending after the marker is a hangup and the transport disconnects. Ending without it may be a relay between the peers failing, which looks the same on the wire, so the transport redials: the bot either reappears on the new session or is never announced on it. `disconnect()` sends the marker from this side, so the bot ends the call at once.
 
 ## Events
 
