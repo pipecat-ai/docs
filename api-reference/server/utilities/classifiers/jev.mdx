@@ -1,0 +1,212 @@
+---
+title: "Jev Classifier"
+sidebarTitle: "Jev"
+description: "Answer classifier questions with JevClassifier and JevClient backed by TypeSafe's hosted classification model"
+---
+
+## Overview
+
+`JevClassifier` answers questions by asking Jev, TypeSafe's hosted classification model. Jev's probabilities are calibrated.
+
+Build one with an API key to get a client of its own, or pass a `JevClient` to share one between several classifiers.
+
+## Installation
+
+```bash
+uv add "pipecat-ai[jev]"
+```
+
+## Prerequisites
+
+A Jev API key from [TypeSafe](https://typesafe.ai).
+
+```bash
+export TYPESAFE_API_KEY=your_api_key
+```
+
+## Configuration
+
+### JevClassifier
+
+<ParamField path="api_key" type="str | None" default="None">
+  Jev API key, when the classifier should have a client of its own. One of
+  `api_key` and `client` is required.
+</ParamField>
+
+<ParamField path="client" type="JevClient | None" default="None">
+  A client to share. One of `api_key` and `client` is required.
+</ParamField>
+
+### JevClient
+
+<ParamField path="api_key" type="str">
+  Jev API key.
+</ParamField>
+
+<ParamField path="base_url" type="str" default='"https://api.typesafe.ai"'>
+  Where the API is served.
+</ParamField>
+
+<ParamField path="model" type="str" default='"jev-1.13.0"'>
+  The Jev model to ask. Pinned so thresholds tuned against it keep holding;
+  `jev-latest` follows TypeSafe's newest release.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="10.0">
+  Seconds to wait for a reply before giving up.
+</ParamField>
+
+<ParamField path="max_retries" type="int" default="3">
+  How many times to retry a request Jev refused because it was busy.
+</ParamField>
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.classifiers.jev.classifier import JevClassifier
+from pipecat.classifiers.base_classifier import YesNoQuestion
+
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+results = await classifier.yes_no(
+    "Please leave a message",
+    {"answer": YesNoQuestion(instructions="is this a voicemail greeting?")},
+)
+results["answer"].probability  # 0.95
+```
+
+### Sharing a Client
+
+```python
+from pipecat.classifiers.jev.client import JevClient
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+client = JevClient(api_key=os.getenv("TYPESAFE_API_KEY"))
+turn_classifier = JevClassifier(client=client)
+voicemail_classifier = JevClassifier(client=client)
+
+# Both classifiers share one HTTP/2 connection pool
+```
+
+### Connection Management
+
+```python
+# Open the connection ahead of the first question
+await classifier.setup(task_manager)
+
+# Close the connection when done
+await classifier.cleanup()
+```
+
+A connection that cannot be opened at setup is only a warning: the first question opens it itself.
+
+## Properties
+
+### client
+
+The `JevClient` this classifier asks through.
+
+### model
+
+The Jev model the questions go to.
+
+## JevClient
+
+One `JevClient` holds one HTTP/2 connection pool, adds the auth header, retries when Jev is busy, and counts the tokens every request used. Several `JevClassifier` instances can share one.
+
+### Properties
+
+#### model
+
+The Jev model the questions go to.
+
+#### usage
+
+Tokens used so far, over every request. A `JevUsage` object with `input_tokens` and `output_tokens` counts.
+
+### Methods
+
+#### connect()
+
+Open the connection to Jev.
+
+```python
+await client.connect()
+```
+
+Lists the models, the cheapest request there is, so the first question finds the connection already open. Connects once: a client shared by several classifiers is asked by each of them, and only the first call sends anything.
+
+**Raises:** `ClassifierError` — If Jev could not be reached or refused the request.
+
+#### close()
+
+Close the connection pool.
+
+```python
+await client.close()
+```
+
+## Notes
+
+- A client the classifier created is closed in `cleanup()`; a shared one is left to whoever made it.
+- The client retries with exponential backoff when Jev answers 429 or 529 (busy), up to `max_retries` attempts.
+- Idle connections are kept open for 240 seconds between questions, so a gap between them does not cost a new TLS handshake.
+
+## Example
+
+```python
+import os
+from pipecat.classifiers.jev.classifier import JevClassifier
+from pipecat.classifiers.base_classifier import (
+    YesNoQuestion,
+    ChoiceQuestion,
+    ScoreQuestion,
+)
+
+classifier = JevClassifier(api_key=os.environ["TYPESAFE_API_KEY"])
+
+# Yes/no question
+yes_no = (
+    await classifier.yes_no(
+        "Hi, you've reached Sam. Leave a message.",
+        {"answer": YesNoQuestion(instructions="is this a voicemail greeting?")},
+    )
+)["answer"]
+yes_no.is_yes  # True
+yes_no.probability  # 0.95
+
+# Choice question
+choice = (
+    await classifier.choice(
+        "I'd like to book a table for, um",
+        {
+            "turn": ChoiceQuestion(
+                instructions="is the user's turn over?",
+                options={
+                    "complete": "the user finished",
+                    "short": "a brief pause",
+                    "long": "asked for time",
+                },
+            )
+        },
+    )
+)["turn"]
+choice.choice  # "short"
+choice.confidence  # 0.88
+
+# Score question
+score = (
+    await classifier.score(
+        "This is the third time I call and nobody helps me!",
+        {
+            "mood": ScoreQuestion(
+                instructions="how upset is the user?",
+                levels=["calm", "impatient", "frustrated", "asking for a person"],
+            )
+        },
+    )
+)["mood"]
+score.score  # 2.1 (between "impatient" and "frustrated")
+score.confidence  # 0.85
+```

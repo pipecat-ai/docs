@@ -1,0 +1,145 @@
+---
+title: "LLM Classifier"
+sidebarTitle: "LLM"
+description: "Answer classifier questions with LLMClassifier backed by any Pipecat LLM service"
+---
+
+## Overview
+
+`LLMClassifier` answers questions by asking an LLM for a JSON object. Every question about a state goes to the LLM in one out-of-pipeline call, through the service's `run_inference()`. The LLM is asked for one JSON object with an answer per question, and the object is parsed into results.
+
+The probabilities are whatever the LLM wrote, so they are not calibrated. Any service that implements `run_inference()` can back a classifier; realtime services cannot.
+
+## Configuration
+
+<ParamField path="llm" type="LLMService[Any]">
+  The LLM that answers the questions.
+</ParamField>
+
+<ParamField path="instructions" type="str | None" default="None">
+  System instructions for the LLM. The default asks for one JSON object with an
+  answer per question.
+</ParamField>
+
+<ParamField path="max_tokens" type="int | None" default="None">
+  Cap on the reply's length, for services that take one.
+</ParamField>
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.classifiers.base_classifier import YesNoQuestion
+from pipecat.services.openai.llm import OpenAILLMService
+
+classifier = LLMClassifier(llm=OpenAILLMService(model="gpt-4o-mini"))
+results = await classifier.yes_no(
+    "Hi, you've reached Dana. Leave a message.",
+    {"voicemail": YesNoQuestion(instructions="is this a voicemail greeting?")},
+)
+results["voicemail"].is_yes  # True
+results["voicemail"].probability  # 0.97
+```
+
+### With Custom Instructions
+
+```python
+classifier = LLMClassifier(
+    llm=OpenAILLMService(model="gpt-4o-mini"),
+    instructions="You are a classifier specialized in conversation analysis.",
+    max_tokens=500,
+)
+```
+
+## Properties
+
+### llm
+
+The LLM service that answers the questions.
+
+### model
+
+The LLM service's model, as a string, or `None` if the model is not a string.
+
+## How It Works
+
+### Question Rendering
+
+Each question is rendered as text with its options and the expected answer shape. For example:
+
+```
+Input:
+Hi, you've reached Dana. Leave a message.
+
+Question "voicemail": is this a voicemail greeting?
+Answer shape: {"probability": <probability that the answer is yes>}
+
+Reply with one JSON object of this shape: {"voicemail": <answer to "voicemail">}
+```
+
+### Reply Parsing
+
+The LLM's reply is parsed as JSON. Fences and prose around the object are ignored, so the LLM can say "Here's the answer: ```json...```" and the classifier will extract the object.
+
+Where the service supports a reply schema, the reply's shape is enforced by the provider. Otherwise, the prompt asks for the shape and the reply is parsed.
+
+## Notes
+
+- The classifier does not report token usage through metrics: the `on_metrics` event includes only the processing time, not an `LLMUsageMetricsData` entry.
+- A lone answer often comes back without its name around it. The classifier accepts `{"probability": 0.9}` when one yes/no question was asked.
+- For score questions, probabilities that do not sum to 1 are scaled to sum to 1. A probability distribution that sums to 0 is an error.
+- The classifier clamps probabilities to the [0, 1] range, so an LLM that writes 1.2 or -0.1 is treated as 1.0 or 0.0.
+
+## Example
+
+```python
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.classifiers.base_classifier import (
+    YesNoQuestion,
+    ChoiceQuestion,
+    ScoreQuestion,
+)
+from pipecat.services.openai.llm import OpenAILLMService
+
+llm = OpenAILLMService(
+    api_key=os.environ["OPENAI_API_KEY"],
+    settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+)
+classifier = LLMClassifier(llm=llm)
+
+# All three question types in one call
+results = await classifier.ask(
+    "I was charged twice for March. This is the third time I'm calling.",
+    {
+        "refund": YesNoQuestion(
+            instructions="Does the customer want money back?",
+            yes="asks for a refund, a credit, or a charge to be reversed",
+            no="anything else",
+        ),
+        "department": ChoiceQuestion(
+            instructions="Which team should take this call?",
+            options={
+                "billing": "invoices, payments, refunds",
+                "technical": "bugs, outages, errors",
+                "sales": "pricing, new contracts",
+                "other": None,
+            },
+        ),
+        "mood": ScoreQuestion(
+            instructions="How upset is the customer?",
+            levels=["calm", "frustrated", "angry"],
+        ),
+    },
+)
+
+refund = results["refund"]  # YesNoResult
+refund.is_yes  # True
+
+department = results["department"]  # ChoiceResult
+department.choice  # "billing"
+
+mood = results["mood"]  # ScoreResult
+mood.score  # 1.2 (between "calm" and "frustrated")
+```

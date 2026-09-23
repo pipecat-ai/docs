@@ -1,0 +1,219 @@
+---
+title: "Classifiers"
+sidebarTitle: "Overview"
+description: "Answer typed questions about state with BaseClassifier, JevClassifier, and LLMClassifier"
+---
+
+## Overview
+
+A classifier answers typed questions about some state. A question is a `YesNoQuestion`, a `ChoiceQuestion` among options, or a `ScoreQuestion` on a scale. Questions are asked by name, several about one state at once.
+
+Classifiers are plain objects that live outside the pipeline. Whoever needs answers creates one, keeps it, and calls it. No frames flow into a classifier.
+
+## Question Types
+
+### YesNoQuestion
+
+Whether the state meets a condition.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]">
+  What is being checked for, as a yes or no question. Text, or structured data
+  holding the question in one field and what it refers to in others.
+</ParamField>
+
+<ParamField path="yes" type="str | dict[str, Any] | list[Any] | None" default="None">
+  What counts as a yes, when the question alone leaves it open.
+</ParamField>
+
+<ParamField path="no" type="str | dict[str, Any] | list[Any] | None" default="None">
+  What counts as a no.
+</ParamField>
+
+### ChoiceQuestion
+
+Which of several options fits the state.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]">
+  What is being decided.
+</ParamField>
+
+<ParamField path="options" type="dict[str, str | dict[str, Any] | list[Any] | None]">
+  The options to choose from, each mapped to a description of when it applies,
+  or `None` when the option itself says enough.
+</ParamField>
+
+### ScoreQuestion
+
+Where the state falls on an ordered scale.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]">
+  What is being rated.
+</ParamField>
+
+<ParamField path="levels" type="list[str | dict[str, Any] | list[Any]]">
+  The levels of the scale in order, lowest first, each described in a few words
+  or as structured data. At least two.
+</ParamField>
+
+## Result Types
+
+### YesNoResult
+
+Answer to a `YesNoQuestion`.
+
+<ParamField path="probability" type="float">
+  How likely the answer is yes, from 0 to 1.
+</ParamField>
+
+**Properties:**
+
+- `is_yes: bool` — Whether yes is the likelier answer. Callers that need more certainty compare `probability` with a threshold of their own.
+
+### ChoiceResult
+
+Answer to a `ChoiceQuestion`.
+
+<ParamField path="choice" type="str">
+  The option that fits best.
+</ParamField>
+
+<ParamField path="probabilities" type="dict[str, float]">
+  How likely each option is, keyed by option.
+</ParamField>
+
+<ParamField path="confidence" type="float">
+  How sure the classifier is of `choice`, from 0 to 1.
+</ParamField>
+
+### ScoreResult
+
+Answer to a `ScoreQuestion`.
+
+<ParamField path="score" type="float">
+  Where the state falls on the scale, as a position from 0 (the first level) to
+  one less than the number of levels. It is the probability-weighted position,
+  so it may fall between two levels.
+</ParamField>
+
+<ParamField path="levels" type="list[ScoreLevel]">
+  How likely each level is, in the question's order. Each `ScoreLevel` has a
+  `level` (as the question gave it) and a `probability` from 0 to 1.
+</ParamField>
+
+<ParamField path="confidence" type="float">
+  How sure the classifier is of `score`, from 0 to 1.
+</ParamField>
+
+**Methods:**
+
+- `probability(level) -> float` — How likely one level is. Raises `KeyError` if the scale has no such level.
+
+## BaseClassifier
+
+Base class for all classifiers. Subclasses implement `_ask()` to answer questions.
+
+### Methods
+
+#### ask()
+
+Answer several questions about one state.
+
+```python
+results = await classifier.ask(state, questions)
+```
+
+**Parameters:**
+
+| Parameter   | Type                                   | Description              |
+| ----------- | -------------------------------------- | ------------------------ |
+| `state`     | `str \| dict[str, Any] \| list[Any]`   | What the questions are about |
+| `questions` | `Mapping[str, ClassifierQuestion]`     | The questions, by name   |
+
+**Returns:** `dict[str, ClassifierResult]` — One result per question, by the same names, each of the type its question calls for.
+
+**Raises:** `ClassifierError` — If the answers could not be produced.
+
+#### yes_no()
+
+Ask whether the state meets each condition.
+
+```python
+results = await classifier.yes_no(state, questions)
+```
+
+**Returns:** `dict[str, YesNoResult]` — How likely each answer is yes, by the same names.
+
+#### choice()
+
+Ask which option fits the state, for each question.
+
+```python
+results = await classifier.choice(state, questions)
+```
+
+**Returns:** `dict[str, ChoiceResult]` — The option that fits and how likely each one is, by the same names.
+
+#### score()
+
+Ask where the state falls on each scale.
+
+```python
+results = await classifier.score(state, questions)
+```
+
+**Returns:** `dict[str, ScoreResult]` — The position on each scale and how likely each level is, by the same names.
+
+## Event Handlers
+
+Classifiers emit the following events:
+
+### on_metrics
+
+Called after every call with its metrics: the time it took and, when the classifier knows it, the tokens it used.
+
+```python
+@classifier.event_handler("on_metrics")
+async def on_metrics(classifier, data: list[MetricsData]):
+    await self.push_frame(MetricsFrame(data=data))
+```
+
+A classifier cannot push frames, so the owner puts the metrics in a `MetricsFrame`.
+
+**Parameters:**
+
+| Parameter    | Type                  | Description                           |
+| ------------ | --------------------- | ------------------------------------- |
+| `classifier` | `BaseClassifier`      | The classifier instance               |
+| `data`       | `list[MetricsData]`   | Time and token usage metrics          |
+
+## Usage
+
+An owner that runs inside a worker calls `setup()` with its task manager before the first question, and `cleanup()` when done.
+
+```python
+await self._classifier.setup(self.task_manager)
+
+@self._classifier.event_handler("on_metrics")
+async def on_metrics(classifier, data: list[MetricsData]):
+    await self.push_frame(MetricsFrame(data=data))
+```
+
+## Example
+
+```python
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+results = await classifier.choice(
+    "I'd like to book a table for, um",
+    {
+        "turn": ChoiceQuestion(
+            instructions="is the user's turn over?",
+            options={
+                "complete": "the user finished",
+                "short": "a brief pause",
+                "long": "asked for time",
+            },
+        )
+    },
+)
+results["turn"].choice  # "short"
+```
