@@ -5147,6 +5147,48 @@ tts = CartesiaTTSService(
 # llm -> llm_text_processor -> tts
 ```
 
+### Pronunciation Hints
+
+Many TTS services support pronunciation hints that let you control how specific words are spoken using the International Phonetic Alphabet (IPA). Each service provides a `pronunciation_transform_ipa()` classmethod that creates a text transform from a dictionary mapping words to their IPA pronunciations:
+
+```python
+from pipecat.services.cartesia.tts import CartesiaTTSService
+
+# Define pronunciations for medical terms
+pronunciations = {
+    "Metformin": "mɛtˈfɔɹmɪn",
+    "Adalimumab": "ˌædəˈlɪmumæb"
+}
+
+# Create pronunciation transform
+pronounce = CartesiaTTSService.pronunciation_transform_ipa(pronunciations)
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    text_transforms=[
+        ("*", pronounce),  # Register last so nothing rewrites its markup
+    ],
+)
+```
+
+**How it works:**
+
+- Each word is matched whole and case-insensitively wherever it appears in the text
+- Matched words are replaced with the service's pronunciation markup (e.g., Cartesia's `<<phoneme>>` blocks, ElevenLabs' SSML `<phoneme>` tags)
+- Words that cannot be used are reported once when the transform is built and spoken as written
+- The transform is automatically skipped when the service doesn't support pronunciation markup
+
+**Important:** Register pronunciation transforms **last** in `text_transforms`. Transforms run in order, so one that runs after it (stripping markdown, replacing text) can rewrite the markup and break the hint.
+
+**Service support:**
+
+- **Cartesia**: Inline phoneme blocks (`<<…>>`)
+- **Deepgram Aura-2**: Inline pronunciation objects (WebSocket and HTTP)
+- **Deepgram Flux**: No pronunciation support
+- **ElevenLabs**: SSML `<phoneme>` tags (v2 models only with `enable_ssml_parsing=True` for WebSocket)
+- **ElevenLabs Dialogue**: IPA between slashes (v3 models)
+- **Inworld**: IPA between slashes (single words only)
+
 ### Text Transforms
 
 For TTS-specific text preprocessing, you can provide custom text transforms that modify text in a just-in-time manner before sending the text off to the TTS service. This is useful for handling special text segments that need to be altered for better pronunciation or clarity, such as spelling out phone numbers, removing URLs, or expanding abbreviations. These text transforms can be mapped to a specific text aggregation type, like with `skip_aggregator_types`, or applied globally to all text using `'*'` as the type.
@@ -55665,6 +55707,32 @@ tts = CartesiaTTSService(
 )
 ```
 
+### format_pronunciation(word: str, ipa: str) -> str | None
+
+Renders a pronunciation as Cartesia inline phoneme blocks. Cartesia reads `<<…>>` blocks of `|`-separated IPA phones, with stress marks directly before the vowel they stress.
+
+```python
+# Format a single word's pronunciation
+formatted = CartesiaTTSService.format_pronunciation("Metformin", "mɛtˈfɔɹmɪn")
+# Returns: "<<m|ɛ|t|f|ˈ|ɔ|ɹ|m|ɪ|n>>"
+```
+
+Most applications should use `pronunciation_transform_ipa()` instead, which creates a text transform that automatically replaces words with their pronunciations:
+
+```python
+pronounce = CartesiaTTSService.pronunciation_transform_ipa({
+    "Metformin": "mɛtˈfɔɹmɪn",
+    "Adalimumab": "ˌædəˈlɪmumæb"
+})
+
+tts = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    text_transforms=[
+        ("*", pronounce),  # Register last
+    ],
+)
+```
+
 <Tip>
   The `InputParams` / `params=` pattern is deprecated as of v0.0.105. Use
   `Settings` / `settings=` instead. See the [Service Settings
@@ -56311,6 +56379,7 @@ tts = DeepgramSageMakerTTSService(
 - **Choosing a service**: The Aura WebSocket service (`DeepgramTTSService`) and Aura SageMaker service (`DeepgramSageMakerTTSService`) both support real-time streaming with interruption handling, making them suitable for interactive conversations. The HTTP service (`DeepgramHttpTTSService`) is simpler but processes each request as a batch. The Flux services (`DeepgramFluxTTSService` and `DeepgramFluxSageMakerTTSService`) are streaming-first options built for voice agents, with token-level streaming and cross-turn prosody state.
 - **Encoding validation**: The WebSocket service validates the `encoding` parameter at initialization and raises a `ValueError` for unsupported formats.
 - **SageMaker deployment**: The SageMaker services (`DeepgramSageMakerTTSService` and `DeepgramFluxSageMakerTTSService`) require a Deepgram TTS model deployed to an AWS SageMaker endpoint. See the [Deepgram SageMaker deployment guide](https://developers.deepgram.com/docs/deploy-amazon-sagemaker) for setup instructions.
+- **Pronunciation hints**: Aura-2 services (`DeepgramTTSService`, `DeepgramHttpTTSService`, and `DeepgramSageMakerTTSService`) support inline pronunciation objects for English and Spanish. Flux has no pronunciation markup, so `pronunciation_transform_ipa()` speaks words as written. See the [voice controls documentation](https://developers.deepgram.com/docs/tts-voice-controls) for which controls each model supports.
 
 ### Flux notes
 
@@ -56701,6 +56770,7 @@ tts = ElevenLabsDialogueTTSService(
 - **Audio tags**: Eleven v3 performs inline audio tags such as `[laughs]` and `[excited]`. They come back as spoken characters in the alignment, so they reach the LLM context as text unless a text filter removes them.
 - **Set a voice up front**: Text-to-Dialogue rejects keepalives that don't name a registered context. If no `voice` is set when the service connects, the connection idles out after 20 seconds.
 - **Pronunciation dictionaries**: The `pronunciation_dictionary_locators` parameter is deprecated as of v1.6.0. Use the `text_transforms` parameter with `replace_text` instead. Pronunciation dictionary substitutions can rewrite the spoken words in ways that no longer match the text sent to synthesis, which breaks the alignment-based word-completion tracking. Client-side `replace_text` transforms are tracked correctly and maintain word timestamp accuracy.
+- **Pronunciation hints**: `ElevenLabsTTSService` and `ElevenLabsHttpTTSService` support SSML `<phoneme>` tags on v2 models (`eleven_flash_v2`, `eleven_turbo_v2`) only. The WebSocket service requires `enable_ssml_parsing=True`; the HTTP service always reads SSML. `ElevenLabsDialogueTTSService` (v3 models) reads IPA between slashes instead of SSML tags.
 
 ## Event Handlers
 
@@ -58724,6 +58794,7 @@ async with aiohttp.ClientSession() as session:
 - **Word timestamps**: Both services provide word-level timestamps for synchronized text display. Timestamps are tracked cumulatively across utterances within a turn. When timestamps are not received from the service, a fallback mechanism ensures the full text is still committed to the LLM conversation context, even on interruption.
 - **Auto mode**: When `auto_mode=True` (default), the server controls flushing of buffered text for optimal latency and quality. This is recommended when text is sent in full sentences or phrases (i.e., when using `text_aggregation_mode=TextAggregationMode.SENTENCE`).
 - **Keepalive**: The WebSocket service sends periodic keepalive messages every 60 seconds to maintain the connection.
+- **Pronunciation hints**: Inworld reads IPA between slashes (e.g., `/kriːt/`), one word per pair of slashes. Only English IPA symbols are supported.
 
 ## Event Handlers
 
