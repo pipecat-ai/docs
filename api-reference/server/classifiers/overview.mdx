@@ -1,0 +1,244 @@
+---
+title: "BaseClassifier"
+sidebarTitle: "Overview"
+description: "Reference for BaseClassifier, its YesNoQuestion, ChoiceQuestion and ScoreQuestion types, typed results, and ClassifierError."
+---
+
+## Overview
+
+A classifier answers typed questions about some state. The state is plain text or structured data, such as a transcript with speaker labels or a screen snapshot. A question is a `YesNoQuestion`, a `ChoiceQuestion` among options, or a `ScoreQuestion` on a scale. Questions are asked by name, several about one state at once, and each gets a typed result with probabilities.
+
+A classifier is a plain object, not a frame processor. Whoever needs answers creates one, keeps it, and calls it. Nothing is added to a pipeline and no frames flow into it. Pipecat components that make small decisions take one as a `classifier` argument, such as [`VoicemailDetector`](/api-reference/server/extensions/voicemail) and [`UIWorker`](/api-reference/server/workers/ui-worker).
+
+For a walkthrough, see [Pipecat Classifiers](/pipecat/learn/classifiers).
+
+<CardGroup cols={2}>
+  <Card
+    title="JevClassifier"
+    icon="bolt"
+    href="/api-reference/server/classifiers/jev"
+  >
+    Answers through Jev, TypeSafe's hosted classification model, with
+    calibrated probabilities.
+  </Card>
+  <Card
+    title="LLMClassifier"
+    icon="brain"
+    href="/api-reference/server/classifiers/llm"
+  >
+    Answers through any Pipecat LLM service that supports `run_inference()`.
+  </Card>
+</CardGroup>
+
+```python
+from pipecat.classifiers.base_classifier import (
+    BaseClassifier,
+    ChoiceQuestion,
+    ChoiceResult,
+    ClassifierError,
+    ScoreQuestion,
+    ScoreResult,
+    YesNoQuestion,
+    YesNoResult,
+)
+```
+
+## Questions
+
+Every field that describes something (`instructions`, `yes`, `no`, an option, a level) takes text, or structured data such as a dict holding the question in one field and what it refers to in others.
+
+### YesNoQuestion
+
+Whether the state meets a condition.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]" required>
+  What is being checked for, as a yes or no question.
+</ParamField>
+
+<ParamField
+  path="yes"
+  type="str | dict[str, Any] | list[Any] | None"
+  default="None"
+>
+  What counts as a yes, when the question alone leaves it open.
+</ParamField>
+
+<ParamField
+  path="no"
+  type="str | dict[str, Any] | list[Any] | None"
+  default="None"
+>
+  What counts as a no.
+</ParamField>
+
+### ChoiceQuestion
+
+Which of several options fits the state.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]" required>
+  What is being decided.
+</ParamField>
+
+<ParamField
+  path="options"
+  type="dict[str, str | dict[str, Any] | list[Any] | None]"
+  required
+>
+  The options to choose from, each mapped to a description of when it applies,
+  or `None` when the option's name says enough.
+</ParamField>
+
+### ScoreQuestion
+
+Where the state falls on an ordered scale.
+
+<ParamField path="instructions" type="str | dict[str, Any] | list[Any]" required>
+  What is being rated.
+</ParamField>
+
+<ParamField path="levels" type="list[str | dict[str, Any] | list[Any]]" required>
+  The levels of the scale in order, lowest first, each described in a few words
+  or as structured data. At least two.
+</ParamField>
+
+## Results
+
+### YesNoResult
+
+The answer to a `YesNoQuestion`.
+
+| Field         | Type    | Description                                                                                                        |
+| ------------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `probability` | `float` | How likely the answer is yes, from 0 to 1.                                                                         |
+| `is_yes`      | `bool`  | Whether yes is the likelier answer (`probability >= 0.5`). For more certainty, compare `probability` with your own threshold. |
+
+### ChoiceResult
+
+The answer to a `ChoiceQuestion`.
+
+| Field           | Type               | Description                                    |
+| --------------- | ------------------ | ---------------------------------------------- |
+| `choice`        | `str`              | The option that fits best.                     |
+| `probabilities` | `dict[str, float]` | How likely each option is, keyed by option.    |
+| `confidence`    | `float`            | How sure the classifier is of `choice`, 0 to 1. |
+
+### ScoreResult
+
+The answer to a `ScoreQuestion`.
+
+| Field        | Type               | Description                                                                                                                                                                  |
+| ------------ | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `score`      | `float`            | Where the state falls on the scale, from 0 (the first level) to one less than the number of levels. It is the probability-weighted position, so it can fall between two levels. |
+| `levels`     | `list[ScoreLevel]` | How likely each level is, in the question's order. Each `ScoreLevel` has the `level` as the question gave it and its `probability`.                                         |
+| `confidence` | `float`            | How sure the classifier is of `score`, from 0 to 1.                                                                                                                          |
+
+`ScoreResult.probability(level)` returns the probability of one level, given as the question gave it, and raises `KeyError` if the scale has no such level:
+
+```python
+result = (await classifier.score(transcript, {"mood": question}))["mood"]
+result.probability("angry")  # 0.12
+```
+
+### ClassifierError
+
+Raised when a classifier cannot answer: the backend failed or did not reply in time, or its reply could not be turned into results. Every classifier answers or raises within a time bound of its own, so a caller waiting on one is never left hanging.
+
+## BaseClassifier
+
+The base class every classifier extends. It is a `BaseObject`, so it takes an optional `name` and supports event handlers.
+
+### Methods
+
+#### ask
+
+```python
+async def ask(
+    state: str | dict[str, Any] | list[Any],
+    questions: Mapping[str, ClassifierQuestion],
+) -> dict[str, ClassifierResult]
+```
+
+Answers several questions about one state, in one call. `questions` can mix kinds. Returns one result per question, under the same names, each of the type its question calls for.
+
+#### yes_no, choice, score
+
+```python
+async def yes_no(state, questions: Mapping[str, YesNoQuestion]) -> dict[str, YesNoResult]
+async def choice(state, questions: Mapping[str, ChoiceQuestion]) -> dict[str, ChoiceResult]
+async def score(state, questions: Mapping[str, ScoreQuestion]) -> dict[str, ScoreResult]
+```
+
+Typed versions of `ask()` for questions of one kind. They return results already typed, so no `isinstance` check is needed.
+
+All four raise `ClassifierError` when the answers could not be produced.
+
+#### setup
+
+```python
+async def setup(task_manager: BaseTaskManager)
+```
+
+An owner that runs inside an agent calls this with its task manager before the first question. A `JevClassifier` also opens its connection here, so the first question does not pay for it.
+
+#### cleanup
+
+```python
+async def cleanup()
+```
+
+Releases the classifier's resources. Call it when you are done asking.
+
+### Properties
+
+| Property | Type          | Description                                              |
+| -------- | ------------- | -------------------------------------------------------- |
+| `model`  | `str \| None` | The model that answers, as named in the metrics. |
+
+### Event Handlers
+
+#### on_metrics
+
+Called after every call with its metrics: a `ProcessingMetricsData` with the time the call took and, when the classifier knows it, an `LLMUsageMetricsData` with the tokens it used.
+
+```python
+@classifier.event_handler("on_metrics")
+async def on_metrics(classifier, data: list[MetricsData]):
+    ...
+```
+
+A classifier cannot push frames. When its owner is a frame processor, the owner puts the data in a `MetricsFrame` so it reaches the pipeline's observers like any other metrics:
+
+```python
+class MyProcessor(FrameProcessor):
+    def __init__(self, classifier: BaseClassifier):
+        super().__init__()
+        self._classifier = classifier
+        self._classifier.add_event_handler("on_metrics", self._on_classifier_metrics)
+
+    async def setup(self, setup: FrameProcessorSetup):
+        await super().setup(setup)
+        await self._classifier.setup(self.task_manager)
+
+    async def cleanup(self):
+        await super().cleanup()
+        await self._classifier.cleanup()
+
+    async def _on_classifier_metrics(self, classifier, data):
+        await self.push_frame(MetricsFrame(data=data))
+```
+
+## Writing a Classifier
+
+To back classifiers with another model or service, subclass `BaseClassifier` and implement `_ask()`. It receives the state and the questions and returns the results by name, plus the tokens the call used when that is known (or `None`). Raise `ClassifierError` when the backend fails. The public methods, typing and metrics are handled by the base class.
+
+```python
+from pipecat.classifiers.base_classifier import BaseClassifier, ClassifierError
+
+
+class MyClassifier(BaseClassifier):
+    async def _ask(self, state, questions):
+        results = {}
+        for name, question in questions.items():
+            results[name] = ...  # a YesNoResult, ChoiceResult or ScoreResult
+        return results, None
+```
