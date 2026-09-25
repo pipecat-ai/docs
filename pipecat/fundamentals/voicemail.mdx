@@ -1,56 +1,48 @@
 ---
 title: "Voicemail Detection"
-description: "Automatically classify outbound calls as conversation or voicemail and respond appropriately"
+description: "Classify outbound calls as conversation or voicemail with VoicemailDetector and a classifier, and leave a message when voicemail answers."
 ---
 
 ## Overview
 
-The VoicemailDetector classifies incoming communication as either live conversation or voicemail systems. This module is built primarily for voice AI bots that perform outbound calling, enabling them to respond appropriately based on whether a human answered or the call went to voicemail.
+When a bot places an outbound call, it needs to know who picked up. A person expects a quick, natural reply. A voicemail greeting should be listened to in full, and then the bot should leave a message after the beep.
 
-The detector is optimized for fast conversation response times, where TTS output is generated immediately but held in a gate until the classification decision is made. This ensures minimal latency for live conversations while preventing inappropriate responses to voicemail systems.
+`VoicemailDetector` makes that call. It listens to what the other side says and asks a [classifier](/pipecat/learn/classifiers) whether it's a person or a voicemail. Meanwhile the bot's reply is generated as usual but held back, so a person hears it as soon as the verdict is in, and a voicemail greeting is never talked over.
 
 ## How It Works
 
-The VoicemailDetector uses a parallel pipeline architecture to perform real-time classification without interrupting conversation flow. It analyzes the initial response from the called party and determines whether it's a human greeting or an automated voicemail system.
+The detector is two processors: the detector itself, after the STT service, and a gate, right after the TTS service.
 
-Key features:
-
-- **Real-time classification** - Determines conversation vs voicemail as soon as audio is received
-- **TTS gating** - Holds generated audio until classification is complete
-- **Event-driven** - Triggers custom handlers when voicemail is detected
-- **Configurable timing** - Adjustable delay for voicemail response timing
+1. **Listen.** After each transcription, the detector asks its classifier whether the transcript so far sounds like a person or a voicemail. The classifier runs in the background, so frames keep flowing.
+2. **Hold.** While the decision is pending, the gate buffers the bot's speech. The LLM and TTS run as normal, so the reply is ready the moment the verdict arrives.
+3. **Wait for silence.** No answer is acted on while the caller is speaking. "Hi, this is Sam" is what a person says when they pick up, and also how a greeting starts. Only what follows tells them apart: a greeting keeps going after its pauses, while a person stops and waits. Once the caller has been quiet for `decision_timeout`, the latest answer becomes the verdict.
+4. **Act.** For a conversation, the gate releases the held speech and the call goes on. For a voicemail, the held speech is dropped, and once the greeting has been quiet for `voicemail_response_delay`, `on_voicemail_detected` fires so you can leave a message.
 
 ## Basic Setup
 
-### 1. Initialize the Detector
+### 1. Create the Detector
+
+Pass the detector a classifier. `JevClassifier` answers in about a tenth of a second, which matters here: every bit of classification time is time a person waits in silence after saying "hello?".
 
 ```python
+import os
+
+from pipecat.classifiers.jev.classifier import JevClassifier
 from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
-from pipecat.services.openai.llm import OpenAILLMService
 
-# Create an LLM for classification
-classifier_llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Initialize the detector
 voicemail_detector = VoicemailDetector(
-    llm=classifier_llm,
-    voicemail_response_delay=2.0  # Default: 2 seconds
+    classifier=JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY")),
 )
 ```
 
-<Note>
-  The VoicemailDetector works with two LLMs: your main conversation LLM (which
-  must be text-based) and the classifier LLM (which can be either text-based or
-  realtime with a `text` output modality). Realtime LLMs are not compatible for
-  the main conversation LLM due to output control requirements.
-</Note>
+`JevClassifier` needs the `jev` extra (`uv add "pipecat-ai[jev]"`) and a TypeSafe API key. To classify with an LLM you already use instead, see [Using an LLM Classifier](#using-an-llm-classifier).
 
 ### 2. Configure the Pipeline
 
-The VoicemailDetector requires two components in your pipeline:
+The detector needs two components in your pipeline:
 
-- `detector()`: between STT and user context aggregator
-- `gate()`: immediately after TTS service
+- `detector()`: between the STT service and the user context aggregator
+- `gate()`: immediately after the TTS service
 
 ```python
 pipeline = Pipeline([
@@ -66,68 +58,129 @@ pipeline = Pipeline([
 ])
 ```
 
-### 3. Handle Voicemail Events
+### 3. Leave a Message
 
-When a voicemail is detected, the `on_voicemail_detected` event is triggered. In your event handler, you have access to `processor`, which is a FrameProcessor instance, allowing you to push frames to the pipeline. For example, you may want to have the bot output a pre-canned message and then end the call.
+When the call reaches voicemail, `on_voicemail_detected` fires once the greeting has finished. The handler receives the detector, which is a frame processor, so you can push frames through it. For example, speak a message and then end the call:
 
 ```python
+from pipecat.frames.frames import EndWorkerFrame, TTSSpeakFrame
+
+
 @voicemail_detector.event_handler("on_voicemail_detected")
-async def handle_voicemail(processor):
+async def on_voicemail_detected(detector):
     logger.info("Voicemail detected! Leaving a message...")
 
-    # Leave a voicemail message
-    await processor.push_frame(
-        TTSSpeakFrame("Hello, this is Jamie calling about your appointment. Please call me back at 555-0123.")
+    await detector.push_frame(
+        TTSSpeakFrame(
+            "Hello, this is Alex calling about your appointment. "
+            "Please call me back at 555-0123 when you get this."
+        )
     )
 
-    # Optionally end the call after leaving the message. Push downstream so the
-    # message finishes playing before the pipeline shuts down.
-    await processor.push_frame(EndWorkerFrame(), FrameDirection.DOWNSTREAM)
+    # The message is left, so the call is over. EndWorkerFrame travels
+    # downstream behind the message, so the message finishes playing first.
+    await detector.push_frame(EndWorkerFrame())
 ```
+
+After a voicemail verdict, the detector stops passing the other side's speech to the rest of the pipeline, so your conversation LLM never replies to the greeting. The handler fires once: a beep or a prompt heard while the message plays doesn't trigger it again.
 
 ## Detecting a Conversation
 
-When a conversation is detected, no additional processing is required by the VoicemailDetector. Once the VoicemailDetector classifies the call as a conversation, the TTSGate will be flushed, allowing the conversation to continue.
+When a person answers, there's nothing to do: the gate releases the bot's held reply and the conversation continues. If you want to react, for example to log the outcome or start a timer, handle `on_conversation_detected`:
+
+```python
+@voicemail_detector.event_handler("on_conversation_detected")
+async def on_conversation_detected(detector):
+    logger.info("A person answered")
+```
+
+If the classifier can't answer at all, because it failed or timed out, the detector assumes a conversation once the caller goes quiet. A person is never left waiting for a bot that won't speak.
 
 ## Configuration Options
 
-### Custom System Prompt
-
-For specialized use cases, you can provide a custom classification prompt. The prompt must instruct the LLM to respond with exactly "CONVERSATION" or "VOICEMAIL":
-
-```python
-custom_prompt = """
-Your custom classification logic here.
-Consider factors like business hours, call patterns, etc.
-""" + VoicemailDetector.CLASSIFIER_RESPONSE_INSTRUCTION
-
-voicemail_detector = VoicemailDetector(
-    llm=classifier_llm,
-    custom_system_prompt=custom_prompt
-)
-```
-
-<Note>
-  The `CLASSIFIER_RESPONSE_INSTRUCTION` constant contains the required response
-  format: `'Respond with ONLY "CONVERSATION" if a person answered, or
-  "VOICEMAIL" if it\'s voicemail/recording.'`
-</Note>
-
-For most use cases, the default classifier prompt will work effectively. If you need to customize the behavior, reference the built-in prompt as a starting point and modify from there.
-
 ### Response Timing
 
-The `voicemail_response_delay` parameter controls how long to wait after the user stops speaking before triggering the voicemail event:
+Two parameters control the timing. Tune them against the greetings your calls actually reach.
+
+**`decision_timeout`** (default 1 second) is how long the caller must be quiet before the latest answer decides. Raise it if greetings with long pauses get classified as conversations. Lower it to answer people faster.
 
 ```python
 voicemail_detector = VoicemailDetector(
-    llm=classifier_llm,
-    voicemail_response_delay=3.0  # Wait 3 seconds instead of default 2
+    classifier=classifier,
+    decision_timeout=1.5,
 )
 ```
 
-This delay ensures:
+**`voicemail_response_delay`** (default 2 seconds) is how long the greeting must be quiet after a voicemail verdict before `on_voicemail_detected` fires. It ensures the greeting has finished and the recording has started before you speak.
 
-- Voicemail greetings have finished playing
-- The response occurs during the recording period
-- Proper timing for different voicemail system behaviors
+```python
+voicemail_detector = VoicemailDetector(
+    classifier=classifier,
+    voicemail_response_delay=3.0,
+)
+```
+
+### Using an LLM Classifier
+
+To classify with an LLM service instead of Jev, wrap it in an `LLMClassifier`. Any service that supports `run_inference()` works, and a small, fast model is usually enough. It doesn't need to be the LLM in your pipeline:
+
+```python
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.services.openai.llm import OpenAILLMService
+
+classifier_llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+)
+
+voicemail_detector = VoicemailDetector(classifier=LLMClassifier(llm=classifier_llm))
+```
+
+An LLM request takes longer than a Jev call, and that time adds to the silence a person hears before the bot replies.
+
+## Migrating from the `llm` Parameter
+
+Before 1.12.0, the detector took an `llm` and an optional `custom_system_prompt`. Both are deprecated and will be removed in 2.0.0. Until then, an `llm` is wrapped in an `LLMClassifier` for you.
+
+```python
+# Before
+voicemail_detector = VoicemailDetector(llm=classifier_llm)
+
+# After
+voicemail_detector = VoicemailDetector(classifier=JevClassifier(api_key=...))
+
+# Or, to keep using the same LLM
+voicemail_detector = VoicemailDetector(classifier=LLMClassifier(llm=classifier_llm))
+```
+
+A `custom_system_prompt` no longer needs to ask for a `CONVERSATION` or `VOICEMAIL` reply; that constant, `CLASSIFIER_RESPONSE_INSTRUCTION`, has been removed. If you customized the prompt, move your guidance into an `LLMClassifier`'s `instructions`, and keep its default instructions for the reply format:
+
+```python
+from pipecat.classifiers.llm.classifier import DEFAULT_INSTRUCTIONS, LLMClassifier
+
+classifier = LLMClassifier(
+    llm=classifier_llm,
+    instructions=f"Calls go to businesses after hours.\n\n{DEFAULT_INSTRUCTIONS}",
+)
+```
+
+The event handlers now receive the detector itself rather than an internal processor. Code that pushes frames from a handler keeps working.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="VoicemailDetector Reference"
+    icon="book"
+    href="/api-reference/server/extensions/voicemail"
+  >
+    Parameters, events, and how the decision is made
+  </Card>
+  <Card
+    title="Pipecat Classifiers"
+    icon="scale-balanced"
+    href="/pipecat/learn/classifiers"
+  >
+    How classifiers work and how to choose one
+  </Card>
+</CardGroup>

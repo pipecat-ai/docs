@@ -1,98 +1,131 @@
 ---
 title: "VoicemailDetector"
-description: "Technical implementation details and architecture for voicemail detection"
+description: "Reference for VoicemailDetector and TTSGate: classifier-based voicemail detection for outbound calls, with parameters and events."
 ---
 
 ## Overview
 
-This document provides technical implementation details for the VoicemailDetector, including its parallel pipeline architecture and performance considerations for production use.
+`VoicemailDetector` decides whether an outbound call reached a person or went to voicemail. It listens to what the other side says and asks a [classifier](/api-reference/server/classifiers/overview). Until it has a verdict, its `TTSGate` holds the bot's speech back, so a voicemail greeting is never talked over and a person hears the bot's reply as soon as the verdict is in.
+
+For a guide to setting it up, see [Voicemail Detection](/pipecat/fundamentals/voicemail).
 
 <CardGroup cols={2}>
   <Card
-    title="API Reference"
-    icon="book"
-    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.extensions.voicemail.voicemail_detector.html"
+    title="Voicemail Detection Guide"
+    icon="voicemail"
+    href="/pipecat/fundamentals/voicemail"
   >
-    Complete API documentation for all VoicemailDetector classes and methods
+    Set up voicemail detection and leave a message
   </Card>
   <Card
     title="Example Implementation"
     icon="code"
     href="https://github.com/pipecat-ai/pipecat/blob/main/examples/features/features-voicemail-detection.py"
   >
-    Working example showing VoicemailDetector integration in a complete pipeline
+    A complete outbound bot with voicemail detection
   </Card>
 </CardGroup>
 
-## Architecture
+```python
+from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
+```
 
-The VoicemailDetector uses a parallel pipeline architecture with two processing branches:
+## Configuration
 
-- **Conversation Branch**: Handles normal conversation flow and can be blocked when voicemail is detected to prevent the main LLM from processing additional input.
+<ParamField path="classifier" type="BaseClassifier" required>
+  What decides between a person and a voicemail, such as a
+  [`JevClassifier`](/api-reference/server/classifiers/jev) or an
+  [`LLMClassifier`](/api-reference/server/classifiers/llm). The detector owns
+  its lifecycle: it sets the classifier up and cleans it up with the pipeline.
+</ParamField>
 
-- **Classification Branch**: Contains the LLM classifier and decision logic. This branch closes after making a classification decision to prevent unnecessary LLM calls.
+<ParamField path="decision_timeout" type="float" default="1.0">
+  Seconds of silence after the caller stops speaking before the latest answer
+  decides. A greeting resumes after its pauses while a person stops and waits,
+  so a verdict on a fragment such as "hi, this is Sam" is not acted on until the
+  caller has really stopped.
+</ParamField>
 
-The system coordinates between branches using a notification system and gates that control frame flow based on classification decisions. TTS frames are buffered during classification and either released (for conversations) or cleared (for voicemail) based on the decision.
+<ParamField path="voicemail_response_delay" type="float" default="2.0">
+  Seconds of silence after a voicemail verdict before `on_voicemail_detected`
+  fires, so the message is left after the greeting ends and the recording
+  starts. Speech, such as the rest of the greeting, restarts the wait.
+</ParamField>
 
-## Performance Considerations
+<ParamField path="llm" type="LLMService | None" default="None" deprecated>
+  _Deprecated since 1.12.0, removed in 2.0.0._ An LLM service for the
+  classification. It is wrapped in an `LLMClassifier`. Pass
+  `classifier=LLMClassifier(llm=llm)` instead.
+</ParamField>
 
-### LLM Selection
+<ParamField path="custom_system_prompt" type="str | None" default="None" deprecated>
+  _Deprecated since 1.12.0, removed in 2.0.0._ A system prompt for the `llm`,
+  placed in front of the `LLMClassifier`'s own instructions. Pass an
+  `LLMClassifier` with your own `instructions` instead.
+</ParamField>
 
-The VoicemailDetector works with two separate LLMs in your pipeline:
+## Methods
 
-**Conversation LLM (main pipeline):**
+### detector
 
-- Must be text-based for compatibility with the VoicemailDetector's gating system
-- Realtime LLMs are not compatible as they don't allow the required level of output control
-- This is the LLM that handles normal conversation after classification
+```python
+def detector() -> VoicemailDetector
+```
 
-**Classifier LLM (VoicemailDetector parameter):**
+The processor to place after the STT service and before the user context aggregator. It is the detector itself.
 
-- Can be either text-based or realtime LLMs
-- For realtime LLMs: Set output modality to `text` to ensure text-based responses
-- Must be able to output "CONVERSATION" or "VOICEMAIL" keywords for classification
-- Recommended models: OpenAILLMService with `gpt-4o`, GoogleLLMService with `gemini-2.0-flash`
+### gate
 
-The two LLMs operate independently. You can use a realtime LLM for classification (with text output) while using a text-based LLM for conversation, or use text-based LLMs for both.
+```python
+def gate() -> TTSGate
+```
 
-### Response Timing
+The `TTSGate` to place right after the TTS service. While the decision is pending it buffers TTS frames (`TTSStartedFrame`, `TTSTextFrame`, `TTSAudioRawFrame`, `TTSStoppedFrame`) and passes everything else. A conversation verdict releases the buffered frames in order. A voicemail verdict discards them, since they were meant for a person.
 
-The `voicemail_response_delay` parameter should be tuned based on your target voicemail systems. The default value of 2 seconds is a good starting point, but you may need to adjust it based on your target voicemail systems.
+## How the Decision Is Made
 
-## Common Issues
+1. After each transcription, the detector asks the classifier a choice question, `"conversation"` or `"voicemail"`, about the whole transcript so far. Transcriptions that arrive while a question is in flight are asked about together in the next one.
+2. The detector keeps the latest answer but does not act on it while the caller is speaking.
+3. Once the caller has been quiet for `decision_timeout` and any question in flight has been answered, the latest answer becomes the verdict. The verdict is final.
+4. If the classifier never answered, because every call failed or timed out, the detector assumes a conversation, so a person is never left waiting on a bot that won't speak.
 
-**Classification not working:**
+On a **conversation** verdict, the gate releases the held speech and `on_conversation_detected` fires.
 
-- Confirm both `detector()` and `gate()` are correctly placed in pipeline
-- Check that STT service is producing text input for classification
-- Ensure the LLM is a text-based LLM
-
-**Timing problems:**
-
-- Adjust `voicemail_response_delay` based on observed voicemail greeting patterns
-- Monitor classification speed; slow LLM responses affect conversation latency
-
-**Audio playback issues:**
-
-- Ensure `gate()` is placed immediately after TTS service
-- Verify TTS frames are being generated before classification completes
-
-**Custom prompt validation:**
-The system validates custom prompts and warns if they're missing required response keywords ("CONVERSATION" and "VOICEMAIL"). Include the `CLASSIFIER_RESPONSE_INSTRUCTION` constant to ensure proper functionality.
+On a **voicemail** verdict, the gate drops the held speech and the pipeline is interrupted. From then on the detector stops passing the other side's frames downstream (only system, end, stop and agent lifecycle frames still flow), so the greeting never reaches the conversation LLM. After `voicemail_response_delay` of silence, `on_voicemail_detected` fires, once.
 
 ## Event Handlers
 
-| Event                      | Description                                |
-| -------------------------- | ------------------------------------------ |
-| `on_conversation_detected` | Live conversation detected (not voicemail) |
-| `on_voicemail_detected`    | Voicemail detected                         |
+| Event                      | Description                                                                 |
+| -------------------------- | --------------------------------------------------------------------------- |
+| `on_conversation_detected` | A person answered. The held speech has been released.                       |
+| `on_voicemail_detected`    | The call went to voicemail and the greeting has been quiet for `voicemail_response_delay`. |
+
+Both handlers receive the detector, which is a frame processor, so a handler can push frames through it:
 
 ```python
 @voicemail_detector.event_handler("on_conversation_detected")
 async def on_conversation_detected(detector):
-    print("Live person detected — starting conversation")
+    logger.info("A person answered")
+
 
 @voicemail_detector.event_handler("on_voicemail_detected")
 async def on_voicemail_detected(detector):
-    print("Voicemail detected — leaving message")
+    await detector.push_frame(TTSSpeakFrame("Hi, this is Alex. Please call me back."))
+    await detector.push_frame(EndWorkerFrame())
 ```
+
+## Metrics
+
+The detector pushes its classifier's [`on_metrics`](/api-reference/server/classifiers/overview#on_metrics) data into the pipeline as a `MetricsFrame`, so the time each classification took (and, with `JevClassifier`, the tokens it used) shows up alongside the pipeline's other metrics.
+
+## Requirements
+
+- The detector is built for a cascaded pipeline: it reads the STT service's transcriptions and holds the TTS service's output.
+- An `LLMClassifier` needs a service that supports `run_inference()`, so a realtime (speech-to-speech) LLM cannot back it.
+
+## Removed in 1.12.0
+
+The detector used to run a parallel pipeline with its own LLM. These parts of it were removed from `pipecat.extensions.voicemail.voicemail_detector`:
+
+- `NotifierGate`, `ClassifierGate`, `ConversationGate` and `ClassificationProcessor`
+- `VoicemailDetector.CLASSIFIER_RESPONSE_INSTRUCTION` and `VoicemailDetector.DEFAULT_SYSTEM_PROMPT`
