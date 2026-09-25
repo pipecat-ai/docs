@@ -7564,9 +7564,9 @@ async def on_assistant_turn_stopped(aggregator, message):
 
 ### Interruptions with no transcript
 
-When the user interrupts but nothing is transcribed — a cough, background noise, or speech the STT could not recognize — the bot stops talking but the context has no new user message. By default, the aggregator runs the LLM once with a developer message asking the user to repeat or resuming where it left off. This prevents the conversation from stalling mid-response.
+When the user interrupts but nothing is transcribed — a cough, background noise, or speech the STT could not recognize — the bot stops talking but the context has no new user message. By default, the aggregator runs the LLM once, so the bot asks the user to repeat or picks up where it left off. This prevents the conversation from stalling mid-response.
 
-Configure this behavior with the [`empty_user_turn`](/api-reference/server/utilities/turn-management/user-turn-strategies#additional-parameters) parameter on `LLMUserAggregatorParams`. Set it to `None` to leave such turns unanswered, or customize the prompts with `EmptyUserTurnConfig`.
+Configure this behavior with the [`empty_user_turn`](/api-reference/server/utilities/turn-management/user-turn-strategies#param-empty-user-turn) parameter on `LLMUserAggregatorParams`. Set it to `None` to leave such turns unanswered, or customize the prompts with `EmptyUserTurnConfig`.
 
 ## Controlling interruptions
 
@@ -7997,8 +7997,9 @@ Idle detection monitors user activity and:
 1. Starts a timer when the bot finishes speaking (`BotStoppedSpeakingFrame`)
 2. Cancels the timer when the user or bot starts speaking
 3. Suppresses the timer during function calls and active user turns (to avoid false triggers during interruptions)
-4. Emits an `on_user_turn_idle` event when the timer expires
-5. Allows you to implement escalating responses or gracefully end the conversation in your application code
+4. Restarts the timer after a user turn that ends with no transcript and gets no reply (e.g. background noise)
+5. Emits an `on_user_turn_idle` event when the timer expires
+6. Allows you to implement escalating responses or gracefully end the conversation in your application code
 
 ## Basic Implementation
 
@@ -81582,6 +81583,11 @@ The config distinguishes two cases:
   answered (default `1`). Further ones are left unanswered until the user says
   something that is transcribed.
 
+No recovery runs while the user is muted or a function call is pending, since
+the function call's result runs the LLM anyway. An empty turn is ended by
+`user_turn_stop_timeout`, so the recovery follows that long after the user
+stops speaking.
+
 Ignored with a realtime LLM service, which hears the user's audio directly.
 
 </ParamField>
@@ -83080,17 +83086,23 @@ async def on_user_turn_message_added(aggregator, message: UserTurnMessageAddedMe
 
 ### on_user_turn_stop_timeout
 
-Fired when a user turn times out without any stop strategy triggering. This is a fallback mechanism that ends the turn after a configurable timeout period (default: 5.0 seconds) when the user has stopped speaking according to VAD but no transcription-based stop has occurred. Commonly, this event is used to retrigger the LLM response after the user has stopped speaking.
+Fired when a user turn times out without any stop strategy triggering. This is a fallback mechanism that ends the turn after a configurable timeout period (default: 5.0 seconds) when the user has stopped speaking according to VAD but no transcription-based stop has occurred.
 
 ```python
 @user_aggregator.event_handler("on_user_turn_stop_timeout")
 async def on_user_turn_stop_timeout(aggregator):
-    message = {
-        "role": "developer",
-        "content": "Continue.",
-    }
-    await user_aggregator.queue_frame(LLMMessagesAppendFrame([message], run_llm=True))
+    logger.info("User turn ended by the stop timeout")
 ```
+
+<Tip>
+  A turn that times out often has no transcript at all, for example a cough,
+  background noise, or speech the STT could not recognize. To get the bot to
+  respond after such a turn, use
+  [`empty_user_turn`](/api-reference/server/utilities/turn-management/user-turn-strategies#param-empty-user-turn)
+  instead of running the LLM from this event. It's on by default for turns that
+  interrupted the bot, and `idle_prompt` extends it to turns while the bot was
+  waiting for the user.
+</Tip>
 
 **Parameters:**
 
