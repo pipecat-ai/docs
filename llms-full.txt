@@ -9242,14 +9242,15 @@ The detector is optimized for fast conversation response times, where TTS output
 
 ## How It Works
 
-The VoicemailDetector uses a parallel pipeline architecture to perform real-time classification without interrupting conversation flow. It analyzes the initial response from the called party and determines whether it's a human greeting or an automated voicemail system.
+The VoicemailDetector collects what the other side says and asks its classifier after each transcription whether the call reached a person or a voicemail. Once the caller has been quiet for `decision_timeout` (default 1 second), the latest answer decides. The detector holds the bot's speech until the decision is made.
 
 Key features:
 
-- **Real-time classification** - Determines conversation vs voicemail as soon as audio is received
+- **Progressive classification** - Re-evaluates the classification as more speech is heard
+- **Silence-based decision** - Waits for silence to distinguish greetings from conversations
 - **TTS gating** - Holds generated audio until classification is complete
 - **Event-driven** - Triggers custom handlers when voicemail is detected
-- **Configurable timing** - Adjustable delay for voicemail response timing
+- **Configurable timing** - Adjustable delays for decision and voicemail response timing
 
 ## Basic Setup
 
@@ -9257,23 +9258,24 @@ Key features:
 
 ```python
 from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.classifiers.jev.classifier import JevClassifier
 
-# Create an LLM for classification
-classifier_llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+# Create a classifier for voicemail detection
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
 
 # Initialize the detector
 voicemail_detector = VoicemailDetector(
-    llm=classifier_llm,
-    voicemail_response_delay=2.0  # Default: 2 seconds
+    classifier=classifier,
+    voicemail_response_delay=2.0,  # Default: 2 seconds
+    decision_timeout=1.0  # Default: 1 second
 )
 ```
 
 <Note>
-  The VoicemailDetector works with two LLMs: your main conversation LLM (which
-  must be text-based) and the classifier LLM (which can be either text-based or
-  realtime with a `text` output modality). Realtime LLMs are not compatible for
-  the main conversation LLM due to output control requirements.
+  VoicemailDetector requires a classifier that implements the `BaseClassifier`
+  interface. You can use `JevClassifier` for fast classification, or
+  `LLMClassifier` with any LLM service that supports `run_inference()`. Realtime
+  LLMs cannot back an `LLMClassifier` as they don't support one-shot inference.
 </Note>
 
 ### 2. Configure the Pipeline
@@ -9322,46 +9324,54 @@ When a conversation is detected, no additional processing is required by the Voi
 
 ## Configuration Options
 
-### Custom System Prompt
+### Using an LLM Classifier
 
-For specialized use cases, you can provide a custom classification prompt. The prompt must instruct the LLM to respond with exactly "CONVERSATION" or "VOICEMAIL":
+If you prefer to use an LLM for classification instead of JevClassifier, you can use `LLMClassifier`:
 
 ```python
-custom_prompt = """
-Your custom classification logic here.
-Consider factors like business hours, call patterns, etc.
-""" + VoicemailDetector.CLASSIFIER_RESPONSE_INSTRUCTION
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.services.openai.llm import OpenAILLMService
 
-voicemail_detector = VoicemailDetector(
-    llm=classifier_llm,
-    custom_system_prompt=custom_prompt
-)
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+classifier = LLMClassifier(llm=llm, timeout=10.0)  # Default timeout: 10 seconds
+
+voicemail_detector = VoicemailDetector(classifier=classifier)
 ```
 
-<Note>
-  The `CLASSIFIER_RESPONSE_INSTRUCTION` constant contains the required response
-  format: `'Respond with ONLY "CONVERSATION" if a person answered, or
-  "VOICEMAIL" if it\'s voicemail/recording.'`
-</Note>
+`LLMClassifier` automatically handles the classification prompt and response parsing. It supports any LLM service that implements `run_inference()`.
 
-For most use cases, the default classifier prompt will work effectively. If you need to customize the behavior, reference the built-in prompt as a starting point and modify from there.
+<Warning>
+  The `llm` and `custom_system_prompt` parameters are deprecated since version
+  1.12.0 and will be removed in version 2.0.0. Use the `classifier` parameter
+  instead. For backward compatibility, passing `llm` will automatically wrap it
+  in an `LLMClassifier`.
+</Warning>
 
 ### Response Timing
 
-The `voicemail_response_delay` parameter controls how long to wait after the user stops speaking before triggering the voicemail event:
+The detector has two timing parameters:
+
+**`decision_timeout`** controls how long to wait after the caller stops speaking before acting on the latest classification:
 
 ```python
 voicemail_detector = VoicemailDetector(
-    llm=classifier_llm,
+    classifier=classifier,
+    decision_timeout=1.5  # Wait 1.5 seconds instead of default 1
+)
+```
+
+This ensures the detector distinguishes between a pause in a greeting (which resumes) and a person who has finished speaking and is waiting for a response.
+
+**`voicemail_response_delay`** controls how long to wait after a voicemail verdict before triggering the `on_voicemail_detected` event:
+
+```python
+voicemail_detector = VoicemailDetector(
+    classifier=classifier,
     voicemail_response_delay=3.0  # Wait 3 seconds instead of default 2
 )
 ```
 
-This delay ensures:
-
-- Voicemail greetings have finished playing
-- The response occurs during the recording period
-- Proper timing for different voicemail system behaviors
+This delay ensures the voicemail greeting has finished and the recording has started before the message is left.
 
 # IVR Navigation
 Source: https://docs.pipecat.ai/pipecat/fundamentals/ivr.md
@@ -74845,59 +74855,56 @@ This document provides technical implementation details for the VoicemailDetecto
 
 ## Architecture
 
-The VoicemailDetector uses a parallel pipeline architecture with two processing branches:
+The VoicemailDetector is a single frame processor placed after the STT service. It collects transcriptions and asks its classifier whether the call reached a person or a voicemail. After each transcription, the classifier runs in the background and the detector keeps the latest answer. Once the caller has been quiet for `decision_timeout` (default 1 second), the latest answer decides.
 
-- **Conversation Branch**: Handles normal conversation flow and can be blocked when voicemail is detected to prevent the main LLM from processing additional input.
-
-- **Classification Branch**: Contains the LLM classifier and decision logic. This branch closes after making a classification decision to prevent unnecessary LLM calls.
-
-The system coordinates between branches using a notification system and gates that control frame flow based on classification decisions. TTS frames are buffered during classification and either released (for conversations) or cleared (for voicemail) based on the decision.
+The detector holds the bot's speech via a `TTSGate` processor placed after the TTS service. TTS frames are buffered while the decision is pending, then either released (for conversations) or cleared (for voicemail) based on the verdict.
 
 ## Performance Considerations
 
-### LLM Selection
+### Classifier Selection
 
-The VoicemailDetector works with two separate LLMs in your pipeline:
+The VoicemailDetector requires a classifier that implements the `BaseClassifier` interface:
 
-**Conversation LLM (main pipeline):**
+**JevClassifier:**
 
-- Must be text-based for compatibility with the VoicemailDetector's gating system
-- Realtime LLMs are not compatible as they don't allow the required level of output control
-- This is the LLM that handles normal conversation after classification
+- Fast, specialized classification service
+- Recommended for production use
+- Requires a Typesafe API key
 
-**Classifier LLM (VoicemailDetector parameter):**
+**LLMClassifier:**
 
-- Can be either text-based or realtime LLMs
-- For realtime LLMs: Set output modality to `text` to ensure text-based responses
-- Must be able to output "CONVERSATION" or "VOICEMAIL" keywords for classification
-- Recommended models: OpenAILLMService with `gpt-4o`, GoogleLLMService with `gemini-2.0-flash`
+- Uses any LLM service with `run_inference()` support
+- Cannot use realtime LLMs (they don't support one-shot inference)
+- Has a configurable `timeout` parameter (default 10 seconds)
+- Recommended models: OpenAI `gpt-4o`, Google `gemini-2.0-flash`
 
-The two LLMs operate independently. You can use a realtime LLM for classification (with text output) while using a text-based LLM for conversation, or use text-based LLMs for both.
+The main conversation LLM operates independently and can be any type (text-based or realtime).
 
 ### Response Timing
 
-The `voicemail_response_delay` parameter should be tuned based on your target voicemail systems. The default value of 2 seconds is a good starting point, but you may need to adjust it based on your target voicemail systems.
+The detector has two timing parameters that should be tuned based on your use case:
+
+- `decision_timeout` (default 1.0s): How long to wait after the caller stops speaking before acting on the latest classification
+- `voicemail_response_delay` (default 2.0s): How long to wait after a voicemail verdict before leaving the message
 
 ## Common Issues
 
 **Classification not working:**
 
 - Confirm both `detector()` and `gate()` are correctly placed in pipeline
-- Check that STT service is producing text input for classification
-- Ensure the LLM is a text-based LLM
+- Check that STT service is producing transcriptions
+- Verify the classifier is responding (check logs for classification failures)
 
 **Timing problems:**
 
+- Adjust `decision_timeout` if verdicts are too fast or too slow
 - Adjust `voicemail_response_delay` based on observed voicemail greeting patterns
-- Monitor classification speed; slow LLM responses affect conversation latency
+- Monitor classification speed with metrics
 
 **Audio playback issues:**
 
 - Ensure `gate()` is placed immediately after TTS service
 - Verify TTS frames are being generated before classification completes
-
-**Custom prompt validation:**
-The system validates custom prompts and warns if they're missing required response keywords ("CONVERSATION" and "VOICEMAIL"). Include the `CLASSIFIER_RESPONSE_INSTRUCTION` constant to ensure proper functionality.
 
 ## Event Handlers
 
