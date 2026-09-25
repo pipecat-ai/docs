@@ -1,0 +1,267 @@
+---
+title: "Pipecat Classifiers"
+sidebarTitle: "Classifiers"
+description: "Answer small yes/no, choice, and score questions with JevClassifier or LLMClassifier, with probabilities and no conversation LLM turn."
+---
+
+Besides holding the conversation, a voice agent makes lots of small decisions. Did the call reach a person or a voicemail? Which button does "the blue one" mean? Is this click worth a comment? Is the customer about to cancel?
+
+You could ask your conversation LLM each time, but that costs a full LLM turn, adds text to the context, and leaves you parsing free-form answers. A **classifier** is built for these questions. You ask it typed questions about some state and get typed answers with probabilities, in one call, without touching the conversation.
+
+## Pipeline Integration
+
+A classifier is not a pipeline component. It's a plain object: whoever needs answers creates one, keeps it, and calls it. Nothing is added to the pipeline and no frames flow into it.
+
+Most of the time you don't call it yourself. Pipecat components that make small decisions take one as a `classifier` argument and ask it for you:
+
+```python
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+
+voicemail = VoicemailDetector(classifier=classifier)
+```
+
+The rest of this page shows how to ask a classifier directly, which is also how those components use it.
+
+## Asking a Question
+
+Create a classifier and ask it a question about a **state**, the thing the question is about:
+
+```python
+import os
+
+from pipecat.classifiers.base_classifier import YesNoQuestion
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+
+results = await classifier.yes_no(
+    "Hi, you've reached Dana. Leave a message.",
+    {"voicemail": YesNoQuestion(instructions="is this a voicemail greeting?")},
+)
+
+results["voicemail"].is_yes  # True
+results["voicemail"].probability  # 0.97
+```
+
+Questions are passed by name, and the results come back under the same names. That's what lets you ask several questions at once, as shown below.
+
+## Three Kinds of Question
+
+Every question is one of three kinds, and each kind has its own result type.
+
+<Tabs>
+  <Tab title="Yes or no">
+    A `YesNoQuestion` asks whether the state meets a condition. Add `yes` and `no` when the question alone leaves the boundary open.
+
+    ```python
+    YesNoQuestion(
+        instructions="Does the customer want money back?",
+        yes="asks for a refund, a credit, or a charge to be reversed",
+        no="anything else",
+    )
+    ```
+
+    The `YesNoResult` has the `probability` that the answer is yes and `is_yes`, which is true when yes is the likelier answer.
+
+  </Tab>
+  <Tab title="Choice">
+    A `ChoiceQuestion` asks which of several options fits. Each option maps to a description of when it applies, or `None` when its name says enough.
+
+    ```python
+    ChoiceQuestion(
+        instructions="Which team should take this call?",
+        options={
+            "billing": "invoices, payments, refunds",
+            "technical": "bugs, outages, errors",
+            "sales": "pricing, new contracts",
+            "other": None,
+        },
+    )
+    ```
+
+    The `ChoiceResult` has the `choice`, a `probabilities` dict with one entry per option, and the `confidence` in the choice.
+
+  </Tab>
+  <Tab title="Score">
+    A `ScoreQuestion` asks where the state falls on an ordered scale. List at least two `levels`, lowest first.
+
+    ```python
+    ScoreQuestion(
+        instructions="How upset is the customer?",
+        levels=["calm", "frustrated", "angry"],
+    )
+    ```
+
+    The `ScoreResult` has a `score` from 0 (the first level) to one less than the number of levels. It's the probability-weighted position, so a score of 1.4 sits between "frustrated" and "angry". It also has the probability of each level in `levels`, and `probability(level)` to look one up.
+
+  </Tab>
+</Tabs>
+
+## Asking Several Questions at Once
+
+Several questions about the same state go in one call rather than one call each. `ask()` takes any mix of kinds and returns a result of the right type for each:
+
+```python
+from pipecat.classifiers.base_classifier import (
+    ChoiceQuestion,
+    ScoreQuestion,
+    YesNoQuestion,
+)
+
+transcript = [
+    {"role": "assistant", "content": "Thanks for calling Acme. How can I help you today?"},
+    {"role": "user", "content": "I was charged twice for March. This is the third time I'm calling."},
+    {"role": "assistant", "content": "I'm sorry about that. Let me look at the account."},
+    {"role": "user", "content": "Honestly, if this isn't fixed today I'm cancelling."},
+]
+
+results = await classifier.ask(
+    transcript,
+    {
+        "refund": YesNoQuestion(instructions="Does the customer want money back?"),
+        "department": ChoiceQuestion(
+            instructions="Which team should take this call?",
+            options={"billing": None, "technical": None, "sales": None, "other": None},
+        ),
+        "mood": ScoreQuestion(
+            instructions="How upset is the customer?",
+            levels=["calm", "frustrated", "angry"],
+        ),
+    },
+)
+```
+
+With `ask()`, each result's type depends on its question. When every question is the same kind, `yes_no()`, `choice()` and `score()` return results that are already typed.
+
+Notice the state here. It can be plain text, or structured data such as a transcript with speaker roles, a dict of fields, or a trimmed screen snapshot. Structured data tells the classifier more: with roles, it knows which lines the customer said.
+
+<Tip>
+  Run
+  [`features-classifiers.py`](https://github.com/pipecat-ai/pipecat/blob/main/examples/features/features-classifiers.py)
+  to ask these three questions yourself, with Jev or with an OpenAI model.
+</Tip>
+
+## Choosing a Classifier
+
+Pipecat includes two classifiers. They answer the same questions and return the same results, so you can swap one for the other.
+
+|                   | `JevClassifier`                                              | `LLMClassifier`                                         |
+| ----------------- | ------------------------------------------------------------ | ------------------------------------------------------- |
+| **Backed by**     | Jev, TypeSafe's hosted classification model                  | Any Pipecat LLM service with `run_inference()`          |
+| **Speed**         | About a tenth of a second                                    | A full LLM request                                      |
+| **Probabilities** | Calibrated                                                   | Whatever the LLM writes                                 |
+| **Setup**         | `uv add "pipecat-ai[jev]"` and a `TYPESAFE_API_KEY`          | None beyond the LLM you already use                     |
+| **Metrics**       | Time and tokens                                              | Time only                                               |
+
+`LLMClassifier` wraps an LLM service you already have. It calls the service directly, outside the pipeline, so the service doesn't need to be in one:
+
+```python
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.services.openai.llm import OpenAILLMService
+
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+)
+classifier = LLMClassifier(llm=llm)
+```
+
+Start with `LLMClassifier` if you'd rather not add a dependency, and switch to `JevClassifier` when decisions sit on the path to the user hearing a reply, such as voicemail detection, where every extra fraction of a second is noticeable.
+
+## Acting on the Answer
+
+`is_yes` is true when yes is the likelier answer, a probability of 0.5 or more. When acting on a wrong answer is costly, compare the probability with a threshold of your own:
+
+```python
+result = (await classifier.yes_no(state, {"cancel": question}))["cancel"]
+if result.probability > 0.8:
+    await offer_retention_discount()
+```
+
+Thresholds are only meaningful when the probabilities are calibrated, which is what Jev provides. `JevClient` pins the Jev model version by default, so thresholds you tune keep holding until you choose to upgrade.
+
+## Using a Classifier in Your Own Code
+
+When you ask a classifier from your own processor or agent, keep three things in mind:
+
+- **Lifecycle.** Call `setup()` with your task manager before the first question and `cleanup()` when you are done. `JevClassifier` opens its connection in `setup()`, so the first question does not pay for it.
+- **Errors.** A classifier that cannot answer, or doesn't answer in time, raises `ClassifierError`. Every classifier has a timeout, so a call never hangs. Decide what your code does without an answer.
+- **Metrics.** After every call, the classifier fires `on_metrics` with the time it took and, when it knows, the tokens it used. A classifier can't push frames, so a processor that owns one pushes the data as a `MetricsFrame`.
+
+```python
+from pipecat.classifiers.base_classifier import ClassifierError, YesNoQuestion
+from pipecat.frames.frames import MetricsFrame
+from pipecat.processors.frame_processor import FrameProcessor
+
+
+class ChurnDetector(FrameProcessor):
+    def __init__(self, classifier):
+        super().__init__()
+        self._classifier = classifier
+        self._classifier.add_event_handler("on_metrics", self._on_metrics)
+
+    async def setup(self, setup):
+        await super().setup(setup)
+        await self._classifier.setup(self.task_manager)
+
+    async def cleanup(self):
+        await super().cleanup()
+        await self._classifier.cleanup()
+
+    async def _on_metrics(self, classifier, data):
+        await self.push_frame(MetricsFrame(data=data))
+
+    async def _is_churning(self, transcript) -> bool:
+        question = YesNoQuestion(instructions="Might the customer leave?")
+        try:
+            results = await self._classifier.yes_no(transcript, {"churn": question})
+        except ClassifierError:
+            return False
+        return results["churn"].probability > 0.8
+```
+
+## Where Pipecat Uses Classifiers
+
+<CardGroup cols={2}>
+  <Card
+    title="Voicemail Detection"
+    icon="voicemail"
+    href="/pipecat/fundamentals/voicemail"
+  >
+    `VoicemailDetector` asks whether an outbound call reached a person or a
+    voicemail.
+  </Card>
+  <Card title="Controlling the UI" icon="window" href="/pipecat/learn/ui-worker">
+    `UIWorker` asks which element the user means and what is on the screen,
+    without an LLM turn.
+  </Card>
+</CardGroup>
+
+## Key Takeaways
+
+- **A classifier is a plain object** that answers typed questions about some state. It doesn't sit in the pipeline.
+- **Three kinds of question**: yes or no, a choice among options, and a score on a scale, each with probabilities.
+- **Ask several at once**: questions go by name, and all the questions about one state share one call.
+- **Two classifiers, one interface**: `JevClassifier` for fast, calibrated answers, and `LLMClassifier` over any LLM service you already use.
+
+## What's Next
+
+With the single-agent basics and classifiers covered, let's see how Pipecat coordinates multiple agents, starting with giving an agent its own LLM and tools.
+
+<Card
+  title="Multiple LLM Agents"
+  icon="arrow-right"
+  href="/pipecat/learn/multiple-llm-agents"
+>
+  Give an agent its own LLM and register tools with the @tool decorator
+</Card>
+
+<Card
+  title="Classifiers API Reference"
+  icon="book"
+  href="/api-reference/server/classifiers/overview"
+>
+  Question and result types, `JevClassifier`, and `LLMClassifier`
+</Card>
