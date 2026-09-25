@@ -77146,11 +77146,22 @@ All observers must inherit from `BaseObserver` and can implement these methods:
 
 `ProcessorSetUp` carries the `processor` and the `started_at_ns` / `finished_at_ns` bracketing its `setup()`. Services connect during setup, so this is where that cost can be measured. Processors are set up concurrently, so these arrive in completion order rather than pipeline order, and the times come from `time.monotonic_ns()` because the pipeline clock isn't running yet.
 
+### Frame Push Behavior
+
+A frame is pushed again by every processor that passes it along. By default, an observer receives every push. An observer that handles a frame once (such as one that reports the moment a frame represents) should set `observe_every_push=False` and will be told about a frame only on its first push.
+
+The `FramePushed` event includes a `first_push` field that identifies whether this is the first time a frame is being pushed, allowing observers to distinguish the initial push from subsequent relays.
+
 ```python
 from pipecat.observers.base_observer import BaseObserver, FramePushed, FrameProcessed
 
 class CustomObserver(BaseObserver):
+    def __init__(self):
+        # observe_every_push=True by default
+        super().__init__()
+
     async def on_push_frame(self, data: FramePushed):
+        # data.first_push tells you if this is the first push
         # Your frame observation logic here
         pass
 
@@ -77161,6 +77172,20 @@ class CustomObserver(BaseObserver):
     async def on_pipeline_started(self):
         # Called when the pipeline has fully started
         pass
+```
+
+**Example: Observer that handles each frame once**
+
+```python
+class EventObserver(BaseObserver):
+    def __init__(self):
+        # Only observe the first push of each frame
+        super().__init__(observe_every_push=False)
+
+    async def on_push_frame(self, data: FramePushed):
+        # This is called once per frame, on its first push
+        if isinstance(data.frame, BotStartedSpeakingFrame):
+            logger.info("Bot started speaking")
 ```
 
 ## Lifecycle and Cleanup
@@ -77382,7 +77407,6 @@ The `ErrorObserver` reports each error a pipeline raises, once, where it is rais
 - Includes recovered errors that don't reach the top of the pipeline
 - Provides error categorization via `ErrorCategory`
 - Tracks processor usability after failures
-- Deduplicates errors that travel through multiple processors
 
 ## Usage
 
@@ -77444,7 +77468,7 @@ Each error is reported as an `ErrorEvent` with the following fields:
 
 ## Notes
 
-- Errors are reported once per occurrence, even though they travel upstream through multiple processors
+- Errors are reported once per occurrence, on their first push
 - An error is attributed to the processor that raised it, not the ones that passed it along
 - `processor_usable` distinguishes transient failures (unreachable service) from permanent ones (invalid credentials)
 - Errors recovered by a processor (e.g., service switcher failover) are still reported, unlike `PipelineWorker.on_pipeline_error` which only sees errors that reach the top
@@ -77809,7 +77833,6 @@ The observer monitors `MetricsFrame` instances flowing through the pipeline. Eac
 2. Observer extracts each metric from the frame
 3. Observer converts metrics to structured records
 4. Observer emits `on_service_latency` or `on_service_usage` events
-5. Frame is marked as reported to avoid duplicates
 
 Metrics are reported individually per piece of work. A turn that triggers two LLM inferences reports two `on_service_usage` events.
 
@@ -77817,7 +77840,6 @@ Metrics are reported individually per piece of work. A turn that triggers two LL
 
 - **No aggregation**: Records are never summed. Group them yourself as needed.
 - **What's excluded**: Processing time, text aggregation latency, and smart-turn predictions are deliberately absent. They describe internal behavior rather than what users wait for.
-- **Duplicate prevention**: Each `MetricsFrame` is reported once, even if relayed through multiple processors.
 - **Requires metrics**: Services must emit `MetricsFrame` instances (most do by default).
 
 # Speaking Observer
@@ -77936,7 +77958,6 @@ The user appears at two layers because they answer different questions: `user_sp
 - **Accurate timing**: Speech is timed to when it began and ended, not to when the detector confirmed it. An interval drawn from these timestamps matches what was actually said.
 - **Self-contained records**: Moments that close a stretch of speech include `started_at`, so you can read duration from a single record without pairing it with the opening moment.
 - **No turn definition**: What counts as a turn stays with the reader. A turn built into the records would freeze one definition into every event, where the moments can be grouped differently later.
-- **Duplicate prevention**: Each frame is reported once, even if relayed through multiple processors. Broadcast interruptions (which arrive as two frames) are reported once.
 - **Open stretches**: A stretch whose closing moment never arrives stays open rather than quietly joining itself to the next one.
 
 # Transcription Log Observer
@@ -78175,6 +78196,16 @@ async def on_turn_ended(observer, turn_number, duration, was_interrupted):
 
 You can configure the observer's behavior when creating a `PipelineWorker`:
 
+<ParamField path="turn_end_timeout_secs" type="float" default="2.5">
+  Timeout in seconds after bot stops speaking before automatically ending the
+  turn.
+</ParamField>
+
+<ParamField path="max_frames" type="int | None" default="None" deprecated>
+  **Deprecated since 1.12.0.** No replacement. The observer receives each frame
+  once. Will be removed in 2.0.0.
+</ParamField>
+
 ```python
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 
@@ -78379,9 +78410,9 @@ async def on_first_bot_speech_latency(observer, latency):
 
 ### Constructor Parameters
 
-<ParamField path="max_frames" type="int" default="100">
-  Maximum number of frame IDs to keep in history for duplicate detection.
-  Prevents unbounded memory growth in long conversations.
+<ParamField path="max_frames" type="int | None" default="None" deprecated>
+  **Deprecated since 1.12.0.** No replacement. The observer receives each frame
+  once. Will be removed in 2.0.0.
 </ParamField>
 
 <ParamField path="min_contribution_secs" type="float" default="0.005">
