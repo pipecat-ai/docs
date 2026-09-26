@@ -14230,9 +14230,24 @@ judge:
   When `transcription.service:` is omitted, it defaults to `moonshine`.
 </Note>
 
-In either modality, the `judge.eval:` block selects the judge LLM: `ollama` (the default, `gemma4:12b`, with an optional `endpoint:` for a remote Ollama), or any other OpenAI-compatible LLM through a [`factory:`](#custom-services-with-factory). `service: openai` is deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0. This is the LLM that decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics.
+In either modality, the `judge.eval:` block configures what decides the verdicts: `ollama` (the default, `gemma4:12b`, with an optional `endpoint:` for a remote Ollama), or a classifier or LLM through a [`factory:`](#custom-services-with-factory). `service: openai` is deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0. The judge decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics. An LLM judge also provides the reason behind each verdict; a classifier judge returns verdicts with confidence scores and can optionally use an `explainer:` LLM to generate reasons.
 
 An `extra:` mapping is forwarded to the judge as top-level request parameters, which is how provider-specific options reach it. The default judge is thinking-capable and only its JSON verdict is ever read, so the default `extra:` turns reasoning off. It buys nothing, costs latency, and eats into the token budget the verdict needs.
+
+When using a classifier for judging (via a `factory:`), verdicts include confidence scores but no reasons. An optional `explainer:` LLM block can be added to generate reasons for verdicts below a confidence threshold:
+
+```yaml
+judge:
+  eval:
+    factory: my_evals.classifier # returns a BaseClassifier
+    explainer:
+      service: ollama
+      model: gemma4:12b
+      extra:
+        reasoning_effort: none
+```
+
+The explainer runs only when needed and its reasons accompany the classifier's verdicts. Set `explainer: false` to disable reasons entirely.
 
 <Note>
   Naming a `model:` without an `extra:` drops the defaults rather than merging
@@ -14252,7 +14267,7 @@ A simulation's `simulator:` block, the LLM that plays the caller, takes the same
 
 ## Custom services with `factory:`
 
-The built-in `service:` names are the local, keyless services: Ollama for the judge and the persona, Kokoro for the user's voice, Moonshine and Whisper for the agent's audio. Any other provider is a `factory:`, a dotted path to a callable that takes the block's mapping and returns the service. The scenario stays a description of the test, while the provider, its settings, and its key live in code. Any extra keys you put in the block are passed through to your factory:
+The built-in `service:` names are the local, keyless services: Ollama for the judge and the persona, Kokoro for the user's voice, Moonshine and Whisper for the agent's audio. Any other provider is a `factory:`, a dotted path to a callable that takes the block's mapping and returns the service or classifier. The scenario stays a description of the test, while the provider, its settings, and its key live in code. Any extra keys you put in the block are passed through to your factory:
 
 ```yaml
 judge:
@@ -14298,7 +14313,8 @@ def voice(config):
 
 The pipeline sets each service's sample rate, so a factory doesn't. What a factory must return depends on the block:
 
-- `judge.eval:` and `simulator:`: an OpenAI-compatible LLM service, and for the persona one that supports function calling.
+- `judge.eval:`: a `BaseClassifier` (e.g., `JevClassifier`, `LLMClassifier`) or an OpenAI-compatible LLM service. When returning an LLM service, it will be wrapped in an `LLMClassifier` automatically.
+- `simulator:`: an OpenAI-compatible LLM service that supports function calling.
 - `user.speech:`: a local or HTTP TTS. The cache around it drives synthesis directly, so a WebSocket-streaming TTS yields nothing there.
 - `judge.transcription:`: any pipeline STT.
 
@@ -14836,11 +14852,12 @@ simulation = EvalSimulationScenario(
 
 ## Customizing the judge and the persona
 
-`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` works with any Pipecat LLM service backed by an OpenAI-compatible API, and `judge=` applies to either kind:
+`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` takes a classifier that decides verdicts, and optionally an explainer LLM that provides reasons. The `judge=` parameter applies to either kind:
 
 ```python
 import os
 
+from pipecat.classifiers.llm.classifier import LLMClassifier
 from pipecat.evals.judge import EvalJudge
 from pipecat.evals.session import EvalSession
 from pipecat.services.openai.llm import OpenAILLMService
@@ -14853,9 +14870,15 @@ llm = OpenAILLMService(
 session = EvalSession.from_scenario(
     scenario,
     "ws://localhost:7860",
-    judge=EvalJudge(llm),
+    judge=EvalJudge(LLMClassifier(llm=llm), explainer=llm),
 )
 ```
+
+<Note>
+  Passing an LLM service directly to `EvalJudge` (`EvalJudge(llm)` or
+  `EvalJudge(service=llm)`) is deprecated since 1.3.0 and will be removed in
+  2.0.0. Use `EvalJudge(LLMClassifier(llm=llm), explainer=llm)` instead.
+</Note>
 
 For a simulation, `persona_llm=` is the LLM that plays the caller. It runs inside the harness's own pipeline, so it can be any Pipecat `LLMService` that supports function calling, which the persona needs to hang up with its `end_call` tool. Passing it for a scripted scenario raises a `ValueError`:
 
@@ -90431,6 +90454,13 @@ await runner.run(worker)
 <ParamField path="enable_turn_tracking" type="bool" default="True">
   Whether to enable turn tracking. See [The OpenTelemetry
   guide](/api-reference/server/utilities/opentelemetry) for details.
+</ParamField>
+
+<ParamField path="enable_rtvi" type="bool | None" default="None">
+  Whether to automatically add RTVI support to the pipeline. `None` adds it
+  unless the pipeline is bridged: a bridged worker has no client of its own, and
+  its RTVI would report every frame a second time as it crosses the bridge. Pass
+  `True` to enable RTVI on a bridged worker, or `False` to disable it entirely.
 </ParamField>
 
 <ParamField path="conversation_id" type="str | None" default="None">
