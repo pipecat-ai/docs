@@ -3,7 +3,7 @@ title: "Using the Library"
 description: "Run scripted scenarios and simulations from Python with the pipecat.evals API: sessions, results, custom judges and persona LLMs, and suites."
 ---
 
-Everything the `pipecat eval` CLI does is available as a library under `pipecat.evals`. Use it to run evals from your own test runner (pytest, a CI script, a custom dashboard), to build scenarios in code instead of YAML, or to customize pieces like the judge LLM or the persona LLM.
+Everything the `pipecat eval` CLI does is available as a library under `pipecat.evals`. Use it to run evals from your own test runner (pytest, a CI script, a custom dashboard), to build scenarios in code instead of YAML, or to customize pieces like the judge or the persona LLM.
 
 A **session** is one conversation with a bot, driven to a result. `EvalSession.from_scenario()` builds the session for a loaded scenario of either kind: an `EvalScriptSession` for a [scripted scenario](/pipecat/evals/scripted-scenarios), which returns an `EvalScriptResult`, or an `EvalSimulationSession` for a [simulation](/pipecat/evals/simulated-scenarios), which returns an `EvalSimulationResult`. `EvalSession` is the base class of both, and `EvalSessionParams` is how a run behaves, whichever kind it is.
 
@@ -265,7 +265,7 @@ simulation = EvalSimulationScenario(
 
 ## Customizing the judge and the persona
 
-`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` takes a classifier that decides verdicts, and optionally an explainer LLM that provides reasons. The `judge=` parameter applies to either kind:
+`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` takes the [classifier](/pipecat/learn/classifiers) that decides the verdicts and, as `explainer=`, the LLM asked for the reason behind a `no` or an unsure verdict. For an LLM judge, that is one service in both roles. The `judge=` parameter applies to either kind:
 
 ```python
 import os
@@ -287,10 +287,26 @@ session = EvalSession.from_scenario(
 )
 ```
 
+To judge with [Jev](/pipecat/evals/scenario-configuration#judging-with-a-classifier), pass a `JevClassifier` and keep an LLM as the explainer, or pass `explainer=None` for verdicts with their probabilities alone:
+
+```python
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+judge = EvalJudge(
+    JevClassifier(api_key=os.environ["TYPESAFE_API_KEY"]),
+    explainer=llm,
+    explain_below=0.75,  # also explain a verdict less sure than this
+    allow_continue=False,  # every judged reply is a final answer
+)
+```
+
+`explain_below` and `allow_continue` are the [`explain_below:`](/pipecat/evals/scenario-configuration#reasons-from-the-explainer) and [`allow_continue:`](/pipecat/evals/scenario-configuration#final-answers-with-allow_continue) keys of a `judge.eval:` block. The judge sets its classifier up before its first question, and the session closes it when the run ends.
+
 <Note>
   Passing an LLM service directly to `EvalJudge` (`EvalJudge(llm)` or
-  `EvalJudge(service=llm)`) is deprecated since 1.3.0 and will be removed in
-  2.0.0. Use `EvalJudge(LLMClassifier(llm=llm), explainer=llm)` instead.
+  `EvalJudge(service=llm)`) is deprecated since 1.12.0 and will be removed in
+  2.0.0. Use `EvalJudge(LLMClassifier(llm=llm), explainer=llm)` instead, which
+  is what the old form did.
 </Note>
 
 For a simulation, `persona_llm=` is the LLM that plays the caller. It runs inside the harness's own pipeline, so it can be any Pipecat `LLMService` that supports function calling, which the persona needs to hang up with its `end_call` tool. Passing it for a scripted scenario raises a `ValueError`:
@@ -303,13 +319,15 @@ session = EvalSession.from_scenario(
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
     ),
-    judge=EvalJudge(llm),
+    judge=EvalJudge(LLMClassifier(llm=llm), explainer=llm),
 )
 ```
 
 Passing `judge=None` explicitly to the `EvalSimulationSession` constructor runs the conversation without a judge: measured metrics are still computed, and the run reports no verdict on the goal.
 
-The judge keeps the conversation it judges. A scripted session feeds it each user turn and agent reply, a simulation session each line and tool call as they happen, and asks it for a verdict with `evaluate()` for a reply, `evaluate_call()` for a function call's [`eval:`](/pipecat/evals/scripted-scenarios#judging-a-call-with-eval), and `evaluate_run(criteria, success)` for a whole simulation. Code driving an `EvalJudge` by hand fills it with `add_user_message()`, `add_assistant_message()`, and `add_tool_call()` before asking.
+The judge keeps the conversation it judges. A scripted session feeds it each user turn and agent reply, a simulation session each line and tool call as they happen, and asks it for a verdict with `evaluate()` for a reply, `evaluate_call()` for a function call's [`eval:`](/pipecat/evals/scripted-scenarios#judging-a-call-with-eval), and `evaluate_run(criteria, success)` for a whole simulation. Code driving an `EvalJudge` by hand fills it with `add_user_message()`, `add_assistant_message()`, and `add_tool_call()` before asking, and calls `close()` when it's done, so the classifier releases what it holds open.
+
+A `JudgeVerdict` carries the `verdict`, its `reason`, the classifier's `raw_response`, and a `confidence` from 0 to 1, the probability of the answer given. Jev's confidence is calibrated; an LLM's is its own guess. `evaluate_run()` returns a `RunVerdicts` with the `goal`'s verdict and, under `turns`, a verdict per agent turn for each criterion.
 
 ### Custom audio services
 
@@ -425,6 +443,14 @@ Each run is mutated in place as it executes (`status`, `stopping`, `result`, `er
 </Warning>
 
 `EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, `repeat`, and so on), mirroring the CLI flags.
+
+## Migrating from 1.11
+
+The judge decides every verdict with a classifier since 1.12.0. A scenario's `judge:` block needs no change: an LLM named there classifies through an `LLMClassifier` and explains its own `no` verdicts, as before. An LLM judge now picks one of a fixed set of answers instead of answering a prose prompt, so a borderline reply can get a different verdict than it did, and a simulation is judged one agent turn per call instead of the whole run in one call, so it costs more calls. The old constructor keeps working until 2.0.0 and emits a `DeprecationWarning`:
+
+| Deprecated                                 | Use instead                                        |
+| ------------------------------------------ | -------------------------------------------------- |
+| `EvalJudge(llm)`, `EvalJudge(service=llm)` | `EvalJudge(LLMClassifier(llm=llm), explainer=llm)` |
 
 ## Migrating from 1.10
 
