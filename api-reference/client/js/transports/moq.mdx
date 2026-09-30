@@ -9,7 +9,7 @@ description: "MoqTransport for the JavaScript SDK: Media over QUIC audio and RTV
 
 It publishes the microphone as an Opus broadcast and consumes the bot's, discovering codec and sample rate from the bot's catalog at connect time rather than pinning them in code. RTVI messages travel in both directions over a dedicated JSON stream track, so this is a full RTVI transport rather than an audio-only path. The transport automatically deduplicates messages across reconnects, preventing redelivery of messages such as `client-ready` when either side replays its log.
 
-Connection uses WebTransport with a WebSocket fallback (raced by `@moq/net`), with auto-reconnect via `Connection.Reload`. Once the session reaches `ready`, relay reconnects happen in the background without changing the state — messages sent during a reconnect are queued and replayed to the bot when it resubscribes.
+Connection uses WebTransport with a WebSocket fallback (raced by `@moq/net`), with auto-reconnect via a private `Connection` loop. Once the session reaches `ready`, relay reconnects happen in the background without changing the state — messages sent during a reconnect are queued and replayed to the bot when it resubscribes.
 
 ## Installation
 
@@ -106,15 +106,16 @@ const transport = new MoqTransport({
 
 <ParamField path="audioLatencyMs" type="number" default="80">
   Jitter buffer floor, in milliseconds. Lower is more interactive and drops more
-  on a poor network; higher is smoother at the cost of delay.
+  on a poor network; higher is smoother at the cost of delay. Maps to
+  `@moq/watch` `Sync.delay`.
 </ParamField>
 
 <ParamField path="audioBufferMaxMs" type="number | 'real-time'" default="30000">
   Ceiling for buffered playback. A bot writes TTS audio faster than real time
   with future-dated timestamps, and the player buffers it rather than skipping
   ahead — this caps how much may build up. An interruption flushes it early.
-  Pass `"real-time"` to collapse to the floor instead, which only makes sense
-  against a genuinely live publisher.
+  Pass `"real-time"` to collapse the buffer instead, which only makes sense
+  against a genuinely live publisher. Maps to `@moq/watch` `Sync.buffer`.
 </ParamField>
 
 <ParamField path="audioSampleRate" type="number" default="48000">
@@ -138,7 +139,7 @@ Audio track names within a broadcast come from the bot's catalog, so they aren't
 
 Each transcript track is a single group that a subscriber reads from its first record, so a reconnect on either side, including the automatic one from `@moq/net`, replays the whole log. Every record the transport sends is the RTVI message plus `seq`, its position in the connection's log, and `epoch`, an id minted per connection. Incoming records at or below the last `seq` accepted for the bot's current `epoch` are dropped, a different `epoch` is a new bot whose count starts over, and both fields are removed before the message reaches `PipecatClient`. A record without `seq` is delivered unchanged, so a bot that predates the fields keeps working. The bot side of the same format is described with the [server transport](/api-reference/server/services/transport/moq#transcript-records); `acceptTranscriptRecord` and the `TranscriptRecord` type are exported for other implementations of the stream.
 
-Each side also sends a `session-ending` marker on its transcript before it leaves. The bot's tracks ending after the marker is a hangup and the transport disconnects. Ending without it may be a relay between the peers failing, which looks the same on the wire, so the transport redials: the bot either reappears on the new session or is never announced on it. `disconnect()` sends the marker from this side, so the bot ends the call at once.
+Each side also sends a `session-ending` marker on its transcript before it leaves. The bot's tracks ending after the marker is a hangup and the transport disconnects. Ending without it may be a relay between the peers failing, which looks the same on the wire — the origin request stays open and automatically re-resolves when the bot republishes. `disconnect()` sends the marker from this side, so the bot ends the call at once.
 
 ## Events
 
