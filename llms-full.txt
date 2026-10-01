@@ -36110,6 +36110,7 @@ Video services enable you to build an avatar where audio and video are synchroni
 | Service                                                     | Setup                         | Maintainer |
 | ----------------------------------------------------------- | ----------------------------- | ---------- |
 | [Anam](/api-reference/server/services/video/anam)           | `uv add pipecat-anam`         | Community  |
+| [bitHuman](/api-reference/server/services/video/bithuman)   | `uv add pipecat-bithuman`     | Community  |
 | [HeyGen](/api-reference/server/services/video/heygen)       | `uv add "pipecat-ai[heygen]"` | Pipecat    |
 | [Protoface](/api-reference/server/services/video/protoface) | `uv add pipecat-protoface`    | Community  |
 | [Simli](/api-reference/server/services/video/simli)         | `uv add "pipecat-ai[simli]"`  | Pipecat    |
@@ -47981,6 +47982,12 @@ Before using Sarvam STT services, you need:
   Audio codec/format of the input file.
 </ParamField>
 
+<ParamField path="keyterms" type="list[str]" default="None">
+  Connection-time recognition hints for `saaras:v4`. At most 50 terms of 64
+  characters each; put each phrase in a separate item. Cannot be updated at
+  runtime.
+</ParamField>
+
 <ParamField
   path="params"
   type="SarvamSTTService.InputParams"
@@ -48058,6 +48065,12 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 <ParamField path="return_timestamps" type="bool" default="False">
   Whether final transcripts should include segment offsets.
+</ParamField>
+
+<ParamField path="keyterms" type="list[str]" default="None">
+  Connection-time recognition hints for `saaras:v4`. At most 50 terms of 64
+  characters each; put each phrase in a separate item. Cannot be updated at
+  runtime.
 </ParamField>
 
 <ParamField path="prefix_padding_ms" type="int" default="None">
@@ -48228,7 +48241,7 @@ await stt.update_config(
   - `endpointing="vad"` (default): Sarvam's server-side VAD decides turn boundaries. The service proposes turn frames via `ProposedUserStartedSpeakingFrame` and `ProposedUserStoppedSpeakingFrame`.
   - `endpointing="manual"`: The pipeline drives turn boundaries via `VADUserStartedSpeakingFrame` and `VADUserStoppedSpeakingFrame`. Requires a VAD analyzer on the user aggregator.
 - **VAD analyzer required**: A VAD analyzer is required in either endpointing mode. Under `vad` it times transcription latency; under `manual` it also marks the turn for Sarvam.
-- **In-band configuration updates**: Settings can be updated mid-conversation via `update_config()` without reconnecting. Connection-only values (`sample_rate`, `return_timestamps`, `prefix_padding_ms`, `endpointing`) cannot be updated at runtime.
+- **In-band configuration updates**: Settings can be updated mid-conversation via `update_config()` without reconnecting. Connection-only values (`sample_rate`, `return_timestamps`, `keyterms`, `prefix_padding_ms`, `endpointing`) cannot be updated at runtime.
 - **Stream types**: `fast` provides lowest latency, `balanced` provides moderate latency with better quality, and `simulated` is for testing. The stream type controls server-side flush cadence; the client always sends audio in 50ms chunks.
 
 <Tip>
@@ -70134,6 +70147,101 @@ in the source repository for a complete working pipeline.
 Tested with Pipecat v0.0.100+ (Python 3.10+). Check the [source
 repository](https://github.com/anam-org/pipecat-anam) for the latest tested
 version and changelog.
+
+# bitHuman Video Avatar
+Source: https://docs.pipecat.ai/api-reference/server/services/video/bithuman.md
+
+BitHumanVideoService renders a lip-synced bitHuman avatar in your own process from your Pipecat agent's TTS audio.
+
+## Overview
+
+`BitHumanVideoService` takes your bot's TTS audio and turns it into a talking avatar.
+It pushes `OutputImageRawFrame` (RGB) and the matching `TTSAudioRawFrame`, so the mouth
+and the voice leave together. The avatar renders in your own process through the
+`bithuman` Python SDK. Expression 2 animates any character from one portrait;
+Essence 2 renders a photoreal person from one portrait.
+
+Interruptions are handled: on `InterruptionFrame` the avatar drops the reply in flight
+and goes back to idle.
+
+## Installation
+
+```bash
+uv add pipecat-bithuman
+# Expression 2 avatars:
+uv add "pipecat-bithuman[expression-2]"
+```
+
+## Prerequisites
+
+### bitHuman account setup
+
+1. Create an account at [www.bithuman.ai](https://www.bithuman.ai) and create an API secret.
+2. Download an avatar model (`.imx`). See [docs.bithuman.ai](https://docs.bithuman.ai/platforms/python).
+
+### Required environment variables
+
+- `BITHUMAN_API_SECRET`: your bitHuman API secret.
+- `BITHUMAN_MODEL_PATH`: path to the `.imx` model (or pass `model_path`).
+
+Rendering bills active session time: 2 credits a minute on your own machine. From 2026-10-12, SDK use requires the Creator plan or higher. See docs.bithuman.ai/pricing.
+
+## Configuration
+
+Constructor parameters for `BitHumanVideoService`:
+
+<ParamField path="model_path" type="str" default="None">
+  Path to the avatar's `.imx` model. Defaults to `BITHUMAN_MODEL_PATH`.
+</ParamField>
+
+<ParamField path="api_secret" type="str" default="None">
+  bitHuman API secret. Defaults to `BITHUMAN_API_SECRET`. Never logged.
+</ParamField>
+
+<ParamField path="sync_video_to_audio" type="bool" default="True">
+  Sets `sync_with_audio` on each image so the transport shows it after its audio.
+</ParamField>
+
+<ParamField path="audio_passthrough_on_error" type="bool" default="True">
+  If the avatar fails, forward TTS audio unchanged so the bot keeps talking.
+</ParamField>
+
+<ParamField path="stop_frame_timeout_s" type="float" default="2.0">
+  Release a held `TTSStoppedFrame` after this much quiet with no end-of-speech.
+</ParamField>
+
+<ParamField path="end_drain_timeout_s" type="float" default="30.0">
+  On `EndFrame`, the longest wait for queued speech to finish.
+</ParamField>
+
+The service has no runtime-updatable `Settings` yet.
+
+Session time is metered while the avatar is open (talking or idle). It closes on
+`EndFrame`, `CancelFrame` or cleanup.
+
+## Usage
+
+```python
+from pipecat_bithuman import BitHumanVideoService
+
+avatar = BitHumanVideoService(model_path="avatar.imx")
+
+pipeline = Pipeline(
+    [transport.input(), stt, user_aggregator, llm, tts, avatar, transport.output(),
+     assistant_aggregator]
+)
+```
+
+Enable `video_out_enabled=True` on the transport. The service logs the frame size on the
+first frame; set `video_out_width` and `video_out_height` to match.
+
+A complete example is in the
+[repository](https://github.com/bithuman-product/pipecat-bithuman/blob/main/examples/bot.py).
+
+## Compatibility
+
+Tested with Pipecat v1.12.0 (Python 3.11+). Check the source repository for the latest
+tested version and changelog.
 
 # HeyGen Video Avatar
 Source: https://docs.pipecat.ai/api-reference/server/services/video/heygen.md
