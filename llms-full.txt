@@ -20685,6 +20685,23 @@ def spawn_fly_machine(room_url: str, token: str):
         raise Exception(f"Bot was unable to enter started state: {res.text}")
 ```
 
+<Warning>
+  The bot worker above uses one shared vCPU. Shared vCPUs can burst above their
+  baseline CPU quota, but [Fly limits them to that quota once the burst balance is
+  depleted](https://fly.io/docs/machines/cpu-performance/). A bot that needs more
+  sustained CPU can then be throttled, delaying real-time audio processing even
+  when it has enough memory. Increasing memory alone does not increase the CPU
+  quota.
+
+Before using this size in production, test your pipeline for the full expected
+session duration and monitor CPU quota balance and throttling in Fly's metrics.
+If the worker exhausts its burst balance, consider allocating more shared vCPUs
+or using a `performance` vCPU. CPU needs depend on your pipeline, including its
+VAD, STT, and TTS services; a size that works for a short test may not support a
+longer call.
+
+</Warning>
+
 We want to make sure the machine started ok before returning any data to the user. Fly launches machines pretty fast, but will timeout if things take longer than they should. Depending on your transport method, you may want to optimistically return a response to the user, so they can join the room and poll for the status of their bot.
 
 ## Launch the Fly project
@@ -38025,7 +38042,7 @@ With `video_in_enabled`, a participant's camera (`"camera"`) and screen share (`
 
 A `UserImageRequestFrame` is answered with the next frame of the requested source, so image-request tools such as `fetch_user_image` work with LiveKit. A request for a source the participant isn't sending, or one still waiting when the participant stops sending it or leaves, completes with an error result.
 
-`capture_participant_video(participant_id, framerate=30, video_source="camera")` captures a source at a framerate and takes precedence over `video_in_sources`. A `framerate` of `0` passes on frames only to answer image requests, and `None` passes on every frame.
+`capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a source at a framerate and takes precedence over `video_in_sources`. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on frames only to answer image requests. Get the `participant_id` with `transport.get_client_id(client)`. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
 
 ## Usage
 
@@ -40409,6 +40426,19 @@ params = DailyParams(
     },
 )
 ```
+
+### Capturing video on demand
+
+`BaseTransport.capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a user's video source on demand and takes precedence over `video_in_sources` for that source. It is implemented by `DailyTransport`, `SmallWebRTCTransport` and `LiveKitTransport`; other transports log a warning. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on only the frames that answer image requests. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
+
+`BaseTransport.get_client_id(client)` returns the `participant_id` for the client passed to `on_client_connected`: the participant id on Daily, the participant identity on LiveKit, the peer connection id on SmallWebRTC and the stream id on Vonage. Transports without client events log a warning and return an empty string.
+
+```python
+client_id = transport.get_client_id(client)
+await transport.capture_participant_video(client_id, framerate=1, video_source="screenVideo")
+```
+
+On `SmallWebRTCTransport`, calling `capture_participant_video()` without a `participant_id` is deprecated since 1.13.0.
 
 ## Transport Subclasses
 
@@ -65579,7 +65609,7 @@ while the pipeline is running.
 import os
 
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat_vakyam import VakyamTTSService
 
 tts = VakyamTTSService(
@@ -65601,7 +65631,7 @@ pipeline = Pipeline(
         context_aggregator.assistant(),
     ]
 )
-worker = PipelineWorker(pipeline, params=PipelineParams(allow_interruptions=True))
+worker = PipelineWorker(pipeline)
 ```
 
 To speak Hindi instead of Tamil, change the language code:
@@ -73931,7 +73961,7 @@ Configuration passed via the `options` constructor argument using
 ```python
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.workers.runner import WorkerRunner
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat.plugins.pinch import PinchTranslatorService, TranslatorOptions
 
 async def main():
@@ -73953,7 +73983,7 @@ async def main():
         transport.output(),
     ])
 
-    worker = PipelineWorker(pipeline, params=PipelineParams(allow_interruptions=True))
+    worker = PipelineWorker(pipeline)
 ```
 
 ## Compatibility
@@ -81352,16 +81382,17 @@ The function automatically:
 
 ### Transport Helper Functions
 
-**Client ID Detection**:
+**Client ID Detection** (deprecated since 1.13.0, removed in 2.0.0):
 
 ```python
 from pipecat.runner.utils import get_transport_client_id
 
 client_id = get_transport_client_id(transport, client)
-# Returns pc_id for WebRTC or participant ID for Daily
 ```
 
-**Video Capture** (Daily only):
+Use `transport.get_client_id(client)` instead.
+
+**Video Capture** (deprecated since 1.13.0, removed in 2.0.0):
 
 ```python
 from pipecat.runner.utils import maybe_capture_participant_camera, maybe_capture_participant_screen
@@ -81373,7 +81404,7 @@ await maybe_capture_participant_camera(transport, client, framerate=30)
 await maybe_capture_participant_screen(transport, client, framerate=15)
 ```
 
-These functions safely handle transport detection and only execute if the transport supports the operation.
+List the sources in `TransportParams.video_in_sources` to capture them as each user connects, or call `transport.capture_participant_video()` to capture one on demand.
 
 ## When to Use These Utilities
 
