@@ -33,6 +33,19 @@ worker = PipelineWorker(pipeline, rtvi_processor=GoogleRTVIProcessor())
 
 To disable RTVI entirely, set `enable_rtvi=False`.
 
+### Configuration
+
+<ParamField path="transport" type="BaseTransport" default="None">
+  Optional transport used to control audio streaming start.
+</ParamField>
+
+<ParamField path="allowed_file_url_networks" type="list[str]" default="None">
+  CIDR ranges (e.g. `["10.0.0.0/8"]`) to trust in addition to the public
+  internet when handling [`send-file`](#send-file) URLs. Defaults to the
+  `PIPECAT_ALLOWED_FILE_URL_NETWORKS` environment variable (comma-separated
+  CIDR ranges), or an empty list if unset.
+</ParamField>
+
 ## Properties
 
 ### client_version
@@ -288,6 +301,68 @@ The processor handles `dtmf` client messages for keypad input (e.g., phone menu 
 ```
 
 When a bot uses a `DTMFAggregator`, the aggregator accumulates keys and flushes them (on `#` or its idle timeout) into a transcription like `"DTMF: 123#"` that the LLM can react to.
+
+## Send File
+
+The processor handles `send-file` client messages (protocol 2.2.0) that send a file to the LLM along with accompanying text. Clients gate `sendFile()` on the bot advertising protocol 2.2.0 or later.
+
+```python
+# Client message format (JSON)
+{
+  "label": "rtvi-ai",
+  "type": "send-file",
+  "id": "msg-123",
+  "data": {
+    "content": "Summarize this document",
+    "file": {
+      "format": "application/pdf",
+      "name": "report.pdf",
+      "source": {"type": "url", "url": "https://example.com/report.pdf"}
+    },
+    "options": {
+      "run_immediately": true,
+      "audio_response": true,
+      "custom_options": {}
+    }
+  }
+}
+```
+
+| Field                       | Description                                                                                                                                   |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `content`                   | Text to accompany the file.                                                                                                                   |
+| `file.format`               | MIME type of the file, e.g. `application/pdf`.                                                                                                |
+| `file.name`                 | Optional file name.                                                                                                                           |
+| `file.source`               | Either `{"type": "bytes", "bytes": "<base64>"}` (images may also include `width` and `height`) or `{"type": "url", "url": "..."}`.            |
+| `options.run_immediately`   | Interrupt the bot and run the LLM right away. Defaults to `true`.                                                                             |
+| `options.audio_response`    | Speak the response. When `false`, TTS is skipped for this response. Defaults to `true`.                                                       |
+| `options.custom_options`    | Provider-specific options, e.g. `detail` for OpenAI or `citations` for Bedrock.                                                               |
+
+Image files sent as bytes are pushed downstream as a `UserImageRawFrame`; all other files are pushed as a `UserFileRawFrame`, both appended to the context.
+
+### URL sources
+
+How a `url` source is handled depends on the URL:
+
+- `s3://` and `gs://` URIs are passed straight to the LLM provider, which resolves them with its own cloud IAM (e.g. Bedrock reading from S3).
+- Publicly routable `http://` and `https://` URLs are passed to the LLM provider, which fetches them itself.
+- Non-public `http://` and `https://` URLs are refused by default. If the resolved addresses fall within `allowed_file_url_networks`, the bot server fetches the file itself (30 second timeout, 50 MB limit, redirects not followed) and sends the LLM the bytes instead.
+- Any other URL scheme, or a host that fails to resolve, results in an error response to the client.
+
+```python
+from pipecat.processors.frameworks.rtvi import RTVIProcessor
+
+worker = PipelineWorker(
+    pipeline,
+    rtvi_processor=RTVIProcessor(allowed_file_url_networks=["10.0.0.0/8"]),
+)
+```
+
+<Note>
+  Hostnames are resolved once before fetching, so this check does not defend
+  against DNS rebinding. Only trust private networks whose file servers you
+  control.
+</Note>
 
 ## UI Messaging
 
