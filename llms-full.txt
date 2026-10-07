@@ -4205,6 +4205,26 @@ llm = YourLLMService(
   complete. The deadline covers the handler's execution as a whole, so reporting
   an intermediate result neither clears it nor restarts it. Work the handler
   spawns into a task of its own isn't cancelled with it.
+- **`file_resolver`** (default `None`): A
+  [`FileResolver`](/api-reference/server/utilities/file-handling) that fetches
+  file URLs in the context (from RTVI `send-file` messages) that the provider
+  can't read itself. URLs the provider can fetch directly, such as public `http(s)` URLs,
+  `s3://` on AWS Bedrock, or `gs://` on Google Vertex, are passed through; others
+  are downloaded once, cached by URL, and inlined. `http(s)` downloads are limited
+  to publicly routable addresses plus any CIDR ranges in `allowed_url_networks`
+  (defaults to the `PIPECAT_ALLOWED_FILE_URL_NETWORKS` environment variable),
+  with redirects refused and a 50 MB cap. Other URL schemes, such as the
+  `pipecat:<id>` URLs minted by runner uploads, are resolved through the
+  resolver's `file_storage`. Share one instance across services that may consume
+  the same files. Without one, the service creates a default resolver.
+
+```python
+from pipecat.utils.file_resolver import FileResolver
+
+llm = YourLLMService(
+    file_resolver=FileResolver(file_storage=runner_args.file_storage),
+)
+```
 
 Set the `PIPECAT_LOG_LLM_CONTEXT` environment variable to control how much of the context LLM services include in their DEBUG logs. `full` (the default) logs every message; `off` logs each response without the context. The value is read once, and an unknown value raises `InvalidEnvVarValueError` when an LLM service is created.
 
@@ -77927,6 +77947,199 @@ Similarly, the `LLMAssistantAggregatorParams` fields were renamed:
 
 The old field names still work with a `DeprecationWarning`.
 
+# File Resolution and Storage
+Source: https://docs.pipecat.ai/api-reference/server/utilities/file-handling.md
+
+Resolve send-file URLs into bytes with FileResolver and store client uploads behind pluggable FileStorage backends like LocalFileStorage.
+
+## Overview
+
+A file sent to the bot in an RTVI [`send-file`](/api-reference/server/rtvi/rtvi-processor#send-file) message lands in the LLM context as a URL. That URL can take several forms: `pipecat:<id>` for a file uploaded through the [development runner's upload endpoints](/api-reference/server/utilities/runner/guide), `s3://` or `gs://` for a file in cloud storage, or a plain `http(s)` link. Some of these URLs can be passed to the LLM provider as-is; others must first be fetched by the server and inlined as bytes — a decision that depends on the provider and on who can reach the URL. Two classes in `pipecat.utils` split that work:
+
+- **`FileStorage`** (`pipecat.utils.file_storage`) is the storage half: the interface behind the runner's upload endpoints, which saves client uploads and mints the URLs that come back in `send-file` messages.
+- **`FileResolver`** (`pipecat.utils.file_resolver`) is the fetching half: configured on an LLM service via its [`file_resolver`](/pipecat/learn/llm#base-class-configuration) parameter, it downloads the bytes right before a completion when the provider can't fetch the URL itself — loading stored uploads back through the storage backend.
+
+Passing the same storage instance to both sides — which the development runner does for you via `runner_args.file_storage` — means the upload endpoint and the resolver agree on where uploads live.
+
+## FileStorage
+
+The abstract interface between an upload endpoint, which saves uploads and hands the resulting URL back to the client, and the `FileResolver`, which loads the bytes back when the client references that URL in a `send-file` message.
+
+The URL is the contract: `save()` returns one, callers pass it back unmodified, and each implementation mints whatever form it can later resolve — `pipecat:<id>` for `LocalFileStorage`, or e.g. `gs://`/`s3://` for a custom cloud backend (which the LLM provider may then even fetch itself, without `load()` being involved at all).
+
+### Interface
+
+<ParamField path="save(filename, contents)" type="async → str">
+  Store a file and return the URL later passed to `load()` or `delete()`.
+  Implementations should not derive the returned URL from `filename`.
+</ParamField>
+
+<ParamField path="load(file_url)" type="async → bytes">
+  Return the stored contents for a URL previously returned by `save()`. Raises
+  `FileNotFoundError` if the URL is invalid or no longer stored.
+</ParamField>
+
+<ParamField path="delete(file_url)" type="async → None">
+  Remove the stored file, if present.
+</ParamField>
+
+<ParamField
+  path="delete_after_load"
+  type="class attribute, bool"
+  default="False"
+>
+  Whether a file should be deleted once its bytes have been consumed (loaded and
+  inlined into the LLM context by a `FileResolver`). Safe only when every URL
+  the backend resolves is an upload it owns; leave `False` for backends whose
+  URLs may point at shared data (e.g. arbitrary objects in a cloud bucket),
+  where "read into a conversation" must not mean "destroy".
+</ParamField>
+
+### LocalFileStorage
+
+The default backend: files on local disk, addressed as `pipecat:<hex>`. Suitable for local development and single-process deployments. The random hex suffix can't be used for path traversal and doesn't leak the original filename. Sets `delete_after_load = True`, since every `pipecat:` URL is an upload it owns; deleting an already-missing file is a no-op, so a consumed upload may safely be deleted again by session-end cleanup.
+
+<ParamField path="folder" type="str">
+  Directory to store files in. Created on first save if missing.
+</ParamField>
+
+<ParamField path="max_files" type="int" default="10">
+  Maximum number of files to retain; oldest files (by mtime) are deleted once
+  this is exceeded. Set to `0` to disable trimming.
+</ParamField>
+
+The development runner constructs one for you from `-u/--uploads-folder` and `--uploads-folder-max-files`.
+
+### Custom backends
+
+To store uploads somewhere other than local disk, implement the interface and — when using the development runner — return it from a synchronous `create_file_storage()` function defined next to your `bot()`. The runner installs it behind the upload endpoints and injects it into the bot as `runner_args.file_storage`:
+
+```python
+class BucketFileStorage(FileStorage):
+    async def save(self, filename: str, contents: bytes) -> str:
+        blob_name = f"uploads/{uuid.uuid4().hex}"
+        await upload_to_bucket(MY_BUCKET, blob_name, contents)
+        return f"gs://{MY_BUCKET}/{blob_name}"
+
+    async def load(self, file_url: str) -> bytes:
+        return await download_from_bucket(file_url)
+
+    async def delete(self, file_url: str) -> None:
+        await delete_from_bucket(file_url)
+
+
+def create_file_storage():
+    return BucketFileStorage()
+
+
+async def bot(runner_args: RunnerArguments):
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        file_resolver=FileResolver(file_storage=runner_args.file_storage),
+    )
+    ...
+```
+
+See the [runner guide](/api-reference/server/utilities/runner/guide) for the upload endpoints, CLI flags, and session-end cleanup behavior.
+
+## FileResolver
+
+Fetches and caches the bytes behind file URLs the LLM provider can't fetch itself.
+
+```python
+from pipecat.utils.file_resolver import FileResolver
+
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    file_resolver=FileResolver(file_storage=runner_args.file_storage),
+)
+```
+
+### Constructor
+
+<ParamField path="file_storage" type="FileStorage" default="None">
+  Storage backend used to resolve URLs it minted (e.g. `pipecat:<id>` from the
+  development runner's upload endpoints — pass `runner_args.file_storage`
+  there). Without it, only `data:` and `http(s)` URLs can be resolved.
+</ParamField>
+
+<ParamField path="allowed_url_networks" type="list[str]" default="None">
+  CIDR ranges (e.g. `["10.0.0.0/8"]`) this server is trusted to fetch from, in
+  addition to the public internet. An `http(s)` URL that resolves outside both
+  is refused. Defaults to the `PIPECAT_ALLOWED_FILE_URL_NETWORKS` environment
+  variable (comma-separated).
+</ParamField>
+
+<ParamField path="max_fetch_bytes" type="int" default="52428800">
+  Maximum size of a fetched file. Defaults to 50 MB.
+</ParamField>
+
+<ParamField path="fetch_timeout_secs" type="float" default="30">
+  Total timeout for an `http(s)` fetch.
+</ParamField>
+
+### URL handling
+
+The resolver handles three kinds of URL:
+
+- **`data:` URLs** are decoded directly.
+- **`http(s)` URLs** are fetched by this server, but only when the resolved address is publicly routable or falls within `allowed_url_networks` — a client-supplied URL must not be able to point your server at arbitrary private address space (SSRF). Redirects are refused rather than followed, and downloads are capped at `max_fetch_bytes`.
+- **Any other scheme** is delegated to `file_storage`, which resolves the URLs it minted (`pipecat:<id>` for `LocalFileStorage`; a custom backend resolves whatever its `save()` returned, e.g. `gs://` with the deployment's own credentials).
+
+A URL that can't be resolved — refused by the reachability policy, over the size limit, failed to download, or a scheme nothing is configured for — raises `FileResolverError`. During context conversion this surfaces as `LLMContextConversionError`, and the offending file message is removed from the context so later completions aren't blocked.
+
+<Note>
+  URLs the provider consumes directly — public `http(s)` URLs, `s3://` on AWS
+  Bedrock, `gs://` on Google Vertex — never reach the resolver's fetch path: the
+  adapter passes them through and the provider fetches them itself.
+</Note>
+
+### Caching and sharing
+
+Each URL is fetched once and served from an in-memory cache afterwards: a URL is assumed to identify one immutable piece of content. Content that changes should live at a new URL (uploads mint a fresh URL per upload; a cache-busting query string works for external URLs), or call `forget(url)` when your application knows a URL's content changed.
+
+The caches make resolved files provider-neutral, which drives two scoping rules:
+
+- **Share one instance across LLM services** that may consume the same files (e.g. services switched between mid-session), so they reuse each other's downloads. This matters doubly for `delete_after_load` backends: the stored copy is deleted once the bytes are cached, so the cache entry becomes the surviving copy.
+- **Scope a resolver to one session.** An instance shared across sessions would hold every session's files in memory and stretch the one-fetch-per-URL assumption across all of them.
+
+### Methods
+
+<ParamField path="fetch(url)" type="async → bytes">
+  Return the bytes behind `url`, fetching and caching them on first use. A
+  storage-resolved file is deleted after a successful load when the backend sets
+  `delete_after_load`.
+</ParamField>
+
+<ParamField path="ensure_data_url(url, mime_type)" type="async → str">
+  Return the `data:` form of `url`'s bytes, encoding and caching it on first use
+  — for adapters whose provider consumes base64 rather than raw bytes.
+</ParamField>
+
+<ParamField path="classify(url)" type="async → UrlReachability">
+  Classify who can reach an `http(s)` URL, honoring `allowed_url_networks`.
+  Classified once per URL; later calls return the cached verdict.
+</ParamField>
+
+<ParamField path="forget(url)" type="None">
+  Drop everything cached for `url`, forcing a re-fetch on next use. A forgotten
+  `delete_after_load` upload can't be re-fetched — its stored copy was deleted
+  when first cached.
+</ParamField>
+
+<ParamField
+  path="cached_bytes(url) / cached_data_url(url) / cached_reachability(url)"
+  type="… | None"
+>
+  Synchronous cache reads, returning `None` when nothing is cached for `url`.
+</ParamField>
+
+<ParamField path="file_storage" type="property → FileStorage | None">
+  The storage backend used to resolve URLs it minted, if any.
+</ParamField>
+
+Subclass and override `fetch()` to support additional schemes or credentialed fetches beyond what the storage backend provides.
+
 # FrameFilter
 Source: https://docs.pipecat.ai/api-reference/server/utilities/filters/frame-filter.md
 
@@ -80686,6 +80899,7 @@ All runner arguments also include:
 
 - **`handle_sigint`**: Whether the bot should handle SIGINT (Ctrl+C) signals. Pass this to `WorkerRunner(handle_sigint=runner_args.handle_sigint)` so bots run directly can install their own signal handler while hosted bots leave signals to the host.
 - **`handle_sigterm`**: Whether the bot should handle SIGTERM signals (managed automatically)
+- **`file_storage`**: The [`FileStorage`](/api-reference/server/utilities/file-handling) backend serving the host's upload endpoints, or `None` when uploads are disabled. It is the backend returned by a synchronous `create_file_storage()` function defined in the bot module, if there is one; otherwise the runner's `-u/--uploads-folder` local storage. Pass it to an LLM service's file resolver with `file_resolver=FileResolver(file_storage=runner_args.file_storage)` so send-file messages can resolve uploaded files.
 
 <Note>
   For WhatsApp connections, `SmallWebRTCRunnerArguments.body` contains a
@@ -80908,6 +81122,12 @@ Options:
                              "credential": "p"}'). Defaults to PIPECAT_ICE_SERVERS, which takes
                              the same entries comma-separated or as a JSON array. Without this
                              the bot gathers host candidates only.
+  -f, --downloads-folder PATH  Folder of files available for download (--folder is a
+                             deprecated alias)
+  -u, --uploads-folder PATH  Folder for client file uploads; enables the upload endpoints.
+                             Defaults to PIPECAT_UPLOADS_FOLDER env var.
+  --uploads-folder-max-files INTEGER
+                             Max files kept in the uploads folder; oldest removed (default: 10)
   --esp32                    Enable SDP munging for ESP32 WebRTC compatibility
   -d, --direct               Connect directly to Daily room for testing (automatically sets transport to daily)
   --dialin                   Enable Daily PSTN dial-in webhook handling
@@ -80933,6 +81153,14 @@ Options:
 **`--dialin`**: Enables the `/daily-dialin-webhook` endpoint for handling Daily PSTN dial-in calls. This endpoint receives webhook data from Daily when a phone call dials into your configured phone number, creates a SIP-enabled room, and spawns your bot. (It no longer requires `-t daily`, though dial-in is a Daily feature.)
 
 **`--allowed-origins`**: Restricts which origins can connect to HTTP and WebSocket endpoints. Useful for preventing Cross-Site WebSocket Hijacking (CSWSH) attacks. When set, connections with a missing or disallowed `Origin` header are rejected. Can be specified multiple times for multiple origins. Defaults to the `PIPECAT_ALLOWED_ORIGINS` environment variable (comma-separated). Leave unset to allow all origins.
+
+**`--downloads-folder` / `-f`**: Folder of files the runner makes available for download. The older `--folder` flag still works as a deprecated alias.
+
+**`--uploads-folder` / `-u`**: Enables client file uploads, stored in the given folder through a `LocalFileStorage`. The runner exposes `POST /sessions/{session_id}/files` (50 MB cap), and a flat `POST /files` for transports whose clients never learn a session id. Each responds with an RTVI file source (`{"type": "url", "url": "pipecat:<id>"}`) that the client passes straight back in a `send-file` message. A session's uploads are deleted when its bot session ends (not for the flat `/files` route). `/start` responses include a `fileUploadUrl`, relative to the `/start` endpoint's origin, naming the route to use; it's omitted when uploads are disabled. Defaults to the `PIPECAT_UPLOADS_FOLDER` environment variable.
+
+**`--uploads-folder-max-files`**: Caps how many files stay in the uploads folder as a backstop; the oldest are removed first. Defaults to 10.
+
+To store uploads somewhere other than the local folder, such as a cloud bucket, define a `create_file_storage()` function next to your `bot()` that returns a [`FileStorage`](/api-reference/server/utilities/file-handling) (`pipecat.utils.file_storage`). The runner calls it and injects the result into the bot as `runner_args.file_storage`; pass it to your LLM service's `FileResolver` so `send-file` URLs can be resolved.
 
 **`--esp32`**: Enables SDP (Session Description Protocol) modifications needed for ESP32 WebRTC compatibility. Must be used with a specific IP address via `--host`.
 
@@ -81093,6 +81321,8 @@ For `"transport": "twilio" | "telnyx" | "plivo" | "exotel"` or `"transport": "we
 ```
 
 Telephony connections use `/ws`; plain WebSocket clients use `/ws-client` (and also receive a `sessionId`). The bot starts when the connection is established.
+
+When file uploads are enabled, the `/start` response also includes `fileUploadUrl`, the route to POST uploads to, relative to the `/start` endpoint's origin. It is the session-scoped `/sessions/{session_id}/files` route when the session is registered, or the flat `/files` route otherwise. Files uploaded through a session-scoped route are deleted when the session ends. The field is omitted when uploads are disabled.
 
 ### The `/status` Endpoint
 
@@ -86895,6 +87125,51 @@ The processor handles `dtmf` client messages for keypad input (e.g., phone menu 
 ```
 
 When a bot uses a `DTMFAggregator`, the aggregator accumulates keys and flushes them (on `#` or its idle timeout) into a transcription like `"DTMF: 123#"` that the LLM can react to.
+
+## Send File
+
+The processor handles `send-file` client messages (protocol 2.2.0) that send a file to the LLM along with accompanying text. Clients gate `sendFile()` on the bot advertising protocol 2.2.0 or later.
+
+```python
+# Client message format (JSON)
+{
+  "label": "rtvi-ai",
+  "type": "send-file",
+  "id": "msg-123",
+  "data": {
+    "content": "Summarize this document",
+    "file": {
+      "format": "application/pdf",
+      "name": "report.pdf",
+      "source": {"type": "url", "url": "https://example.com/report.pdf"}
+    },
+    "options": {
+      "run_immediately": true,
+      "audio_response": true,
+      "custom_options": {}
+    }
+  }
+}
+```
+
+| Field                     | Description                                                                                                                        |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `content`                 | Text to accompany the file.                                                                                                        |
+| `file.format`             | MIME type of the file, e.g. `application/pdf`.                                                                                     |
+| `file.name`               | Optional file name.                                                                                                                |
+| `file.source`             | Either `{"type": "bytes", "bytes": "<base64>"}` (images may also include `width` and `height`) or `{"type": "url", "url": "..."}`. |
+| `options.run_immediately` | Interrupt the bot and run the LLM right away. Defaults to `true`.                                                                  |
+| `options.audio_response`  | Speak the response. When `false`, TTS is skipped for this response. Defaults to `true`.                                            |
+| `options.custom_options`  | Provider-specific options, e.g. `detail` for OpenAI or `citations` for Bedrock.                                                    |
+
+Image files sent as bytes are pushed downstream as a `UserImageRawFrame`; all other files are pushed as a [`UserFileRawFrame`](/api-reference/server/frames/system-frames#userfilerawframe), both appended to the context.
+
+### URL sources
+
+The URL is passed through on the frame and resolved right before each LLM completion, where the handling depends on the provider:
+
+- URLs the LLM provider can consume directly are passed straight through for the provider to fetch itself: publicly routable `http://` and `https://` URLs (per supported MIME type), `s3://` URIs on AWS Bedrock, and `gs://` URIs on Google Vertex, each resolved with the provider's own cloud IAM.
+- Everything else — including the `pipecat:<id>` URLs minted by the [development runner's upload endpoints](/api-reference/server/utilities/runner/guide) and non-public `http(s)` URLs — is downloaded by the LLM service's [`FileResolver`](/api-reference/server/utilities/file-handling) and inlined as base64; its CIDR allowlist governs which private-network URLs may be fetched.
 
 ## UI Messaging
 
