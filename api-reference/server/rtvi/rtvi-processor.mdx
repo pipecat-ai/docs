@@ -33,19 +33,6 @@ worker = PipelineWorker(pipeline, rtvi_processor=GoogleRTVIProcessor())
 
 To disable RTVI entirely, set `enable_rtvi=False`.
 
-### Configuration
-
-<ParamField path="transport" type="BaseTransport" default="None">
-  Optional transport used to control audio streaming start.
-</ParamField>
-
-<ParamField path="allowed_file_url_networks" type="list[str]" default="None">
-  CIDR ranges (e.g. `["10.0.0.0/8"]`) to trust in addition to the public
-  internet when handling [`send-file`](#send-file) URLs. Defaults to the
-  `PIPECAT_ALLOWED_FILE_URL_NETWORKS` environment variable (comma-separated CIDR
-  ranges), or an empty list if unset.
-</ParamField>
-
 ## Properties
 
 ### client_version
@@ -338,31 +325,14 @@ The processor handles `send-file` client messages (protocol 2.2.0) that send a f
 | `options.audio_response`  | Speak the response. When `false`, TTS is skipped for this response. Defaults to `true`.                                            |
 | `options.custom_options`  | Provider-specific options, e.g. `detail` for OpenAI or `citations` for Bedrock.                                                    |
 
-Image files sent as bytes are pushed downstream as a `UserImageRawFrame`; all other files are pushed as a `UserFileRawFrame`, both appended to the context.
+Image files sent as bytes are pushed downstream as a `UserImageRawFrame`; all other files are pushed as a [`UserFileRawFrame`](/api-reference/server/frames/system-frames#userfilerawframe), both appended to the context.
 
 ### URL sources
 
-How a `url` source is handled depends on the URL:
+The URL is passed through on the frame and resolved right before each LLM completion, where the handling depends on the provider:
 
-- `s3://` and `gs://` URIs are passed straight to the LLM provider, which resolves them with its own cloud IAM (e.g. Bedrock reading from S3).
-- Publicly routable `http://` and `https://` URLs are passed to the LLM provider, which fetches them itself.
-- Non-public `http://` and `https://` URLs are refused by default. If the resolved addresses fall within `allowed_file_url_networks`, the bot server fetches the file itself (30 second timeout, 50 MB limit, redirects not followed) and sends the LLM the bytes instead.
-- Any other URL scheme, or a host that fails to resolve, results in an error response to the client.
-
-```python
-from pipecat.processors.frameworks.rtvi import RTVIProcessor
-
-worker = PipelineWorker(
-    pipeline,
-    rtvi_processor=RTVIProcessor(allowed_file_url_networks=["10.0.0.0/8"]),
-)
-```
-
-<Note>
-  Hostnames are resolved once before fetching, so this check does not defend
-  against DNS rebinding. Only trust private networks whose file servers you
-  control.
-</Note>
+- URLs the LLM provider can consume directly are passed straight through for the provider to fetch itself: publicly routable `http://` and `https://` URLs (per supported MIME type), `s3://` URIs on AWS Bedrock, and `gs://` URIs on Google Vertex, each resolved with the provider's own cloud IAM.
+- Everything else — including the `pipecat:<id>` URLs minted by the [development runner's upload endpoints](/api-reference/server/utilities/runner/guide) and non-public `http(s)` URLs — is downloaded by the LLM service's [`FileResolver`](/api-reference/server/utilities/file-handling) and inlined as base64; its CIDR allowlist governs which private-network URLs may be fetched.
 
 ## UI Messaging
 
