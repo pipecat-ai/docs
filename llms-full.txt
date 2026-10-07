@@ -4205,6 +4205,25 @@ llm = YourLLMService(
   complete. The deadline covers the handler's execution as a whole, so reporting
   an intermediate result neither clears it nor restarts it. Work the handler
   spawns into a task of its own isn't cancelled with it.
+- **`file_resolver`** (default `None`): A `FileResolver` that fetches file URLs in
+  the context (from RTVI `send-file` messages) that the provider can't read
+  itself. URLs the provider can fetch directly, such as public `http(s)` URLs,
+  `s3://` on AWS Bedrock, or `gs://` on Google Vertex, are passed through; others
+  are downloaded once, cached by URL, and inlined. `http(s)` downloads are limited
+  to publicly routable addresses plus any CIDR ranges in `allowed_url_networks`
+  (defaults to the `PIPECAT_ALLOWED_FILE_URL_NETWORKS` environment variable),
+  with redirects refused and a 50 MB cap. Other URL schemes, such as the
+  `pipecat:<id>` URLs minted by runner uploads, are resolved through the
+  resolver's `file_storage`. Share one instance across services that may consume
+  the same files. Without one, the service creates a default resolver.
+
+```python
+from pipecat.utils.file_resolver import FileResolver
+
+llm = YourLLMService(
+    file_resolver=FileResolver(file_storage=runner_args.file_storage),
+)
+```
 
 Set the `PIPECAT_LOG_LLM_CONTEXT` environment variable to control how much of the context LLM services include in their DEBUG logs. `full` (the default) logs every message; `off` logs each response without the context. The value is read once, and an unknown value raises `InvalidEnvVarValueError` when an LLM service is created.
 
@@ -29137,7 +29156,7 @@ pipecat cloud deploy [agent-name] --max-agents 25
 <Step title="Session Assignment">
 
 - ✅ If a warm instance is available, the session will be assigned to that instance
-- ⏳ If no warm agent instances are available, and your pool is not at capacity, a new instance will be provisioned to handle the request (e.g a cold-start)
+- ⏳ If no warm agent instances are available, and your pool is not at capacity, a new instance will be provisioned to handle the request (e.g a cold-start). The session waits for an instance instead of failing. If no instance is ready within about 2 minutes, the session is dropped.
 - ❌ If your pool is at capacity, your application will receive a `429` response from the start request
 
 </Step>
@@ -29158,7 +29177,7 @@ pipecat cloud deploy [agent-name] --max-agents 25
 
 ## Cold-starts
 
-A cold start may occur when an active session request is made and no warm agent instances are available in the pool to handle it. In this case, Pipecat Cloud will provision a new instance to handle the request.
+A cold start may occur when an active session request is made and no warm agent instances are available in the pool to handle it. In this case, Pipecat Cloud will provision a new instance to handle the request. The start request returns right away, and the session waits for the new instance. If no instance is ready within about 2 minutes, the session is dropped, so set `min-agents` high enough that traffic bursts don't rely on this wait.
 
 Cold starts require additional time to provision the instance and load the agent instances, which may result in a delay for the user. To minimize cold starts, you can configure your pool to maintain a minimum number of warm agent instances at all times.
 
@@ -80809,6 +80828,12 @@ Options:
                              "credential": "p"}'). Defaults to PIPECAT_ICE_SERVERS, which takes
                              the same entries comma-separated or as a JSON array. Without this
                              the bot gathers host candidates only.
+  -f, --downloads-folder PATH  Folder of files available for download (--folder is a
+                             deprecated alias)
+  -u, --uploads-folder PATH  Folder for client file uploads; enables the upload endpoints.
+                             Defaults to PIPECAT_UPLOADS_FOLDER env var.
+  --uploads-folder-max-files INTEGER
+                             Max files kept in the uploads folder; oldest removed (default: 10)
   --esp32                    Enable SDP munging for ESP32 WebRTC compatibility
   -d, --direct               Connect directly to Daily room for testing (automatically sets transport to daily)
   --dialin                   Enable Daily PSTN dial-in webhook handling
@@ -80834,6 +80859,14 @@ Options:
 **`--dialin`**: Enables the `/daily-dialin-webhook` endpoint for handling Daily PSTN dial-in calls. This endpoint receives webhook data from Daily when a phone call dials into your configured phone number, creates a SIP-enabled room, and spawns your bot. (It no longer requires `-t daily`, though dial-in is a Daily feature.)
 
 **`--allowed-origins`**: Restricts which origins can connect to HTTP and WebSocket endpoints. Useful for preventing Cross-Site WebSocket Hijacking (CSWSH) attacks. When set, connections with a missing or disallowed `Origin` header are rejected. Can be specified multiple times for multiple origins. Defaults to the `PIPECAT_ALLOWED_ORIGINS` environment variable (comma-separated). Leave unset to allow all origins.
+
+**`--downloads-folder` / `-f`**: Folder of files the runner makes available for download. The older `--folder` flag still works as a deprecated alias.
+
+**`--uploads-folder` / `-u`**: Enables client file uploads, stored in the given folder through a `LocalFileStorage`. The runner exposes `POST /sessions/{session_id}/files` (50 MB cap), and a flat `POST /files` for transports whose clients never learn a session id. Each responds with an RTVI file source (`{"type": "url", "url": "pipecat:<id>"}`) that the client passes straight back in a `send-file` message. A session's uploads are deleted when its bot session ends (not for the flat `/files` route). `/start` responses include a `fileUploadUrl`, relative to the `/start` endpoint's origin, naming the route to use; it's omitted when uploads are disabled. Defaults to the `PIPECAT_UPLOADS_FOLDER` environment variable.
+
+**`--uploads-folder-max-files`**: Caps how many files stay in the uploads folder as a backstop; the oldest are removed first. Defaults to 10.
+
+To store uploads somewhere other than the local folder, such as a cloud bucket, define a `create_file_storage()` function next to your `bot()` that returns a `FileStorage` (`pipecat.utils.file_storage`). The runner calls it and injects the result into the bot as `runner_args.file_storage`; pass it to your LLM service's `FileResolver` so `send-file` URLs can be resolved.
 
 **`--esp32`**: Enables SDP (Session Description Protocol) modifications needed for ESP32 WebRTC compatibility. Must be used with a specific IP address via `--host`.
 
