@@ -12,6 +12,8 @@ Pipecat Flows defines a hierarchy of exceptions for handling errors during flow 
 from pipecat.flows import (
     FlowError,
     FlowInitializationError,
+    FlowProblem,
+    FlowReferenceError,
     FlowTransitionError,
     InvalidFunctionError,
     ActionError,
@@ -25,7 +27,8 @@ FlowError
 ├── FlowInitializationError
 ├── FlowTransitionError
 ├── InvalidFunctionError
-└── ActionError
+├── ActionError
+└── FlowReferenceError
 ```
 
 ## FlowError
@@ -49,7 +52,7 @@ except FlowError as e:
 class FlowInitializationError(FlowError)
 ```
 
-Raised when flow manager initialization fails. Common causes include invalid configuration, missing dependencies, or calling `initialize()` with an invalid node config.
+Raised when `initialize()` fails, such as when the initial node config is invalid.
 
 **Raised by:** `FlowManager.initialize()`
 
@@ -69,9 +72,9 @@ Raised when a node transition fails. This typically occurs when attempting to tr
 class InvalidFunctionError(FlowError)
 ```
 
-Raised when a function cannot be registered or executed. Common causes include functions not found in the main module, invalid function signatures, direct functions that don't return a tuple, or missing docstrings on direct functions.
+Raised when a function handler is invalid: a direct function with a bad signature or no docstring, a handler that returns something other than a result or a `(result, next_node)` tuple, or a tool on a node built in Python that returns `TRANSITION_IN_YAML`.
 
-**Raised by:** Function registration, `FlowsDirectFunctionWrapper.validate_function()`
+**Raised by:** Function registration, `FlowsDirectFunctionWrapper.validate_function()`, and the handler that runs a function call
 
 ## ActionError
 
@@ -82,3 +85,64 @@ class ActionError(FlowError)
 Raised when an action execution fails. This includes both built-in actions (`tts_say`, `end_conversation`, `function`) and custom registered actions. Common causes include missing required fields (e.g., `text` for `tts_say`), unregistered action types, or handler execution errors.
 
 **Raised by:** `ActionManager.execute_actions()`, action handler registration
+
+## FlowReferenceError
+
+```python
+class FlowReferenceError(FlowError)
+```
+
+Raised when a flow config's references cannot all be resolved. Constructing a [`Flow`](/api-reference/pipecat-flows/flow) checks every tool and action handler the config names and raises this once, with every unresolved reference, rather than stopping at the first.
+
+**Raised by:** `Flow.__init__()`
+
+```python
+from pipecat.flows import Flow, FlowConfig, FlowReferenceError
+
+try:
+    flow = Flow(FlowConfig.from_file("flow.yaml"), handlers=handlers)
+except FlowReferenceError as e:
+    for problem in e.problems:
+        logger.error(f"{problem.code}: {problem.message}")
+```
+
+<ParamField path="problems" type="list[FlowProblem]">
+  Every unresolved reference, in the order found. Also rendered into the
+  exception's message, one per line.
+</ParamField>
+
+## FlowProblem
+
+```python
+@dataclass
+class FlowProblem
+```
+
+One reference a flow config makes that its handlers do not satisfy. Not an exception itself — a `FlowReferenceError` carries a list of them.
+
+<ParamField path="code" type="str">
+  Stable identifier for the kind of problem. See the table below.
+</ParamField>
+
+<ParamField path="message" type="str">
+  Human-readable description naming the node, function, or handler involved.
+</ParamField>
+
+<ParamField path="node" type="str | None">
+  The node the problem is about, when there is one. `None` for a problem in
+  `global_functions`.
+</ParamField>
+
+<ParamField path="function" type="str | None">
+  The function entry the problem is about, when there is one.
+</ParamField>
+
+### Codes
+
+| Code                | Meaning                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| `missing_tool`      | A tool the config names is not in the handlers.                                          |
+| `ambiguous_tool`    | A tool name resolves to different callables in more than one of the handlers.            |
+| `invalid_tool`      | A tool is not callable, or is not a valid direct function.                               |
+| `missing_handler`   | An action handler the config names is not in the handlers, or is not callable.           |
+| `ambiguous_handler` | An action handler name resolves to different callables in more than one of the handlers. |

@@ -1,0 +1,412 @@
+---
+title: "Scenario Configuration"
+description: "Scenario files for scripted and simulated scenarios: the scenarios: list, file defaults, user: and judge: blocks, factory:, and !include."
+---
+
+Scripted and simulated scenarios share the same file format and the same configuration. A file lists its scenarios under `scenarios:`, and any key can sit at the top of the file as the default for all of them. The `user:` block sets how the user's side reaches the agent. The `judge:` block sets what the judge hears and what decides its verdicts. `factory:` and `!include` work the same way in both. This page covers the file format and those shared blocks. The fields that belong to one kind alone are on the [scripted](/pipecat/evals/scripted-scenarios#configuration) and [simulated](/pipecat/evals/simulated-scenarios#anatomy-of-a-simulation) pages.
+
+Everything here is optional apart from `name:` and the `scenarios:` list. A scenario with no configuration blocks runs entirely in [text mode](#text-and-audio-modes) with the default judge, which is the fastest way to start.
+
+## Scenario files
+
+A scenario file has a `name:` and a `scenarios:` list. Each entry is one scenario, with a `name:` of its own, and its keys say which kind it is: `turns:` makes it [scripted](/pipecat/evals/scripted-scenarios), `persona:` makes it a [simulation](/pipecat/evals/simulated-scenarios). Most files hold one scenario:
+
+```yaml capital_question.yaml
+name: capital_question
+
+scenarios:
+  - name: capital_question
+    turns:
+      - user: "What is the capital of Germany?"
+        expect:
+          - event: response
+            eval: "the response says the capital of Germany is Berlin"
+```
+
+A file holds several when they test one behavior through many short conversations. Each scenario runs on its own, against its own bot, and is named `<file>/<scenario>`, so the file above runs as `capital_question/capital_question` and the one below as `turn_completion/short_answer` and `turn_completion/cutoff`. Scripted scenarios and simulations can share a file.
+
+```yaml turn_completion.yaml
+name: turn_completion
+judge: !include ../judge_text.yaml
+
+scenarios:
+  - name: short_answer
+    turns:
+      - user: "Japan."
+        expect:
+          - event: response
+  - name: cutoff
+    turns:
+      - user: "I'd go to Japan because"
+        expect:
+          - event: response
+            absent: true
+            within_ms: 3000
+```
+
+### File-level defaults
+
+Any key a scenario can have may also sit at the top of the file. There it is the default for every scenario in the file, which is what `judge:` does above. A scenario that sets the same key replaces the whole value. Nothing is merged, so a scenario's `context:` is written out in full, never added to.
+
+This is not a fixed list: every scenario key works this way, and it decides the kind too, so a file with `persona:` at the top holds simulations unless a scenario sets `turns:` instead. The only exception is `name:`, which at the top of the file names the file.
+
+- **Either kind**: `user:`, `judge:`, `trigger_disconnect:`.
+- **Scripted**: `turns:`, `context:`, `stop_on_failure:`.
+- **Simulated**: `persona:`, `goal:`, `success:`, `metrics:`, `simulator:`, `max_turns:`, `max_duration_s:`, `max_silence_s:`, `runs:`.
+
+`turns:` and `persona:` are the ones to share when a file's scenarios hold the same conversation and differ in one thing only. With `turns:` at the top and one scenario per judge or modality, every judge sees exactly the same conversation:
+
+```yaml interruption.yaml
+name: interruption
+
+turns:
+  - user: "Tell me a long, detailed story about the history of Paris."
+    expect:
+      - event: llm_started
+  - user: "Actually, never mind that. What's the capital of Japan?"
+    send_after: { event: llm_started, delay_ms: 2000 }
+    expect:
+      - event: response
+        eval: "says Tokyo instead of continuing the Paris story"
+
+scenarios:
+  - name: text
+    judge: !include ../judge_text.yaml
+  - name: audio
+    user: !include ../user_audio.yaml
+    judge: !include ../judge_audio.yaml
+```
+
+With `persona:` at the top and a `goal:` per scenario, the same caller goes on different errands:
+
+```yaml diner.yaml
+name: diner
+persona: "Jamie, calling a restaurant. Friendly and to the point."
+success: "the bot did what the caller asked and confirmed it"
+
+scenarios:
+  - name: book
+    goal: "Book a table for two at 6 PM tonight, then end the call."
+  - name: cancel
+    goal: "Cancel tonight's booking under the name Jamie, then end the call."
+```
+
+<Note>
+  Before 1.11.0 a file held one scenario, with its `turns:` or `persona:` at the
+  top level and no `scenarios:` list. Such a file still loads, as one scenario
+  under the file's `name:`, with a `DeprecationWarning`, and will stop loading
+  in 2.0.0. Wrap the scenario in a `scenarios:` list with its own `name:`.
+</Note>
+
+## Text and audio modes
+
+Two top-level blocks control a scenario's modalities, and each has its own `modality:` field:
+
+- `user:` sets how the user's turns are delivered to the agent: sent as text, bypassing its STT (`modality: text`), or synthesized into real speech (`modality: audio`). In a scripted scenario the turns are the ones you wrote; in a simulation they are the persona's replies.
+- `judge:` sets what the judge evaluates: the agent's LLM text, with its TTS skipped (`modality: text`), or a transcription of its actual spoken audio (`modality: audio`).
+
+When `modality:` isn't specified, or a block is omitted entirely, it defaults to `text`. The two sides are also independent: you can drive the agent with text while judging its real speech, or speak to it and judge the LLM text.
+
+A scenario with neither block runs entirely in text mode. No audio flows on either side, so this is the fastest and cheapest way to test prompts, conversational logic, and function calling: no audio service cost, and a multi-turn scenario finishes in seconds. The only services the harness itself needs are the judge (an LLM on Ollama with `gemma4:12b` by default) and, for a simulation, the persona LLM.
+
+<Note>
+  The top-level `user:` block only configures delivery. In a scripted scenario,
+  each turn's own `user:` field (see [User
+  turns](/pipecat/evals/scripted-scenarios#user-turns)) is the utterance itself,
+  and is written the same way in both modes.
+</Note>
+
+## User delivery with `user:`
+
+**Text (the default).** Each user turn is sent to the agent as text, bypassing its STT. This needs no configuration; it's equivalent to:
+
+```yaml
+user:
+  modality: text
+```
+
+**Audio.** Each user turn is synthesized by a TTS the harness runs and streamed into your agent's pipeline at real-time cadence, exercising its VAD, turn detection, and STT exactly as a live microphone would. Synthesized audio is cached across runs, so repeated turns don't re-synthesize. The `speech:` block (the TTS service and voice) is required, unless every spoken turn of a scripted scenario names an [`audio:` file](/pipecat/evals/scripted-scenarios#playing-audio-files-with-audio) to play instead:
+
+```yaml
+user:
+  modality: audio
+  speech:
+    service: kokoro # local TTS, no API key, no per-run cost
+    voice: af_heart
+    sample_rate: 16000
+    speed: 1.0 # optional: Kokoro's rate multiplier, 0.5 to 2.0
+```
+
+<Note>
+  The built-in speech service is `kokoro`, a local model. For a cloud voice,
+  name a [`factory:`](#custom-services-with-factory). `service: cartesia` is
+  deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0.
+</Note>
+
+Both the `speech:` and `judge.transcription:` blocks take an optional `language`, so a non-English agent can be driven and judged in the language it speaks:
+
+```yaml
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: zf_xiaobei # voices are language-specific, so match the language
+    language: zh
+```
+
+It accepts a code like `zh` or a `Language`, and an unrecognized code raises a `ValueError` naming it. Omitting it leaves the service's own default, which is English. Voices are not selected for you: `af_heart` speaks US English whatever `language` says.
+
+`speech.speed:` makes the synthesized user talk faster or slower. It is Kokoro's rate multiplier, `1.0` by default, and pauses scale with it, so a faster rate also shortens the silences at commas. Cached user audio is keyed by the speed too, so changing it re-synthesizes the turns.
+
+<Tip>
+  Prefer `whisper` over `moonshine` for transcribing a non-English agent.
+  Moonshine's non-English models return empty or truncated transcripts, and an
+  empty transcript is indistinguishable from a bot that said nothing.
+</Tip>
+
+## Judging with `judge:`
+
+**Text (the default).** The agent's TTS is skipped automatically, including any on-connect greeting, and the judge evaluates the LLM's text output. Fast and silent; equivalent to:
+
+```yaml
+judge:
+  modality: text
+```
+
+**Audio.** The agent speaks for real. The harness captures its synthesized audio, transcribes it with the configured STT, and the `response` event becomes that transcription, so the judge evaluates what a user would actually have heard. This is the true end-to-end check: STT in, LLM in the middle, TTS out. The `transcription:` block is required:
+
+```yaml
+judge:
+  modality: audio
+  transcription:
+    service: moonshine # STT for the agent's audio (or: whisper)
+    model: small-streaming
+  eval:
+    service: ollama # the LLM that judges
+    model: gemma4:12b
+```
+
+<Note>
+  The built-in transcribers are `moonshine` and `whisper`, both local models.
+  When `transcription.service:` is omitted, it defaults to `moonshine`.
+</Note>
+
+In either modality, the `judge.eval:` block sets what decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics. Every verdict comes from a [classifier](/pipecat/learn/classifiers), which picks one of the possible answers and gives a probability for each. By default that is an `LLMClassifier` over Ollama (`gemma4:12b`, with an optional `endpoint:` for a remote Ollama), so the default judge needs no API key. A [`factory:`](#custom-services-with-factory) can return any other LLM to classify with, or a classifier of its own, such as [Jev](#judging-with-a-classifier). `service: openai` is deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0.
+
+An `extra:` mapping is forwarded to the judging LLM as top-level request parameters, which is how provider-specific options reach it. The default model is thinking-capable and only its JSON answer is ever read, so the default `extra:` turns reasoning off. It buys nothing, costs latency, and eats into the token budget the answer needs.
+
+<Note>
+  Naming a `model:` without an `extra:` drops the defaults rather than merging
+  with them, since they are chosen for the default model. To pin an older judge,
+  set only what it needs:
+
+```yaml
+judge:
+  eval:
+    service: ollama
+    model: gemma2:9b # no extra:, since gemma2 isn't thinking-capable
+```
+
+</Note>
+
+A simulation's `simulator:` block, the LLM that plays the caller, takes the same `service`, `model`, `endpoint`, `extra`, and `factory` keys as `judge.eval:`, and defaults to the same local model. See [The persona LLM](/pipecat/evals/simulated-scenarios#the-persona-llm-with-simulator).
+
+### Judging with a classifier
+
+An LLM works as a judge, but a judge only ever picks an answer, which is what a dedicated classifier does faster. [`JevClassifier`](/api-reference/server/classifiers/jev) asks Jev, TypeSafe's hosted classification model, which answers each check in a few hundred milliseconds. Its probabilities are calibrated, so a close call looks like one. Pipecat's own release evals judge with it. It needs the `jev` extra (`uv add "pipecat-ai[jev]"`) and a `TYPESAFE_API_KEY`, and a factory builds it:
+
+```yaml
+judge:
+  eval:
+    factory: my_evals.jev_judge # returns a BaseClassifier
+    explainer: # the LLM that gives the reasons, see below
+      service: ollama
+      model: gemma4:12b
+      extra:
+        reasoning_effort: none
+```
+
+```python my_evals.py
+import os
+
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+
+def jev_judge(config):
+    return JevClassifier(api_key=os.environ["TYPESAFE_API_KEY"])
+```
+
+A factory may return any `BaseClassifier`, so a classifier of your own judges the same way.
+
+### Reasons from the explainer
+
+A classifier answers with probabilities, not reasons. So the judge asks an LLM, the **explainer**, for the reason behind every `no`, and behind any verdict less sure than `explain_below` (`0.75` by default). It never asks about a `continue`, which is only a request to wait for more of the reply. The explainer answers the same question on its own, which costs one LLM call per verdict it explains, or one per simulation run when any of the run's verdicts needs a reason. Its answer never changes a verdict: the classifier's stands, and when the two disagree the reason says so ("the explainer judged yes: ...").
+
+A verdict's reason ends with the probabilities the classifier gave, and a verdict that wasn't explained has only those:
+
+```
+judge said no: the reply says the capital is Berlin, not Madrid (P(yes)=0.02, P(no)=0.97, P(continue)=0.01)
+judge said yes: P(yes)=0.98, P(no)=0.01, P(continue)=0.01
+```
+
+Which LLM explains depends on the block:
+
+- With the default judge, or an LLM from a factory, the LLM that judges also explains.
+- With a classifier from a factory, the default Ollama model explains, unless an `explainer:` block names another LLM. The block takes the same `service`, `model`, `endpoint`, `extra`, and `factory` keys as an LLM `judge.eval:` block.
+- `explainer: false` turns reasons off, so every verdict carries its probabilities alone, and a judge like Jev needs no LLM beside it.
+
+`explain_below: 0` limits the reasons to the `no` verdicts, and a value above `1` explains every verdict, which is how to compare a classifier's verdicts against an LLM's. An LLM's probabilities are its own guess rather than calibrated, and rarely fall below `0.75`, so with an LLM judge it's in practice the `no` verdicts that get explained.
+
+### Final answers with `allow_continue:`
+
+A reply the agent is still working on isn't a `no`: "Let me check on that" comes before the answer. So when the judge decides a reply, it has a third answer, `continue`, on which the harness waits for more of the reply and asks again (see [Semantic judging with `eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval)). When every reply you judge is a final answer, with nothing for the agent to fetch first, set `allow_continue: false`:
+
+```yaml
+judge:
+  eval:
+    allow_continue: false # every judged reply is a final answer
+```
+
+The judge then answers only yes or no, so it never waits for more of a reply that is already complete. With `continue` allowed, a judge that wrongly waits on a complete reply lets the turn run out its time budget, and the turn fails as `judge_continue` instead of as a `no` with a reason. A reply that is still arriving is judged again as more of it comes either way. `allow_continue:` only affects an `eval:` on a reply: a function call's `eval:` and a simulation have no `continue` to begin with.
+
+## Custom services with `factory:`
+
+The built-in `service:` names are the local, keyless services: Ollama for the judge and the persona, Kokoro for the user's voice, Moonshine and Whisper for the agent's audio. Any other provider is a `factory:`, a dotted path to a callable that takes the block's mapping and returns the service or classifier. The scenario stays a description of the test, while the provider, its settings, and its key live in code. Any extra keys you put in the block are passed through to your factory:
+
+```yaml
+judge:
+  modality: audio
+  eval:
+    factory: my_evals.judge
+    model: gpt-4o-mini # available to your factory as config["model"]
+  transcription:
+    factory: my_evals.transcriber
+
+user:
+  modality: audio
+  speech:
+    factory: my_evals.voice
+    voice: luna
+```
+
+```python my_evals.py
+import os
+
+from pipecat.services.fal.stt import FalSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.rime.tts import RimeHttpTTSService
+
+
+def judge(config):
+    return OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(model=config["model"]),
+    )
+
+
+def transcriber(config):
+    return FalSTTService(api_key=os.environ["FAL_KEY"])
+
+
+def voice(config):
+    return RimeHttpTTSService(
+        api_key=os.environ["RIME_API_KEY"],
+        settings=RimeHttpTTSService.Settings(voice=config["voice"]),
+    )
+```
+
+The pipeline sets each service's sample rate, so a factory doesn't. What a factory must return depends on the block:
+
+- `judge.eval:`: a `BaseClassifier`, such as a `JevClassifier`, or any LLM service that supports `run_inference()` (OpenAI and OpenAI-compatible, Anthropic, Google, AWS Bedrock, and others), which the judge asks through an `LLMClassifier`.
+- `judge.eval.explainer:`: an LLM service that supports `run_inference()`.
+- `simulator:`: an OpenAI-compatible LLM service that supports function calling.
+- `user.speech:`: a local or HTTP TTS. The cache around it drives synthesis directly, so a WebSocket-streaming TTS yields nothing there.
+- `judge.transcription:`: any pipeline STT.
+
+`pipecat eval` loads the nearest `.env` before it runs, so a factory can read its API key from the environment the way your agent does.
+
+For a fully custom setup (your own caching, a pre-built service instance), pass the services to a session as `judge=`, `persona_llm=`, `user_tts=`, and `bot_stt=` through the [library](/pipecat/evals/library#customizing-the-judge-and-the-persona).
+
+## Sharing config with `!include`
+
+Any value can be pulled from another file with `!include`, resolved relative to the scenario file. This keeps per-scenario noise down when a whole directory of scenarios shares the same audio setup, or the same `simulator:` block:
+
+```yaml
+name: capital_question
+
+user: !include user_audio.yaml
+judge: !include judge_audio.yaml
+
+scenarios:
+  - name: capital_question
+    turns:
+      - user: "What is the capital of Germany?"
+        expect:
+          - event: response
+            eval: "the response says the capital of Germany is Berlin"
+```
+
+A scenario file has a `name:`; an included fragment has none, which is how a directory run tells the two apart. An `!include` at the top of the file is a [file-level default](#file-level-defaults), so one scenario can still override it, as the `interruption` example above does per modality.
+
+## Running scenarios back to back
+
+By default the bot keeps running between scenarios. When a scenario ends its eval connection closes, but the eval transport suppresses the bot's `on_client_disconnected` handler, so the pipeline stays up to serve the next scenario. This is what lets `pipecat eval run a.yaml b.yaml c.yaml` drive a whole list, scripted scenarios and simulations mixed, against one bot instance with no reboot between them, which keeps a run fast. A file that holds several scenarios runs them the same way, one after another on the same bot.
+
+The trade-off is that anything the bot accumulated in one scenario is still there for the next. For results to be independent, each scenario has to start from a clean slate, and clearing that state is split between the harness and your bot:
+
+- **Conversation context**: a scripted scenario can seed or clear it with [`context:`](/pipecat/evals/scripted-scenarios#seeding-the-context-with-context), which replaces the bot's LLM context with the messages you provide. Without it, and always for a simulation, the previous conversation carries forward, which is rarely what you want across independent scenarios.
+- **Application state**: counters, flags, cached data, anything your bot holds outside the LLM context. The harness can't see this, so resetting it is your bot's job. A common place is the bot's connect handler, which runs again for each scenario's connection.
+
+A [suite](/pipecat/evals/suites) avoids the problem by starting a fresh bot for every run. That is also why a simulation's `runs:` is honored by the suite and not by `pipecat eval run`.
+
+## Exercising the disconnect path
+
+Some bots do meaningful work in `on_client_disconnected`, like a goodbye message, session teardown, or resource cleanup. Because the eval transport suppresses that handler by default, set `trigger_disconnect: true` on a scenario of either kind to fire it when that scenario ends:
+
+```yaml
+name: test_goodbye_on_disconnect
+
+scenarios:
+  - name: goodbye
+    trigger_disconnect: true
+    turns:
+      - user: "Thanks for your help!"
+        expect:
+          - event: response
+            eval: "the agent acknowledges the thanks"
+      # on_client_disconnected fires after this turn, so the agent can
+      # send a goodbye message or clean up resources.
+```
+
+Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with `trigger_disconnect: true` usually ends the bot process. Treat it as a terminal run, last in a list.
+
+<Note>
+  Enable it for every scenario in a run with `pipecat eval run
+  --trigger-disconnect`; a scenario's own `trigger_disconnect` field still takes
+  precedence. This is independent of `--stop-bot`, which tears the bot down via
+  an `eval-cancel` message regardless of the disconnect handler.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Scripted Scenarios"
+    icon="file-pen"
+    iconType="duotone"
+    href="/pipecat/evals/scripted-scenarios"
+  >
+    Turns, events, and assertions, plus the scripted-only `context:` and
+    `stop_on_failure:` fields.
+  </Card>
+
+  <Card
+    title="Simulated Scenarios"
+    icon="user-headset"
+    iconType="duotone"
+    href="/pipecat/evals/simulated-scenarios"
+  >
+    A persona and a goal, the `simulator:` block, a success criterion, and
+    metrics.
+  </Card>
+</CardGroup>

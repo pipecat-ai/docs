@@ -7,9 +7,9 @@ description: "MoqTransport for the JavaScript SDK: Media over QUIC audio and RTV
 
 `MoqTransport` connects a `PipecatClient` to a Pipecat bot over [Media over QUIC](https://quic.video) — either through a relay both sides dial, or directly to a bot serving its own socket.
 
-It publishes the microphone as an Opus broadcast and consumes the bot's, discovering codec and sample rate from the bot's catalog at connect time rather than pinning them in code. RTVI messages travel in both directions over a dedicated JSON stream track, so this is a full RTVI transport rather than an audio-only path.
+It publishes the microphone as an Opus broadcast and consumes the bot's, discovering codec and sample rate from the bot's catalog at connect time rather than pinning them in code. RTVI messages travel in both directions over a dedicated JSON stream track, so this is a full RTVI transport rather than an audio-only path. The transport automatically deduplicates messages across reconnects, preventing redelivery of messages such as `client-ready` when either side replays its log.
 
-Connection uses WebTransport, with `@moq/net` racing a WebSocket fallback if WebTransport can't be reached.
+Connection uses WebTransport with a WebSocket fallback (raced by `@moq/net`), with auto-reconnect via `Connection.Reload`. Once the session reaches `ready`, relay reconnects happen in the background without changing the state — messages sent during a reconnect are queued and replayed to the bot when it resubscribes.
 
 ## Installation
 
@@ -123,6 +123,15 @@ const transport = new MoqTransport({
   resamples, so exact agreement isn't required.
 </ParamField>
 
+<ParamField path="relayRetryTimeoutMs" type="number" default="60000">
+  How long, in milliseconds, the transport keeps trying to reach the relay
+  before giving up. It applies to the first connection and to each reconnect
+  after the relay is lost. When it runs out, the transport moves to `error` and
+  reports a fatal error through `onError`. Must be finite and positive. Behind a
+  layer-4 load balancer with source-IP stickiness, the window has to outlast the
+  time the balancer takes to remove a lost relay from rotation.
+</ParamField>
+
 ### Broadcast paths
 
 Each side publishes on one path and subscribes to the other's:
@@ -133,6 +142,16 @@ client subscribes  <namespace>/<botId>
 ```
 
 Audio track names within a broadcast come from the bot's catalog, so they aren't configured here. The transcript track is the exception — it's a JSON stream rather than a media rendition, so the catalog doesn't describe it and both sides agree on the name by convention.
+
+### Transcript records
+
+Each transcript track is a single group that a subscriber reads from its first record, so a reconnect on either side, including the automatic one from `@moq/net`, replays the whole log. Every record the transport sends is the RTVI message plus `seq`, its position in the connection's log, and `epoch`, an id minted per connection. Incoming records at or below the last `seq` accepted for the bot's current `epoch` are dropped, a different `epoch` is a new bot whose count starts over, and both fields are removed before the message reaches `PipecatClient`. A record without `seq` is delivered unchanged, so a bot that predates the fields keeps working. The bot side of the same format is described with the [server transport](/api-reference/server/services/transport/moq#transcript-records); `acceptTranscriptRecord` and the `TranscriptRecord` type are exported for other implementations of the stream.
+
+Each side also sends a `session-ending` marker on its transcript before it leaves. The bot's tracks ending after the marker is a hangup and the transport disconnects. Ending without it may be a relay between the peers failing, which looks the same on the wire, so the transport redials: the bot either reappears on the new session or is never announced on it. `disconnect()` sends the marker from this side, so the bot ends the call at once.
+
+## Media Support
+
+`MoqTransport` carries the microphone and bot audio only. `cam`, `screenShare`, and `botVideo` are `false`. See [`mediaSupport`](/api-reference/client/js/client-methods#mediasupport).
 
 ## Events
 

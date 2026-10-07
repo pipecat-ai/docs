@@ -1,0 +1,161 @@
+---
+title: "JevClassifier"
+sidebarTitle: "Jev"
+description: "JevClassifier and JevClient answer classifier questions through Jev, TypeSafe's hosted classification model, with calibrated probabilities."
+---
+
+## Overview
+
+`JevClassifier` answers [classifier questions](/api-reference/server/classifiers/overview) through Jev, TypeSafe's hosted classification model. All the questions about one state go to Jev in one request, and an answer typically comes back in about a tenth of a second. Jev's probabilities are calibrated, so a threshold such as "act when the probability is above 0.8" means the same thing from one question to the next.
+
+A `JevClassifier` asks through a `JevClient`, which holds the HTTP/2 connection, adds the auth header, retries when Jev is busy, and counts tokens. Build the classifier with an API key to give it a client of its own, or pass a `JevClient` to share one connection between several classifiers.
+
+## Installation
+
+```bash
+uv add "pipecat-ai[jev]"
+```
+
+## Prerequisites
+
+A Jev API key from [TypeSafe](https://typesafe.ai), usually set as an environment variable:
+
+```bash
+TYPESAFE_API_KEY=...
+```
+
+## Configuration
+
+### JevClassifier
+
+```python
+from pipecat.classifiers.jev.classifier import JevClassifier
+```
+
+<ParamField path="api_key" type="str | None" default="None">
+  Jev API key, when the classifier should have a client of its own. One of
+  `api_key` and `client` is required.
+</ParamField>
+
+<ParamField path="client" type="JevClient | None" default="None">
+  A client to share with other classifiers. One of `api_key` and `client` is
+  required.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Name of the classifier, as it appears in logs and metrics.
+</ParamField>
+
+### JevClient
+
+```python
+from pipecat.classifiers.jev.client import JevClient
+```
+
+<ParamField path="api_key" type="str" required>
+  Jev API key.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.typesafe.ai">
+  Where the API is served.
+</ParamField>
+
+<ParamField path="model" type="str" default="jev-1.13.0">
+  The Jev model to ask. It is pinned so thresholds you tune against it keep
+  holding. `jev-latest` follows TypeSafe's newest release.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="10.0">
+  Seconds to wait for a reply before raising `ClassifierError`.
+</ParamField>
+
+<ParamField path="max_retries" type="int" default="3">
+  How many times to retry a request Jev refused because it was busy (HTTP 429 or
+  529), with exponential backoff.
+</ParamField>
+
+## Usage
+
+### Basic Usage
+
+```python
+import os
+
+from pipecat.classifiers.base_classifier import YesNoQuestion
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+classifier = JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+
+results = await classifier.yes_no(
+    "Hi, you've reached Dana. Leave a message.",
+    {"voicemail": YesNoQuestion(instructions="is this a voicemail greeting?")},
+)
+results["voicemail"].is_yes  # True
+results["voicemail"].probability  # 0.97
+```
+
+Most of the time you don't call the classifier yourself: you pass it to a component that asks it, such as [`VoicemailDetector`](/api-reference/server/extensions/voicemail) or [`UIWorker`](/api-reference/server/workers/ui-worker).
+
+### Sharing a Client
+
+Several classifiers can share one `JevClient`, and with it one connection pool and one token count:
+
+```python
+from pipecat.classifiers.jev.classifier import JevClassifier
+from pipecat.classifiers.jev.client import JevClient
+
+client = JevClient(api_key=os.getenv("TYPESAFE_API_KEY"))
+
+voicemail = VoicemailDetector(classifier=JevClassifier(client=client))
+ui_worker = MyUIWorker("ui", llm=ui_llm, classifier=JevClassifier(client=client))
+```
+
+A client the classifier created is closed in the classifier's `cleanup()`. A shared client is left open, so close it yourself with `await client.close()` when every classifier using it is done.
+
+### Opening the Connection Early
+
+`setup()` opens the connection to Jev ahead of the first question, so the first answer does not pay for the TLS handshake. Components that own a classifier, such as `VoicemailDetector`, call it for you. If the connection cannot be opened at setup, a warning is logged and the first question opens it instead.
+
+## JevClassifier Properties
+
+| Property | Type        | Description                              |
+| -------- | ----------- | ---------------------------------------- |
+| `client` | `JevClient` | The client this classifier asks through. |
+| `model`  | `str`       | The Jev model the questions go to.       |
+
+## JevClient Reference
+
+### Properties
+
+| Property | Type       | Description                                                                   |
+| -------- | ---------- | ----------------------------------------------------------------------------- |
+| `model`  | `str`      | The Jev model the questions go to.                                            |
+| `usage`  | `JevUsage` | Tokens used so far over every request, as `input_tokens` and `output_tokens`. |
+
+### Methods
+
+#### connect
+
+```python
+await client.connect()
+```
+
+Opens the connection to Jev. It connects once: a client shared by several classifiers is connected by each of them, and only the first call sends anything. Raises `ClassifierError` if Jev could not be reached or refused the request.
+
+#### close
+
+```python
+await client.close()
+```
+
+Closes the connection pool.
+
+## Metrics
+
+After every call, a `JevClassifier` reports the time it took as `ProcessingMetricsData` and the tokens Jev used as `LLMUsageMetricsData` through its [`on_metrics`](/api-reference/server/classifiers/overview#on_metrics) event.
+
+## Notes
+
+- **Limits**: a choice question takes at most 255 options, available as `JEV_MAX_CHOICE_OPTIONS` in `pipecat.classifiers.jev.classifier`. A question with more raises `ClassifierError` before anything is sent.
+- **Errors**: a rejected request, a busy Jev after every retry, an unreachable server, or a reply missing an answer all raise `ClassifierError`.
+- **Idle connections** are kept open for 240 seconds, so a gap between questions does not cost a new TLS handshake.

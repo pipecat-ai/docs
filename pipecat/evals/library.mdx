@@ -1,54 +1,63 @@
 ---
 title: "Using the Library"
-description: "Run, build, and orchestrate evals from Python with the pipecat.evals API."
+description: "Run scripted scenarios and simulations from Python with the pipecat.evals API: sessions, results, custom judges and persona LLMs, and suites."
 ---
 
-Everything the `pipecat eval` CLI does is available as a library under `pipecat.evals`. Use it to run evals from your own test runner (pytest, a CI script, a custom dashboard), to build scenarios in code instead of YAML, or to customize pieces like the judge LLM.
+Everything the `pipecat eval` CLI does is available as a library under `pipecat.evals`. Use it to run evals from your own test runner (pytest, a CI script, a custom dashboard), to build scenarios in code instead of YAML, or to customize pieces like the judge or the persona LLM.
 
-## Running a scenario
+A **session** is one conversation with a bot, driven to a result. `EvalSession.from_scenario()` builds the session for a loaded scenario of either kind: an `EvalScriptSession` for a [scripted scenario](/pipecat/evals/scripted-scenarios), which returns an `EvalScriptResult`, or an `EvalSimulationSession` for a [simulation](/pipecat/evals/simulated-scenarios), which returns an `EvalSimulationResult`. `EvalSession` is the base class of both, and `EvalSessionParams` is how a run behaves, whichever kind it is.
 
-`EvalScenario.load()` parses a scenario file, and `EvalSession.from_scenario()` builds a ready-to-run session, constructing the judge, user speech, and transcriber the scenario calls for:
+<Note>
+  `pipecat.evals` itself exports nothing. Import each name from the submodule
+  that defines it, as the examples below do.
+</Note>
+
+## Running a scripted scenario
+
+`EvalScenarioFile.load()` reads a [scenario file](/pipecat/evals/scenario-configuration#scenario-files) and holds every scenario in it, and `EvalSession.from_scenario()` builds a ready-to-run session for one of them, constructing the judge, user speech, and transcriber the scenario calls for:
 
 ```python
 import asyncio
 
-from pipecat.evals.harness import EvalSession
-from pipecat.evals.scenario import EvalScenario
+from pipecat.evals.scenario import EvalScenarioFile
+from pipecat.evals.session import EvalSession
 
 
 async def main():
-    scenario = EvalScenario.load("scenarios/capital_question.yaml")
-    session = EvalSession.from_scenario(scenario, "ws://localhost:7860")
-    result = await session.run()
+    for scenario in EvalScenarioFile.load("scenarios/capital_question.yaml"):
+        session = EvalSession.from_scenario(scenario, "ws://localhost:7860")
+        result = await session.run()
 
-    if result.passed:
-        print(f"PASS ({result.duration_ms}ms)")
-    else:
-        for failure in result.failures:
-            print(f"  {failure}")
+        if result.passed:
+            print(f"{scenario.name}: PASS ({result.duration_ms}ms)")
+        else:
+            for failure in result.failures:
+                print(f"  {failure}")
 
 
 asyncio.run(main())
 ```
 
-The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`.
+The agent must already be running with its eval transport (`python bot.py -t eval`), just as with `pipecat eval run`. `from_scenario()` is typed by the scenario it is given: a type checker sees a session built from an `EvalScriptScenario` as an `EvalScriptSession`, with no narrowing needed. `EvalScriptSession.from_scenario()` from `pipecat.evals.script_session` takes the same arguments. See [Loading a scenario file](#loading-a-scenario-file) for picking one scenario out of a file.
 
 ### The result
 
-`run()` returns an `EvalResult`:
+`run()` returns an `EvalScriptResult`:
 
 | Field           | Description                                                                                         |
 | --------------- | --------------------------------------------------------------------------------------------------- |
 | `scenario_name` | Name of the scenario that ran.                                                                      |
 | `passed`        | Whether every assertion passed.                                                                     |
 | `failures`      | The failed assertions, each with the turn index, expectation index, event name, reason, and `kind`. |
-| `turns`         | One `EvalTurnResult` per scenario turn, in order. See below.                                        |
+| `turns`         | One `EvalScriptTurnResult` per scenario turn, in order. See below.                                  |
 | `duration_ms`   | Wall-clock time the run took.                                                                       |
 | `events_seen`   | Every semantic event observed, for diagnostics.                                                     |
 | `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).            |
 | `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.          |
 
-Each `EvalTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, and its `duration_ms`. `EvalResult.failures` is these turns' failures flattened, plus any that belong to no turn — a failed connect, say.
+Each `EvalScriptTurnResult` carries its `turn_index`, a `status` of `passed`, `failed`, or `not_run`, the `failures` it produced, its `expectations`, and its `duration_ms`. `EvalScriptResult.failures` is these turns' failures flattened, plus any that belong to no turn, such as a failed connect.
+
+`expectations` is one `EvalExpectationResult` per expectation the turn resolved, in order, up to the one that timed out: its `expectation_index`, `event_name`, whether it `passed`, and what it `matched` when it did, in short. That is the marker of an `llm_marker`, a function call's signature, or the text of a reply or transcript, and it is empty for an event that carries no text. What a passed run matched is only recorded here; a failure's reason is in the turn's `failures`.
 
 `not_run` is deliberately distinct from a pass, so a turn the scenario never reached doesn't inflate a rate:
 
@@ -59,35 +68,161 @@ scored = [t for t in result.turns if t.status != "not_run"]
 print(f"{sum(1 for t in scored if t.status == 'passed')}/{len(scored)} turns")
 ```
 
-`failures` carry a `kind` alongside the reason — `timeout`, `judge_no`, `text_mismatch`, `missing_function_call`, and so on — which is the stable key to group by when scoring a sweep rather than reading one run.
+`failures` carry a `kind` alongside the reason (`timeout`, `judge_no`, `text_mismatch`, `missing_function_call`, and so on), which is the stable key to group by when scoring a sweep rather than reading one run.
 
 This maps cleanly onto a pytest test:
 
 ```python
 import pytest
 
-from pipecat.evals.harness import EvalSession
-from pipecat.evals.scenario import EvalScenario
+from pipecat.evals.scenario import EvalScenarioFile
+from pipecat.evals.session import EvalSession
 
 
 @pytest.mark.asyncio
 async def test_capital_question():
-    scenario = EvalScenario.load("scenarios/capital_question.yaml")
+    file = EvalScenarioFile.load("scenarios/capital_question.yaml")
+    scenario = file["capital_question/capital_question"]
     result = await EvalSession.from_scenario(scenario, "ws://localhost:7860").run()
     assert result.passed, "\n".join(str(f) for f in result.failures)
 ```
+
+## Running a simulation
+
+A simulation loads and runs the same way. For a simulation, `EvalSession.from_scenario()` builds an `EvalSimulationSession`, constructing the persona LLM from the file's `simulator:` block and the judge from its `judge:` block, plus the user TTS and the transcriber in audio mode:
+
+```python
+import asyncio
+
+from pipecat.evals.scenario import EvalScenarioFile
+from pipecat.evals.session import EvalSession
+
+
+async def main():
+    file = EvalScenarioFile.load("scenarios/simulated/book_table.yaml")
+    simulation = file["book_table/available"]
+    session = EvalSession.from_scenario(simulation, "ws://localhost:7860")
+    result = await session.run()
+
+    if result.passed:
+        print(f"PASS: {result.reason}")
+    else:
+        print(f"FAIL: {result.failure}")
+    for metric in result.metrics:
+        print(f"  {metric.name}: {metric.score} ({metric.reason})")
+
+
+asyncio.run(main())
+```
+
+A session runs the simulation once. The `runs:` field is honored by the [suite](#orchestrating-suites), which spawns a fresh agent for each run. `EvalSimulationSession.from_scenario()` from `pipecat.evals.simulation_session` is the same call on the kind's own class.
+
+### The result
+
+`run()` returns an `EvalSimulationResult`:
+
+| Field             | Description                                                                                                                                         |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `simulation_name` | Name of the simulation that ran.                                                                                                                    |
+| `passed`          | Whether the run completed, the judge said `success:` was met, and no metric with a threshold fell short.                                            |
+| `succeeded`       | The judge's verdict on `success:` alone.                                                                                                            |
+| `reason`          | The judge's reason for its verdict, or the error.                                                                                                   |
+| `failure`         | Why the run did not pass, or `None`: the error, then `goal not met: ...`, then the first failed metric.                                             |
+| `error`           | Set when the run did not complete (a failed connect, a harness error). Such a run is neither a goal success nor a goal failure.                     |
+| `metrics`         | One `EvalSimulationMetricScore` per metric, in the order the file lists them. See below.                                                            |
+| `messages`        | The conversation, the persona's turns as `user` messages and the agent's as `assistant`. The `assistant` messages are the turns the metrics scored. |
+| `turns`           | The persona's turn count.                                                                                                                           |
+| `ended_by`        | How the run ended: `end_call`, `bot`, `max_turns`, `max_duration`, `silence`, or `error`.                                                           |
+| `end_call`        | The persona's own `end_call` claim (`success`, `reason`) when it made one. Advisory: the judge decides `succeeded`.                                 |
+| `duration_ms`     | Wall-clock time the run took.                                                                                                                       |
+| `events_seen`     | Every semantic event observed, for diagnostics.                                                                                                     |
+| `debug_log`       | The harness's timestamped decision trace.                                                                                                           |
+
+Each `EvalSimulationMetricScore` carries the metric's `name`, its `score` (the share of turns the judge said yes to for a judged metric, `1.0` or `0.0` for a measured one, `None` when there was nothing to judge or measure), whether it `passed`, its `reason`, its `min_score`, its measured `value` (the seconds, words, turns, or number of calls), and a `failure_kind` (`judge_no`, `judge_no_verdict`, `out_of_range`, or `function_calls`; `None` when it passed). A judged metric also carries one `EvalSimulationTurnVerdict` per agent turn with the 1-based `turn`, whether it `passed`, the judge's `verdict` (`yes`, `no`, or `none` when the judge gave none, which counts as a no), and its `reason`:
+
+```python
+bot_turns = [m["content"] for m in result.messages if m["role"] == "assistant"]
+for metric in result.metrics:
+    for verdict in metric.verdicts:
+        if not verdict.passed:
+            said = bot_turns[verdict.turn - 1]
+            print(f"{metric.name} turn {verdict.turn}: {said!r}: {verdict.reason}")
+```
+
+## Loading a scenario file
+
+`EvalScenarioFile.load()`, from `pipecat.evals.scenario`, reads a file and parses each scenario in its `scenarios:` list as whichever kind it is, with the file's top-level keys applied as defaults. The result holds the file's `name`, its `path`, and its `scenarios` in file order, each an `EvalScriptScenario` or an `EvalSimulationScenario` named `<file>/<scenario>`. Iterate over it, take its `len()`, or index it by a scenario's full name. `EvalSession.from_scenario()` builds the matching session for each, so a file mixing both kinds runs through one call per scenario:
+
+```python
+from pipecat.evals.results import EvalScriptResult
+from pipecat.evals.scenario import EvalScenarioFile
+from pipecat.evals.session import EvalSession
+
+
+async def run_file(path: str, bot_url: str) -> bool:
+    passed = True
+    for scenario in EvalScenarioFile.load(path):
+        result = await EvalSession.from_scenario(scenario, bot_url).run()
+        if isinstance(result, EvalScriptResult):
+            passed &= result.passed and result.skipped is None
+        else:
+            passed &= result.passed
+    return passed
+```
+
+`load()` raises a `ValueError` naming the problem for a file with no `name:`, an empty `scenarios:` list, a scenario without a `name:` or with a duplicate one, or a scenario with both `turns:` and `persona:` or neither. Indexing a name the file doesn't hold raises a `KeyError` listing the names it does. A file in the pre-1.11.0 shape, with `turns:` or `persona:` at the top level and no `scenarios:`, loads as that one scenario under the file's `name:` and emits a `DeprecationWarning`.
+
+`EvalKind`, from the same module, names the two kinds, `script` and `simulation`, as a suite run or a results record reports them.
+
+<Warning>
+  `EvalScriptScenario.load()`, `EvalSimulationScenario.load()`, and
+  `load_scenario_file()` are deprecated since 1.11.0 and will be removed in
+  2.0.0. Each returns one scenario, so it raises a `ValueError` on a file that
+  holds several. Use `EvalScenarioFile.load()`.
+</Warning>
+
+## Run parameters
+
+How a run behaves, whichever kind it is, is one `EvalSessionParams` from `pipecat.evals.session`, passed as `params=` to `from_scenario()` or to a session's constructor. It is plain configuration, so one instance serves many runs:
+
+```python
+from pipecat.evals.session import EvalSession, EvalSessionParams
+
+params = EvalSessionParams(
+    record_path="recordings/capital_question.wav",
+    stop_bot=True,
+)
+result = await EvalSession.from_scenario(scenario, "ws://localhost:7860", params=params).run()
+```
+
+| Field                | Default | Description                                                                                                                                      |
+| -------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `connect_timeout_s`  | `5.0`   | How long to wait for the bot to accept the WebSocket connection.                                                                                 |
+| `default_timeout_ms` | `60000` | Scripted scenarios only: the latency budget for expectations without their own `within_ms`.                                                      |
+| `record_path`        | `None`  | Where to save the conversation audio. Only an audio-mode run records.                                                                            |
+| `cache_dir`          | `None`  | Directory for cached synthesized user audio; `None` for the default under the user cache directory.                                              |
+| `use_cache`          | `True`  | When `False`, ignore cached user audio and synthesize every turn, with no cache reads or writes.                                                 |
+| `stop_bot`           | `False` | When `True`, ask the bot to cancel its pipeline, and exit, on teardown.                                                                          |
+| `trigger_disconnect` | `False` | When `True`, fire the bot's `on_client_disconnected` handler when the connection ends. A scenario's own `trigger_disconnect` field also opts in. |
+
+<Warning>
+  Passing these as individual keyword arguments to `from_scenario()`
+  (`connect_timeout_s=`, `stop_bot=`, and so on) is deprecated since 1.9.0 and
+  will be removed in 2.0.0. They still work, override the `params` field of the
+  same name, and emit a `DeprecationWarning`.
+</Warning>
 
 ## Building scenarios in code
 
 Scenarios are plain dataclasses, so you can construct them programmatically, generating turns from a dataset, parameterizing a template, or skipping YAML entirely:
 
 ```python
-from pipecat.evals.scenario import EvalExpectation, EvalScenario, EvalTurn
+from pipecat.evals.script import EvalExpectation, EvalScriptScenario, EvalScriptTurn
 
-scenario = EvalScenario(
+scenario = EvalScriptScenario(
     name="capital_question",
     turns=[
-        EvalTurn(
+        EvalScriptTurn(
             user="What is the capital of Germany?",
             expect=[
                 EvalExpectation(
@@ -106,15 +241,38 @@ scenario = EvalScenario(
   `response` only when you also configure audio judging).
 </Note>
 
-## Customizing the judge
+A simulation is built the same way. Each metric is an `EvalSimulationMetric` with either a `criterion` or a `measure`, and `simulator=` takes a plain mapping with the same shape as the YAML block when the persona shouldn't run on the default local model:
 
-`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` works with any Pipecat LLM service backed by an OpenAI-compatible API:
+```python
+from pipecat.evals.simulation import EvalSimulationMetric, EvalSimulationScenario
+
+simulation = EvalSimulationScenario(
+    name="book_table",
+    persona="Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number when asked.",
+    goal="Book a table for two at 6 PM, then end the call.",
+    success="the bot confirmed a reservation for two at 6 PM",
+    metrics=[
+        EvalSimulationMetric(
+            name="politeness",
+            criterion="the reply is courteous, never curt or dismissive",
+            min_score=1.0,
+        ),
+        EvalSimulationMetric(name="latency", measure="latency", max_value=5.0),
+    ],
+    max_turns=8,
+)
+```
+
+## Customizing the judge and the persona
+
+`from_scenario()` builds the judge from the scenario's `judge:` block, but you can inject your own. `EvalJudge` takes the [classifier](/pipecat/learn/classifiers) that decides the verdicts and, as `explainer=`, the LLM asked for the reason behind a `no` or an unsure verdict. For an LLM judge, that is one service in both roles. The `judge=` parameter applies to either kind:
 
 ```python
 import os
 
-from pipecat.evals.harness import EvalSession
+from pipecat.classifiers.llm.classifier import LLMClassifier
 from pipecat.evals.judge import EvalJudge
+from pipecat.evals.session import EvalSession
 from pipecat.services.openai.llm import OpenAILLMService
 
 llm = OpenAILLMService(
@@ -125,18 +283,106 @@ llm = OpenAILLMService(
 session = EvalSession.from_scenario(
     scenario,
     "ws://localhost:7860",
-    judge=EvalJudge(llm),
+    judge=EvalJudge(LLMClassifier(llm=llm), explainer=llm),
 )
 ```
 
-The same injection points exist for the user's synthesized voice (`speech=`, wrapping any `TTSService` in an `EvalSpeech`) and the transcriber used for the agent's spoken audio (`transcriber=`, wrapping any `STTService` in an `EvalTranscriber`). The wrapped services can be local models or HTTP-based; WebSocket-streaming services are rejected, since they need a running pipeline to manage their connection lifecycle.
+To judge with [Jev](/pipecat/evals/scenario-configuration#judging-with-a-classifier), pass a `JevClassifier` and keep an LLM as the explainer, or pass `explainer=None` for verdicts with their probabilities alone:
+
+```python
+from pipecat.classifiers.jev.classifier import JevClassifier
+
+judge = EvalJudge(
+    JevClassifier(api_key=os.environ["TYPESAFE_API_KEY"]),
+    explainer=llm,
+    explain_below=0.75,  # also explain a verdict less sure than this
+    allow_continue=False,  # every judged reply is a final answer
+)
+```
+
+`explain_below` and `allow_continue` are the [`explain_below:`](/pipecat/evals/scenario-configuration#reasons-from-the-explainer) and [`allow_continue:`](/pipecat/evals/scenario-configuration#final-answers-with-allow_continue) keys of a `judge.eval:` block. The judge sets its classifier up before its first question, and the session closes it when the run ends.
+
+<Note>
+  Passing an LLM service directly to `EvalJudge` (`EvalJudge(llm)` or
+  `EvalJudge(service=llm)`) is deprecated since 1.12.0 and will be removed in
+  2.0.0. Use `EvalJudge(LLMClassifier(llm=llm), explainer=llm)` instead, which
+  is what the old form did.
+</Note>
+
+For a simulation, `persona_llm=` is the LLM that plays the caller. It runs inside the harness's own pipeline, so it can be any Pipecat `LLMService` that supports function calling, which the persona needs to hang up with its `end_call` tool. Passing it for a scripted scenario raises a `ValueError`:
+
+```python
+session = EvalSession.from_scenario(
+    simulation,
+    "ws://localhost:7860",
+    persona_llm=OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+    ),
+    judge=EvalJudge(LLMClassifier(llm=llm), explainer=llm),
+)
+```
+
+Passing `judge=None` explicitly to the `EvalSimulationSession` constructor runs the conversation without a judge: measured metrics are still computed, and the run reports no verdict on the goal.
+
+The judge keeps the conversation it judges. A scripted session feeds it each user turn and agent reply, a simulation session each line and tool call as they happen, and asks it for a verdict with `evaluate()` for a reply, `evaluate_call()` for a function call's [`eval:`](/pipecat/evals/scripted-scenarios#judging-a-call-with-eval), and `evaluate_run(criteria, success)` for a whole simulation. Code driving an `EvalJudge` by hand fills it with `add_user_message()`, `add_assistant_message()`, and `add_tool_call()` before asking, and calls `close()` when it's done, so the classifier releases what it holds open.
+
+A `JudgeVerdict` carries the `verdict`, its `reason`, the classifier's `raw_response`, and a `confidence` from 0 to 1, the probability of the answer given. Jev's confidence is calibrated; an LLM's is its own guess. `evaluate_run()` returns a `RunVerdicts` with the `goal`'s verdict and, under `turns`, a verdict per agent turn for each criterion.
+
+### Custom audio services
+
+`from_scenario()` also takes `user_tts=` for the user's synthesized voice and `bot_stt=` for transcribing the agent's spoken audio, for either kind. `bot_stt` is any Pipecat `STTService`. `user_tts` is a `CachingTTSService`, which wraps a `TTSService` and caches its audio on disk so repeated turns don't re-synthesize; give it a `cache_key` that identifies the voice configuration:
+
+```python
+import os
+
+from pipecat.evals.session import EvalSession
+from pipecat.evals.tts import CachingTTSService
+from pipecat.services.fal.stt import FalSTTService
+from pipecat.services.rime.tts import RimeHttpTTSService
+
+user_tts = CachingTTSService(
+    RimeHttpTTSService(
+        api_key=os.environ["RIME_API_KEY"],
+        settings=RimeHttpTTSService.Settings(voice="luna"),
+        sample_rate=16000,
+    ),
+    cache_key="rime-luna-16000",
+)
+
+session = EvalSession.from_scenario(
+    scenario,
+    "ws://localhost:7860",
+    user_tts=user_tts,
+    bot_stt=FalSTTService(api_key=os.environ["FAL_KEY"]),
+)
+```
+
+The wrapped services can be local models or HTTP-based; WebSocket-streaming services are rejected, since they need a running pipeline to manage their connection lifecycle. For the YAML-only route, the `factory:` escape hatch in the [Scenario Configuration](/pipecat/evals/scenario-configuration#custom-services-with-factory) page reaches the same services without code.
 
 ## Observing progress
 
-Register an `on_progress` event handler to receive notifications as each turn and expectation resolves:
+Every session emits an `on_progress` event as the conversation advances. A scripted session reports an `EvalScriptTurnProgress` as each turn and expectation resolves; a simulation session reports an `EvalSimulationProgress` for each line as it is spoken, with a `status` of `bot` or `user`, the `text`, and the persona's `turn` count so far, then one with a `status` of `ended` whose `text` says how the conversation ended:
 
 ```python
-from pipecat.evals.harness import EvalSession, EvalTurnProgress
+from pipecat.evals.results import EvalSimulationProgress
+from pipecat.evals.session import EvalSession
+
+session = EvalSession.from_scenario(simulation, url)
+
+
+@session.event_handler("on_progress")
+async def on_progress(session, progress: EvalSimulationProgress):
+    if progress.status == "ended":
+        print(f"ended by {progress.text} after {progress.turn} turn(s)")
+    else:
+        print(f"{progress.status}: {progress.text}")
+```
+
+For a scripted session the record has `turn_index`, `status`, `event_name`, and `detail`:
+
+```python
+from pipecat.evals.session import EvalSession
 
 session = EvalSession.from_scenario(scenario, url)
 
@@ -148,17 +394,21 @@ async def on_progress(session, progress):
 
 <Warning>
   The `on_progress` callback parameter is deprecated since 1.9.0 and will be
-  removed in 2.0.0. Use the `on_progress` event handler instead.
+  removed in 2.0.0. Use the `on_progress` event handler instead. It only ever
+  applied to scripted scenarios, so passing it for a simulation raises a
+  `ValueError`.
 </Warning>
 
 ## Orchestrating suites
 
-`EvalManifest` and `EvalSuite` are the library behind `pipecat eval suite`: the suite spawns each agent with its eval transport on its own port, runs its scenarios, and executes several runs concurrently:
+`EvalManifest` and `EvalSuite` are the library behind `pipecat eval suite`: the suite spawns each agent with its eval transport on its own port, runs its scenarios of either kind, each in its own process, and executes several runs concurrently:
 
 ```python
 import asyncio
 from pathlib import Path
 
+from pipecat.evals.scenario import EvalKind
+from pipecat.evals.session import EvalSessionParams
 from pipecat.evals.suite import EvalManifest, EvalSuite
 
 
@@ -166,28 +416,69 @@ async def main():
     manifest = EvalManifest.load("manifest.yaml")
     suite = EvalSuite(manifest)
 
-    # Optionally narrow the runs, like the CLI's -p / -s flags.
-    suite.filter(pattern="support")
+    # Optionally narrow the runs, like the CLI's -p / -s / -k flags.
+    suite.filter(pattern="support", kind=EvalKind.SIMULATION)
 
     @suite.event_handler("on_update")
     async def on_update(suite, run):
-        print(run.bot, run.scenario, run.status)
+        print(run.label, run.scenario, run.kind, run.status)
 
-    await suite.run(Path("eval-runs/logs"))
+    await suite.run(Path("eval-runs/logs"), params=EvalSessionParams(use_cache=False))
 
     for run in suite.runs:
         verdict = run.error or ("passed" if run.result and run.result.passed else "failed")
-        print(f"{run.bot} / {run.scenario}: {verdict}")
+        print(f"{run.label} / {run.scenario} #{run.attempt}: {verdict}")
 
 
 asyncio.run(main())
 ```
 
-Each run is mutated in place as it executes (`status`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`.
+Each run is mutated in place as it executes (`status`, `stopping`, `result`, `error`, `duration_ms`), so a live display can render directly from `suite.runs`. A run's `scenario` is its `<file>/<scenario>` name, and `suite.filter(scenario=...)` accepts that or either half of it. Its `bot` is the manifest entry's bot path, `name` the entry's `name:` if it has one, and `label` whichever of the two the display uses; `suite.filter(pattern=...)` matches either. A run's `kind` is `script` or `simulation`, and its `result` is the matching result type. A simulation appears once per attempt: `attempts` is the manifest's `repeat`, or the simulation's own `runs`, and `sweep` says which. A sweep is a measurement, where a failure is data; a simulation's own runs are a requirement, where every attempt must pass.
 
 <Warning>
   The `on_update` callback parameter to `suite.run()` is deprecated since 1.9.0
-  and will be removed in 2.0.0. Use the `on_update` event handler instead.
+  and will be removed in 2.0.0. Use the `on_update` event handler instead. So
+  are its `use_cache` and `default_timeout_ms` keyword arguments: pass
+  `params=EvalSessionParams(...)`.
 </Warning>
 
-`EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, and so on), mirroring the CLI flags.
+`EvalManifest.load()` accepts keyword overrides for every manifest value (`concurrency`, `base_port`, `spawn`, `scenarios_dir`, `repeat`, and so on), mirroring the CLI flags.
+
+## Migrating from 1.11
+
+The judge decides every verdict with a classifier since 1.12.0. A scenario's `judge:` block needs no change: an LLM named there classifies through an `LLMClassifier` and explains its own `no` verdicts, as before. An LLM judge now picks one of a fixed set of answers instead of answering a prose prompt, so a borderline reply can get a different verdict than it did, and a simulation is judged one agent turn per call instead of the whole run in one call, so it costs more calls. The old constructor keeps working until 2.0.0 and emits a `DeprecationWarning`:
+
+| Deprecated                                 | Use instead                                        |
+| ------------------------------------------ | -------------------------------------------------- |
+| `EvalJudge(llm)`, `EvalJudge(service=llm)` | `EvalJudge(LLMClassifier(llm=llm), explainer=llm)` |
+
+## Migrating from 1.10
+
+A scenario file holds a list of scenarios since 1.11.0, so the loaders that returned one scenario per file, and the judge API that took a transcript, are deprecated. The old names keep working until 2.0.0 and emit a `DeprecationWarning`:
+
+| Deprecated                                                   | Use instead                                                                                                                        |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `EvalScriptScenario.load()`, `EvalSimulationScenario.load()` | `EvalScenarioFile.load()` (in `pipecat.evals.scenario`), which holds every scenario in the file                                    |
+| `load_scenario_file()`                                       | `EvalScenarioFile.load()`                                                                                                          |
+| `turns:` or `persona:` at a file's top level                 | A `scenarios:` list, each entry with its own `name:`; see [Scenario files](/pipecat/evals/scenario-configuration#scenario-files)   |
+| `EvalJudge.evaluate_run(transcript, criteria, success)`      | Feed the judge with `add_user_message()`, `add_assistant_message()`, and `add_tool_call()`, then `evaluate_run(criteria, success)` |
+| `EvalSimulationDriver.transcript()`                          | No replacement: the judge keeps the conversation it judges                                                                         |
+| A manifest entry's bare `runner_body: <file>`                | `runner_body: { path: <file> }`; see [Entry options](/pipecat/evals/suites#entry-options)                                          |
+
+## Migrating from 1.8
+
+Simulations arrived in 1.9.0 with a rename of the scripted API, so the two kinds sit side by side. `EvalSession` stays. It is now the base class of both kinds and the home of the `from_scenario()` that builds either, and it moved to `pipecat.evals.session`. Constructing `EvalSession(...)` directly is no longer supported; use the kind's own class. The old names keep working until 2.0.0 and emit a `DeprecationWarning`:
+
+| Deprecated                                         | Use instead                                                            |
+| -------------------------------------------------- | ---------------------------------------------------------------------- |
+| `pipecat.evals.harness`                            | `pipecat.evals.session` and `pipecat.evals.script_session`             |
+| `EvalScenario`                                     | `EvalScriptScenario` (in `pipecat.evals.script`)                       |
+| `EvalTurn`                                         | `EvalScriptTurn`                                                       |
+| `EvalResult`                                       | `EvalScriptResult` (in `pipecat.evals.results`)                        |
+| `EvalTurnResult`                                   | `EvalScriptTurnResult`                                                 |
+| `EvalTurnProgress`                                 | `EvalScriptTurnProgress`                                               |
+| `RTVIEvalSerializer`                               | `EvalSerializer`                                                       |
+| `on_progress=` / `on_update=`                      | The `on_progress` / `on_update` event handlers                         |
+| `stop_bot=`, `use_cache=`, and the other run knobs | `params=EvalSessionParams(...)`, see [Run parameters](#run-parameters) |
+
+`EvalSpeech` and `EvalTranscriber` are gone: pass `user_tts=` and `bot_stt=` as shown [above](#custom-audio-services). `SEND_CHUNK_MS` was removed with no replacement, since the harness now paces the user's audio through its own output transport.

@@ -66,7 +66,9 @@ const EXPECTED_URL_STUBS = {
   "api-reference/server/links/server-reference":
     "https://reference-server.pipecat.ai/",
   "api-reference/client/ios/api-reference": "https://docs-ios.pipecat.ai/",
-  "api-reference/client/android/api-reference": "https://docs-android.rtvi.ai/",
+  "api-reference/client/android/api-reference":
+    "https://docs-android.pipecat.ai/",
+  "api-reference/client/cpp/api-reference": "https://docs-cxx.pipecat.ai/",
 };
 const GRANDFATHERED_PARENS = new Set([
   "api-reference/server/rtvi/introduction",
