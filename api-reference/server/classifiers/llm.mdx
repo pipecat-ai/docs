@@ -1,0 +1,104 @@
+---
+title: "LLMClassifier"
+sidebarTitle: "LLM"
+description: "LLMClassifier answers classifier questions with any Pipecat LLM service that supports run_inference(), in one JSON reply per call."
+---
+
+## Overview
+
+`LLMClassifier` answers [classifier questions](/api-reference/server/classifiers/overview) with a Pipecat LLM service. All the questions about one state go to the LLM in one out-of-pipeline call through the service's `run_inference()`, and the LLM replies with one JSON object holding an answer per question.
+
+It needs no extra dependency or API key beyond the LLM you already use, which makes it a good starting point. The trade-offs, compared with [`JevClassifier`](/api-reference/server/classifiers/jev):
+
+- **Latency**: every call is a full LLM request.
+- **Calibration**: the probabilities are whatever the LLM wrote, so they are not calibrated. Treat thresholds as rough.
+- **Metrics**: `on_metrics` reports the time a call took but no token usage.
+
+Any service that implements `run_inference()` can back an `LLMClassifier`, such as the OpenAI, Anthropic, Google and AWS Bedrock LLM services. Realtime (speech-to-speech) services cannot.
+
+```python
+from pipecat.classifiers.llm.classifier import LLMClassifier
+```
+
+## Configuration
+
+<ParamField path="llm" type="LLMService" required>
+  The LLM service that answers the questions. It is called directly, so it does
+  not need to be in a pipeline, and it can be the same service instance your
+  pipeline uses.
+</ParamField>
+
+<ParamField path="instructions" type="str | None" default="None">
+  System instructions for the LLM. The default tells the LLM it is a classifier
+  and describes the JSON reply it must write. If you replace it, keep asking for
+  that reply shape.
+</ParamField>
+
+<ParamField path="max_tokens" type="int | None" default="None">
+  Cap on the reply's length, for services that take one.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="10.0">
+  Seconds to wait for the LLM's reply before raising `ClassifierError`.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Name of the classifier, as it appears in logs and metrics.
+</ParamField>
+
+## Usage
+
+```python
+import os
+
+from pipecat.classifiers.base_classifier import YesNoQuestion
+from pipecat.classifiers.llm.classifier import LLMClassifier
+from pipecat.services.openai.llm import OpenAILLMService
+
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAILLMService.Settings(model="gpt-4o-mini"),
+)
+classifier = LLMClassifier(llm=llm)
+
+results = await classifier.yes_no(
+    "Hi, you've reached Dana. Leave a message.",
+    {"voicemail": YesNoQuestion(instructions="is this a voicemail greeting?")},
+)
+results["voicemail"].is_yes  # True
+results["voicemail"].probability  # 0.97
+```
+
+A small, fast model is usually enough for classification. Components that take a classifier, such as [`UIWorker`](/api-reference/server/workers/ui-worker), build an `LLMClassifier` over their own LLM when you don't pass one.
+
+## Properties
+
+| Property | Type          | Description                                              |
+| -------- | ------------- | -------------------------------------------------------- |
+| `llm`    | `LLMService`  | The LLM service that answers the questions.              |
+| `model`  | `str \| None` | The LLM service's current model, read from its settings. |
+
+## How It Works
+
+The classifier writes the state and the questions into one user message, describing the answer shape each question needs, and sends it with its `instructions` as the system instruction. For example:
+
+```text
+Input:
+Hi, you've reached Dana. Leave a message.
+
+Question "voicemail": is this a voicemail greeting?
+Answer shape: {"probability": <probability that the answer is yes>}
+
+Reply with one JSON object of this shape: {"voicemail": <answer to "voicemail">}
+```
+
+It also passes a JSON schema of the reply as `run_inference(response_schema=...)`. Services and models that can enforce a schema, such as OpenAI, Anthropic and Google, return JSON in exactly that shape. Others ignore the schema with a warning, and the classifier relies on the prompt and parses the reply, ignoring code fences and prose around the JSON object.
+
+The reply is then turned into results:
+
+- Probabilities are clamped to the 0 to 1 range.
+- A choice result's `confidence` is the probability of the chosen option.
+- A score question is answered with a probability per level. Probabilities that don't sum to 1 are scaled so they do, the `score` is the probability-weighted position, and the `confidence` is the largest level probability.
+- When a single question was asked and the reply has no name around its answer, the answer is taken as that question's.
+
+A call that fails, times out, or cannot be parsed raises `ClassifierError`, as does a choice that is not one of the options.

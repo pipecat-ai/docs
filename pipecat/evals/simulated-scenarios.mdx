@@ -9,7 +9,7 @@ A simulated scenario, a simulation for short, describes a caller rather than a s
 name: book_table
 
 scenarios:
-  - name: book_table
+  - name: available
     persona: |
       Jamie, booking dinner for two tonight at 6 PM. Gives a name and phone number
       when asked (Jamie Lee, 555-0142). Polite, answers one question at a time.
@@ -32,25 +32,23 @@ scenarios:
 pipecat eval run book_table.yaml -v
 ```
 
-A scenario with a `persona:` is a simulation; one with `turns:` is a [scripted scenario](/pipecat/evals/scripted-scenarios). In a scripted scenario you control the user's side exactly and assert exactly what the agent does. In a simulation you give the caller a goal and let them adapt to the agent. One file covers the many ways a conversation can go, and you check that the goal was reached and that each reply met your quality bar. Both run with the same commands, sit side by side in a [suite manifest](/pipecat/evals/suites), and share the `user:` and `judge:` blocks.
+A simulation lives in a [scenario file](/pipecat/evals/scenario-configuration#scenario-files)'s `scenarios:` list, like a scripted scenario. A scenario with a `persona:` is a simulation; one with `turns:` is a [scripted scenario](/pipecat/evals/scripted-scenarios). In a scripted scenario you control the user's side exactly and assert exactly what the agent does. In a simulation you give the caller a goal and let them adapt to the agent. One file covers the many ways a conversation can go, and you check that the goal was reached and that each reply met your quality bar. Both run with the same commands, sit side by side in a [suite manifest](/pipecat/evals/suites), and share the `user:` and `judge:` blocks.
 
 ## Anatomy of a simulation
 
-A scenario file holds one or more scenarios under `scenarios:`, each with a `name:`. Most files hold one scenario; several scenarios per file suit sending the same caller on different errands. Any configuration a scenario can have (like `judge:` or `simulator:`) may also sit at the file's top level as the default for all scenarios:
-
 ```yaml
-name: book_table # file name
+name: book_table # required: the file's name
 
-simulator: # shared by all scenarios in this file (default shown)
+simulator: # optional: the LLM that plays the caller (default shown)
   service: ollama
   model: gemma4:12b
   extra:
     reasoning_effort: none
 
-user: # shared (default text)
+user: # optional: how the caller's turns reach the agent (default text)
   modality: text
 
-judge: # shared (defaults shown)
+judge: # optional: judge modality and LLM (defaults shown)
   modality: text
   eval:
     service: ollama
@@ -58,8 +56,9 @@ judge: # shared (defaults shown)
     extra:
       reasoning_effort: none
 
-scenarios:
-  - name: book_table # the scenario's name
+scenarios: # required: the simulations the file holds
+  - name: available # required: this simulation's name
+
     persona: | # required: who the caller is
       Jamie, booking dinner for two tonight at 6 PM. ...
 
@@ -81,19 +80,7 @@ scenarios:
     trigger_disconnect: false # optional: fire on_client_disconnected at the end
 ```
 
-Each scenario is named `<file>/<scenario>`. A common shape for multiple scenarios: the same persona and `success` criterion at the file level, with each scenario giving the caller a different errand via `goal:`:
-
-```yaml
-name: diner
-persona: "Casey, calling a restaurant. Friendly and to the point."
-success: "the bot did what the caller asked and confirmed it"
-
-scenarios:
-  - name: book
-    goal: "Book a table for two at 6 PM tonight, then end the call."
-  - name: cancel
-    goal: "Cancel tonight's booking under the name Casey, then end the call."
-```
+The simulation runs as `book_table/available`, its file's name and then its own. The `simulator:`, `user:`, and `judge:` blocks sit at the top of the file here, as defaults for every simulation in it, and any other key can too. A file that holds several simulations is how one caller goes on different errands; see [Several simulations in one file](#several-simulations-in-one-file).
 
 The rest of this page covers each part:
 
@@ -171,7 +158,7 @@ The model must support function calling, since the persona hangs up through its 
 
 ## Text and audio modes
 
-A simulation takes the same top-level `user:` and `judge:` blocks as a scripted scenario, with the same defaults, so the [Scenario Configuration](/pipecat/evals/scenario-configuration) page applies here: `user.modality` and `user.speech` decide whether the persona's turns reach the agent as text or as synthesized speech, and `judge.modality`, `judge.transcription`, and `judge.eval` decide whether the agent speaks and which LLM judges the outcome. `factory:` and `!include` work the same way.
+A simulation takes the same top-level `user:` and `judge:` blocks as a scripted scenario, with the same defaults, so the [Scenario Configuration](/pipecat/evals/scenario-configuration) page applies here: `user.modality` and `user.speech` decide whether the persona's turns reach the agent as text or as synthesized speech, and `judge.modality`, `judge.transcription`, and `judge.eval` decide whether the agent speaks and what judges the outcome. `factory:` and `!include` work the same way.
 
 With neither block, a simulation runs entirely in text mode: the persona's replies are sent to the agent as text, the agent's TTS is skipped, and the persona hears the LLM's text output. This is the fast way to check a flow end to end and to iterate on prompts and tools.
 
@@ -185,8 +172,8 @@ user:
   speech:
     service: kokoro
     voice: af_heart
-    speed: 1.0 # optional; Kokoro's rate (default 1.0)
     sample_rate: 16000
+    speed: 1.0 # optional: Kokoro's rate multiplier, 0.5 to 2.0
 
 judge:
   modality: audio
@@ -219,12 +206,12 @@ Anything the agent must do once, like reading the order back or calling `complet
 
 ### What the judge sees
 
-The judge reads the whole transcript in one call, with each of the agent's function calls placed before the reply it preceded, by name and arguments. A completed call is stronger evidence of an action than the agent saying it did it, and the judge is told so. The judge does not see a call's result. So:
+The judge decides `success:` over the whole conversation, with each of the agent's function calls placed before the reply it preceded, by name and arguments. A completed call is stronger evidence of an action than the agent saying it did it, and the judge is told so. The judge does not see a call's result. So:
 
 - Whether the agent made a call at all is a [`function_calls` measure](#checking-tool-calls-with-function_calls), no judge needed.
 - If a reply must match backend data, write the expected value into the criterion ("the reply says the appointment is on Tuesday September fifteenth") and keep your mocks deterministic so it stays true across runs.
 
-The same call also scores every judged metric on every agent reply, so a simulation costs one judge call no matter how many metrics it has. The judge LLM comes from the `judge.eval:` block, Ollama with `gemma4:12b` by default.
+Judged metrics are decided per agent reply: each reply is one question, answered for every metric at once, with the conversation before it as context. The goal and all the replies are asked at the same time, so a run costs one judge call for the goal plus one per agent reply, however many metrics it has, and one more to the [explainer](/pipecat/evals/scenario-configuration#reasons-from-the-explainer) when any verdict needs a reason. The judge comes from the `judge.eval:` block, an LLM on Ollama with `gemma4:12b` by default. A fast [classifier such as Jev](/pipecat/evals/scenario-configuration#judging-with-a-classifier) keeps a long run's many calls quick.
 
 ## Metrics
 
@@ -232,7 +219,7 @@ The same call also scores every judged metric on every agent reply, so a simulat
 
 ### Judged metrics with `criterion:`
 
-A criterion says what every reply of the agent should be. The judge answers yes or no for each agent turn, never a partial score, taking into account the conversation before that turn and the tool calls the agent had made by then. The metric's score is the share of turns that got a yes: `0.80` is four replies in five.
+A criterion says what every reply of the agent should be. For each agent turn, the judge decides whether the reply meets the criterion, fails it, or isn't in the situation the criterion is about, taking into account the conversation before that turn and the tool calls the agent had made by then. Only a reply that fails it counts against the metric, and there is never a partial score. The metric's score is the share of turns that passed: `0.80` is four replies in five.
 
 ```yaml
 metrics:
@@ -248,7 +235,7 @@ metrics:
 
 `min_score:` is the share of turns that must pass, in `0..1`: `1` means every reply, `0.8` allows one slip in five. The `brevity` metric above has none, so its score is reported but never fails the run.
 
-Phrase a rule as a condition plus what a reply outside it does. The judge is told that a rule which forbids something, or only applies in some situation, is met by a reply that doesn't do that thing or isn't in that situation. Spelling it out anyway ("a reply that turns down no time passes") keeps a bare "never" from being read as "always".
+Phrase a rule as a condition plus what a reply outside it does. A rule that only applies in some situation ("when ...", "if ...") doesn't apply to a reply outside it, and that reply passes. Spelling it out anyway ("a reply that turns down no time passes") keeps a bare "never" from being read as "always".
 
 A turn the judge gives no answer for counts as a no, but is recorded as `none` rather than `no`, so you can tell judge trouble from agent trouble. A metric that failed only on unanswered turns has the `failure_kind` `judge_no_verdict`; one the judge said no to has `judge_no`. A run in which the agent said nothing has no turns to score, so a judged metric is unscored and passes.
 
@@ -329,7 +316,7 @@ A run **passes** when it completed, the judge said `success:` was met, and no me
 
 ## Running a simulation
 
-Start your agent with its eval transport, then run the file the same way as a scripted scenario. Pass `-v` to watch the conversation as it happens and read the judge's reasons at the end:
+Start your agent with its eval transport, then run the file the same way as a scripted scenario. Pass `-v` to watch the conversation as it happens and read the judge's verdict at the end:
 
 ```bash
 pipecat eval run book_table.yaml -v
@@ -346,7 +333,7 @@ pipecat eval run book_table.yaml -v
 
       ended by end_call after 4 persona turn(s)
 
-    judge: the bot confirmed a reservation for two at 6 PM after calling book_table
+    judge: P(yes)=0.98
 
     metrics:
       politeness: 1.00 (min 1.00) | 4/4 turns
@@ -354,24 +341,24 @@ pipecat eval run book_table.yaml -v
 
     persona: succeeded: The reservation was confirmed for two at 6 PM.
 
-  ✓ ws://localhost:7860 book_table end_call (14230ms)
+  ✓ ws://localhost:7860 book_table/available end_call (14230ms)
 
   1/1 passed  ·  14.2s
 ```
 
-The line beside the ✓ or ✗ is how the run ended. A failed simulation shows the judge's verdict instead of a list of assertions. A judged metric that failed lists the replies the judge said no to, with a reason for each:
+The line beside the ✓ or ✗ is how the run ended. The `judge:` line is the verdict's reason, here only the classifier's probability, since the [explainer](/pipecat/evals/scenario-configuration#reasons-from-the-explainer) is asked only about a `no` or an unsure verdict. A failed simulation shows the judge's verdict instead of a list of assertions. A judged metric that failed lists the replies the judge said no to, with a reason for each:
 
 ```
-  ✗ ws://localhost:7860 book_table end_call (16102ms)
+  ✗ ws://localhost:7860 book_table/available end_call (16102ms)
 
   Failures (1 of 1):
-  ✗ ws://localhost:7860 book_table
-      • politeness 0.75 below 1.00: turn 3: the reply is curt, a bare "No." end_call
+  ✗ ws://localhost:7860 book_table/available
+      • politeness 0.75 below 1.00: turn 3: the reply is curt, a bare "No." (P(meets)=0.08, P(fails)=0.90, P(not_applicable)=0.02) end_call
 
   0/1 passed, 1 failed  ·  16.1s
 ```
 
-The failure shown is the first thing that went wrong, in this order: an error, then the goal ("goal not met: ..."), then the first failed metric. Every metric's score, value, and per-turn verdicts are in the decision trace at `<scenario>.eval.log`, and in `results.jsonl` when a suite ran it. The judge and the persona LLM's own logs are in `<scenario>.debug.log` under `-d`.
+The failure shown is the first thing that went wrong, in this order: an error, then the goal ("goal not met: ..."), then the first failed metric. Every metric's score, value, and per-turn verdicts are in the decision trace at `<file>__<scenario>.eval.log`, and in `results.jsonl` when a suite ran it. The judge's and the persona LLM's own logs are in `<file>__<scenario>.debug.log` under `-d`.
 
 ## Writing good simulations
 
@@ -381,7 +368,53 @@ The failure shown is the first thing that went wrong, in this order: an error, t
 - **A measured metric bounds the worst reply.** Set `latency` and `words` for the slowest and longest reply you can accept, not the typical one.
 - **Use `function_calls` for what the judge can't see.** The judge reads calls, not results, and `calls: []` is the check for an agent that should call nothing.
 - **Run it more than once.** Set `runs: 3` and let the suite prove the flow holds, not just that it held once.
+- **Put the callers of one bot in one file.** A `scenarios:` list with a caller per entry shares the `simulator:`, `judge:`, and limits, and each caller still runs on its own.
 - **Use a script when you need exact control.** If the test is "when the user says this, the agent must call this tool with these arguments", write a [scripted scenario](/pipecat/evals/scripted-scenarios). A simulation is for checking a goal, not a specific exchange.
+
+## Several simulations in one file
+
+A file's `scenarios:` list can hold several simulations, and any key at the top of the file is the default for all of them. That suits a bot with one job and several kinds of caller: the file sets the `simulator:`, the `judge:`, and the limits once, and each simulation is a caller with its own `persona:`, `goal:`, and `success:`. Pipecat's own `book_table` file holds a caller whose time is free, a flexible one whose first choice is taken, and one who can only make times that are all taken, where success is a graceful no:
+
+```yaml book_table.yaml
+name: book_table
+
+simulator: !include ../simulator.yaml
+judge: !include ../judge_text.yaml
+max_turns: 8
+max_duration_s: 120
+
+scenarios:
+  - name: available
+    persona: |
+      Jamie, calling to book a table for tonight. Friendly and to the point: gives
+      the party size and the time when asked, one detail per turn.
+    goal: "Book a table for two at 6 PM tonight, then end the call."
+    success: "the bot confirmed a reservation for a party of two at 6 PM"
+
+  - name: impossible
+    persona: |
+      Casey, calling to book a table for tonight. Can only make 7 PM or 8 PM;
+      asks for the other one if the first is unavailable, and if neither works,
+      thanks the assistant and ends the call without booking anything.
+    goal: "Book a table for two tonight at 7 PM or 8 PM; if neither is available, end the call without a reservation."
+    success: "the bot said neither 7 PM nor 8 PM was available, offered other times, and did not book a table at a time the caller had not accepted"
+```
+
+Every simulation key can sit at the top of the file as a default, not only the blocks: `persona:`, `goal:`, `success:`, `metrics:`, `simulator:`, `max_turns:`, `max_duration_s:`, `max_silence_s:`, `runs:`, and the shared `user:`, `judge:`, and `trigger_disconnect:`. A simulation that sets the same key replaces the whole value. So when the caller is the same and only the errand differs, put `persona:` and `success:` at the top with a `goal:` per simulation:
+
+```yaml diner.yaml
+name: diner
+persona: "Jamie, calling a restaurant. Friendly and to the point."
+success: "the bot did what the caller asked and confirmed it"
+
+scenarios:
+  - name: book
+    goal: "Book a table for two at 6 PM tonight, then end the call."
+  - name: cancel
+    goal: "Cancel tonight's booking under the name Jamie, then end the call."
+```
+
+When every caller is held to the same bar, put `metrics:` at the top instead. Each simulation runs on its own, against its own bot, as `book_table/available` and `book_table/impossible`, and a suite's `-s book_table` runs them all. The full rules, and a scripted scenario's side of them, are on [Scenario files](/pipecat/evals/scenario-configuration#scenario-files).
 
 ## Next steps
 
