@@ -36145,6 +36145,7 @@ Speech-to-Text services receive and audio input and output transcriptions.
 
 | Service                                                         | Setup                                                                         | Maintainer |
 | --------------------------------------------------------------- | ----------------------------------------------------------------------------- | ---------- |
+| [.wave](/api-reference/server/services/stt/dotwave)             | `uv add pipecat-dotwave`                                                      | Community  |
 | [AssemblyAI](/api-reference/server/services/stt/assemblyai)     | `uv add "pipecat-ai[assemblyai]"`                                             | Pipecat    |
 | [AWS Transcribe](/api-reference/server/services/stt/aws)        | `uv add "pipecat-ai[aws]"`                                                    | Pipecat    |
 | [Azure](/api-reference/server/services/stt/azure)               | `uv add "pipecat-ai[azure]"`                                                  | Pipecat    |
@@ -44668,6 +44669,222 @@ Turn events receive `(service, transcript)` where `transcript` is the current tr
   v0.0.105. Use `Settings` / `settings=` instead. See the [Service Settings
   guide](/pipecat/fundamentals/service-settings) for migration details.
 </Tip>
+
+# .wave Speech-to-Text
+Source: https://docs.pipecat.ai/api-reference/server/services/stt/dotwave.md
+
+Streaming STT with WaveSTTService over .wave's Deepgram-compatible WebSocket API, with interim results and multilingual support.
+
+## Overview
+
+`WaveSTTService` provides streaming speech-to-text through
+[.wave](https://dotwave.ai/), over its `/v1/listen` WebSocket, a
+Deepgram-compatible streaming transcription endpoint. The service extends
+Pipecat's `WebsocketSTTService` and pushes `InterimTranscriptionFrame` and
+`TranscriptionFrame` results into the pipeline. When the VAD reports the end of
+speech, it sends `Finalize` and marks the answering transcription as finalized.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/dotwave-ai/pipecat-dotwave"
+  >
+    Source code, README, and issues for the .wave integration
+  </Card>
+  <Card
+    title="Example"
+    icon="play"
+    href="https://github.com/dotwave-ai/pipecat-dotwave/blob/main/examples/transcription-dotwave.py"
+  >
+    Transcribe a browser microphone in a single file
+  </Card>
+  <Card
+    title=".wave Socket Reference"
+    icon="book"
+    href="https://dotwave.ai/docs/deepgram/"
+  >
+    Messages, parameters, languages, and close codes
+  </Card>
+  <Card title=".wave" icon="globe" href="https://dotwave.ai/">
+    Create an account and an API key
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-dotwave
+```
+
+## Prerequisites
+
+### .wave Account Setup
+
+Before using the .wave STT service, you need:
+
+1. **.wave Account**: Sign up at [dotwave.ai](https://dotwave.ai/)
+2. **API Key**: Create an API key in the .wave console
+
+### Required Environment Variables
+
+- `DOTWAVE_API_KEY`: Your .wave API key for authentication
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  .wave API key, sent as `Authorization: Token <key>`.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="api.dotwave.ai">
+  API endpoint: a bare host, or a URL with a scheme such as
+  `ws://localhost:8080`. A bare host uses `wss`.
+</ParamField>
+
+<ParamField path="encoding" type="str" default="linear16">
+  Encoding sent on the socket: `"linear16"`, `"mulaw"`, or `"alaw"`. Pipeline
+  audio is converted as needed: `linear16` is sent at 16 or 24 kHz (other rates
+  are resampled to 16 kHz), `mulaw` and `alaw` at 8 kHz.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Sample rate of the incoming audio in Hz. If `None`, uses the pipeline's input
+  sample rate.
+</ParamField>
+
+<ParamField path="utterance_end_ms" type="int" default="None">
+  Silence in milliseconds (1000 to 3200) after which the socket ends a segment
+  on its own, sending a final with `speech_final` and an `UtteranceEnd` message.
+  If `None`, segments end on `Finalize`, which the service sends when the VAD
+  reports the end of speech.
+</ParamField>
+
+<ParamField path="interim_results" type="bool" default="True">
+  Whether to receive interim results.
+</ParamField>
+
+<ParamField path="extra_headers" type="dict[str, str]" default="None">
+  Additional headers for the WebSocket handshake. Merged after the default
+  headers, so they can override them.
+</ParamField>
+
+<ParamField path="settings" type="WaveSTTService.Settings" default="None">
+  Runtime-updatable settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="None">
+  P99 latency from speech end to final transcript, in seconds, used by turn
+  strategies. .wave has not measured this value for Pipecat, so Pipecat's
+  default applies if `None`. Measure your deployment with
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) and pass the
+  result.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument
+using `WaveSTTService.Settings(...)`. These can be updated mid-conversation with
+`STTUpdateSettingsFrame`; a change reconnects the socket.
+
+| Parameter  | Type                      | Default                    | Description                                                                                         |
+| ---------- | ------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------- |
+| `model`    | `str`                     | `"nemotron-asr-streaming"` | Transcription model.                                                                                |
+| `language` | `Language \| str \| None` | `None`                     | Language to transcribe. `None` or `"multi"` selects automatic language detection.                   |
+| `extra`    | `dict`                    | `{}`                       | Additional query parameters, sent as given. A parameter the socket refuses is reported as an error. |
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+
+from pipecat_dotwave import WaveSTTService
+
+stt = WaveSTTService(api_key=os.getenv("DOTWAVE_API_KEY"))
+
+# ... add stt to your pipeline, after a VAD
+```
+
+### With a Language and a Segment Rule
+
+```python
+import os
+
+from pipecat.transcriptions.language import Language
+
+from pipecat_dotwave import WaveSTTService
+
+stt = WaveSTTService(
+    api_key=os.getenv("DOTWAVE_API_KEY"),
+    utterance_end_ms=1000,
+    settings=WaveSTTService.Settings(language=Language.PT_BR),
+)
+```
+
+### Telephony Audio
+
+```python
+import os
+
+from pipecat_dotwave import WaveSTTService
+
+stt = WaveSTTService(
+    api_key=os.getenv("DOTWAVE_API_KEY"),
+    encoding="mulaw",
+)
+```
+
+## Notes
+
+- **VAD required for timely finals**: Put a VAD upstream of the service (a
+  `VADProcessor`, or the user aggregator's VAD). On `VADUserStoppedSpeakingFrame`
+  the service sends `Finalize`, and the transcription that answers it is pushed
+  with `finalized=True`.
+- **Finals join with a space**: Each final carries the whole words since the
+  previous final, so successive `TranscriptionFrame` texts join with one space,
+  as Pipecat's user aggregator does. Each interim replaces the previous one.
+- **Languages**: A Pipecat `Language` is sent as the tag the socket expects.
+  Regional values pass through (`Language.PT_BR` as `pt-BR`), `Language.EN` is
+  sent as `en` (English, United States), and a bare code with a single regional
+  variant is sent as that variant (`Language.DE` as `de-DE`). You can also pass
+  a tag string such as `"pt-BR"`. A language .wave does not serve is refused when
+  the socket opens, with an error naming the tags it does serve. Frames carry
+  the reported language as a Pipecat `Language`, and none with automatic
+  detection.
+- **Not supported**: `diarize`, `multichannel`, `channels`, `keywords`, and
+  `endpointing`. Passing them to the constructor raises `TypeError`.
+- **Keepalive**: A session closes after 30 seconds without audio, so the service
+  sends a short burst of silence after 20 idle seconds.
+- **Errors**: `Error` messages from the socket are pushed as `ErrorFrame`. A
+  refused API key (close code 4401) or a malformed request (4400) is permanent
+  and not retried; other closes reconnect with backoff.
+- **Pricing**: $0.00045 per minute of audio. See
+  [pricing and limits](https://dotwave.ai/docs/pricing-and-limits/).
+
+## Event Handlers
+
+`WaveSTTService` supports the standard service connection events:
+
+| Event                 | Description                   |
+| --------------------- | ----------------------------- |
+| `on_connected`        | Connected to the .wave socket |
+| `on_disconnected`     | Disconnected from the socket  |
+| `on_connection_error` | A connection error occurred   |
+
+```python
+@stt.event_handler("on_connected")
+async def on_connected(service):
+    print("Connected to .wave")
+```
+
+## Compatibility
+
+Tested with Pipecat v1.12.0. Requires Pipecat 1.12.0 or later and Python 3.11 or
+later. Check the [source repository](https://github.com/dotwave-ai/pipecat-dotwave)
+for the latest tested version and changelog.
 
 # ElevenLabs Speech-to-Text
 Source: https://docs.pipecat.ai/api-reference/server/services/stt/elevenlabs.md
