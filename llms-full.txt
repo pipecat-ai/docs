@@ -22545,33 +22545,35 @@ Real-time transcription of user speech, including both partial and final results
 
     Identifier for the user who spoke.
 
-#### user-backchannel 🤖
+#### user-input 🤖
 
-A short acknowledgment the user said while the bot talks, such as "mhm". It doesn't interrupt the bot or reach the LLM. Introduced in RTVI version 2.3.0.
+What the user said or typed. The observer sends one for each transcription (alongside `user-transcription`), for each user backchannel (a short acknowledgment such as "mhm" said while the bot talks, which doesn't interrupt the bot or reach the LLM), and as an acknowledgment of each `send-text` message.
 
-- **type**: `'user-backchannel'`
+- **type**: `'user-input'`
 - **data**:
   - **text**: `string`
 
-    What the user said.
+    What the user said or typed.
 
-  - **user_id**: `string`
+  - **input_type**: `'transcription' | 'chat' | 'backchannel'`
 
-    Identifier for the user who spoke.
+    The kind of input: speech transcribed by the STT, text the client sent, or a backchannel.
 
   - **timestamp**: `string`
 
-    The timestamp when the user said it.
+    The timestamp when the user said or sent it.
 
-#### bot-backchannel 🤖
+  - **final**: `boolean`
 
-A short acknowledgment the bot says, such as "Mm-hmm.", sent when the bot starts saying it. It is sent in place of `bot-output` and `bot-tts-text`. Introduced in RTVI version 2.3.0.
+    Whether the text is final. Only an interim transcription is not.
 
-- **type**: `'bot-backchannel'`
-- **data**:
-  - **text**: `string`
+  - **user_id**: `string` (optional)
 
-    The text of the acknowledgment.
+    Identifier for the user who spoke or typed. For `chat`, only set when the transport knows the sender, such as Daily and LiveKit.
+
+  - **msg_id**: `string` (optional)
+
+    For `chat`, the id of the client's `send-text` message.
 
 #### bot-output 🤖
 
@@ -22590,6 +22592,8 @@ The best-effort representation of the bot's output text, including both spoken a
   - **aggregated_by**: `string`
 
     Indicates how the text was aggregated (e.g., "sentence", "word", "code", "url"). "sentence" and "word" are reserved aggregation types defined by the RTVI standard. Other aggregation types may be defined by custom text aggregators used by the server.
+
+    A short acknowledgment the bot says, such as "Mm-hmm.", has type `backchannel`. It is only sent to clients of protocol 2.2.0 or later.
 
 #### bot-transcription 🤖
 
@@ -88073,12 +88077,6 @@ worker = PipelineWorker(
   Indicates if the bot's TTS messages should be sent.
 </ParamField>
 
-<ParamField path="bot_backchannel_enabled" default="True">
-  Indicates if the bot's backchannel messages (`bot-backchannel`) should be
-  sent. Text of type `backchannel` is never sent as `bot-output` or
-  `bot-tts-text`.
-</ParamField>
-
 <ParamField path="bot_speaking_enabled" default="True">
   Indicates if the bot's started/stopped speaking messages should be sent.
 </ParamField>
@@ -88110,8 +88108,10 @@ worker = PipelineWorker(
   Indicates if user's transcription messages should be sent.
 </ParamField>
 
-<ParamField path="user_backchannel_enabled" default="True">
-  Indicates if user's backchannel messages (`user-backchannel`) should be sent.
+<ParamField path="user_input_enabled" default="True">
+  Indicates if the user's input messages (`user-input`) should be sent. They
+  report transcriptions (including interim ones), user backchannels, and the
+  text the client sent with `send-text`.
 </ParamField>
 
 <ParamField path="user_audio_level_enabled" default="False">
@@ -88127,7 +88127,9 @@ worker = PipelineWorker(
 </ParamField>
 
 <ParamField path="skip_aggregator_types" default="None">
-  List of aggregation types to skip sending as tts/output messages.
+  List of aggregation types to skip sending as tts/output messages. Text of type
+  `backchannel` is only sent to clients of protocol 2.2.0 or later; add
+  `"backchannel"` to keep it from every client.
   <Note>
     {" "}
     If using this to avoid sending secure information, be sure to also disable
@@ -88230,45 +88232,47 @@ worker = PipelineWorker(
 
 The observer maps Pipecat's internal frames to RTVI protocol messages:
 
-| Pipeline Frame                             | RTVI Message                                                    |
-| ------------------------------------------ | --------------------------------------------------------------- |
-| **Speech Events**                          |
-| `UserStartedSpeakingFrame`                 | `RTVIUserStartedSpeakingMessage`                                |
-| `UserStoppedSpeakingFrame`                 | `RTVIUserStoppedSpeakingMessage`                                |
-| `VADUserStartedSpeakingFrame`              | `VADUserStartedSpeakingMessage`                                 |
-| `VADUserStoppedSpeakingFrame`              | `VADUserStoppedSpeakingMessage`                                 |
-| `BotStartedSpeakingFrame`                  | `RTVIBotStartedSpeakingMessage`                                 |
-| `BotStoppedSpeakingFrame`                  | `RTVIBotStoppedSpeakingMessage`                                 |
-| **User Mute**                              |
-| `UserMuteStartedFrame`                     | `RTVIUserMuteStartedMessage`                                    |
-| `UserMuteStoppedFrame`                     | `RTVIUserMuteStoppedMessage`                                    |
-| **Transcription**                          |
-| `TranscriptionFrame`                       | `RTVIUserTranscriptionMessage(final=true)`                      |
-| `InterimTranscriptionFrame`                | `RTVIUserTranscriptionMessage(final=false)`                     |
-| `UserBackchannelFrame`                     | `user-backchannel`                                              |
-| **Bot Output**                             |
-| `AggregatedTextFrame`                      | `RTVIBotOutputMessage`                                          |
-| `AggregatedTextFrame` (type `backchannel`) | `bot-backchannel` (in place of `bot-output` and `bot-tts-text`) |
-| **LLM Processing**                         |
-| `LLMFullResponseStartFrame`                | `RTVIBotLLMStartedMessage`                                      |
-| `LLMFullResponseEndFrame`                  | `RTVIBotLLMStoppedMessage`                                      |
-| `LLMTextFrame`                             | `RTVIBotLLMTextMessage`                                         |
-| `LLMMarkerResponseFrame`                   | `bot-llm-marker` (when enabled)                                 |
-| **TTS Events**                             |
-| `TTSStartedFrame`                          | `RTVIBotTTSStartedMessage`                                      |
-| `TTSStoppedFrame`                          | `RTVIBotTTSStoppedMessage`                                      |
-| `TTSTextFrame`                             | `RTVIBotTTSTextMessage`                                         |
-| **Function Calls**                         |
-| `FunctionCallsStartedFrame`                | `llm-function-call-started`                                     |
-| `FunctionCallInProgressFrame`              | `llm-function-call-in-progress`                                 |
-| `FunctionCallResultFrame`                  | `llm-function-call-stopped`                                     |
-| **Context/Metrics**                        |
-| `LLMContextFrame`                          | `RTVIUserLLMTextMessage`                                        |
-| `MetricsFrame`                             | `RTVIMetricsMessage`                                            |
-| `RTVIServerMessageFrame`                   | `RTVIServerMessage`                                             |
-| **User Interface**                         |
-| `RTVIUICommandFrame`                       | `UICommandMessage` (`ui-command`)                               |
-| `RTVIUIJobGroupFrame`                      | `UIJobGroupMessage` (`ui-job-group`)                            |
+| Pipeline Frame                | RTVI Message                                               |
+| ----------------------------- | ---------------------------------------------------------- |
+| **Speech Events**             |
+| `UserStartedSpeakingFrame`    | `RTVIUserStartedSpeakingMessage`                           |
+| `UserStoppedSpeakingFrame`    | `RTVIUserStoppedSpeakingMessage`                           |
+| `VADUserStartedSpeakingFrame` | `VADUserStartedSpeakingMessage`                            |
+| `VADUserStoppedSpeakingFrame` | `VADUserStoppedSpeakingMessage`                            |
+| `BotStartedSpeakingFrame`     | `RTVIBotStartedSpeakingMessage`                            |
+| `BotStoppedSpeakingFrame`     | `RTVIBotStoppedSpeakingMessage`                            |
+| **User Mute**                 |
+| `UserMuteStartedFrame`        | `RTVIUserMuteStartedMessage`                               |
+| `UserMuteStoppedFrame`        | `RTVIUserMuteStoppedMessage`                               |
+| **Transcription**             |
+| `TranscriptionFrame`          | `RTVIUserTranscriptionMessage(final=true)`                 |
+| `InterimTranscriptionFrame`   | `RTVIUserTranscriptionMessage(final=false)`                |
+| `TranscriptionFrame`          | `user-input` (`input_type="transcription"`, `final=true`)  |
+| `InterimTranscriptionFrame`   | `user-input` (`input_type="transcription"`, `final=false`) |
+| `UserBackchannelFrame`        | `user-input` (`input_type="backchannel"`)                  |
+| `RTVISendTextFrame`           | `user-input` (`input_type="chat"`)                         |
+| **Bot Output**                |
+| `AggregatedTextFrame`         | `RTVIBotOutputMessage`                                     |
+| **LLM Processing**            |
+| `LLMFullResponseStartFrame`   | `RTVIBotLLMStartedMessage`                                 |
+| `LLMFullResponseEndFrame`     | `RTVIBotLLMStoppedMessage`                                 |
+| `LLMTextFrame`                | `RTVIBotLLMTextMessage`                                    |
+| `LLMMarkerResponseFrame`      | `bot-llm-marker` (when enabled)                            |
+| **TTS Events**                |
+| `TTSStartedFrame`             | `RTVIBotTTSStartedMessage`                                 |
+| `TTSStoppedFrame`             | `RTVIBotTTSStoppedMessage`                                 |
+| `TTSTextFrame`                | `RTVIBotTTSTextMessage`                                    |
+| **Function Calls**            |
+| `FunctionCallsStartedFrame`   | `llm-function-call-started`                                |
+| `FunctionCallInProgressFrame` | `llm-function-call-in-progress`                            |
+| `FunctionCallResultFrame`     | `llm-function-call-stopped`                                |
+| **Context/Metrics**           |
+| `LLMContextFrame`             | `RTVIUserLLMTextMessage`                                   |
+| `MetricsFrame`                | `RTVIMetricsMessage`                                       |
+| `RTVIServerMessageFrame`      | `RTVIServerMessage`                                        |
+| **User Interface**            |
+| `RTVIUICommandFrame`          | `UICommandMessage` (`ui-command`)                          |
+| `RTVIUIJobGroupFrame`         | `UIJobGroupMessage` (`ui-job-group`)                       |
 
 The [User Interface](/client/rtvi-standard#user-interface) frames are emitted by `PipelineWorker` when a [`UIWorker`](/api-reference/server/workers/ui-worker) sends a command or runs a job group; the observer translates them into the outbound `ui-command` / `ui-job-group` messages the client renders.
 
