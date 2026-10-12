@@ -68857,9 +68857,9 @@ A delegation names no task: the GPT-Live model signals only that it is handing w
   type="Callable[[BackendOutput], Awaitable[BackendOutput | None]]"
   default="None"
 >
-  Called with each [`BackendOutput`](#backendoutput) before it is sent, to
-  adjust its text or whether the user may hear it. Return `None` to send nothing
-  for an output.
+  Called with each [`BackendOutput`](#backendoutput) the model produces before
+  it is sent, to adjust its text or whether the user may hear it. Return `None`
+  to send nothing for an output.
 </ParamField>
 
 <ParamField
@@ -68868,9 +68868,11 @@ A delegation names no task: the GPT-Live model signals only that it is handing w
   default="BACKEND_PAIRING_INSTRUCTION"
 >
   Text appended to the backend LLM's system instruction about working as the
-  backend of a voice assistant. Rarely worth replacing: a replacement must still
-  teach the model how to [mark what the user should
-  hear](#choosing-what-the-user-hears), or nothing it writes is spoken.
+  backend of a voice assistant, including how to mark what the user should hear.
+  Rarely worth replacing: a replacement that leaves out the marking leaves
+  nothing spoken. To shape what the user hears, use the backend's own system
+  instruction instead (see [Choosing What the User
+  Hears](#choosing-what-the-user-hears)).
 </ParamField>
 
 <ParamField path="user_params" type="LLMUserAggregatorParams" default="None">
@@ -68885,6 +68887,8 @@ A delegation names no task: the GPT-Live model signals only that it is handing w
 >
   Parameters for the backend's assistant aggregator.
 </ParamField>
+
+`send_output(output, *, apply_transform_output=False)` sends a `BackendOutput` of the app's own, such as from a tool, alongside the model's. It skips `transform_output` unless `apply_transform_output=True`. See [Choosing What the User Hears](#choosing-what-the-user-hears).
 
 ### BackendOutput
 
@@ -69003,21 +69007,25 @@ The service adds `backend` to the runner as a child of the pipeline worker, so t
 
 ### Choosing What the User Hears
 
-A message the backend's model begins with `>>` asks to be spoken (`prefers_spoken=True`) and arrives without the mark; anything else it writes does not. A `transform_output` callback sees every `BackendOutput` after that and can change it:
+The backend's model decides which of what it writes the user hears. It speaks up for a result, a question it cannot proceed without, or news the user should have now, and works through the steps in between in silence. What it chooses to say arrives with `prefers_spoken=True`. To shape that judgment, say in the backend's own system instruction, in plain words, what the user should and should not be told.
+
+When something must be said as given, such as a booking system's confirmation code, a tool can send it itself with `send_output`, whatever the model would have chosen to say:
 
 ```python
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.workers.llm import BackendLLMWorker, BackendOutput
 
 
-async def transform_output(output: BackendOutput) -> BackendOutput:
-    # Keep the backend's thoughts out of the conversation.
-    if output.is_thought:
-        return None
-    return output
-
-
-backend = BackendLLMWorker(llm=..., context=..., transform_output=transform_output)
+async def rebook_flight(params: FunctionCallParams, flight_number: str):
+    booking = await booking_system.rebook(flight_number)
+    told = f"You're booked on {booking.flight}. Your confirmation code is {booking.code}."
+    backend = params.pipeline_worker
+    assert isinstance(backend, BackendLLMWorker)
+    await backend.send_output(BackendOutput(text=told))
+    await params.result_callback({"status": "confirmed", "user_told": told})
 ```
+
+The result lets the model know the user has already been told. For code that should see every output the model produces, `transform_output` can drop one, rewrite it, or change whether it is spoken.
 
 ### Restoring a Conversation
 
@@ -90247,8 +90255,10 @@ agent = MyAgent("my_agent", llm=OpenAILLMService(api_key="..."))
 ## Configuration
 
 <ParamField path="name" type="str" default="None">
-  Unique name for this agent. Auto-generated when omitted; give one when other
-  workers address it by name.
+  Unique name for this agent on the bus. Auto-generated when omitted; give one
+  when other workers need to address it by name, for example with
+  [`activate_worker()`](/api-reference/server/workers/base-worker#activate_worker)
+  or [`job()`](/api-reference/server/workers/base-worker#job).
 </ParamField>
 
 <ParamField path="llm" type="LLMService" required>
