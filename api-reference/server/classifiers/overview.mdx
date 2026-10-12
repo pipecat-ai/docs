@@ -50,6 +50,7 @@ from pipecat.classifiers.base_classifier import (
     ChoiceQuestion,
     ChoiceResult,
     ClassifierError,
+    ClassifierImage,
     ScoreQuestion,
     ScoreResult,
     YesNoQuestion,
@@ -131,6 +132,35 @@ Where the state falls on an ordered scale.
   or as structured data. At least two.
 </ParamField>
 
+## Images
+
+A classifier that can see images takes them alongside the state, through the `images` argument of `ask()`, `yes_no()`, `choice()` and `score()`. Check `supports_images` to find out whether a classifier can: `ClefClassifier` and `LLMClassifier` can, `JevClassifier` cannot.
+
+### ClassifierImage
+
+An encoded image the questions can look at.
+
+<ParamField path="data" type="bytes" required>
+  The encoded image: PNG, JPEG or WebP.
+</ParamField>
+
+<ParamField path="content_type" type="str" default="read from data">
+  The image's MIME type: `image/png`, `image/jpeg` or `image/webp`. Read from
+  `data` when not given. A `ValueError` is raised if `data` is not one of these
+  image types.
+</ParamField>
+
+`await ClassifierImage.from_frame(frame)` builds an image from an `ImageRawFrame`, such as a frame from the user's camera. Raw pixels are encoded as a JPEG, and a frame whose format is already a MIME type keeps its bytes.
+
+```python
+image = await ClassifierImage.from_frame(frame)
+results = await classifier.yes_no(
+    "A frame from the user's camera.",
+    {"person": YesNoQuestion(instructions="Is there a person in the frame?")},
+    images=[image],
+)
+```
+
 ## Results
 
 ### YesNoResult
@@ -171,7 +201,7 @@ result.probability("angry")  # 0.12
 
 ### ClassifierError
 
-Raised when a classifier cannot answer: the backend failed or did not reply in time, or its reply could not be turned into results. Every classifier answers or raises within a time bound of its own, so a caller waiting on one is never left hanging.
+Raised when a classifier cannot answer: the backend failed or did not reply in time, its reply could not be turned into results, or it was given images and cannot see them. Every classifier answers or raises within a time bound of its own, so a caller waiting on one is never left hanging.
 
 ## BaseClassifier
 
@@ -185,20 +215,22 @@ The base class every classifier extends. It is a `BaseObject`, so it takes an op
 async def ask(
     state: str | dict[str, Any] | list[Any],
     questions: Mapping[str, ClassifierQuestion],
+    *,
+    images: Sequence[ClassifierImage] | None = None,
 ) -> dict[str, ClassifierResult]
 ```
 
-Answers several questions about one state, in one call. `questions` can mix kinds. Returns one result per question, under the same names, each of the type its question calls for.
+Answers several questions about one state, in one call. `questions` can mix kinds. Returns one result per question, under the same names, each of the type its question calls for. `images` are images the questions can look at, for a classifier that [supports them](#images). A classifier that cannot see images raises `ClassifierError` when given some.
 
 #### yes_no, choice, score
 
 ```python
-async def yes_no(state, questions: Mapping[str, YesNoQuestion]) -> dict[str, YesNoResult]
-async def choice(state, questions: Mapping[str, ChoiceQuestion]) -> dict[str, ChoiceResult]
-async def score(state, questions: Mapping[str, ScoreQuestion]) -> dict[str, ScoreResult]
+async def yes_no(state, questions: Mapping[str, YesNoQuestion], *, images=None) -> dict[str, YesNoResult]
+async def choice(state, questions: Mapping[str, ChoiceQuestion], *, images=None) -> dict[str, ChoiceResult]
+async def score(state, questions: Mapping[str, ScoreQuestion], *, images=None) -> dict[str, ScoreResult]
 ```
 
-Typed versions of `ask()` for questions of one kind. They return results already typed, so no `isinstance` check is needed.
+Typed versions of `ask()` for questions of one kind, taking the same `images`. They return results already typed, so no `isinstance` check is needed.
 
 All four raise `ClassifierError` when the answers could not be produced.
 
@@ -220,9 +252,10 @@ Releases the classifier's resources. Call it when you are done asking.
 
 ### Properties
 
-| Property | Type          | Description                                      |
-| -------- | ------------- | ------------------------------------------------ |
-| `model`  | `str \| None` | The model that answers, as named in the metrics. |
+| Property          | Type          | Description                                                                           |
+| ----------------- | ------------- | ------------------------------------------------------------------------------------- |
+| `model`           | `str \| None` | The model that answers, as named in the metrics.                                      |
+| `supports_images` | `bool`        | Whether questions can come with images. `False` unless the classifier says otherwise. |
 
 ### Event Handlers
 
@@ -259,14 +292,14 @@ class MyProcessor(FrameProcessor):
 
 ## Writing a Classifier
 
-To back classifiers with another model or service, subclass `BaseClassifier` and implement `_ask()`. It receives the state and the questions and returns the results by name, plus the tokens the call used when that is known (or `None`). Raise `ClassifierError` when the backend fails. The public methods, typing and metrics are handled by the base class.
+To back classifiers with another model or service, subclass `BaseClassifier` and implement `_ask()`. It receives the state, the questions and the `images` (always empty unless the classifier overrides `supports_images` to return `True`), and returns the results by name, plus the tokens the call used when that is known (or `None`). Raise `ClassifierError` when the backend fails. The public methods, typing and metrics are handled by the base class.
 
 ```python
 from pipecat.classifiers.base_classifier import BaseClassifier, ClassifierError
 
 
 class MyClassifier(BaseClassifier):
-    async def _ask(self, state, questions):
+    async def _ask(self, state, questions, images=()):
         results = {}
         for name, question in questions.items():
             results[name] = ...  # a YesNoResult, ChoiceResult or ScoreResult
