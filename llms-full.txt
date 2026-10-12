@@ -36377,6 +36377,7 @@ Turn detection models decide when the user has finished speaking.
 | --------------------------------------------------------------------------------- | ---------------------------- | ---------- |
 | [Krisp VIVA Turn](/api-reference/server/utilities/turn-detection/krisp-viva-turn) | `uv add "pipecat-ai[krisp]"` | Pipecat    |
 | [Smart Turn](/api-reference/server/utilities/turn-detection/smart-turn-overview)  | Built in                     | Pipecat    |
+| [turn-1-mini](/api-reference/server/utilities/turn-detection/turn-1-mini)         | `uv pip install git+https://github.com/P99Lab/pipecat-p99lab` | Community  |
 
 ## VAD
 
@@ -65439,13 +65440,14 @@ Before using `SpeechifyHttpTTSService`, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `SpeechifyHttpTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter                | Type              | Default     | Description                                                                             |
-| ------------------------ | ----------------- | ----------- | --------------------------------------------------------------------------------------- |
-| `voice`                  | `str`             | `geffen_32` | Voice identifier (e.g., `geffen_32`, `beatrice_32`).                                    |
-| `model`                  | `str`             | `simba-3.2` | Model identifier. Use `simba-3.2` for English or `simba-3.0` for multilingual.          |
-| `language`               | `Language \| str` | `None`      | Language for synthesis. Supported: DE, EN, ES, FR, IT, PT. _(Inherited.)_               |
-| `loudness_normalization` | `bool \| None`    | `None`      | Whether to normalize audio loudness to a standard level. Adds latency.                  |
-| `text_normalization`     | `bool \| None`    | `None`      | Whether to spell out numbers, dates, and similar tokens before synthesis. Adds latency. |
+| Parameter                | Type              | Default     | Description                                                                                                                                                                                                                                                                                      |
+| ------------------------ | ----------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `voice`                  | `str`             | `geffen_32` | Voice identifier (e.g., `geffen_32`, `beatrice_32`).                                                                                                                                                                                                                                             |
+| `model`                  | `str`             | `simba-3.2` | Model identifier. Use `simba-3.2` for English or `simba-3.0` for multilingual.                                                                                                                                                                                                                   |
+| `language`               | `Language \| str` | `None`      | Language for synthesis. Supported: DE, EN, ES, FR, IT, PT. _(Inherited.)_                                                                                                                                                                                                                        |
+| `loudness_normalization` | `bool \| None`    | `None`      | Whether to normalize audio loudness to a standard level. Adds latency.                                                                                                                                                                                                                           |
+| `text_normalization`     | `bool \| None`    | `None`      | Whether to spell out numbers, dates, and similar tokens before synthesis. Adds latency.                                                                                                                                                                                                          |
+| `safety_identifier`      | `str \| None`     | `None`      | Stable, opaque end-user identifier (1 to 64 characters of letters, digits, and `. _ - : \| + / =`) so Speechify can rate-limit or block one user instead of the whole workspace. Use a keyed hash of an internal user id, never personal data such as an email address, which Speechify rejects. |
 
 ## Usage
 
@@ -84562,6 +84564,98 @@ This differs from the [Smart Turn model](/api-reference/server/utilities/turn-de
 - Requires a valid Krisp SDK license and turn detection model file
 - Works with any VAD analyzer (Silero is recommended)
 - Emits `TurnMetricsData` with end-to-end processing time, measuring the interval from VAD speech-to-silence transition to the model crossing the probability threshold
+
+# turn-1-mini
+Source: https://docs.pipecat.ai/api-reference/server/utilities/turn-detection/turn-1-mini.md
+
+Local, audio-only end-of-turn detection with p99lab's turn-1-mini model
+
+## Overview
+
+`LocalTurn1MiniAnalyzer` is a turn analyzer that decides when the user has
+finished speaking. It runs [turn-1-mini](https://huggingface.co/p99lab/turn-1-mini),
+a 5.3M-parameter causal streaming model, on the user's audio. It needs no
+transcript, no API key and no GPU: the model runs locally on one CPU core.
+
+It is used wherever Pipecat accepts a turn analyzer, with the same wiring as the
+turn analyzers that ship with Pipecat.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/P99Lab/pipecat-p99lab"
+  >
+    Source code, examples, and issues for the integration
+  </Card>
+  <Card
+    title="Model Card"
+    icon="cube"
+    href="https://huggingface.co/p99lab/turn-1-mini"
+  >
+    turn-1-mini weights (Apache-2.0), evaluation and limits
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv pip install git+https://github.com/P99Lab/pipecat-p99lab
+```
+
+## Prerequisites
+
+No account or API key. The model (22 MB) downloads from Hugging Face on first
+use and then works offline.
+
+- **A VAD analyzer in the pipeline**, for example `SileroVADAnalyzer`
+- **English audio**: the model is trained and evaluated on English only
+
+## Configuration
+
+`LocalTurn1MiniAnalyzer(params=Turn1MiniParams(...))`
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `threshold` | `0.5` | Probability above which the turn is treated as finished. Lower is faster and interrupts more; higher is more patient. |
+| `fallback_secs` | off | Optional: end the turn after this much silence if the score during the silence reached `fallback_threshold`. Shortens long waits after short answers. |
+| `fallback_threshold` | off | Score needed for the fallback to apply. |
+
+Presets: `Turn1MiniParams.fast()` (0.2), `Turn1MiniParams.balanced()` (0.5,
+default) and `Turn1MiniParams.patient()` (0.7).
+
+## Usage
+
+```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat_p99lab import LocalTurn1MiniAnalyzer
+
+turn_strategies = UserTurnStrategies(
+    stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalTurn1MiniAnalyzer())]
+)
+
+# Pass to the user aggregator:
+# LLMUserAggregatorParams(user_turn_strategies=turn_strategies, vad_analyzer=SileroVADAnalyzer())
+```
+
+A complete example is in the repository's
+[`examples/foundational`](https://github.com/P99Lab/pipecat-p99lab/tree/main/examples/foundational)
+folder.
+
+## Compatibility
+
+Tested with Pipecat v1.12.0 and v0.0.108, Python 3.12.
+
+## Notes
+
+- Known weak spot: after a short answer followed by silence, the model can wait
+  for the timeout. The `fallback_secs` option addresses this.
+- Maintained by p99lab, the company that makes turn-1-mini. Contact:
+  research@p99lab.com
 
 # DTMFAggregator
 Source: https://docs.pipecat.ai/api-reference/server/utilities/dtmf-aggregator.md
