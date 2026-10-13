@@ -63,6 +63,10 @@ images/ logo/ videos/   # Static assets
 
 ## Content conventions
 
+Writing style (what to document, what to leave out, page templates, how to
+size an edit) is in [STYLE.md](STYLE.md). Read it before writing or editing a
+page. This section covers frontmatter, navigation, and components.
+
 ### MDX frontmatter
 
 Every page needs a `title` and a `description`. The frontmatter `title` becomes
