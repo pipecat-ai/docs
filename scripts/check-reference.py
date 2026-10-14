@@ -38,6 +38,8 @@ Usage:
                                      [--format text|github|summary]
 
   --pipecat PATH  pipecat checkout (default: ../pipecat, per CLAUDE.md)
+  --ignore FILE   confirmed false positives (default:
+                  scripts/check-reference-ignore.txt)
 
 Exit code: 1 if any finding is reported, else 0. Standard library only.
 """
@@ -86,6 +88,7 @@ class Cls:
     fields: dict[str, Param] = field(default_factory=dict)  # dataclass/BaseModel
     constants: dict[str, str] = field(default_factory=dict)
     members: set[str] = field(default_factory=set)  # methods, properties, self.* attributes
+    class_constants: dict[str, str] = field(default_factory=dict)
 
 
 def unparse(node):
@@ -155,14 +158,26 @@ class SourceIndex:
                 continue
             if isinstance(value, (ast.Constant, ast.UnaryOp)):
                 consts[target.id] = unparse(value)
-            elif isinstance(value, (ast.Subscript, ast.BinOp)) and target.id[:1].isupper():
+            elif isinstance(value, ast.BinOp):
+                try:  # `25 * 1024 * 1024`
+                    consts[target.id] = repr(eval(compile(ast.Expression(value), "<const>", "eval"), {"__builtins__": {}}))
+                except Exception:
+                    if target.id[:1].isupper():
+                        self.type_aliases[target.id] = unparse(value)
+            elif isinstance(value, ast.Subscript) and target.id[:1].isupper():
                 self.type_aliases[target.id] = unparse(value)
         self.module_constants[module] = consts
         imports = {}
         for node in tree.body:
-            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            if isinstance(node, ast.ImportFrom):
+                if node.level:
+                    pkg = module.split(".") if rel.endswith("__init__.py") else module.split(".")[:-1]
+                    pkg = pkg[: len(pkg) - (node.level - 1)]
+                    src = ".".join(pkg + ([node.module] if node.module else []))
+                else:
+                    src = node.module
                 for alias in node.names:
-                    imports[alias.asname or alias.name] = (node.module, alias.name)
+                    imports[alias.asname or alias.name] = (src, alias.name)
         self.module_imports[module] = imports
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
@@ -202,6 +217,8 @@ class SourceIndex:
                 t = item.targets[0]
                 if isinstance(t, ast.Name) and t.id == "Settings" and isinstance(item.value, ast.Name):
                     c.settings_ref = item.value.id
+                elif isinstance(t, ast.Name) and isinstance(item.value, ast.Constant):
+                    c.class_constants[t.id] = unparse(item.value)
             elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
                 name = item.target.id
                 if not name.startswith("_") and not (
@@ -555,7 +572,9 @@ def norm_default(v, consts, code=False):
         return None
     v = consts.get(v, v)
     v = re.sub(r"\.value$", "", v)  # `Model.PULSE.value`: compare as the member
-    if v in ("None", "NOT_GIVEN", "NotGiven", "NotGiven()") or v.endswith("_NOT_GIVEN"):
+    if v == "None":
+        return "x:None"
+    if v in ("NOT_GIVEN", "NotGiven", "NotGiven()") or v.endswith("_NOT_GIVEN"):
         return UNSET
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
         return "s:" + v[1:-1]
@@ -773,14 +792,16 @@ class Checker:
                 "unmarked-deprecation", page.path, e.line, t.cls.name, e.name,
                 f"deprecated in {dep.get('deprecated_in')}" + (f"; use {dep['replacement']}" if dep.get("replacement") else ""),
             )
-        consts = {**self.consts, **self.idx.constants_for(t.owner.module)}
+        consts = {**self.consts, **self.idx.constants_for(t.owner.module), **t.cls.class_constants, **t.owner.class_constants}
         doc, src = norm_default(e.default, consts), norm_default(p.default, consts, code=True)
-        if dep and t.mode == "params":
-            doc = None  # a deprecated parameter's own default defers to settings
         same = doc == src or (
             doc and src and doc[0] in "xs" and src[0] in "xs"
             and doc[2:].lower() in (src[2:].lower(), src[2:].split(".")[-1].lower())
         )
+        # `None` on a page for a field Pipecat leaves NOT_GIVEN is fine: both
+        # mean "not sent". `NOT_GIVEN` on a page where Pipecat sets a value
+        # (including `None`) is not.
+        same = same or (doc == "x:None" and src == UNSET)
         if doc and src and not same:
             self.add("default-mismatch", page.path, e.line, t.cls.name, e.name, f"page `{e.default}`, code `{p.default}`")
         dt = type_bases(e.type, self.idx.type_aliases)
@@ -858,6 +879,19 @@ KINDS = [
 TYPE_WORDS = {"string": "str", "integer": "int", "boolean": "bool", "number": "float"}
 
 
+def load_ignore(path):
+    """Confirmed false positives: `page kind name  # why`, one per line."""
+    out = set()
+    if not os.path.exists(path):
+        return out
+    for line in open(path, encoding="utf-8"):
+        line = line.split("#", 1)[0].strip()
+        if line:
+            page, kind, name = line.split()
+            out.add((page, kind, name))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--pipecat", default=os.path.join(ROOT, "..", "pipecat"))
@@ -865,6 +899,7 @@ def main():
     ap.add_argument("--page", help="glob, relative to the repo root")
     ap.add_argument("--only", help="comma-separated finding kinds")
     ap.add_argument("--format", choices=["text", "github", "summary"], default="text")
+    ap.add_argument("--ignore", default=os.path.join(ROOT, "scripts", "check-reference-ignore.txt"))
     a = ap.parse_args()
 
     if not os.path.isdir(os.path.join(a.pipecat, "src", "pipecat")):
@@ -882,6 +917,8 @@ def main():
     findings = checker.findings
     if a.page:
         findings = [f for f in findings if fnmatch.fnmatch(f["page"], a.page)]
+    ignored = load_ignore(a.ignore)
+    findings = [f for f in findings if (f["page"], f["kind"], f["name"]) not in ignored]
     if a.only:
         keep = set(a.only.split(","))
         findings = [f for f in findings if f["kind"] in keep]
