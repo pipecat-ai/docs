@@ -731,6 +731,10 @@ class Checker:
         return by_alias, all_targets
 
     def match_group(self, g, by_alias, all_targets):
+        # A table under a method's heading (`### job_group`) documents that
+        # method's parameters, not a class.
+        if g.chain and re.fullmatch(r"[a-z_]\w*(\(.*\))?(\s*->.*)?", g.chain[0].strip("` ")):
+            return None
         names = {e.name.split(".")[0] for e in g.entries}
         wants_settings = any("setting" in h.lower() for h in g.chain[:1])
         # 1. A class named in the enclosing headings.
