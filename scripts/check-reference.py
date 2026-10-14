@@ -38,6 +38,7 @@ Usage:
                                      [--format text|github|summary]
 
   --pipecat PATH  pipecat checkout (default: ../pipecat, per CLAUDE.md)
+  --pages-from F  report only on the pages listed in F (CI passes a PR's pages)
   --ignore FILE   confirmed false positives (default:
                   scripts/check-reference-ignore.txt)
 
@@ -897,6 +898,11 @@ def main():
     ap.add_argument("--pipecat", default=os.path.join(ROOT, "..", "pipecat"))
     ap.add_argument("--json")
     ap.add_argument("--page", help="glob, relative to the repo root")
+    ap.add_argument(
+        "--pages-from",
+        help="file listing pages (one per line) to report on; the rest are still read, "
+        "since a class's home page is decided across the site",
+    )
     ap.add_argument("--only", help="comma-separated finding kinds")
     ap.add_argument("--format", choices=["text", "github", "summary"], default="text")
     ap.add_argument("--ignore", default=os.path.join(ROOT, "scripts", "check-reference-ignore.txt"))
@@ -917,6 +923,9 @@ def main():
     findings = checker.findings
     if a.page:
         findings = [f for f in findings if fnmatch.fnmatch(f["page"], a.page)]
+    if a.pages_from:
+        wanted = {line.strip() for line in open(a.pages_from) if line.strip()}
+        findings = [f for f in findings if f["page"] in wanted]
     ignored = load_ignore(a.ignore)
     findings = [f for f in findings if (f["page"], f["kind"], f["name"]) not in ignored]
     if a.only:
