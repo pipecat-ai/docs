@@ -77,7 +77,8 @@ Before using AWS Bedrock LLM services, you need:
 <ParamField path="aws_access_key" type="str" default="None">
   AWS access key ID. If `None`, falls back to environment variables and the
   default botocore credential chain (instance profiles, IRSA, ECS task roles,
-  SSO, etc.).
+  SSO, etc.). Credentials from the chain are read once, when the service is
+  created, so temporary credentials stop working when they expire.
 </ParamField>
 
 <ParamField path="aws_secret_key" type="str" default="None">
@@ -135,11 +136,11 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `max_tokens`                      | `int`       | `None`                       | Maximum number of tokens to generate.                                                                                                                                                                                                                                                         |
 | `temperature`                     | `float`     | `None`                       | Sampling temperature (0.0 to 1.0). Lower values are more focused, higher values are more creative.                                                                                                                                                                                            |
 | `top_p`                           | `float`     | `None`                       | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                                                                                                                                                                                                          |
-| `top_k`                           | `int`       | `None`                       | Top-k sampling parameter.                                                                                                                                                                                                                                                                     |
-| `seed`                            | `int`       | `None`                       | Random seed for deterministic outputs.                                                                                                                                                                                                                                                        |
+| `top_k`                           | `int`       | `None`                       | Top-k sampling parameter. Not sent by this service, so it has no effect.                                                                                                                                                                                                                      |
+| `seed`                            | `int`       | `None`                       | Random seed for deterministic outputs. Not sent by this service, so it has no effect.                                                                                                                                                                                                         |
 | `stop_sequences`                  | `List[str]` | `None`                       | List of strings that stop generation when encountered.                                                                                                                                                                                                                                        |
 | `effort`                          | `str`       | `None`                       | How much reasoning the model spends before answering: `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. Sent as Converse's `outputConfig.effort`; only reasoning models accept it. See [AWS docs](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_OutputConfig.html). |
-| `latency`                         | `str`       | `None`                       | Performance mode: `"standard"` or `"optimized"`.                                                                                                                                                                                                                                              |
+| `latency`                         | `str`       | `None`                       | Performance mode: `"standard"` or `"optimized"`. Any other value isn't sent.                                                                                                                                                                                                                  |
 | `enable_prompt_caching`           | `bool`      | `False`                      | Whether to enable prompt caching by adding cachePoint markers to system prompts and tool definitions. Can reduce TTFT by up to 85% for multi-turn conversations. See [AWS docs](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).                                    |
 | `additional_model_request_fields` | `dict`      | `{}`                         | Additional model-specific parameters passed directly to the API.                                                                                                                                                                                                                              |
 
@@ -155,6 +156,8 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 ### Basic Setup
 
 ```python
+import os
+
 from pipecat.services.aws.llm import AWSBedrockLLMService
 
 llm = AWSBedrockLLMService(
@@ -211,7 +214,7 @@ await worker.queue_frame(
 
 ## Notes
 
-- **Credential resolution**: Credentials are resolved via a fallback chain: explicit parameters → environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) → botocore credential provider chain (instance profiles, IRSA, ECS task roles, SSO, credential files). Services running with IAM roles no longer need to export static credentials.
+- **Credential resolution**: Credentials are resolved via a fallback chain: explicit parameters → environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) → botocore credential provider chain (instance profiles, IRSA, ECS task roles, SSO, credential files), so services running with IAM roles don't need to export static credentials.
 - **No-op tool handling**: AWS Bedrock requires at least one tool to be defined when tool content exists in the conversation. The service automatically adds a placeholder tool when needed to prevent API errors.
 - **Model-specific parameters**: Some models (e.g., Claude Sonnet 4.5) don't allow certain parameter combinations. The service only includes explicitly set parameters in the inference config to avoid conflicts.
 - **Retry behavior**: When `retry_on_timeout=True`, the first attempt uses the `retry_timeout_secs` timeout. If it times out, a second attempt is made with no timeout limit.
@@ -221,10 +224,11 @@ await worker.queue_frame(
 
 `AWSBedrockLLMService` supports the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
-| Event                       | Description                                                             |
-| --------------------------- | ----------------------------------------------------------------------- |
-| `on_completion_timeout`     | Called when an LLM completion request times out                         |
-| `on_function_calls_started` | Called when function calls are received and execution is about to start |
+| Event                         | Description                                                             |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `on_completion_timeout`       | Called when an LLM completion request times out                         |
+| `on_function_calls_started`   | Called when function calls are received and execution is about to start |
+| `on_function_calls_cancelled` | Called after one or more in-progress function calls are cancelled       |
 
 ```python
 @llm.event_handler("on_completion_timeout")
