@@ -90,7 +90,7 @@ Before using Grok Realtime services, you need:
   `SessionProperties` with voice `"eve"` and server-side VAD enabled. See
   [SessionProperties](#sessionproperties) below.
 
-_Deprecated in v0.0.105. Use `settings=GrokRealtimeLLMService.Settings(session_properties=...)` instead._
+_Deprecated since 0.0.105, removed in 2.0.0._ Use `settings=GrokRealtimeLLMService.Settings(session_properties=...)` instead.
 
 </ParamField>
 
@@ -110,11 +110,11 @@ _Deprecated in v0.0.105. Use `settings=GrokRealtimeLLMService.Settings(session_p
 
 Runtime-configurable settings passed via the `settings` constructor argument using `GrokRealtimeLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter            | Type                | Default               | Description                                                                                          |
-| -------------------- | ------------------- | --------------------- | ---------------------------------------------------------------------------------------------------- |
-| `model`              | `str`               | `"grok-voice-latest"` | Model identifier. Defaults to xAI's recommended Voice Agent alias. _(Inherited from base settings.)_ |
-| `system_instruction` | `str`               | `None`                | System instruction/prompt. _(Inherited from base settings.)_                                         |
-| `session_properties` | `SessionProperties` | `SessionProperties()` | Session-level configuration (voice, audio config, tools, etc.).                                      |
+| Parameter            | Type                | Default               | Description                                                                                                                                                      |
+| -------------------- | ------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`              | `str`               | `"grok-voice-latest"` | Model identifier. Defaults to xAI's recommended Voice Agent alias. Set at connection time, so runtime changes are not applied. _(Inherited from base settings.)_ |
+| `system_instruction` | `str`               | `None`                | System instruction/prompt. _(Inherited from base settings.)_                                                                                                     |
+| `session_properties` | `SessionProperties` | `SessionProperties()` | Session-level configuration (voice, audio config, tools, etc.).                                                                                                  |
 
 <Note>
   `NOT_GIVEN` and `None` values are omitted, letting the service use its own
@@ -138,13 +138,13 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 The `turn_detection` field in `SessionProperties` configures voice activity detection and turn management:
 
-| Parameter             | Type    | Default | Description                                                                        |
-| --------------------- | ------- | ------- | ---------------------------------------------------------------------------------- |
-| `type`                | `str`   | `None`  | Detection type: `"server_vad"` for automatic detection, `None` for manual control. |
-| `threshold`           | `float` | `None`  | VAD activation threshold (0.1–0.9). Higher values require louder audio.            |
-| `silence_duration_ms` | `int`   | `None`  | Milliseconds of silence before the server ends the user turn.                      |
-| `prefix_padding_ms`   | `int`   | `None`  | Audio (ms) included before detected speech start.                                  |
-| `idle_timeout_ms`     | `int`   | `None`  | Milliseconds of silence after assistant response before proactive check-in.        |
+| Parameter             | Type                            | Default        | Description                                                                        |
+| --------------------- | ------------------------------- | -------------- | ---------------------------------------------------------------------------------- |
+| `type`                | `Literal["server_vad"] \| None` | `"server_vad"` | Detection type: `"server_vad"` for automatic detection, `None` for manual control. |
+| `threshold`           | `float`                         | `None`         | VAD activation threshold (0.1–0.9). Higher values require louder audio.            |
+| `silence_duration_ms` | `int`                           | `None`         | Milliseconds of silence before the server ends the user turn.                      |
+| `prefix_padding_ms`   | `int`                           | `None`         | Audio (ms) included before detected speech start.                                  |
+| `idle_timeout_ms`     | `int`                           | `None`         | Milliseconds of silence after assistant response before proactive check-in.        |
 
 ### AudioConfiguration
 
@@ -266,29 +266,23 @@ llm = GrokRealtimeLLMService(
 
 ### Updating Settings at Runtime
 
+A `session_properties` delta replaces the stored `SessionProperties` whole, so fields it leaves unset (such as tools, turn detection, and transcription) fall back to their defaults. Copy the full session config and change the fields you need:
+
 ```python
 from pipecat.frames.frames import LLMUpdateSettingsFrame
 from pipecat.services.xai.realtime.llm import GrokRealtimeLLMSettings
-from pipecat.services.xai.realtime.events import SessionProperties
+
+session_properties = session_properties.model_copy(update={"voice": "eve"})
 
 await worker.queue_frame(
     LLMUpdateSettingsFrame(
         delta=GrokRealtimeLLMSettings(
-            session_properties=SessionProperties(
-                instructions="Now speak in Spanish.",
-                voice="eve",
-            ),
+            system_instruction="Now speak in Spanish.",
+            session_properties=session_properties,
         )
     )
 )
 ```
-
-<Tip>
-  The deprecated `session_properties` constructor parameter is replaced by
-  `Settings` as of v0.0.105. Use `Settings` / `settings=` instead. See the
-  [Service Settings guide](/pipecat/fundamentals/service-settings) for migration
-  details.
-</Tip>
 
 ## Methods
 
@@ -319,26 +313,26 @@ Speak a hard-coded TTS line without involving the LLM. Sends a `force_message` c
 ## Notes
 
 - **Model versioning**: The default model `"grok-voice-latest"` tracks xAI's recommended Voice Agent. For stability, pin a specific version in settings (e.g., `model="grok-voice-think-fast-1.0"`).
-- **Audio format auto-configuration**: If audio format is not specified in `session_properties`, the service automatically configures PCM input/output using the pipeline's sample rates.
+- **Audio format auto-configuration**: If `audio.input` or `audio.output` is not set in `session_properties`, the service configures PCM for it using the pipeline's sample rates, which must be one of the supported PCM rates. When you set `audio.input` or `audio.output` (for example, for `transcription` or `speed`), set its `format` too. Input audio is sent without resampling, so a configured input rate must match the pipeline's `audio_in_sample_rate`.
 - **Server-side VAD**: Enabled by default. When VAD is enabled, the server handles speech detection and turn management automatically. Set `turn_detection` to `None` for manual turn detection.
-- **Audio flow timing**: User audio flows after `session.updated` is received. Audio-only pipelines work without explicitly calling `_create_response`.
+- **Audio flow timing**: User audio flows once the session is configured, without waiting for a first context, so the user can speak first without an `LLMRunFrame`.
 - **Interruption handling**: Interruptions send `response.cancel` to stop in-flight assistant audio on the wire and `conversation.item.truncate` to align server-side history with what the user heard. With server VAD enabled, the input buffer is preserved (not cleared) so interrupting user speech remains intact. Manual turn mode clears the input buffer on interruption.
 - **Voice IDs**: Accepts any built-in voice ID from [xAI's catalogue](https://docs.x.ai/docs/guides/voice/agent) or a custom voice ID from the Custom Voices API. Voice IDs are case-insensitive. Default is `"eve"`.
-- **G.711 support**: PCMU and PCMA formats are supported at a fixed 8000 Hz rate, useful for telephony integrations.
+- **G.711 formats**: PCMU and PCMA are fixed at 8000 Hz. The service passes audio through without converting it, and pipeline audio frames are 16-bit PCM, so use `PCMAudioFormat`; for telephony, the transport's serializer converts to and from G.711.
 - **System instruction precedence**: The `system_instruction` from service settings takes precedence over an initial system message in the LLM context. A warning is logged when both are set.
-- **Async tool support**: Functions registered with `cancel_on_interruption=False` are supported. The final tool result is delivered via the formal tool-result channel once the async function completes. Streamed intermediate results (`is_final=False`) are not supported.
+- **Async tool support**: Functions registered with `cancel_on_interruption=False` are supported. The final tool result is delivered via the formal tool-result channel once the async function completes. Intermediate results (`is_final=False`) reach the model as conversation messages.
 
 ## Event Handlers
 
-| Event                            | Parameters                                 | Description                                                   |
-| -------------------------------- | ------------------------------------------ | ------------------------------------------------------------- |
-| `on_conversation_item_created`   | `item_id`, `item`                          | Called when a new conversation item is created in the session |
-| `on_conversation_item_updated`   | `item_id`, `item`                          | Called when a conversation item is updated or completed       |
-| `on_conversation_item_deleted`   | `item_id`                                  | Called when a conversation item is deleted                    |
-| `on_conversation_item_truncated` | `item_id`, `content_index`, `audio_end_ms` | Called when a conversation item is truncated                  |
-| `on_idle_timeout`                | `item_id`                                  | Called when the idle timeout fires (proactive check-in)       |
-| `on_dtmf_received`               | `button`                                   | Called when a DTMF digit is received (SIP sessions)           |
-| `on_mcp_event`                   | `event_type`, `event`                      | Called for MCP discovery and call lifecycle events            |
+| Event                            | Parameters                                 | Description                                                                                                    |
+| -------------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `on_conversation_item_created`   | `item_id`, `item`                          | Called when a new conversation item is created in the session                                                  |
+| `on_conversation_item_updated`   | `item_id`, `item`                          | Called when a conversation item is updated or completed. `item` is `None` when a user transcription completes. |
+| `on_conversation_item_deleted`   | `item_id`                                  | Called when a conversation item is deleted                                                                     |
+| `on_conversation_item_truncated` | `item_id`, `content_index`, `audio_end_ms` | Called when a conversation item is truncated                                                                   |
+| `on_idle_timeout`                | `item_id`                                  | Called when the idle timeout fires (proactive check-in)                                                        |
+| `on_dtmf_received`               | `button`                                   | Called when a DTMF digit is received (SIP sessions)                                                            |
+| `on_mcp_event`                   | `event_type`, `event`                      | Called for MCP discovery and call lifecycle events                                                             |
 
 ```python
 @llm.event_handler("on_conversation_item_created")
