@@ -18,6 +18,14 @@ From every page's Python code samples (except the migration guides):
   - calls to pipecat classes: constructor keywords, required arguments, and
     deprecated arguments; methods called on the objects they return; the
     event names given to `event_handler`
+  - in the page's first sample, which has complete imports (STYLE.md):
+    standard-library modules and pipecat classes it uses without importing
+  - API keys handed to pipecat classes under names pipecat never uses
+
+From every page's text (except the migration guides):
+  - backticked class names outside code blocks, on pages about the Python
+    framework (not the client SDKs or the Pipecat Cloud SDK)
+  - `pipecat-ai[...]` install extras, against pipecat's pyproject.toml
 
 From each page under api-reference/server and api-reference/pipecat-flows:
   - `<ParamField>` entries, grouped by the heading they sit under
@@ -43,6 +51,10 @@ Findings, most to least certain:
   sample-unknown-event   sample handles an event the class never registers
   sample-deprecated-arg  sample passes a deprecated argument
   sample-deprecated-call sample uses a deprecated class or method
+  sample-undefined-name  first sample uses a module or pipecat class it doesn't import
+  sample-unknown-env     sample reads an API key pipecat's env.example and examples never use
+  prose-unknown-name     prose names a class pipecat doesn't have
+  unknown-extra          install extra pipecat's pyproject.toml doesn't declare
 
 Usage:
   python3 scripts/check-reference.py [--pipecat PATH] [--json FILE]
@@ -143,6 +155,41 @@ def field_default(node):
     return unparse(node)
 
 
+def identifiers_in(tree):
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.add(n.name)
+        elif isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.alias):
+            out.add((n.asname or n.name).split(".")[-1])
+            out.add(n.name.split(".")[-1])
+    return out
+
+
+ENV_NAME_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b|\b[A-Z]{2,}[A-Z0-9]*\b")
+
+
+def env_names(pipecat):
+    """Every upper-case name in pipecat's source, examples, and env.example:
+    the environment variables pipecat and its examples read."""
+    out = set()
+    roots = [os.path.join(pipecat, d) for d in ("src", "examples")]
+    files = [os.path.join(pipecat, "env.example")]
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            files += [os.path.join(dirpath, fn) for fn in filenames if fn.endswith((".py", ".example", ".md", ".toml", ".env"))]
+    for f in files:
+        try:
+            out.update(ENV_NAME_RE.findall(open(f, encoding="utf-8").read()))
+        except (OSError, UnicodeDecodeError):
+            pass
+    return out
+
+
 def package_of(module):
     """`pipecat.services.assemblyai.stt` -> `pipecat.services.assemblyai`."""
     return ".".join(module.split(".")[:3])
@@ -160,11 +207,27 @@ class SourceIndex:
         self.refs: dict[str, Counter] = defaultdict(Counter)
         # Events fired on another object (`transport._call_event_handler(...)`).
         self.external_fired: set[str] = set()
+        # Every identifier the source defines or uses (its own names and the
+        # libraries' it calls), to tell a name a page invents from a real one.
+        self.identifiers: set[str] = set()
+        # Classes and functions defined at the top of a pipecat module: what a
+        # sample has to import.
+        self.top_level: set[str] = set()
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if d not in ("tests", "__pycache__")]
             for fn in filenames:
                 if fn.endswith(".py"):
                     self._index(os.path.join(dirpath, fn))
+        # Names pipecat's examples define are real too: pages describe them.
+        for dirpath, dirnames, filenames in os.walk(os.path.join(pipecat, "examples")):
+            for fn in filenames:
+                if fn.endswith(".py"):
+                    try:
+                        tree = ast.parse(open(os.path.join(dirpath, fn), encoding="utf-8").read())
+                    except (SyntaxError, UnicodeDecodeError):
+                        continue
+                    self.identifiers |= identifiers_in(tree)
+        self.env_names = env_names(pipecat)
         self.deprecated: dict[str, dict] = {}
         dep = os.path.join(pipecat, "scripts", "deprecations", "deprecations.json")
         if os.path.exists(dep):
@@ -198,6 +261,11 @@ class SourceIndex:
             elif isinstance(value, ast.Subscript) and target.id[:1].isupper():
                 self.type_aliases[target.id] = unparse(value)
         self.module_constants[module] = consts
+        self.identifiers |= identifiers_in(tree)
+        if ".tests" not in module:
+            for node in tree.body:
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+                    self.top_level.add(node.name)
         refs = self.refs[module]
         for sub in ast.walk(tree):
             if isinstance(sub, ast.Attribute):
@@ -1146,12 +1214,15 @@ def check_samples(checker, page, text):
     own = frozenset(re.findall(r"[A-Z]\w+", " ".join(re.findall(r"^(?:#+ |title: ).*$", text, re.M))))
     local = set()  # names the page's samples define themselves
     trees = []
-    for start, src in samples(text):
+    for i, (start, src) in enumerate(samples(text)):
         try:
             tree = ast.parse(src)
         except SyntaxError:
             continue
         trees.append((start, tree))
+        if i == 0:
+            check_first_sample(checker, page, start, tree)
+        check_env(checker, page, start, tree, "CommunityMaintained" in text)
         for node in ast.walk(tree):
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 local.add(node.name)
@@ -1187,6 +1258,114 @@ def check_samples(checker, page, text):
                         checker.add("sample-unknown-attr", page, line, c.name, attr, f"`{c.name}` has no `{attr}`")
                     else:
                         check_method_call(checker, page, line, c, attr, node)
+
+
+# Standard-library modules a sample may use as `mod.attr`. A sample can't use
+# one without importing it, and no reader variable is named like these.
+STDLIB_MODULES = {
+    "argparse", "asyncio", "base64", "collections", "contextlib", "dataclasses",
+    "datetime", "enum", "functools", "hashlib", "hmac", "inspect", "io",
+    "itertools", "json", "logging", "math", "os", "pathlib", "random", "re",
+    "secrets", "shutil", "signal", "socket", "struct", "subprocess", "sys",
+    "tempfile", "threading", "time", "traceback", "typing", "urllib", "uuid",
+    "wave", "zoneinfo",
+}
+
+
+def bound_names(tree):
+    """Names a sample binds: imports, assignments, definitions, parameters.
+    None when it star-imports, so anything may be bound."""
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                if a.name == "*":
+                    return None
+                out.add(a.asname or a.name.split(".")[0])
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            out.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, ast.arg):
+            out.add(n.arg)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            out.update(n.names)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            out.add(n.name)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            out.add(n.name)
+    return out
+
+
+def is_signature(tree):
+    """A block of signatures (`def f(x: Foo) -> Bar: ...`), not a sample."""
+    def stub(body):
+        return all(
+            isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant) and (b.value.value is Ellipsis or isinstance(b.value.value, str))
+            for b in body
+        )
+    return bool(tree.body) and all(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and stub(n.body)
+        or isinstance(n, ast.ClassDef) and all(isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and stub(m.body) or stub([m]) for m in n.body)
+        for n in tree.body
+    )
+
+
+def check_first_sample(checker, page, start, tree):
+    """The first sample on a page has complete imports (STYLE.md). Flag a name
+    it uses without importing or defining, when the name can only be one
+    thing: a standard-library module used as `mod.attr`, or a class pipecat
+    defines. Other free names (`llm`, `context`) are the reader's to infer."""
+    bound = bound_names(tree)
+    if bound is None or is_signature(tree):
+        return
+    seen = set()
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Name) or not isinstance(n.ctx, ast.Load) or n.id in bound or n.id in seen:
+            continue
+        line = start + n.lineno - 1
+        if n.id in STDLIB_MODULES:
+            if any(isinstance(p, ast.Attribute) and p.value is n for p in ast.walk(tree)):
+                seen.add(n.id)
+                checker.add("sample-undefined-name", page, line, n.id, n.id, f"uses `{n.id}` without `import {n.id}`")
+        elif n.id in checker.idx.top_level and n.id[:1].isupper() and n.id not in checker.generic:
+            seen.add(n.id)
+            checker.add("sample-undefined-name", page, line, n.id, n.id, f"uses pipecat's `{n.id}` without importing it")
+
+
+def env_read(n):
+    """X when `n` is `os.getenv("X")`, `os.environ.get("X")`, or `os.environ["X"]`."""
+    arg = None
+    if isinstance(n, ast.Call) and n.args and unparse(n.func) in ("os.getenv", "getenv", "os.environ.get", "environ.get"):
+        arg = n.args[0]
+    elif isinstance(n, ast.Subscript) and unparse(n.value) in ("os.environ", "environ"):
+        arg = n.slice
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    return None
+
+
+# Prefixes of made-up variables a sample uses to stand for "your provider".
+PLACEHOLDER_ENV = ("MY_", "YOUR_", "OTHER_", "SOME_", "CUSTOM_", "EXAMPLE_", "PROVIDER_", "SERVICE_")
+
+
+def check_env(checker, page, start, tree, community):
+    """An API key a sample hands to a pipecat class under a name pipecat
+    never uses: not in env.example, the source, or the examples. A reader's
+    `.env`, built from env.example, won't have it (`GROK_API_KEY` where
+    pipecat reads `XAI_API_KEY`). Other variables (endpoints, a platform's
+    own settings, a community package's key) are the reader's to name."""
+    if community:
+        return
+    idx = checker.idx
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call) or unparse(call.func).split(".")[0] not in idx.by_name:
+            continue
+        for v in call.args + [kw.value for kw in call.keywords]:
+            name = env_read(v)
+            if name and name.endswith("_API_KEY") and not name.startswith(PLACEHOLDER_ENV) and name not in idx.env_names:
+                line = start + v.lineno - 1
+                checker.add("sample-unknown-env", page, line, unparse(call.func), name, f"pipecat's env.example and examples never use `{name}`")
 
 
 def deprecated_detail(dep):
@@ -1241,6 +1420,108 @@ def check_call(checker, page, line, c, call, own=frozenset()):
     if order or not call.args:
         for name in sorted(required - given):
             checker.add("sample-missing-arg", page, line, c.name, name, f"`{c.name}(...)` requires `{name}`")
+
+
+# --------------------------------------------------------------------------
+# Install extras
+# --------------------------------------------------------------------------
+
+EXTRA_RE = re.compile(r"pipecat-ai\[([^\]\n]*)\]")
+
+
+def norm_extra(name):
+    """PEP 685: extras compare lower-cased, with runs of `-_.` as `-`."""
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def pipecat_extras(pipecat):
+    """The extras pipecat's pyproject.toml declares, normalized."""
+    import tomllib
+
+    with open(os.path.join(pipecat, "pyproject.toml"), "rb") as f:
+        deps = tomllib.load(f).get("project", {}).get("optional-dependencies", {})
+    return {norm_extra(k) for k in deps}
+
+
+def check_extras(checker, page, text, extras):
+    """Flag a `pipecat-ai[...]` install extra pipecat doesn't declare."""
+    for m in EXTRA_RE.finditer(text):
+        line = text.count("\n", 0, m.start()) + 1
+        for name in m.group(1).split(","):
+            name = name.strip()
+            if name and norm_extra(name) not in extras:
+                checker.add("unknown-extra", page, line, "pipecat-ai", name, f"pipecat's pyproject.toml declares no `{name}` extra")
+
+
+# --------------------------------------------------------------------------
+# Class names in prose
+# --------------------------------------------------------------------------
+
+# Pages that name classes from other packages: the client SDKs (JavaScript,
+# Swift, Kotlin) and the Pipecat Cloud SDK.
+PROSE_SKIP = ("client/", "api-reference/client/", "api-reference/pipecat-cloud/")
+# Endings that mark a name as a pipecat class. Endings that libraries share
+# (`Error`, `Config`, `Client`, `Manager`, `Message`) are left out.
+CLASS_SUFFIXES = (
+    "Service", "Transport", "Frame", "Processor", "Serializer", "Params",
+    "Observer", "Strategy", "Filter", "Analyzer", "Aggregator", "Settings",
+    "Runner", "Worker", "Adapter", "Mixer", "Detector", "Classifier",
+)
+CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+# A name inside a code span, not part of a placeholder (`*UpdateSettingsFrame`,
+# `{Provider}TTSService`, `<Name>Service`).
+PROSE_NAME_RE = re.compile(r"(?<![\w*<>{}$-])[A-Z]\w*(?![\w*<>{}])")
+# A line or section about an API that is gone: it may name it.
+HISTORY_RE = re.compile(r"\b(?:remov|renam|replac|deprecat|formerly|previously|no longer|legacy|migrat|used to)", re.I)
+
+CLIENT_LANG_RE = re.compile(r"\b(?:JavaScript|TypeScript|React|Swift|Kotlin|Android|iOS)\b")
+
+
+def check_prose(checker, page, text):
+    """Flag a backticked class name in the page's prose, tables, or
+    ParamFields that pipecat has nowhere in its source or examples."""
+    if page.startswith(PROSE_SKIP) or "CommunityMaintained" in text:
+        return
+    idx = checker.idx
+    defined = set()  # names the page's own samples define
+    for _, src in samples(text):
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        defined |= bound_names(tree) or set()
+    headings = {}  # level -> heading text
+    fence = False
+    for i, ln in enumerate(text.split("\n"), 1):
+        if FENCE_RE.match(ln):
+            fence = not fence
+            continue
+        if fence:
+            continue
+        m = HEADING_RE.match(ln)
+        if m:
+            level = len(m.group(1))
+            headings = {k: v for k, v in headings.items() if k < level}
+            headings[level] = m.group(2)
+            continue
+        if HISTORY_RE.search(ln) or any(HISTORY_RE.search(h) for h in headings.values()):
+            continue
+        if CLIENT_LANG_RE.search(ln):
+            continue  # "in JavaScript, `URLSearchParams`": a name from the client side
+        for span in CODE_SPAN_RE.finditer(ln):
+            # "`MiniMaxHttpTTSService`, not `MiniMaxTTSService`" names the
+            # wrong spelling on purpose.
+            if re.search(r"\b(?:not|instead of|rather than)\s*$", ln[: span.start()]):
+                continue
+            for name in PROSE_NAME_RE.findall(span.group(1)):
+                if (
+                    name.endswith(CLASS_SUFFIXES)
+                    and name not in CLASS_SUFFIXES
+                    and re.search(r"[a-z]", name)
+                    and name not in idx.identifiers
+                    and name not in defined
+                ):
+                    checker.add("prose-unknown-name", page, i, name, name, f"pipecat has no `{name}`")
 
 
 # --------------------------------------------------------------------------
@@ -1426,6 +1707,10 @@ KINDS = [
     "sample-unknown-event",
     "sample-deprecated-arg",
     "sample-deprecated-call",
+    "sample-undefined-name",
+    "sample-unknown-env",
+    "prose-unknown-name",
+    "unknown-extra",
     "cli-stale-option",
     "cli-missing-option",
     "cli-missing-command",
@@ -1468,6 +1753,7 @@ def main():
         sys.exit(f"pipecat source not found at {a.pipecat}; pass --pipecat")
     checker = Checker(SourceIndex(a.pipecat))
 
+    extras = pipecat_extras(a.pipecat)
     pages = 0
     for dirpath, _, filenames in (w for d in PAGE_DIRS for w in os.walk(os.path.join(ROOT, d))):
         for fn in sorted(filenames):
@@ -1486,7 +1772,10 @@ def main():
                 path = os.path.join(dirpath, fn)
                 if not any(os.path.relpath(dirpath, ROOT).startswith(d) for d in PAGE_DIRS):
                     pages += 1
-                check_samples(checker, os.path.relpath(path, ROOT), open(path, encoding="utf-8").read())
+                text = open(path, encoding="utf-8").read()
+                check_samples(checker, os.path.relpath(path, ROOT), text)
+                check_prose(checker, os.path.relpath(path, ROOT), text)
+                check_extras(checker, os.path.relpath(path, ROOT), text, extras)
     checker.completeness()
     check_cli(checker, a.pipecat)
 
