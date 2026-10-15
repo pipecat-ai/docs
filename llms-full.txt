@@ -2427,7 +2427,7 @@ For client/server applications using room-based WebRTC, a handshake ensures both
 ```python
 @rtvi.event_handler("on_client_ready")
 async def on_client_ready(rtvi):
-    # PipelineWorker has already sent bot-ready; start the conversation
+    # PipelineWorker sends bot-ready for you; start the conversation
     await worker.queue_frames([LLMRunFrame()])
 ```
 
@@ -3549,10 +3549,11 @@ Many STT services in Pipecat default to `Language.EN` (English). If you need to 
 **`language=None`**: local Whisper (`WhisperSTTService`) and ElevenLabs support automatic language detection when no language is specified; `GroqSTTService` and `OpenAISTTService` require a language:
 
 ```python
-from pipecat.services.whisper.stt import WhisperSTTService
+from pipecat.services.whisper.stt import Model, WhisperSTTService
 
 stt = WhisperSTTService(
     settings=WhisperSTTService.Settings(
+        model=Model.LARGE_V3_TURBO,  # The default model is English-only
         language=None,  # Auto-detect language
     ),
 )
@@ -17703,22 +17704,24 @@ The dial-out server is simpler than dial-in since you're initiating calls rather
 
 The dial-out bot receives the target phone number and creates a transport without dial-in settings:
 
-**Bot Entry Point**: The `bot()` method receives `RunnerArguments` containing:
+**Bot Entry Point**: The `bot()` function receives `RunnerArguments` whose `body` holds the request body your server sent when it started the bot. In the example server, that's:
 
 - `room_url`: Daily room URL for the call
 - `token`: Daily room token for authentication
-- `phone_number`: Target phone number to call
+- `dialout_settings.phone_number`: Target phone number to call
 
-**Transport Creation**: These arguments are used to configure the `DailyTransport`:
+**Transport Creation**: These values are used to configure the `DailyTransport`:
 
 ```python bot.py
 from pipecat.transports.daily.transport import DailyTransport, DailyParams
 
 async def bot(args: RunnerArguments):
+    body = args.body
+
     # Create transport for dial-out (no dial-in settings needed)
     transport = DailyTransport(
-        args.room_url,
-        args.token,
+        body["room_url"],
+        body["token"],
         "Voice Bot",
         DailyParams(
             api_url=os.getenv("DAILY_API_URL", "https://api.daily.co/v1"),
@@ -17732,7 +17735,8 @@ async def bot(args: RunnerArguments):
     # Dial out once the bot has joined the room
     @transport.event_handler("on_joined")
     async def on_joined(transport, data):
-        await transport.start_dialout({"phoneNumber": args.phone_number})
+        phone_number = body["dialout_settings"]["phone_number"]
+        await transport.start_dialout({"phoneNumber": phone_number})
 
     # Pass transport to your bot pipeline
     # Your bot setup and pipeline creation here...
@@ -20215,11 +20219,11 @@ For the full `/start` request shape, transport-specific behavior, and CLI flags,
 
 Behind `uv run bot.py` the runner is doing a fair amount of work depending on the transport the client requests:
 
-- **WebRTC (`smallwebrtc`)** — mounts a prebuilt UI at `/client`, accepts `POST /api/offer` (with ICE candidates via `PATCH /api/offer`), and bridges the resulting `SmallWebRTCConnection` to your `bot()` function. Also exposes a `POST /start` endpoint that returns a `sessionId`, mimicking Pipecat Cloud's start API.
-- **Daily** — calls Daily's REST API to create a room and issue tokens, then either redirects the browser to the room (via `GET /daily`) or returns the room URL + token via `POST /start`.
-- **Telephony** — returns the carrier-specific XML stub (TwiML for Twilio, the equivalent for Telnyx/Plivo/Exotel) on `POST /`, then accepts the bidirectional media WebSocket at `/ws` and hands it to your bot wrapped in a `WebSocketRunnerArguments`.
-- **Plain WebSocket** — for non-telephony clients (e.g. browser apps using protobuf framing). `POST /start` with `"transport": "websocket"` returns a `wsUrl` for the `/ws-client` endpoint; the bot receives a `WebSocketRunnerArguments` with `transport_type="websocket"`.
-- **Daily PSTN dial-in** — handles Daily's pinless dial-in webhook at `POST /daily-dialin-webhook`, creates a SIP-enabled room, and dispatches the bot with full dial-in context. On by default; `--no-dialin` turns it off.
+- **WebRTC (`smallwebrtc`)**: Mounts a prebuilt UI at `/client`, accepts `POST /api/offer` (with ICE candidates via `PATCH /api/offer`), and bridges the resulting `SmallWebRTCConnection` to your `bot()` function. Also exposes a `POST /start` endpoint that returns a `sessionId`, mimicking Pipecat Cloud's start API.
+- **Daily**: Calls Daily's REST API to create a room and issue tokens, then either redirects the browser to the room (via `GET /daily`) or returns the room URL + token via `POST /start`.
+- **Telephony**: Returns the carrier-specific XML stub (TwiML for Twilio, the equivalent for Telnyx/Plivo/Exotel) on `POST /`, then accepts the bidirectional media WebSocket at `/ws` and hands it to your bot wrapped in a `WebSocketRunnerArguments`.
+- **Plain WebSocket**: For non-telephony clients (e.g. browser apps using protobuf framing). `POST /start` with `"transport": "websocket"` returns a `wsUrl` for the `/ws-client` endpoint; the bot receives a `WebSocketRunnerArguments` with `transport_type="websocket"`.
+- **Daily PSTN dial-in**: Handles Daily's pinless dial-in webhook at `POST /daily-dialin-webhook`, creates a SIP-enabled room, and dispatches the bot with full dial-in context. On by default; `--no-dialin` turns it off.
 
 `GET /` redirects to the prebuilt client UI at `/client/`, and `GET /status` reports which transports the running instance accepts. The `POST /start` and `/sessions/{id}/...` endpoints exposed by the runner are deliberately shaped the same way as [Pipecat Cloud](/pipecat-cloud/introduction)'s session API. That means a client built against the development runner works against PCC unchanged, and a custom production dispatcher can offer the same contract if you want clients to remain portable.
 
@@ -83764,10 +83768,10 @@ await client.startBotAndConnect({
 
 The development runner handles Daily PSTN dial-in webhooks unless started with `--no-dialin`. This allows you to test phone call integrations locally before deploying to production.
 
-### Enabling Dial-In Support
+### Webhook Endpoint
 
 ```bash
-python bot.py -t daily
+python bot.py
 # Webhook endpoint available at:
 # POST http://localhost:7860/daily-dialin-webhook
 ```
@@ -83852,8 +83856,7 @@ ngrok http 7860
 
 <Note>
   Dial-in is a Daily feature and requires a valid `DAILY_API_KEY` environment
-  variable. The webhook doesn't require `-t daily`, but you can pass it to
-  restrict the runner to Daily.
+  variable.
 </Note>
 
 ## Error Handling and Debugging
