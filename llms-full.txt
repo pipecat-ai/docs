@@ -28134,7 +28134,7 @@ Switching organizations will target all CLI commands to the selected organizatio
 Alternatively, you can target a single command with the `--organization` flag (`-o`), for example:
 
 ```bash
-pipecat cloud deploy my-agent image-name --organization my-organization
+pipecat cloud deploy my-agent image-name --credentials my-pull-secret --organization my-organization
 ```
 
 ## API keys
@@ -28499,11 +28499,13 @@ For a complete list of deployment configuration options, see the [CLI deploy ref
 
 ### Deploying with a custom image
 
-If you prefer to build and push images to your own container registry, you can specify an image directly:
+If you prefer to build and push images to your own container registry, you can specify an image directly, along with the [image pull secret](/pipecat-cloud/fundamentals/secrets#image-pull-secrets) Pipecat Cloud uses to pull it:
 
 ```bash
-pipecat cloud deploy my-agent my-image:0.1
+pipecat cloud deploy my-agent my-image:0.1 --credentials my-pull-secret
 ```
+
+For a public image, pass `--no-credentials` instead.
 
 <Note>
   Using a private container registry? See our [Container Registry
@@ -29145,7 +29147,7 @@ By default, sessions are capped at **7200 seconds (2 hours)**. You can configure
 <Tabs>
   <Tab title="CLI">
     ```shell
-    pipecat cloud deploy my-agent your-docker-repository/my-agent:0.1 --max-session-duration 300
+    pipecat cloud deploy my-agent your-docker-repository/my-agent:0.1 --credentials my-pull-secret --max-session-duration 300
     ```
 
     See [`--max-session-duration`](/api-reference/cli/cloud/deploy#param-max-session-duration) for details.
@@ -29708,7 +29710,7 @@ Our goal is to make scaling decisions as simple as possible while giving you the
 You can update your deployment's configuration at any time via the CLI or Pipecat Cloud Dashboard.
 
 ```shell
-pipecat cloud deploy [agent-name] [image] --min-agents 1 --max-agents 5
+pipecat cloud deploy [agent-name] [image] --credentials [image-pull-secret] --min-agents 1 --max-agents 5
 ```
 
 Please note that changing your scaling parameters will not disrupt any active sessions.
@@ -35902,7 +35904,7 @@ pipecat cloud secrets set my-agent-secrets \
   ANTHROPIC_API_KEY=sk_...
 
 # Reference in deployment
-pipecat cloud deploy my-agent my-image:latest --secrets my-agent-secrets
+pipecat cloud deploy my-agent my-image:latest --credentials my-pull-secret --secrets my-agent-secrets
 ```
 
 <Info>
@@ -104436,6 +104438,8 @@ uv tool install "pipecat-ai[cli]" --with pipecatcloud
   must name every plugin you want.
 </Warning>
 
+`pipecat cloud --version` prints the installed `pipecatcloud` version.
+
 `pipecat cloud` still appears in `pipecat --help` without that package, and prints how to enable itself when run.
 
 ## Commands
@@ -105567,8 +105571,10 @@ An unrecognized mode is a usage error — the CLI names the valid modes and exit
 | `1`  | The command ran and failed: an API error, a validation failure, a missing agent, or a confirmation you declined.                                                                                                |
 | `2`  | The command was called wrong, or it needed to prompt and couldn't. Unknown flags, invalid option values, and an unrecognized `--output` mode land here, as does any prompt reached without a terminal on stdin. |
 
-Declining a confirmation exits 1 rather than 0 — an aborted deploy is a failed
-step, not a successful no-op.
+Declining a confirmation exits 1 rather than 0: an aborted deploy is a failed
+step, not a successful no-op. The exception is `organizations keys revoke`: when
+the key you pick is your local default, it asks for confirmation, then clears
+the default and revokes the key whatever you answer.
 
 ## Running non-interactively
 
@@ -105585,20 +105591,25 @@ This applies to every prompt, so the rule to script by is: if running a command
 by hand asks you a question, the CI version of that command needs the
 corresponding flag.
 
-| Command                            | Flag                               |
-| ---------------------------------- | ---------------------------------- |
-| `deploy`                           | `--yes` (or `--force`, implies it) |
-| `agent start` / `stop` / `delete`  | `--force`                          |
-| `secrets set` / `unset` / `delete` | `--skip`                           |
-| `secrets image-pull-secret`        | `--skip`                           |
-| `docker build-push`                | `--yes`                            |
-| `spend-limit set` / `clear`        | `--yes`                            |
-| `organizations keys create`        | `--name`                           |
+| Command                                      | Flag                                      |
+| -------------------------------------------- | ----------------------------------------- |
+| `deploy`                                     | `--yes` (or `--force`, implies it)        |
+| `agent start` / `stop` / `delete` / `unlink` | `--force`                                 |
+| `secrets set` / `unset` / `delete`           | `--skip`                                  |
+| `secrets image-pull-secret`                  | `--skip`, plus the `credentials` argument |
+| `docker build-push`                          | `--yes`                                   |
+| `spend-limit set` / `clear`                  | `--yes`                                   |
+| `organizations select`                       | `--organization`                          |
+| `organizations keys create`                  | `--name`                                  |
+| `organizations registry-keys mint`           | `--name`                                  |
+| `organizations registry-keys revoke`         | `--force`                                 |
+| `github disconnect`                          | `--yes`                                   |
+| `regions delete`                             | `--yes`                                   |
 
-A few commands exist only to ask you something — `organizations select` and
-`organizations keys use` present a picker and have nothing to bypass. Use
-`--organization` on the individual command instead of selecting one first, and
-set `PIPECAT_TOKEN` rather than authenticating interactively.
+`organizations keys use` and `organizations keys revoke` always present a
+picker, with no flag to bypass it. Use `--organization` on the individual
+command instead of selecting one first, and set `PIPECAT_TOKEN` rather than
+authenticating interactively.
 
 <Note>
   These flags skip the *prompt*, not the *check*. `agent delete --force` still
@@ -105644,8 +105655,9 @@ pipecat cloud agent start [ARGS] [OPTIONS]
 
 **Arguments:**
 
-<ParamField path="agent-name" type="string" required>
+<ParamField path="agent-name" type="string">
   Unique string identifier for the agent deployment. Must not contain spaces.
+  Defaults to `agent_name` in `pcc-deploy.toml`.
 </ParamField>
 
 **Options:**
@@ -105705,8 +105717,9 @@ pipecat cloud agent stop [ARGS] [OPTIONS]
 
 **Arguments:**
 
-<ParamField path="agent-name" type="string" required>
-  Name of the agent. Must not contain spaces.
+<ParamField path="agent-name" type="string">
+  Name of the agent. Must not contain spaces. Defaults to `agent_name` in
+  `pcc-deploy.toml`.
 </ParamField>
 
 **Options:**
@@ -105808,6 +105821,11 @@ pipecat cloud agent logs [ARGS] [OPTIONS]
 </ParamField>
 
 **Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization the agent belongs to. If not provided, uses the current
+  organization from your configuration.
+</ParamField>
 
 <ParamField path="--level / -l" type="string">
   Filter logs by severity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
@@ -105971,19 +105989,20 @@ Without `--wait`, the command returns once the deploy is queued, printing the br
 
 With `--wait`, it follows the deploy and reports one of these:
 
-| Outcome        | Meaning                                                                          | Exit |
-| -------------- | -------------------------------------------------------------------------------- | ---- |
-| Succeeded      | The deploy reached a terminal state and succeeded.                               | 0    |
-| Failed         | The deploy reached a terminal state and failed. The reason is printed.           | 1    |
-| Superseded     | A newer push took over as the latest attempt, so this one is no longer reported. | 0    |
-| Still building | Observed and still moving when the wait ran out. It continues server-side.       | 0    |
-| Never observed | The wait never saw the attempt at all.                                           | 1    |
+| Outcome        | Meaning                                                                          | Exit                       |
+| -------------- | -------------------------------------------------------------------------------- | -------------------------- |
+| Succeeded      | The deploy reached a terminal state and succeeded.                               | 0                          |
+| Failed         | The deploy reached a terminal state and failed. The reason is printed.           | 1 (0 with `--output json`) |
+| Superseded     | A newer push took over as the latest attempt, so this one is no longer reported. | 0                          |
+| Still building | Observed and still moving when the wait ran out. It continues server-side.       | 0                          |
+| Never observed | The wait never saw the attempt at all.                                           | 1                          |
 
 <Warning>
-  A zero exit from `--wait` means the deploy was observed and did not fail — not
+  A zero exit from `--wait` means the deploy was observed and did not fail, not
   that it finished. A deploy still building, or superseded by a newer push, also
-  exits 0. Check the outcome itself if you need to gate on completion; in
-  `--output json` it is reported as `waitOutcome`.
+  exits 0. With `--output json`, a failed deploy exits 0 as well: `waitOutcome`
+  is `terminal` for both a success and a failure, so gate on
+  `latestDeploy.status` being `succeeded`.
 </Warning>
 
 "Never observed" exits non-zero on purpose: a wait that saw nothing can't tell a healthy build from an API that was down the whole time, and calling that success is what would make `--wait` unsafe as a deploy gate.
@@ -106027,8 +106046,9 @@ pipecat cloud agent sessions [ARGS] [OPTIONS]
 
 **Arguments:**
 
-<ParamField path="agent-name" type="string" required>
-  Name of the agent to list active sessions for.
+<ParamField path="agent-name" type="string">
+  Name of the agent to list active sessions for. Defaults to `agent_name` in
+  `pcc-deploy.toml`.
 </ParamField>
 
 **Options:**
@@ -106074,6 +106094,11 @@ pipecat cloud agent delete [ARGS] [OPTIONS]
 </ParamField>
 
 **Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization to delete the agent from. If not provided, uses the current
+  organization from your configuration.
+</ParamField>
 
 <ParamField path="--force / -f" type="boolean" default="false">
   Do not prompt for confirmation before deleting the agent.
@@ -106175,6 +106200,13 @@ Retire a profile from new deploys. Existing deployments are unaffected. Disablin
 pipecat cloud agent profiles disable [NAME] [OPTIONS]
 ```
 
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization the profile belongs to. If not provided, uses the current
+  organization from your configuration.
+</ParamField>
+
 ### profiles enable
 
 Re-enable a disabled profile for new deploys.
@@ -106184,6 +106216,13 @@ Re-enable a disabled profile for new deploys.
 ```shell
 pipecat cloud agent profiles enable [NAME] [OPTIONS]
 ```
+
+**Options:**
+
+<ParamField path="--organization / -o" type="string">
+  Organization the profile belongs to. If not provided, uses the current
+  organization from your configuration.
+</ParamField>
 
 # pipecat cloud auth
 Source: https://docs.pipecat.ai/api-reference/cli/cloud/auth.md
@@ -106236,8 +106275,8 @@ pipecat cloud auth use-pat
 ```
 
 The command prompts for the token without echoing it, so it takes no
-arguments and needs an interactive terminal. In CI, set `PIPECAT_TOKEN`
-instead.
+arguments. Without a terminal it reads the token from stdin. In CI, set
+`PIPECAT_TOKEN` instead.
 
 <Tip>
   You can also set the `PIPECAT_TOKEN` environment variable instead of storing
@@ -106247,7 +106286,7 @@ instead.
 
 ## whoami
 
-Displays information about the currently authenticated user, including user ID, active organization, auth method, and Daily API key.
+Displays information about the currently authenticated user, including your email (or user ID when the account has no email), active organization, auth method, and Daily API key.
 
 **Usage:**
 
@@ -106445,8 +106484,9 @@ pipecat cloud docker build-push [ARGS] [OPTIONS]
 **Arguments:**
 
 <ParamField path="agent-name" type="string">
-  Name of the agent to build image for. If not provided, uses the `agent_name`
-  from your `pcc-deploy.toml` file.
+  Name of the agent to build image for. If not provided, uses the repository
+  name from the `image` field in your `pcc-deploy.toml` file (e.g., `my-agent`
+  from `myusername/my-agent:1.0`), or `agent_name` when there is no `image`.
 </ParamField>
 
 **Options:**
@@ -106552,6 +106592,21 @@ Available `[docker]` options:
 <ParamField path="auto_latest" type="boolean" default="true">
   Whether to automatically tag the image as `latest` in addition to the
   specified version.
+</ParamField>
+
+<ParamField path="registry" type="string">
+  Registry type, `dockerhub` or `custom`. Used when neither `--registry` nor the
+  `image` field supplies one.
+</ParamField>
+
+<ParamField path="registry_username" type="string">
+  Registry username. Used when neither `--username` nor the `image` field
+  supplies one.
+</ParamField>
+
+<ParamField path="registry_url" type="string">
+  Custom registry URL. Used when neither `--registry-url` nor the `image` field
+  supplies one.
 </ParamField>
 
 ## Examples
@@ -106799,8 +106854,10 @@ pipecat cloud deploy [ARGS] [OPTIONS]
 
 **Arguments:**
 
-<ParamField path="agent-name" type="string" required>
+<ParamField path="agent-name" type="string">
   Unique string identifier for the agent deployment. Must not contain spaces.
+  Defaults to `agent_name` in `pcc-deploy.toml`; the deploy exits 1 when neither
+  is set.
 </ParamField>
 
 <ParamField path="image" type="string">
@@ -106843,9 +106900,10 @@ pipecat cloud deploy [ARGS] [OPTIONS]
   1 or higher avoids cold starts.
 </ParamField>
 
-<ParamField path="--max-agents / -max" type="number" default="50">
-  Maximum number of allowed agent instances. Must be between 1 and 50. If you
-  need more agents, please contact us at help@daily.co or via
+<ParamField path="--max-agents / -max" type="number">
+  Maximum number of allowed agent instances, at least 1. Omitted, the value
+  isn't sent, so an existing agent keeps its current maximum. The default cap is
+  50; if you need more agents, please contact us at help@daily.co or via
   [Discord](https://discord.gg/dailyco).
 </ParamField>
 
@@ -106870,9 +106928,12 @@ for more information.
 
 </ParamField>
 
-<ParamField path="--profile / -p" type="string" default="agent-1x">
-  The agent profile to use for resource allocation. Valid values are:
-  `agent-1x`, `agent-2x`, `agent-3x`.
+<ParamField path="--profile / -p" type="string">
+  The agent profile to use for resource allocation: a platform profile
+  (`agent-1x`, `agent-2x`, `agent-3x`) or, in a self-hosted region, one your
+  organization defined with [`agent profiles
+  create`](/api-reference/cli/cloud/agent#profiles-create). Omitted, the CLI
+  sends no profile, so a new agent gets the platform default, `agent-1x`.
 
 See [Agent Profiles](/pipecat-cloud/fundamentals/deploy#agent-profiles) for more information.
 
@@ -106888,11 +106949,11 @@ See [Agent Profiles](/pipecat-cloud/fundamentals/deploy#agent-profiles) for more
 
 <ParamField path="--architecture" type="string">
   CPU architecture the agent image requires: `amd64` or `arm64`. Omitted, the
-  region's default applies. The choice is validated against the region's
-  supported architectures (see [`regions
-  list`](/api-reference/cli/cloud/regions#list)) before anything is uploaded.
-  Must match how the image was built. Requires `pipecatcloud` {cliMinVersion}
-  or later.
+  region's default applies. When a region is set by flag or in
+  `pcc-deploy.toml`, the choice is validated against that region's supported
+  architectures (see [`regions list`](/api-reference/cli/cloud/regions#list))
+  before anything is uploaded. Must match how the image was built. Requires
+  `pipecatcloud` {cliMinVersion} or later.
 </ParamField>
 
 <ParamField path="--region / -r" type="string">
@@ -106913,15 +106974,16 @@ See [Agent Profiles](/pipecat-cloud/fundamentals/deploy#agent-profiles) for more
 </ParamField>
 
 <ParamField path="--build-id / -b" type="string">
-  Deploy using an existing cloud build ID instead of building a new image.
-  Cannot be used together with `--image`. You can find build IDs using `pipecat
-  cloud build list`.
+  Deploy using an existing cloud build ID instead of building a new image. Takes
+  precedence over `image`. You can find build IDs using `pipecat cloud build
+  list`.
 </ParamField>
 
 <ParamField path="--no-credentials / -nc" type="boolean" default="false">
-  Deploy without an image pull secret. A deploy that names neither
-  `--credentials` nor an `image_credentials` in the config file is refused,
-  since a private image would fail to pull — pass this when the image is public.
+  Deploy without an image pull secret. Without `--yes` or `--force`, an image
+  deploy that names neither `--credentials` nor an `image_credentials` in the
+  config file is refused, since a private image would fail to pull. Pass this
+  when the image is public.
 </ParamField>
 
 <ParamField path="--build-dir / -d" type="string">
@@ -106958,70 +107020,72 @@ first.
 </ParamField>
 
 <Warning>
-  `--repo` only applies when **creating** an agent. The API accepts a GitHub
-  source on create and ignores it on update, so re-pointing an existing agent
-  goes through [`agent link`](/api-reference/cli/cloud/agent#link) instead.
+  `--repo` only applies when **creating** an agent. If the agent already exists,
+  the deploy exits 1 and points you at [`agent
+  link`](/api-reference/cli/cloud/agent#link), which re-points an existing
+  agent.
 </Warning>
 
-A GitHub source can't be combined with `--image` or `--build-id` — a deploy is
-built from a repository or from an image, not both. The first deploy is followed
-through its build, so the command reports whether it succeeded rather than
-returning as soon as it's queued.
+A GitHub source can't be combined with an `image`, `--build-id`, or
+`--resources` / `[resources]`: a deploy is built from a repository or from an
+image, not both, and a GitHub-sourced agent is sized with `--profile`. The
+first deploy is followed through its build, so the command reports whether it
+succeeded rather than returning as soon as it's queued.
 
 ## Examples
 
 **Deploy a new agent:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds
 ```
 
 **Update an existing agent with a new image:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.2
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.2 --credentials dockerhub-creds
 ```
 
 **Deploy with a specific secret set:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --secrets my-secret-set
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds --secrets my-secret-set
 ```
 
-**Deploy a private image using image pull credentials:**
+**Deploy a public image without an image pull secret:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --no-credentials
 ```
 
 **Keep one instance always warm to avoid cold starts:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --min-agents 1
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds --min-agents 1
 ```
 
 **Limit the maximum number of agent instances:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --max-agents 5
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds --max-agents 5
 ```
 
 **Deploy to a specific region:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --region eu-central
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds --region eu-central
 ```
 
 **Deploy with Krisp VIVA noise cancellation:**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --krisp-viva-audio-filter tel
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds --krisp-viva-audio-filter tel
 ```
 
 **Cap session duration (useful as a safety net for short-interaction agents):**
 
 ```shell
-pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --max-session-duration 300
+pipecat cloud deploy my-first-agent your-docker-repository/my-first-agent:0.1 --credentials dockerhub-creds --max-session-duration 300
 ```
 
 **Deploy using cloud build (interactive):**
@@ -107150,8 +107214,8 @@ image_credentials = "dockerhub-credentials"
 
 </ParamField>
 
-<ParamField path="agent_profile" type="string" default="agent-1x">
-Agent profile for resource allocation. Valid values: `agent-1x`, `agent-2x`, `agent-3x`.
+<ParamField path="agent_profile" type="string">
+Agent profile for resource allocation. Takes the same values as `--profile`.
 
 ```toml
 agent_profile = "agent-2x"
@@ -107217,8 +107281,8 @@ min_agents = 1
 
 </ParamField>
 
-<ParamField path="scaling.max_agents" type="number" default="50">
-Maximum number of agent instances allowed.
+<ParamField path="scaling.max_agents" type="number">
+Maximum number of agent instances allowed, at least 1. Omitted, an existing agent keeps its current maximum.
 
 ```toml
 [scaling]
@@ -107321,8 +107385,10 @@ subdirectory = "bot"
 </ParamField>
 
 <Note>
-  Like `--repo`, a `[git]` section only takes effect when the agent is created.
-  It is ignored on an update.
+  Like `--repo`, a `[git]` section only applies when the agent is created. Once
+  the agent exists, a `pipecat cloud deploy` with a `[git]` section exits 1, so
+  remove the section after the first deploy and ship later commits with [`agent
+  deploy --github`](/api-reference/cli/cloud/agent#deploy).
 </Note>
 
 ### Complete Example
@@ -107571,10 +107637,11 @@ pipecat cloud organizations registry-keys mint --name [NAME] [OPTIONS]
 
 **Options:**
 
-<ParamField path="--name" type="string" required>
+<ParamField path="--name" type="string">
   A label for the key, e.g. `acme-us-east-workstation`, used to tell keys apart
   in `list` and to revoke the right one. When run interactively without this
-  option, the command asks for a name.
+  option, the command asks for a name; without a terminal, or with `--output
+  json`, it exits 2.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -107784,7 +107851,8 @@ pipecat cloud secrets list [ARGS] [OPTIONS]
 **Options:**
 
 <ParamField path="--sets / -s" type="boolean" default="true">
-  Show secret sets only. Filter out image pull secrets from the results.
+  Has no effect: the list always includes image pull secrets, and there is no
+  `--no-sets`.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -107810,12 +107878,13 @@ pipecat cloud secrets set [ARGS] [OPTIONS]
 **Arguments:**
 
 <ParamField path="name" type="string" required>
-  Name of the secret set to create or modify. Must be a valid string identifier
-  containing only characters, numbers, and hyphens.
+  Name of the secret set to create or modify. Letters, numbers, hyphens, and
+  underscores, starting and ending with a letter or number.
 </ParamField>
 
 <ParamField path="secrets" type="string">
-  List of secret key-value pairs e.g. `KEY1=value1 KEY2="value with spaces"`.
+  List of secret key-value pairs e.g. `KEY1=value1 KEY2="value with spaces"`,
+  one pair per argument. Can't be combined with `--file`.
 
 See [this note](/pipecat-cloud/fundamentals/secrets#special-characters) on using special
 characters in secret values.
@@ -107823,7 +107892,7 @@ characters in secret values.
 Example:
 
 ```shell
-pipecat cloud secrets set my-secrets 'API_KEY=123 API_KEY_2="value with spaces"'
+pipecat cloud secrets set my-secrets API_KEY=123 API_KEY_2="value with spaces"
 ```
 
 </ParamField>
@@ -107974,7 +108043,7 @@ pipecat cloud secrets image-pull-secret my-registry-creds https://index.docker.i
 **Options:**
 
 <ParamField path="--encode / -e" type="boolean" default="true">
-  Encode the credentials in base64 format. This is enabled by default.
+  Encode the credentials in base64 format. Always on: there is no `--no-encode`.
 </ParamField>
 
 <ParamField path="--skip / -s" type="boolean" default="false">
@@ -108368,7 +108437,7 @@ Use region codes with other commands:
 **Deploy an agent to a specific region:**
 
 ```shell
-pipecat cloud deploy my-agent my-image:latest --region eu-central
+pipecat cloud deploy my-agent my-image:latest --credentials my-pull-secret --region eu-central
 ```
 
 **Create secrets in a specific region:**
