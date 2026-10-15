@@ -42,6 +42,7 @@ Findings, most to least certain:
   sample-unknown-attr    sample calls a method the object doesn't have
   sample-unknown-event   sample handles an event the class never registers
   sample-deprecated-arg  sample passes a deprecated argument
+  sample-deprecated-call sample uses a deprecated class or method
 
 Usage:
   python3 scripts/check-reference.py [--pipecat PATH] [--json FILE]
@@ -112,6 +113,7 @@ class Cls:
     fields: dict[str, Param] = field(default_factory=dict)  # dataclass/BaseModel
     constants: dict[str, str] = field(default_factory=dict)
     members: set[str] = field(default_factory=set)  # methods, properties, self.* attributes
+    methods: dict[str, list[str]] = field(default_factory=dict)  # method -> positional parameter names
     class_constants: dict[str, str] = field(default_factory=dict)
 
 
@@ -240,6 +242,7 @@ class SourceIndex:
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 c.members.add(item.name)
+                c.methods[item.name] = [a.arg for a in item.args.posonlyargs + item.args.args if a.arg not in ("self", "cls")]
                 for sub in ast.walk(item):
                     if (
                         isinstance(sub, ast.Call)
@@ -504,6 +507,13 @@ class SourceIndex:
             if first is None or (first.params is not None and not self._closed(first, seen)):
                 return False
         return True
+
+    def method_params(self, c, name):
+        """Positional parameter names of method `name` on `c` or its bases."""
+        for k in self.mro(c):
+            if name in k.methods:
+                return k.methods[name]
+        return None
 
     def has_attr(self, c, name):
         """Whether `obj.name` can resolve on an instance of `c`."""
@@ -1133,6 +1143,7 @@ def check_samples(checker, page, text):
             return idx.get(f"{outer.name}.{node.attr}")
         return None
 
+    own = frozenset(re.findall(r"[A-Z]\w+", " ".join(re.findall(r"^(?:#+ |title: ).*$", text, re.M))))
     local = set()  # names the page's samples define themselves
     trees = []
     for start, src in samples(text):
@@ -1160,7 +1171,7 @@ def check_samples(checker, page, text):
             if isinstance(node, ast.Call):
                 c = class_of(node.func, bound)
                 if c:
-                    check_call(checker, page, line, c, node)
+                    check_call(checker, page, line, c, node, own)
                 elif (
                     isinstance(node.func, ast.Attribute)
                     and isinstance(node.func.value, ast.Name)
@@ -1174,10 +1185,39 @@ def check_samples(checker, page, text):
                             checker.add("sample-unknown-event", page, line, c.name, ev, f"`{c.name}` never registers `{ev}`")
                     elif not attr.startswith("__") and not idx.has_attr(c, attr):
                         checker.add("sample-unknown-attr", page, line, c.name, attr, f"`{c.name}` has no `{attr}`")
+                    else:
+                        check_method_call(checker, page, line, c, attr, node)
 
 
-def check_call(checker, page, line, c, call):
+def deprecated_detail(dep):
+    return f"deprecated in {dep.get('deprecated_in')}" + (f"; use {dep['replacement']}" if dep.get("replacement") else "")
+
+
+def check_method_call(checker, page, line, c, name, call):
+    """A call to a method of `c`: the method itself, or an argument passed to
+    it, may be deprecated."""
     idx = checker.idx
+    dep = idx.deprecation(c, name)
+    if dep and dep.get("kind") == "method":
+        checker.add("sample-deprecated-call", page, line, c.name, name, deprecated_detail(dep))
+        return
+    params = idx.method_params(c, name) or []
+    passed = [p for p, a in zip(params, call.args) if not isinstance(a, ast.Starred)]
+    passed += [kw.arg for kw in call.keywords if kw.arg]
+    for p in passed:
+        dep = idx.deprecation(c, f"{name}.{p}")
+        if dep and dep.get("kind") == "parameter":
+            checker.add("sample-deprecated-arg", page, line, c.name, f"{name}({p})", deprecated_detail(dep))
+
+
+def check_call(checker, page, line, c, call, own=frozenset()):
+    idx = checker.idx
+    dep = idx.deprecated.get(c.name)
+    # A page that documents the deprecated class itself (it names it in its
+    # title or a heading) shows it on purpose. A class entry whose message
+    # doesn't name the class records something else (an event, say).
+    if dep and dep.get("kind") == "class" and c.name not in own and c.name in dep.get("message", ""):
+        checker.add("sample-deprecated-call", page, line, c.name, c.name, deprecated_detail(dep))
     ctor = idx.constructor(c)
     if ctor is None:
         return
@@ -1385,6 +1425,7 @@ KINDS = [
     "sample-unknown-attr",
     "sample-unknown-event",
     "sample-deprecated-arg",
+    "sample-deprecated-call",
     "cli-stale-option",
     "cli-missing-option",
     "cli-missing-command",
