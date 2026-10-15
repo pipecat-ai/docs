@@ -155,6 +155,32 @@ API has no entry to mark but the page or section has a migration table, add a
 row there. Keep deprecated entries short: the replacement, the version, nothing
 else.
 
+### Frames and Methods
+
+Pipecat's public interface is frames. A frame pushed into the pipeline keeps
+its place in order with the frames around it, such as the audio of the bot's
+last sentence; a method call acts at once, out of that order. Some classes
+also have methods, for work that has no place in the frame stream or that
+crosses a boundary the pipeline doesn't, such as from the transport to the
+call or the client.
+
+- **When a frame does the job, document the frame** and use it in samples.
+  Leave out a method that does the same thing, and replace it where a page
+  already shows it.
+- **Document a method when no frame does the same job**: session and
+  connection control a reader calls from an event handler (capturing a
+  participant, starting a recording, dialing out), lookups
+  (`participants()`), and calls across the transport or client boundary.
+- **Leave out methods meant for subclasses or for the framework itself**
+  (`process_frame()`, `setup()`, `write_audio_frame()`). They belong on pages
+  about extending Pipecat.
+
+List the frames a reader pushes to a class, and the frames it pushes that a
+reader acts on, in a `## Frames` section with a "Sent to" table and a "Pushed
+by" table (Frame | Fields | Effect). Include the class's own frames and any
+generic frame whose effect is specific to the class. Frames documented on the
+frame reference pages need only a link.
+
 ### Service Pages
 
 Use this section order. A section with nothing to say is left out.
@@ -168,14 +194,16 @@ Use this section order. A section with nothing to say is left out.
    `### Settings`, then a `###` per helper type
 5. `## Usage`: a `###` per task, named for the task ("Restoring a
    Conversation", not "Advanced Usage")
-6. `## Methods`, if the class has public methods beyond the base class
-7. `## Notes`: bullets with a bold label and a colon, for behavior that
+6. `## Frames`, for frames a reader pushes to the class or acts on (see
+   [Frames and Methods](#frames-and-methods))
+7. `## Methods`, for public methods a reader calls that no frame replaces
+8. `## Notes`: bullets with a bold label and a colon, for behavior that
    spans parameters ("**No local VAD**: The model detects the user's turns
    itself, so the pipeline needs no VAD analyzer.")
-8. `## Event Handlers`: an Event | Description table, then one code block
+9. `## Event Handlers`: an Event | Description table, then one code block
 
 A page documenting several classes may use a `##` per class, with Settings,
-Usage, Notes, and Event Handlers as `###` under each.
+Usage, Frames, Methods, Notes, and Event Handlers as `###` under each.
 
 Notes are not a second description of the parameters. If a bullet only
 restates a `<ParamField>`, delete it.

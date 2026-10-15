@@ -9109,9 +9109,9 @@ For example, see [Recording](/api-reference/server/services/transport/daily#reco
 Pipecat's `AudioBufferProcessor` makes it easy to capture high-quality audio recordings of both the user and bot during interactions. Opt for this approach if you want more control over your recording.
 
 <Note>
-  The `AudioBufferProcessor.start_recording()` / `stop_recording()` methods
-  below control this in-pipeline buffer. They are separate from a transport
-  provider's own recording.
+  The `AudioBufferStartRecordingFrame` and `AudioBufferStopRecordingFrame`
+  frames below control this in-pipeline buffer. They are separate from a
+  transport provider's own recording.
 </Note>
 
 This guide focuses on how to recording using the `AudioBufferProcessor`, including high-level guidance for how to set up post-processing jobs for longer recordings.
@@ -9198,17 +9198,20 @@ audiobuffer = AudioBufferProcessor(
 Explicitly start recording when needed, typically when a session begins:
 
 ```python
+from pipecat.frames.frames import AudioBufferStartRecordingFrame
+
 @transport.event_handler("on_client_connected")
 async def on_client_connected(transport, client):
     logger.info(f"Client connected")
     # Start recording explicitly
-    await audiobuffer.start_recording()
+    await worker.queue_frame(AudioBufferStartRecordingFrame())
     # Continue with session initialization...
 ```
 
 <Note>
-  Without `auto_start_recording=True`, you must call `start_recording()`
-  explicitly to begin capturing audio.
+  Without `auto_start_recording=True`, you must push an
+  `AudioBufferStartRecordingFrame` to begin capturing audio. Push an
+  `AudioBufferStopRecordingFrame` to stop and flush the buffered audio.
 </Note>
 
 ### Step 4: Handle Audio Data
@@ -17800,21 +17803,31 @@ A cold transfer hands the caller off to another number and the bot exits.
 
 ### Implementing a cold transfer
 
-Call transfers are typically implemented as LLM function calls that your bot can invoke:
+Call transfers are typically implemented as LLM function calls that your bot can invoke. The handler pushes the announcement and then a [`DailySIPTransferFrame`](/api-reference/server/services/transport/daily#frames), and the transport transfers the call once the announcement has played:
 
 ```python bot.py
-async def dial_operator(transport: BaseTransport, params: FunctionCallParams):
-    """Function the bot can call to transfer to an operator."""
+from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.transports.daily.transport import DailySIPTransferFrame
+
+async def dial_operator(params: FunctionCallParams):
+    """Transfer the caller to a supervisor when they ask for a human."""
     operator_number = os.getenv("OPERATOR_NUMBER", "+1234567890")
 
-    # Inform the user about the transfer
-    content = "I'm transferring you to a supervisor now. Please hold while I connect you."
-    message = {"role": "developer", "content": content}
-    await params.llm.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+    announcement = TTSSpeakFrame("I'm transferring you to a supervisor now. Please hold.")
+    transfer = DailySIPTransferFrame(settings={"toEndPoint": operator_number})
+    # The caller talking over the announcement must not cancel the transfer
+    announcement.interruptible = False
+    transfer.interruptible = False
 
-    # Execute the SIP call transfer
-    transfer_params = {"toEndPoint": operator_number}
-    await transport.sip_call_transfer(transfer_params)
+    await params.llm.push_frame(announcement)
+    await params.llm.push_frame(transfer)
+
+    # The bot has nothing more to say
+    await params.result_callback(
+        {"status": "transferring"},
+        properties=FunctionCallResultProperties(run_llm=False),
+    )
 ```
 
 ### Handling Transfer Events
@@ -18124,43 +18137,38 @@ Internally, Pipecat also pushes each inbound digit as an `InputDTMFFrame` into t
 
 ### Sending DTMF
 
-To send DTMF tones back to the caller, send them through Daily's native DTMF channel. Use the session id from the inbound event (or the dial-out session id captured in `on_dialout_connected`) as the target. The default `method`to send the DTMF tones is `auto`, determined in the SIP offer/answer negotiation. However, if you already know what the remote party supports, then pick the appropriate option: `telephone-events` which are in-band RTP packets (RFC2833/4733) or as a `sip-info` message.
+To send DTMF tones back to the caller, push a [`DailyOutputDTMFFrame`](/api-reference/server/services/transport/daily#frames), which goes through Daily's native DTMF channel. Use the session id from the inbound event (or the dial-out session id captured in `on_dialout_connected`) as the target. The default `method` to send the DTMF tones is `auto`, determined in the SIP offer/answer negotiation. However, if you already know what the remote party supports, then pick the appropriate option: `telephone-event` for in-band RTP packets (RFC2833/4733), or `sip-info` for a SIP INFO message.
 
 ```python bot.py
-@transport.event_handler(“on_dialout_answered”)
+from pipecat.transports.daily.transport import DailyOutputDTMFFrame
+
+@transport.event_handler("on_dialout_answered")
 async def on_dialout_answered(transport, data):
-    logger.info(f”Dial-out answered: {data}”)
+    logger.info(f"Dial-out answered: {data}")
     # Wait briefly for the IVR prompt before sending the PIN
     await asyncio.sleep(1)
 
-    err = await transport.send_dtmf({
-        “sessionId”: data[“sessionId”],  # the dialed-out participant
-        “tones”: “1234#”,                # full sequence in one call
-        “digitDurationMs”: 100,
-        # “method”: “sip-info” | “telephone-event” | “auto”
-    })
-    if err:
-        logger.error(f”send_dtmf failed: {err}”)
+    await worker.queue_frame(
+        DailyOutputDTMFFrame.from_string(
+            "1234#",  # full sequence in one frame
+            session_id=data["sessionId"],  # the dialed-out participant
+            digit_duration_ms=100,
+            # method="sip-info" | "telephone-event" | "auto"
+        )
+    )
 ```
 
-You can also push `OutputDTMFFrame` / `OutputDTMFUrgentFrame` through the pipeline for cases where the tones are part of your bot's conversational logic (IVR navigation, confirming a menu choice) rather than a direct invocation:
+The tones go out after any audio the bot queued before them; `DailyOutputDTMFUrgentFrame` takes the same fields and sends at once. The generic `OutputDTMFFrame` and `OutputDTMFUrgentFrame` also go over Daily's DTMF channel, to the dial-out session or else the dial-in session:
 
 ```python
-# Single key (backward compatible)
-await transport.queue_frame(OutputDTMFUrgentFrame(button=KeypadEntry.ONE))
+from pipecat.audio.dtmf.types import KeypadEntry
+from pipecat.frames.frames import OutputDTMFFrame, OutputDTMFUrgentFrame
+
+# Single key
+await worker.queue_frame(OutputDTMFUrgentFrame(button=KeypadEntry.ONE))
 
 # Multi-key dial string
-await transport.queue_frame(OutputDTMFFrame.from_string("1234#"))
-
-# Daily with explicit session + method
-await transport.queue_frame(
-    DailyOutputDTMFFrame.from_string(
-        "1234#",
-        session_id="abc",
-        digit_duration_ms=80,
-        method="sip-info",
-    )
-)
+await worker.queue_frame(OutputDTMFFrame.from_string("1234#"))
 ```
 
 ## Best Practices
@@ -27668,7 +27676,7 @@ client.sendClientRequest("get-language", Value.Object())
 
 </View>
 
-On the server, respond with `send_server_response()` or push a `RTVIServerResponseFrame`:
+On the server, respond from the `on_client_message` event handler with `send_server_response()` or `send_error_response()`, or from a `FrameProcessor` by pushing an `RTVIServerResponseFrame` that carries the request's `RTVIClientMessageFrame`. Set `error` instead of `data` to send an error response:
 
 <CodeGroup>
 ```python event handler
@@ -27811,37 +27819,25 @@ override fun onServerMessage(data: Value) {
 
 </View>
 
-On the server, send messages via `send_server_message()` or by pushing a `RTVIServerMessageFrame`:
+On the server, send messages by pushing an `RTVIServerMessageFrame`:
 
-<CodeGroup>
-```python Observer
-class CustomObserver(BaseObserver):
-    async def on_push_frame(self, data: FramePushed):
-        if isinstance(data.frame, STTUpdateSettingsFrame):
-            for key, value in data.frame.settings.items():
-                if key == "language":
-                    await rtvi.send_server_message({
-                        "msg": "language-updated",
-                        "language": value,
-                    })
-```
+```python
+from pipecat.utils.types import is_given
 
-```python FrameProcessor
 class CustomFrameProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, STTUpdateSettingsFrame):
-            for key, value in frame.settings.items():
-                if key == "language":
-                    await self.push_frame(
-                        RTVIServerMessageFrame(
-                            data={"msg": "language-updated", "language": value}
-                        )
+        if isinstance(frame, STTUpdateSettingsFrame) and frame.delta:
+            if is_given(frame.delta.language):
+                await self.push_frame(
+                    RTVIServerMessageFrame(
+                        data={"msg": "language-updated", "language": frame.delta.language}
                     )
+                )
         await self.push_frame(frame, direction)
 ```
 
-</CodeGroup>
+From outside the pipeline, such as an event handler, queue it on the worker instead: `await worker.queue_frame(RTVIServerMessageFrame(data={...}))`.
 
 ---
 
@@ -34367,7 +34363,7 @@ Place outbound calls to PSTN numbers and SIP addresses from Pipecat Cloud agents
 
 To initiate outbound calls, you first need to configure your Daily rooms to allow dial-out by setting `enable_dialout` in `dailyRoomProperties`. Then, include the target phone number(s) in the request `body` of `{service}/start`.
 
-In this example, we use the `dialout_settings` array to pass one or more phone numbers for the bot to dial. Each object in the array must include a `phoneNumber` and can optionally specify a `callerId` to control the outbound caller ID.
+In this example, we use the `dialout_settings` array to pass one or more phone numbers for the bot to dial. Each object in the array includes a `phoneNumber` or a `sipUri`, and can specify a `callerId` to control the outbound caller ID.
 
 <Info>
   If no `callerId` is provided, a random phone number will be used to make the
@@ -34379,43 +34375,47 @@ In this example, we use the `dialout_settings` array to pass one or more phone n
 ```bash
 curl --request POST \
 --url https://api.pipecat.daily.co/v1/public/{service}/start \
---header 'Authorization: Bearer $API_KEY' \
+--header "Authorization: Bearer $API_KEY" \
 --header 'Content-Type: application/json' \
 --data-raw '{
-    'createDailyRoom': true,
-    'dailyRoomProperties': {
-        'enable_dialout': true,
-        'exp': 1742353929
+    "createDailyRoom": true,
+    "dailyRoomProperties": {
+        "enable_dialout": true,
+        "exp": 1742353929
     },
-    'body': {
-        'dialout_settings': \
-        [{'phoneNumber': '+1TARGET', 'callerId': 'UUID_OF_PURCHASED_NUM'}]
+    "body": {
+        "dialout_settings": [
+            {"phoneNumber": "+1TARGET", "callerId": "UUID_OF_PURCHASED_NUM"}
+        ]
     }
-}
+}'
 ```
 
 <Info>
-  The API_KEY here is Pipcat Cloud's [public API
+  The API_KEY here is Pipecat Cloud's [public API
   key](../../fundamentals/accounts-and-organizations#api-keys), typically begins
   with "pk_..."
 </Info>
 
-The bot should begin dialing out as soon as the call state transitions to the `joined` state.
+The bot should begin dialing out as soon as it has joined the room.
 
 Unlike dial-in scenarios where the bot typically speaks first, dial-out calls may require the bot to wait for the remote user to speak. In these cases, you can start listening for the remote user when the `on_dialout_answered` event fires.
 
 This is also a good point to initiate voicemail detection—for example, by analyzing the remote user's audio to determine if the call has reached a voicemail.
 
 ```python
-@transport.event_handler("on_call_state_updated")
-async def on_call_state_updated(transport, state):
-    if state == "joined" and dialout_settings:
-        await start_dialout(transport, dialout_settings)
+# The request's "body", as received by bot(runner_args)
+dialout_settings = runner_args.body.get("dialout_settings", [])
+
+@transport.event_handler("on_joined")
+async def on_joined(transport, data):
+    for settings in dialout_settings:
+        await transport.start_dialout(settings)
 
 @transport.event_handler("on_dialout_answered")
-    async def on_dialout_answered(transport, data):
-        # the bot will wait for the user to speak before responding
-        await rtvi.set_bot_ready()
+async def on_dialout_answered(transport, data):
+    # The bot waits for the remote user to speak before responding
+    logger.info(f"Dial-out answered: {data}")
 ```
 
 ### Examples of `dialout_settings`
@@ -34443,7 +34443,7 @@ Here are various configurations you can use in the `dialout_settings` array:
 ```
 
 ```json Multiple Phone Numbers
-"dailout_settings": [
+"dialout_settings": [
   {
     "phoneNumber": "+1xxx",
     "callerId": "uuid-1"
@@ -37207,6 +37207,163 @@ See the [complete example](https://github.com/pipecat-ai/pipecat/blob/main/examp
 - Pipeline integration with participant event handling
 - Advanced features like recording and dial-out
 
+## Frames
+
+**Sent to the transport:**
+
+| Frame                                    | Fields                                                 | Effect                                                                                                                                                                                                                                                                                              |
+| ---------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DailySIPTransferFrame`                  | `settings`                                             | Transfers the phone or SIP call to `settings["toEndPoint"]`, a phone number or SIP URI, once the audio queued before it has played. Without a `sessionId` in `settings`, it transfers the dial-out session, else the dial-in session.                                                               |
+| `DailySIPReferFrame`                     | `settings`                                             | Sends a SIP REFER for the call in `settings["sessionId"]` to `settings["toEndPoint"]`, once the audio queued before it has played.                                                                                                                                                                  |
+| `DailyUpdateRemoteParticipantsFrame`     | `remote_participants`                                  | Applies Daily's [remote participant updates](https://reference-python.daily.co/api_reference.html#daily.CallClient.update_remote_participants), such as permissions, once the audio queued before it has played.                                                                                    |
+| `DailyOutputDTMFFrame`                   | `buttons`, `session_id`, `digit_duration_ms`, `method` | Sends DTMF tones once the audio queued before it has played. Without `session_id`, it sends to the dial-out session, else the dial-in session, and with neither it sends nothing. `None` for `digit_duration_ms` or `method` (`"telephone-event"`, `"sip-info"`, or `"auto"`) uses Daily's default. |
+| `DailyOutputDTMFUrgentFrame`             | `buttons`, `session_id`, `digit_duration_ms`, `method` | Sends DTMF tones at once, as `DailyOutputDTMFFrame` does.                                                                                                                                                                                                                                           |
+| `DailyOutputTransportMessageFrame`       | `message`, `participant_id`                            | Sends an app message to `participant_id`, or to everyone when it is `None`, once the audio queued before it has played.                                                                                                                                                                             |
+| `DailyOutputTransportMessageUrgentFrame` | `message`, `participant_id`                            | Sends an app message at once, as `DailyOutputTransportMessageFrame` does.                                                                                                                                                                                                                           |
+
+When Daily rejects a transfer, REFER, or participant update, the transport pushes an `ErrorFrame`. [`OutputDTMFFrame`](/api-reference/server/frames/data-frames#outputdtmfframe) and [`OutputDTMFUrgentFrame`](/api-reference/server/frames/system-frames#outputdtmfurgentframe) also go over Daily's DTMF channel rather than as audio tones, to the dial-out session, else the dial-in session.
+
+**Pushed by the transport:**
+
+| Frame                             | Fields                      | Meaning                                                                                                                                                                                                |
+| --------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `DailyInputTransportMessageFrame` | `message`, `participant_id` | An app message from participant `participant_id`, pushed both upstream and downstream. It is an [`InputTransportMessageFrame`](/api-reference/server/frames/system-frames#inputtransportmessageframe). |
+
+Queue a goodbye and a transfer together, and the transfer waits for the goodbye to finish playing:
+
+```python
+from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.transports.daily.transport import DailySIPTransferFrame
+
+goodbye = TTSSpeakFrame("Transferring you to our billing team now.")
+transfer = DailySIPTransferFrame(settings={"toEndPoint": "+15551234567"})
+# Otherwise the caller talking over the goodbye drops the transfer
+goodbye.interruptible = False
+transfer.interruptible = False
+
+await worker.queue_frames([goodbye, transfer])
+```
+
+For a transfer the LLM decides on, see [Implementing a cold transfer](/pipecat/telephony/daily-pstn#implementing-a-cold-transfer).
+
+## Methods
+
+### capture_participant_transcription()
+
+```python
+async def capture_participant_transcription(participant_id: str)
+```
+
+Requests Daily's built-in transcription for a participant. Does nothing unless `transcription_enabled` is set; see [Using built-in transcription](#using-built-in-transcription).
+
+### capture_participant_audio()
+
+```python
+async def capture_participant_audio(
+    participant_id: str,
+    audio_source: str = "microphone",
+    sample_rate: int = 16000,
+)
+```
+
+Captures one of a participant's audio sources (`"microphone"`, `"screenAudio"`, or a custom track name) and pushes it as `UserAudioRawFrame`s with `user_id` set to the participant and `transport_source` set to `audio_source`. With `audio_in_user_tracks=True`, the default, each participant's microphone is captured as they join, so call this for other sources. Requires `audio_in_enabled=True` and `transport.input()` in the pipeline.
+
+### capture_participant_video()
+
+```python
+async def capture_participant_video(
+    participant_id: str,
+    framerate: int | None = 30,
+    video_source: str = "camera",
+    color_format: str = "RGB",
+    *,
+    on_request_only: bool = False,
+)
+```
+
+Captures one of a participant's video sources and pushes its frames as `UserImageRawFrame`s in `color_format`. The other arguments work as in [Capturing video on demand](/api-reference/server/services/transport/transport-params#capturing-video-on-demand). Requires `video_in_enabled=True` and `transport.input()` in the pipeline.
+
+### start_dialout()
+
+```python
+async def start_dialout(
+    settings: Mapping[str, Any] | None = None,
+) -> tuple[str, str | None]
+```
+
+Dials out from the room and returns `(session_id, error)`, where `error` is `None` on success. `settings` takes Daily's [dial-out settings](https://reference-python.daily.co/api_reference.html#daily.CallClient.start_dialout), such as `phoneNumber` or `sipUri`. The room needs dial-out enabled; see [Daily PSTN](/pipecat/telephony/daily-pstn#dial-out) and [Daily SIP](/pipecat/telephony/daily-sip#dial-out).
+
+### stop_dialout()
+
+```python
+async def stop_dialout(participant_id: str) -> str | None
+```
+
+Hangs up the dial-out call to a participant and returns an error description, or `None` on success.
+
+### start_recording()
+
+```python
+async def start_recording(
+    streaming_settings: Mapping[str, Any] | None = None,
+    stream_id: str | None = None,
+    force_new: bool | None = None,
+) -> tuple[str, str | None]
+```
+
+Starts Daily's cloud recording and returns `(stream_id, error)`, where `error` is `None` on success. Cloud recording must be enabled on the room or token via `enable_recording`; see [DailyRESTHelper](/api-reference/server/utilities/daily/rest-helper). The recording events are under [Recording](#recording).
+
+```python
+@transport.event_handler("on_first_participant_joined")
+async def on_first_participant_joined(transport, participant):
+    stream_id, error = await transport.start_recording()
+    if error:
+        logger.error(f"Failed to start recording: {error}")
+```
+
+To record from the moment the bot joins instead, configure the meeting token with `DailyRESTHelper`:
+
+```python
+from pipecat.transports.daily.utils import (
+    DailyMeetingTokenParams,
+    DailyMeetingTokenProperties,
+)
+
+token = await helper.get_token(
+    room_url="https://your-domain.daily.co/my-room",
+    params=DailyMeetingTokenParams(
+        properties=DailyMeetingTokenProperties(
+            enable_recording="cloud",
+            start_cloud_recording=True,
+        )
+    ),
+)
+```
+
+### stop_recording()
+
+```python
+async def stop_recording(stream_id: str | None = None) -> str | None
+```
+
+Stops a cloud recording and returns an error description, or `None` on success.
+
+### update_publishing()
+
+```python
+async def update_publishing(publishing_settings: Mapping[str, Any]) -> str | None
+```
+
+Updates the bot's [publishing settings](https://reference-python.daily.co/types.html#publishingsettings), such as camera encodings, and returns an error description, or `None` on success.
+
+### participants()
+
+```python
+def participants() -> Mapping[str, Any]
+```
+
+Returns the participants in the room as Daily reports them, keyed by participant ID, with the bot under the key `"local"`.
+
 ## Notes
 
 ### Using built-in transcription
@@ -37614,61 +37771,7 @@ async def on_transcription_message(transport, message):
 
 ### Recording
 
-Daily supports two ways to record a call: start and stop it imperatively from
-the transport, or configure a meeting token to start cloud recording
-automatically when the bot joins.
-
-#### start_recording / stop_recording
-
-Start and stop Daily's cloud recording during a session.
-
-```python
-async def start_recording(
-    streaming_settings=None, stream_id=None, force_new=None
-) -> tuple[str, CallClientError | None]
-
-async def stop_recording(stream_id=None) -> CallClientError | None
-```
-
-Typically triggered from an event handler once the session is underway:
-
-```python
-@transport.event_handler("on_first_participant_joined")
-async def on_first_participant_joined(transport, participant):
-    stream_id, error = await transport.start_recording()
-    if error:
-        logger.error(f"Failed to start recording: {error}")
-
-# Later, to stop recording:
-await transport.stop_recording()
-```
-
-<Note>
-  Cloud recording must be enabled on the room or token via `enable_recording`.
-  See [DailyRESTHelper](/api-reference/server/utilities/daily/rest-helper).
-</Note>
-
-#### Start recording automatically on join
-
-Instead of calling `start_recording()`, configure a meeting token to begin
-cloud recording as soon as the bot joins, using `DailyRESTHelper`:
-
-```python
-from pipecat.transports.daily.utils import (
-    DailyMeetingTokenParams,
-    DailyMeetingTokenProperties,
-)
-
-token = await helper.get_token(
-    room_url="https://your-domain.daily.co/my-room",
-    params=DailyMeetingTokenParams(
-        properties=DailyMeetingTokenProperties(
-            enable_recording="cloud",
-            start_cloud_recording=True,
-        )
-    ),
-)
-```
+To start and stop a recording, see [start_recording()](#start_recording) and [stop_recording()](#stop_recording).
 
 #### on_recording_started / on_recording_stopped / on_recording_error
 
@@ -38653,6 +38756,76 @@ See the [complete example](https://github.com/pipecat-ai/pipecat/blob/main/examp
 - Pipeline integration with audio processing
 - Event handling for room lifecycle management
 
+## Frames
+
+**Sent to the transport:**
+
+| Frame                                      | Fields                                 | Effect                                                                                                                                         |
+| ------------------------------------------ | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LiveKitOutputTransportMessageFrame`       | `message`, `participant_id` (optional) | Sends `message` on the data channel after the audio queued before it, to the participant with that identity or, without one, to the whole room |
+| `LiveKitOutputTransportMessageUrgentFrame` | `message`, `participant_id` (optional) | Sends `message` the same way, at once                                                                                                          |
+| `OutputDTMFFrame`                          | `button` or `buttons`                  | Sends a SIP DTMF tone. Only the first of `buttons` is sent                                                                                     |
+
+A `dict` message is sent as JSON. A plain [`OutputTransportMessageFrame`](/api-reference/server/frames/data-frames#outputtransportmessageframe) goes to the whole room.
+
+**Pushed by the transport:**
+
+| Frame                               | Fields                      | Meaning                                                                                                                |
+| ----------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `LiveKitInputTransportMessageFrame` | `message`, `participant_id` | A data channel message that parsed as a JSON object, the one `on_app_message` receives. Pushed upstream and downstream |
+
+```python
+from pipecat.transports.livekit.transport import LiveKitOutputTransportMessageFrame
+
+await worker.queue_frame(
+    LiveKitOutputTransportMessageFrame(message={"type": "status"}, participant_id="user-1")
+)
+```
+
+## Methods
+
+The room exists once the pipeline starts. Before that, these methods raise `Exception`.
+
+### get_participants()
+
+```python
+def get_participants() -> list[str]
+```
+
+Returns the LiveKit identities of the remote participants in the room.
+
+### get_participant_metadata()
+
+```python
+async def get_participant_metadata(participant_id: str) -> dict
+```
+
+Returns a participant's `id` (identity), `name`, and `metadata` as a `dict`, or an empty `dict` when no participant in the room has that identity.
+
+### set_metadata()
+
+```python
+async def set_metadata(metadata: str)
+```
+
+Sets the bot's own participant metadata in the room.
+
+### mute_participant()
+
+```python
+async def mute_participant(participant_id: str)
+```
+
+Stops the bot receiving a participant's audio. The participant isn't muted for anyone else in the room.
+
+### unmute_participant()
+
+```python
+async def unmute_participant(participant_id: str)
+```
+
+Resumes the bot receiving a participant's audio after `mute_participant()`.
+
 ## Event Handlers
 
 LiveKitTransport provides event handlers for room lifecycle, participant management, and media track events. Register handlers using the `@event_handler` decorator on the transport instance.
@@ -38741,9 +38914,7 @@ async def on_before_disconnect(transport):
   field set when creating access tokens), not session IDs. Methods like
   `get_participants()`, `get_participant_metadata()`, `mute_participant()`, and
   `unmute_participant()` all use identities, as do all participant-related event
-  handlers. `mute_participant()` and `unmute_participant()` stop and resume the
-  bot receiving that participant's audio; they don't mute the participant for
-  anyone else in the room.
+  handlers.
 </Note>
 
 #### on_first_participant_joined
@@ -40829,12 +41000,52 @@ See the [complete example](https://github.com/pipecat-ai/pipecat-examples/tree/m
 - Bot integration with Pipecat pipeline using `SmallWebRTCTransport`
 - Environment setup and deployment
 
+## Methods
+
+### handle_verify_webhook_request()
+
+```python
+async def handle_verify_webhook_request(
+    self, params: dict[str, str], expected_verification_token: str
+) -> int
+```
+
+Returns the `hub.challenge` of Meta's webhook verification request, for the endpoint to send back. `params` are the request's query parameters. Raises `ValueError` when a parameter is missing, `hub.mode` isn't `"subscribe"`, or `hub.verify_token` doesn't match `expected_verification_token`.
+
+### handle_webhook_request()
+
+```python
+async def handle_webhook_request(
+    self,
+    request: WhatsAppWebhookRequest,
+    connection_callback: Callable[..., Awaitable[None]] | None = None,
+    raw_body: bytes | None = None,
+    sha256_signature: str | None = None,
+) -> bool
+```
+
+Handles a call webhook: a `connect` event answers the call with a new `SmallWebRTCConnection` and passes it to `connection_callback`, and a `terminate` event disconnects the call. Returns `True` when the event was handled, and `False` when ending a call fails. Raises `ValueError` when the request has no connect or terminate event, and `Exception` when the signature check or answering the call fails. An exception in `connection_callback` is logged, not raised.
+
+| Parameter             | Type                                     | Default    | Description                                                                                                       |
+| --------------------- | ---------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------- |
+| `request`             | `WhatsAppWebhookRequest`                 | (required) | The webhook's JSON body                                                                                           |
+| `connection_callback` | `Callable[..., Awaitable[None]] \| None` | `None`     | Called with each new connection and its call. See [Connection Callback Signature](#connection-callback-signature) |
+| `raw_body`            | `bytes \| None`                          | `None`     | The raw request body, checked against the signature when `whatsapp_secret` is set                                 |
+| `sha256_signature`    | `str \| None`                            | `None`     | The request's `X-Hub-Signature-256` header                                                                        |
+
+### terminate_all_calls()
+
+```python
+async def terminate_all_calls() -> None
+```
+
+Ends every ongoing call through the WhatsApp API and disconnects its connection. Call it when your server shuts down.
+
 ## Notes
 
 - WhatsApp only supports SHA-256 fingerprints in SDP, so the client automatically filters out other fingerprint types.
 - Each incoming call creates a new `SmallWebRTCConnection` that can be used with `SmallWebRTCTransport`.
 - The client supports both `pre_accept` and `accept` call flow as required by the WhatsApp Cloud API.
-- Use `terminate_all_calls()` during shutdown to cleanly end all ongoing calls.
 
 ## Additional Resources
 
@@ -40960,9 +41171,10 @@ transport = DailyTransport(
 </ParamField>
 
 <ParamField path="audio_in_stream_on_start" type="bool" default="True">
-  Start audio input streaming immediately when the transport starts. Set to
-  `False` to manually control when audio input begins. Only `DailyTransport`
-  uses it.
+  Start audio input streaming immediately when the transport starts. When
+  `False`, audio input begins when an `InputTransportStartAudioStreamingFrame`
+  reaches the input transport; the RTVI processor pushes one when the client is
+  ready. Only `DailyTransport` uses it.
 </ParamField>
 
 <ParamField path="audio_in_passthrough" type="bool" default="True">
@@ -41067,9 +41279,9 @@ params = DailyParams(
 
 ### Capturing video on demand
 
-`BaseTransport.capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a user's video source on demand and takes precedence over `video_in_sources` for that source. It is implemented by `DailyTransport`, `SmallWebRTCTransport` and `LiveKitTransport`. `TavusTransport` and `LemonSliceTransport` define it with a different signature: `(participant_id, callback, framerate=30, video_source="camera", color_format="RGB")`. Other transports log a warning. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on only the frames that answer image requests. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
+`BaseTransport.capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a user's video source on demand and takes precedence over `video_in_sources` for that source. It is implemented by `DailyTransport`, `SmallWebRTCTransport` and `LiveKitTransport`. Other transports, including `TavusTransport` and `LemonSliceTransport`, log a warning. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on only the frames that answer image requests. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
 
-`BaseTransport.get_client_id(client)` returns the `participant_id` for the client passed to `on_client_connected`: the participant id on Daily, the participant identity on LiveKit, the peer connection id on SmallWebRTC and the stream id on Vonage. Transports without client events log a warning and return an empty string.
+`BaseTransport.get_client_id(client)` returns the `participant_id` for the client passed to `on_client_connected`: the participant id on Daily, the participant identity on LiveKit, the peer connection id on SmallWebRTC and the stream id on Vonage. Other transports log a warning and return an empty string.
 
 ```python
 client_id = transport.get_client_id(client)
@@ -42279,6 +42491,38 @@ async def on_pause(serializer, message):
     logger.info("Audio paused (caller on hold)")
 ```
 
+## Frames
+
+**Sent to the serializer:**
+
+| Frame                                                              | Fields    | Effect                                                                                                                             |
+| ------------------------------------------------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `EndFrame`, `CancelFrame`                                          |           | Sends a `disconnect` message with reason `"completed"`, action `"transfer"`, and the output variables                              |
+| `InterruptionFrame`                                                |           | Sends a barge-in event, so Genesys stops playing the audio it has queued                                                           |
+| `OutputTransportMessageFrame`, `OutputTransportMessageUrgentFrame` | `message` | Sends `message` as JSON when it is a `dict` with a `"version"` field, as the serializer's messages are. Other messages are dropped |
+
+**Pushed by the serializer:**
+
+| Frame            | Fields   | Meaning                         |
+| ---------------- | -------- | ------------------------------- |
+| `InputDTMFFrame` | `button` | The caller pressed a keypad key |
+
+## Methods
+
+### create_resumed_response()
+
+```python
+def create_resumed_response() -> dict[str, Any]
+```
+
+Returns a `resumed` message for Genesys and ends the pause, so the serializer passes audio again. Send it in an `OutputTransportMessageUrgentFrame`:
+
+```python
+await worker.queue_frame(
+    OutputTransportMessageUrgentFrame(message=serializer.create_resumed_response())
+)
+```
+
 ## Protocol Details
 
 ### AudioHook v2 Protocol
@@ -42309,10 +42553,8 @@ A typical session follows this sequence:
 
 - **Fixed packet size**: Set `fixed_audio_packet_size=1600` on your transport parameters. This batches outbound audio into consistent chunks and prevents 429 rate limiting from Genesys.
 - **No extra dependencies**: The serializer uses Pipecat's built-in audio conversion utilities (`pcm_to_ulaw`, `ulaw_to_pcm`) and SOXR resampler.
-- **Barge-in**: When the pipeline emits an `InterruptionFrame`, the serializer automatically sends a barge-in event to Genesys, which stops any queued audio playback on the Genesys side.
 - **Pause/resume**: When Genesys sends a `pause` message (e.g., caller placed on hold), audio processing is suspended. The serializer drops incoming and outgoing audio while paused. Use the `on_pause` event handler and `create_resumed_response()` to control when streaming resumes.
 - **Output variables**: Variables set via `set_output_variables()` are included in the `closed` response when Genesys terminates the session. These variables become available in the Architect flow for routing decisions.
-- **DTMF support**: Phone keypad events are converted to `InputDTMFFrame` objects and can be processed in your pipeline.
 - **L16 format**: The serializer accepts `AudioHookMediaFormat.L16` as a configuration option but drops all audio in both directions with it. Use PCMU (the default).
 
 # Plivo Frame Serializer
@@ -43556,28 +43798,25 @@ async with aiohttp.ClientSession() as session:
     )
 ```
 
+## Frames
+
+**Sent to the service:**
+
+| Frame                    | Fields                                                   | Effect                                                               |
+| ------------------------ | -------------------------------------------------------- | -------------------------------------------------------------------- |
+| `STTUpdateSettingsFrame` | `delta=AssemblyAISTTService.Settings(agent_context=...)` | Replaces the carryover context without reconnecting (U3 Pro models). |
+
+```python
+from pipecat.frames.frames import STTUpdateSettingsFrame
+
+await worker.queue_frame(
+    STTUpdateSettingsFrame(
+        delta=AssemblyAISTTService.Settings(agent_context="What is your order ID?")
+    )
+)
+```
+
 ## Methods
-
-### update_agent_context()
-
-```python
-async def update_agent_context(text: str)
-```
-
-Send the agent's latest spoken reply to AssemblyAI as carryover context. Improves transcription of the user's next turn — short answers, spelled-out entities, disambiguation.
-
-**Parameters:**
-
-- `text` (str): The agent's spoken reply text. Clipped to ~1500 characters.
-
-**Example:**
-
-```python
-# After the agent finishes speaking
-await stt.update_agent_context("What is your order ID?")
-```
-
-> It is automatically invoked each time an assistant turn is completed.
 
 ### warm()
 
@@ -43604,7 +43843,7 @@ await stt.warm()
 - **Turn detection modes**:
   - **Pipecat mode** (`vad_force_turn_endpoint=True`, default): Forces AssemblyAI to return finals ASAP so Pipecat's turn detection (e.g., Smart Turn) decides when the user is done. The service sends a `ForceEndpoint` message when VAD detects the user has stopped speaking.
   - **AssemblyAI mode** (`vad_force_turn_endpoint=False`, U3 Pro models only): AssemblyAI's model controls turn endings using built-in turn detection. The service proposes each turn boundary and automatically requests `ExternalUserTurnStrategies`, so you don't need to configure turn strategies manually. See [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the interruption controls.
-- **Context carryover** (U3 Pro models only): Seed the agent's most recent reply, improving transcription of the user's next turn — short answers, spelled-out entities, disambiguation. `update_agent_context()` is automatically invoked each time an assistant turn is completed. Control the window size with `previous_context_n_turns` (0–100, default 3); set to 0 to disable carryover entirely.
+- **Context carryover** (U3 Pro models only): Seed the agent's most recent reply, improving transcription of the user's next turn: short answers, spelled-out entities, disambiguation. The service sends each completed assistant turn automatically. Control the window size with `previous_context_n_turns` (0–100, default 3); set to 0 to disable carryover entirely.
 - **Voice focus** (U3 Pro models only): Set `voice_focus` to `"near-field"` or `"far-field"` to isolate the primary voice and suppress background noise. Tune suppression strength with `voice_focus_threshold` (0.0–1.0, higher values suppress more).
 - **Speaker diarization**: Enable `speaker_labels=True` in Settings to automatically identify different speakers. The speaker label (e.g., "Speaker A", "Speaker B") replaces `user_id` on interim and final transcription frames. Use the `speaker_format` parameter to format transcripts with speaker labels.
 - **Prompting** (U3 Pro models only): The `prompt` parameter allows you to guide transcription for specific names, terms, or domain vocabulary. May be combined with `keyterms_prompt` on U3 Pro models. AssemblyAI recommends testing without a prompt first.
@@ -49439,7 +49678,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 ### Realtime Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `SarvamRealtimeSTTService.Settings(...)`. These can be updated mid-conversation via `update_config()` or `STTUpdateSettingsFrame`, except `model`, which isn't applied at runtime.
+Runtime-configurable settings passed via the `settings` constructor argument using `SarvamRealtimeSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`, except `model`, which isn't applied at runtime.
 
 | Parameter                | Type                                                                    | Default              | Description                                                                                                                                                                                               |
 | ------------------------ | ----------------------------------------------------------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -49554,11 +49793,17 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 ### Updating Realtime Configuration
 
 ```python
+from pipecat.frames.frames import STTUpdateSettingsFrame
+
 # Update settings mid-conversation without reconnecting
-await stt.update_config(
-    language_code="ta-IN",
-    stream_type="fast",
-    threshold=0.5,
+await worker.queue_frame(
+    STTUpdateSettingsFrame(
+        delta=SarvamRealtimeSTTService.Settings(
+            language=Language.TA_IN,
+            stream_type="fast",
+            threshold=0.5,
+        )
+    )
 )
 ```
 
@@ -49579,7 +49824,7 @@ await stt.update_config(
   - `endpointing="vad"` (default): Sarvam's server-side VAD decides turn boundaries. The service proposes turn frames via `ProposedUserStartedSpeakingFrame` and `ProposedUserStoppedSpeakingFrame`.
   - `endpointing="manual"`: The pipeline drives turn boundaries via `VADUserStartedSpeakingFrame` and `VADUserStoppedSpeakingFrame`. Requires a VAD analyzer on the user aggregator.
 - **VAD analyzer required**: A VAD analyzer is required in either endpointing mode. Under `vad` it times transcription latency; under `manual` it also marks the turn for Sarvam.
-- **In-band configuration updates**: Settings can be updated mid-conversation via `update_config()` without reconnecting. Connection-only values (`sample_rate`, `return_timestamps`, `keyterms`, `prefix_padding_ms`, `endpointing`) cannot be updated at runtime.
+- **In-band configuration updates**: Settings can be updated mid-conversation with `STTUpdateSettingsFrame` without reconnecting. Connection-only values (`sample_rate`, `return_timestamps`, `keyterms`, `prefix_padding_ms`, `endpointing`) cannot be updated at runtime.
 - **Stream types**: `fast` provides lowest latency, `balanced` provides moderate latency with better quality, and `simulated` is for testing. The stream type controls server-side flush cadence; the client always sends audio in 50ms chunks.
 - **No reconnection**: The service doesn't reconnect, and passing `reconnect_on_error` raises `TypeError`. If the connection drops, transcription stops for the rest of the session.
 
@@ -50484,23 +50729,23 @@ Speechmatics Agent STT supports the following endpoints (defaults to `EU2`):
 
 Runtime-configurable settings passed via the `settings` constructor argument using `SpeechmaticsSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter                     | Type                         | Default       | Description                                                                                                                                                                                 |
-| ----------------------------- | ---------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                       | `str`                        | `"linden-1"`  | Transcription model to use. `linden-1` is the only model Agent STT accepts. _(Inherited from base STT settings.)_ Supersedes `operating_point`.                                             |
-| `language`                    | `Language \| str`            | `Language.EN` | Language code for transcription. _(Inherited from base STT settings.)_                                                                                                                      |
-| `domain`                      | `str`                        | `None`        | Domain for Speechmatics API (e.g. for bilingual transcription).                                                                                                                             |
-| `turn_detection_mode`         | `TurnDetectionMode`          | `EXTERNAL`    | How turns are closed. `EXTERNAL` has the caller drive turns via `finalize()` (e.g. Pipecat's own VAD); `VAD` lets the STT service run its own VAD and close turns itself.                   |
-| `speaker_active_format`       | `str`                        | `"{text}"`    | Formatter for speaker output. Available attributes: `{speaker_id}`, `{text}`, `{ts}`, `{lang}`. Example: `"@{speaker_id}: {text}"`.                                                         |
-| `known_speakers`              | `list[SpeakerIdentifier]`    | `[]`          | Known speaker labels and identifiers for speaker attribution.                                                                                                                               |
-| `additional_vocab`            | `list[AdditionalVocabEntry]` | `[]`          | Additional vocabulary to boost recognition of specific words.                                                                                                                               |
-| `operating_point`             | `Model \| str`               | `None`        | _Deprecated since 1.10.0, removed in 2.0.0._ Resolves to `model`, warning when used. If both are given they must name the same value, otherwise a `ValueError` is raised. Removed in 2.0.0. |
-| `enable_partials`             | `bool`                       | `None`        | Emit interim segments as `AddPartialSegment`, updating until the final segment arrives. Agent STT enables partials by default. Set to false to disable partials.                            |
-| `punctuation_overrides`       | `dict`                       | `None`        | Custom punctuation overrides for the STT engine.                                                                                                                                            |
-| `transcript_filtering_config` | `dict`                       | `None`        | Transcript post-processing, as Speechmatics' `transcript_filtering_config` object. `remove_disfluencies` drops fillers such as "um" and "uh"; `replacements` rewrites matched words.        |
-| `enable_diarization`          | `bool`                       | `None`        | Enable speaker diarization to attribute words to unique speakers.                                                                                                                           |
-| `speaker_sensitivity`         | `float`                      | `None`        | Diarization sensitivity. Higher values help distinguish similar voices.                                                                                                                     |
-| `max_speakers`                | `int`                        | `None`        | Maximum number of speakers to detect. Only use when the speaker count is known.                                                                                                             |
-| `prefer_current_speaker`      | `bool`                       | `None`        | Give extra weight to grouping nearby words as the same speaker.                                                                                                                             |
+| Parameter                     | Type                         | Default       | Description                                                                                                                                                                          |
+| ----------------------------- | ---------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`                       | `str`                        | `"linden-1"`  | Transcription model to use. `linden-1` is the only model Agent STT accepts. _(Inherited from base STT settings.)_ Supersedes `operating_point`.                                      |
+| `language`                    | `Language \| str`            | `Language.EN` | Language code for transcription. _(Inherited from base STT settings.)_                                                                                                               |
+| `domain`                      | `str`                        | `None`        | Domain for Speechmatics API (e.g. for bilingual transcription).                                                                                                                      |
+| `turn_detection_mode`         | `TurnDetectionMode`          | `EXTERNAL`    | How turns are closed. `EXTERNAL` closes a turn on `VADUserStoppedSpeakingFrame` (e.g. from Pipecat's own VAD); `VAD` lets the STT service run its own VAD and close turns itself.    |
+| `speaker_active_format`       | `str`                        | `"{text}"`    | Formatter for speaker output. Available attributes: `{speaker_id}`, `{text}`, `{ts}`, `{lang}`. Example: `"@{speaker_id}: {text}"`.                                                  |
+| `known_speakers`              | `list[SpeakerIdentifier]`    | `[]`          | Known speaker labels and identifiers for speaker attribution.                                                                                                                        |
+| `additional_vocab`            | `list[AdditionalVocabEntry]` | `[]`          | Additional vocabulary to boost recognition of specific words.                                                                                                                        |
+| `operating_point`             | `Model \| str`               | `None`        | _Deprecated since 1.10.0, removed in 2.0.0._ Resolves to `model`, warning when used. If both are given they must name the same value, otherwise a `ValueError` is raised. |
+| `enable_partials`             | `bool`                       | `None`        | Emit interim segments as `AddPartialSegment`, updating until the final segment arrives. Agent STT enables partials by default. Set to false to disable partials.                     |
+| `punctuation_overrides`       | `dict`                       | `None`        | Custom punctuation overrides for the STT engine.                                                                                                                                     |
+| `transcript_filtering_config` | `dict`                       | `None`        | Transcript post-processing, as Speechmatics' `transcript_filtering_config` object. `remove_disfluencies` drops fillers such as "um" and "uh"; `replacements` rewrites matched words. |
+| `enable_diarization`          | `bool`                       | `None`        | Enable speaker diarization to attribute words to unique speakers.                                                                                                                    |
+| `speaker_sensitivity`         | `float`                      | `None`        | Diarization sensitivity. Higher values help distinguish similar voices.                                                                                                              |
+| `max_speakers`                | `int`                        | `None`        | Maximum number of speakers to detect. Only use when the speaker count is known.                                                                                                      |
+| `prefer_current_speaker`      | `bool`                       | `None`        | Give extra weight to grouping nearby words as the same speaker.                                                                                                                      |
 
 ## Turn Detection
 
@@ -50508,7 +50753,7 @@ The Speechmatics Agent STT service supports two turn detection modes:
 
 ### External mode (Default)
 
-The default `TurnDetectionMode.EXTERNAL` hands endpointing to the caller. The service does not endpoint on its own; instead, the caller drives turns by calling `finalize()`, typically from Pipecat's own VAD. Use this mode when you want Pipecat's VAD to control turn boundaries.
+The default `TurnDetectionMode.EXTERNAL` hands endpointing to the caller. The service does not endpoint on its own; instead, it closes a turn when it receives `VADUserStoppedSpeakingFrame`, typically from Pipecat's own VAD. Use this mode when you want Pipecat's VAD to control turn boundaries.
 
 ```python
 import os
@@ -50724,6 +50969,22 @@ pipeline = Pipeline([
     transport.output(),
     context_aggregator.assistant()
 ])
+```
+
+## Methods
+
+### send_message()
+
+```python
+async def send_message(message: ClientMessageType | str, **kwargs: Any) -> None
+```
+
+Sends a client message to the Speechmatics session, with any keyword arguments added to the message payload. Send `ClientMessageType.GET_SPEAKERS` to request the session's speaker data, which arrives in [`on_speakers_result`](#event-handlers). Raises `RuntimeError` if the session isn't connected or the message can't be sent.
+
+```python
+from speechmatics.agent_stt import ClientMessageType
+
+await stt.send_message(ClientMessageType.GET_SPEAKERS)
 ```
 
 ## Additional Notes
@@ -67952,6 +68213,16 @@ llm = AWSNovaSonicLLMService(
 # session_continuation=SessionContinuationParams(enabled=False)
 ```
 
+## Methods
+
+### reset_conversation()
+
+```python
+async def reset_conversation()
+```
+
+Disconnects and reconnects, seeding the new session with the context's messages. A trailing user message is sent for the model to answer. Before the service has received its first context, it only logs a warning.
+
 ## Notes
 
 - **Transcription frames**: User speech transcription frames are always emitted upstream. Assistant text transcripts are delivered in real-time using speculative text events, providing text synchronized with audio output for responsive client UIs.
@@ -68189,6 +68460,24 @@ pipeline = Pipeline(
     ]
 )
 ```
+
+## Methods
+
+### reset_conversation()
+
+```python
+async def reset_conversation()
+```
+
+Disconnects and reconnects, sending the context's messages to the new session and asking the model to respond. Before the service has received its first context, it only logs a warning.
+
+### set_audio_input_paused()
+
+```python
+def set_audio_input_paused(paused: bool)
+```
+
+Stops (`True`) or resumes (`False`) sending input audio to Voice Live.
 
 ## Notes
 
@@ -68687,6 +68976,63 @@ llm = GeminiLiveLLMService(
 )
 ```
 
+## Methods
+
+### set_audio_input_paused()
+
+```python
+def set_audio_input_paused(paused: bool)
+```
+
+Stops (`True`) or resumes (`False`) sending input audio to the model.
+
+### set_video_input_paused()
+
+```python
+def set_video_input_paused(paused: bool)
+```
+
+Stops (`True`) or resumes (`False`) sending video frames to the model.
+
+### file_api
+
+```python
+llm.file_api -> GeminiFileAPI
+```
+
+The client for the Gemini File API. Upload a file, then reference its `uri` in a `file_data` content part of a context message. Each method raises an `Exception` when the API returns an error.
+
+| Method                                                                  | Returns                                                         |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `async upload_file(file_path: str, display_name: str \| None = None)`   | `dict`: the file's metadata, with `name` and `uri` under `file` |
+| `async get_file(name: str)`                                             | `dict`: the file's metadata                                     |
+| `async list_files(page_size: int = 10, page_token: str \| None = None)` | `dict`: one page of files                                       |
+| `async delete_file(name: str)`                                          | `True`                                                          |
+
+```python
+from pipecat.processors.aggregators.llm_context import LLMContext
+
+file_info = await llm.file_api.upload_file("menu.txt", display_name="Menu")
+
+context = LLMContext(
+    [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What's on the menu today?"},
+                {
+                    "type": "file_data",
+                    "file_data": {
+                        "mime_type": "text/plain",
+                        "file_uri": file_info["file"]["uri"],
+                    },
+                },
+            ],
+        }
+    ]
+)
+```
+
 ## Notes
 
 - **Model support**: The service supports Gemini 2.5, Gemini 3.x, and the 3.8 Live family (`gemini-3.8-live`, `gemini-3.8-live-extended-thinking`). The service automatically detects and handles model-specific behavior.
@@ -68938,6 +69284,10 @@ llm = GeminiLiveVertexLLMService(
     ),
 )
 ```
+
+## Methods
+
+`set_audio_input_paused()` and `set_video_input_paused()` work as on [Gemini Live](/api-reference/server/services/s2s/gemini-live#methods).
 
 ## Notes
 
@@ -69252,6 +69602,14 @@ Speak a hard-coded TTS line without involving the LLM. Sends a `force_message` c
 **Parameters:**
 
 - `text` (`str`): Verbatim text to synthesize and play
+
+### set_audio_input_paused()
+
+```python
+def set_audio_input_paused(paused: bool)
+```
+
+Stops (`True`) or resumes (`False`) sending input audio to the model.
 
 ## Notes
 
@@ -69616,6 +69974,16 @@ await worker.queue_frame(
     )
 )
 ```
+
+## Methods
+
+### set_audio_input_paused()
+
+```python
+def set_audio_input_paused(paused: bool)
+```
+
+Stops (`True`) or resumes (`False`) sending input audio to the model.
 
 ## Notes
 
@@ -70033,6 +70401,16 @@ async def load_conversation(params: FunctionCallParams, filename: str):
     await params.llm.reset_conversation()
 ```
 
+## Methods
+
+### reset_conversation()
+
+```python
+async def reset_conversation()
+```
+
+Drops the session and starts a new one configured from the context as it is now. See [Restoring a Conversation](#restoring-a-conversation).
+
 ## Notes
 
 - **Turn taking is the model's**: The service proposes user turn boundaries from the API's transcript stream, and `LLMContextAggregatorPair` resolves them with the recommended `ExternalUserTurnStrategies(enable_interruptions=False)`. No `InterruptionFrame` is broadcast: the model handles being talked over itself, and a delegation keeps running when that happens. As a consequence every tool behaves as `cancel_on_interruption=False`; use `cancellable_by_llm=True` for tools the model should be able to cancel on request.
@@ -70417,6 +70795,32 @@ await worker.queue_frame(
     )
 )
 ```
+
+## Methods
+
+### set_audio_input_paused()
+
+```python
+def set_audio_input_paused(paused: bool)
+```
+
+Stops (`True`) or resumes (`False`) sending input audio to the model.
+
+### set_video_input_paused()
+
+```python
+def set_video_input_paused(paused: bool)
+```
+
+Stops (`True`) or resumes (`False`) sending video frames to the model.
+
+### retrieve_conversation_item()
+
+```python
+async def retrieve_conversation_item(item_id: str) -> ConversationItem
+```
+
+Returns the server's copy of a conversation item, such as one reported to `on_conversation_item_created`. Raises an `Exception` with the API's message when no item has that ID.
 
 ## Notes
 
@@ -79040,8 +79444,7 @@ Buffer size in bytes that triggers audio data events:
 </ParamField>
 
 <ParamField path="auto_start_recording" type="bool" default="False">
-  Whether to start recording automatically when the pipeline starts, without
-  requiring a call to `start_recording()` or an
+  Whether to start recording automatically when the pipeline starts, without an
   `AudioBufferStartRecordingFrame`.
 </ParamField>
 
@@ -79066,22 +79469,6 @@ def num_channels(self) -> int
 The number of channels in the audio output (1 for mono, 2 for stereo).
 
 ## Methods
-
-### start_recording()
-
-```python
-async def start_recording()
-```
-
-Start recording audio from both user and bot sources. Initializes recording state, resets audio buffers, and triggers the `on_recording_started` event. Does nothing when recording is already active.
-
-### stop_recording()
-
-```python
-async def stop_recording()
-```
-
-Stop recording and trigger final audio data handlers with any remaining buffered audio, then triggers the `on_recording_stopped` event. Does nothing when recording is not active.
 
 ### has_audio()
 
@@ -79267,11 +79654,10 @@ async def on_recording_stopped(buffer):
 
 ## Recording Control
 
-Recording can be controlled in three ways:
+Recording can be controlled in two ways:
 
 1. **Automatically on pipeline start**: Set `auto_start_recording=True` in the constructor
-2. **Programmatically**: Call `await processor.start_recording()` and `await processor.stop_recording()`
-3. **Via control frames**: Push `AudioBufferStartRecordingFrame` and `AudioBufferStopRecordingFrame` through the pipeline
+2. **Via control frames**: Push [`AudioBufferStartRecordingFrame`](/api-reference/server/frames/control-frames#audiobufferstartrecordingframe) and [`AudioBufferStopRecordingFrame`](/api-reference/server/frames/control-frames#audiobufferstoprecordingframe) through the pipeline. Starting resets the buffers and fires `on_recording_started`; stopping delivers the remaining buffered audio to the audio handlers, then fires `on_recording_stopped`. Each does nothing when recording is already in that state.
 
 ```python
 from pipecat.frames.frames import AudioBufferStartRecordingFrame, AudioBufferStopRecordingFrame
@@ -79907,27 +80293,10 @@ The caches make resolved files provider-neutral, which drives two scoping rules:
   `delete_after_load`.
 </ParamField>
 
-<ParamField path="ensure_data_url(url, mime_type)" type="async → str">
-  Return the `data:` form of `url`'s bytes, encoding and caching it on first use
-  — for adapters whose provider consumes base64 rather than raw bytes.
-</ParamField>
-
-<ParamField path="classify(url)" type="async → UrlReachability">
-  Classify who can reach an `http(s)` URL, honoring `allowed_url_networks`.
-  Classified once per URL; later calls return the cached verdict.
-</ParamField>
-
 <ParamField path="forget(url)" type="None">
   Drop everything cached for `url`, forcing a re-fetch on next use. A forgotten
   `delete_after_load` upload can't be re-fetched — its stored copy was deleted
   when first cached.
-</ParamField>
-
-<ParamField
-  path="cached_bytes(url) / cached_data_url(url) / cached_reachability(url)"
-  type="… | None"
->
-  Synchronous cache reads, returning `None` when nothing is cached for `url`.
 </ParamField>
 
 <ParamField path="file_storage" type="property → FileStorage | None">
@@ -88971,36 +89340,36 @@ async def on_client_ready(rtvi):
 
 `RTVIObserver` reports the LLM's function calls to the client as `llm-function-call-started`, `llm-function-call-in-progress`, and `llm-function-call-stopped` messages; see [RTVIObserver](/api-reference/server/rtvi/rtvi-observer#frame-translation). When the client sends an `llm-function-call-result` message, the processor pushes it downstream as a `FunctionCallResultFrame`.
 
-## Error Handling
+## Frames
 
-Send error messages to clients:
+**Sent to RTVI:**
 
-```python
-# General error
-await processor.send_error("Invalid configuration")
+| Frame                                                                                           | Fields                        | Effect                                                                                                                                                                                                                                           |
+| ----------------------------------------------------------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`ErrorFrame`](/api-reference/server/frames/system-frames#errorframe)                           | `error`                       | Sent to the client as an `error` message. A processor reports one with `await self.push_error("...")`, which pushes it upstream to the `RTVIProcessor` at the start of the pipeline.                                                             |
+| [`RTVIServerResponseFrame`](/api-reference/server/frames/system-frames#rtviserverresponseframe) | `client_msg`, `data`, `error` | Answers a client request. When the client sends a `client-message`, the processor pushes an `RTVIClientMessageFrame` downstream; push a response carrying that frame as `client_msg`. With `error` set, the client receives an `error-response`. |
 
-# Request-specific error
-await processor._send_error_response(request_id, "Invalid arguments")
-```
+Interrupt the bot with an [`InterruptionWorkerFrame`](/api-reference/server/frames/system-frames#interruptionworkerframe).
 
-Error categories:
+## Methods
 
-- Configuration errors
-- Function call errors
-- Protocol errors
-- Fatal and non-fatal errors
+An `on_client_message` handler receives the request as an `RTVI.ClientMessage`, not the `RTVIClientMessageFrame` that `RTVIServerResponseFrame` takes, so it answers with these methods (see [Requesting Data from the Server](/client/guides/custom-messaging#requesting-data-from-the-server)).
 
-## Bot Control
-
-Manage bot state and handle interruptions:
+### send_server_response()
 
 ```python
-# Set bot as ready
-await processor.set_bot_ready()
-
-# Handle interruptions
-await processor.interrupt_bot()
+async def send_server_response(client_msg: RTVI.ClientMessage, data: Any)
 ```
+
+Sends the client a `server-response` to the request `client_msg`, carrying `data`.
+
+### send_error_response()
+
+```python
+async def send_error_response(client_msg: RTVI.ClientMessage, error: str)
+```
+
+Sends the client an `error-response` to the request `client_msg`, carrying `error`.
 
 ## Custom Messaging
 
@@ -89439,6 +89808,14 @@ The observer maps Pipecat's internal frames to RTVI protocol messages:
 | `RTVIUIJobGroupFrame`         | `UIJobGroupMessage` (`ui-job-group`)                                     |
 
 The [User Interface](/client/rtvi-standard#user-interface) frames are emitted by `PipelineWorker` when a [`UIWorker`](/api-reference/server/workers/ui-worker) sends a command or runs a job group; the observer translates them into the outbound `ui-command` / `ui-job-group` messages the client renders.
+
+## Frames
+
+**Sent to the observer:**
+
+| Frame                        | Fields                                                                              | Effect                                                                                               |
+| ---------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `RTVIConfigureObserverFrame` | `function_call_report_level`, `vad_user_speaking_enabled`, `bot_llm_marker_enabled` | Changes the matching `RTVIObserverParams` fields at runtime. Fields left as `None` keep their value. |
 
 # Google RTVI Observer
 Source: https://docs.pipecat.ai/api-reference/server/rtvi/google-rtvi-observer.md
@@ -90726,7 +91103,7 @@ Update STT service settings at runtime. Inherits from `ServiceUpdateSettingsFram
 
 ### AudioBufferStartRecordingFrame
 
-Instructs `AudioBufferProcessor` to start recording audio. This frame can be pushed through the pipeline to start recording on demand. Alternatively, use `AudioBufferProcessor.start_recording()` or enable `auto_start_recording` in the constructor.
+Instructs `AudioBufferProcessor` to start recording audio. This frame can be pushed through the pipeline to start recording on demand. Alternatively, enable `auto_start_recording` in the constructor.
 
 This frame is uninterruptible (`interruptible: bool = field(default=False, init=False)`).
 
@@ -93618,14 +93995,6 @@ Watch for a specific agent's registration. If the agent is already registered, t
 | ------------- | ---------------------------------------- | -------------------------------------------- |
 | `worker_name` | `str`                                    | The agent name to watch for                  |
 | `handler`     | `Callable[[WorkerReadyData], Coroutine]` | Async callable invoked with the agent's data |
-
-#### register
-
-```python
-async def register(self, worker_data: WorkerReadyData) -> bool
-```
-
-Register an agent. Returns `True` if the agent was newly registered, `False` if already known.
 
 # Exceptions
 Source: https://docs.pipecat.ai/api-reference/server/workers/exceptions.md

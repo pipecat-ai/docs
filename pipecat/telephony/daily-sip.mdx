@@ -203,43 +203,38 @@ Internally, Pipecat also pushes each inbound digit as an `InputDTMFFrame` into t
 
 ### Sending DTMF
 
-To send DTMF tones back to the caller, send them through Daily's native DTMF channel. Use the session id from the inbound event (or the dial-out session id captured in `on_dialout_connected`) as the target. The default `method`to send the DTMF tones is `auto`, determined in the SIP offer/answer negotiation. However, if you already know what the remote party supports, then pick the appropriate option: `telephone-events` which are in-band RTP packets (RFC2833/4733) or as a `sip-info` message.
+To send DTMF tones back to the caller, push a [`DailyOutputDTMFFrame`](/api-reference/server/services/transport/daily#frames), which goes through Daily's native DTMF channel. Use the session id from the inbound event (or the dial-out session id captured in `on_dialout_connected`) as the target. The default `method` to send the DTMF tones is `auto`, determined in the SIP offer/answer negotiation. However, if you already know what the remote party supports, then pick the appropriate option: `telephone-event` for in-band RTP packets (RFC2833/4733), or `sip-info` for a SIP INFO message.
 
 ```python bot.py
-@transport.event_handler(“on_dialout_answered”)
+from pipecat.transports.daily.transport import DailyOutputDTMFFrame
+
+@transport.event_handler("on_dialout_answered")
 async def on_dialout_answered(transport, data):
-    logger.info(f”Dial-out answered: {data}”)
+    logger.info(f"Dial-out answered: {data}")
     # Wait briefly for the IVR prompt before sending the PIN
     await asyncio.sleep(1)
 
-    err = await transport.send_dtmf({
-        “sessionId”: data[“sessionId”],  # the dialed-out participant
-        “tones”: “1234#”,                # full sequence in one call
-        “digitDurationMs”: 100,
-        # “method”: “sip-info” | “telephone-event” | “auto”
-    })
-    if err:
-        logger.error(f”send_dtmf failed: {err}”)
+    await worker.queue_frame(
+        DailyOutputDTMFFrame.from_string(
+            "1234#",  # full sequence in one frame
+            session_id=data["sessionId"],  # the dialed-out participant
+            digit_duration_ms=100,
+            # method="sip-info" | "telephone-event" | "auto"
+        )
+    )
 ```
 
-You can also push `OutputDTMFFrame` / `OutputDTMFUrgentFrame` through the pipeline for cases where the tones are part of your bot's conversational logic (IVR navigation, confirming a menu choice) rather than a direct invocation:
+The tones go out after any audio the bot queued before them; `DailyOutputDTMFUrgentFrame` takes the same fields and sends at once. The generic `OutputDTMFFrame` and `OutputDTMFUrgentFrame` also go over Daily's DTMF channel, to the dial-out session or else the dial-in session:
 
 ```python
-# Single key (backward compatible)
-await transport.queue_frame(OutputDTMFUrgentFrame(button=KeypadEntry.ONE))
+from pipecat.audio.dtmf.types import KeypadEntry
+from pipecat.frames.frames import OutputDTMFFrame, OutputDTMFUrgentFrame
+
+# Single key
+await worker.queue_frame(OutputDTMFUrgentFrame(button=KeypadEntry.ONE))
 
 # Multi-key dial string
-await transport.queue_frame(OutputDTMFFrame.from_string("1234#"))
-
-# Daily with explicit session + method
-await transport.queue_frame(
-    DailyOutputDTMFFrame.from_string(
-        "1234#",
-        session_id="abc",
-        digit_duration_ms=80,
-        method="sip-info",
-    )
-)
+await worker.queue_frame(OutputDTMFFrame.from_string("1234#"))
 ```
 
 ## Best Practices
