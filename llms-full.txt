@@ -4266,7 +4266,7 @@ Run one-shot LLM inferences outside the pipeline using `run_inference()`:
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 context = LLMContext()
-context.add_user_message("What is 2+2?")
+context.add_message({"role": "user", "content": "What is 2+2?"})
 
 response = await llm.run_inference(
     context=context,
@@ -22924,13 +22924,13 @@ See the [RTVIProcessor](/api-reference/server/rtvi/rtvi-processor#dtmf-input) do
 
 Indicates that a function call has been initiated by the LLM. The amount of metadata included in this event, and in `llm-function-call-in-progress` and `llm-function-call-stopped`, is controlled by the server's `function_call_report_level` configuration, set per function:
 
-| Level       | Metadata included                                   |
-| ----------- | --------------------------------------------------- |
-| `DISABLED`  | No function call events are sent for the function.  |
-| `NONE`      | `tool_call_id` only (and `cancelled`). The default. |
-| `NAME`      | Adds `function_name`.                               |
-| `ARGUMENTS` | Adds `function_name` and `arguments`.               |
-| `FULL`      | Adds `function_name`, `arguments`, and `result`.    |
+| Level       | Metadata included                                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------------------------ |
+| `DISABLED`  | No function call events are sent for the function.                                                                 |
+| `NONE`      | `tool_call_id` on `in-progress` and `stopped`, plus `cancelled` on `stopped`; `started` carries none. The default. |
+| `NAME`      | Adds `function_name`.                                                                                              |
+| `ARGUMENTS` | Adds `function_name` and `arguments`.                                                                              |
+| `FULL`      | Adds `function_name`, `arguments`, and `result`.                                                                   |
 
 - **type**: `'llm-function-call-started'`
 - **data**:
@@ -36800,9 +36800,10 @@ it via the `params` constructor argument using `BeyParams(...)`.
 | `microphone_out_enabled` | `bool` | `False` | Whether to enable the microphone output track.   |
 
 <Note>
-  `BeyParams` inherits all `DailyParams` fields (for example, `vad_analyzer`).
-  See the [source repository](https://github.com/bey-dev/pipecat-bey) for the
-  authoritative, up-to-date list.
+  `BeyParams` inherits all `DailyParams` fields (for example,
+  `transcription_enabled`). See the [source
+  repository](https://github.com/bey-dev/pipecat-bey) for the authoritative,
+  up-to-date list.
 </Note>
 
 ## Usage
@@ -36814,6 +36815,10 @@ import aiohttp
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 
 from pipecat_bey import BeyParams, BeyTransport
 
@@ -36829,6 +36834,12 @@ async with aiohttp.ClientSession() as session:
             audio_in_enabled=True,
             audio_out_enabled=True,
             microphone_out_enabled=False,
+        ),
+    )
+
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
         ),
     )
@@ -36961,7 +36972,7 @@ Before using DailyTransport, you need:
 
 ### DailyParams
 
-Inherits all parameters from [TransportParams](/api-reference/server/services/transport/transport-params) (audio, video, VAD settings) with these additional fields:
+Inherits all parameters from [TransportParams](/api-reference/server/services/transport/transport-params) (audio and video settings) with these additional fields:
 
 <ParamField path="api_url" type="str" default="https://api.daily.co/v1">
   Daily API base URL.
@@ -38527,7 +38538,7 @@ Before using LiveKitTransport, you need:
 
 ### LiveKitParams
 
-Video output publishes a single `"pipecat-video"` camera track when `video_out_enabled` is set (mirroring how audio output always publishes one `"pipecat-audio"` microphone track). The track is sized using `video_out_width`/`video_out_height` and encodes frames according to `video_out_color_format` (default `"RGB"`); `video_out_framerate` governs how often frames are drawn. Per-destination video routing (multiple named output tracks, as supported by Daily's `camera_out_enabled`/`register_video_destination`) is not yet implemented for LiveKit.
+Video output publishes a single `"pipecat-video"` camera track when `video_out_enabled` is set (mirroring how audio output always publishes one `"pipecat-audio"` microphone track). The track is sized using `video_out_width`/`video_out_height` and publishes each frame in its own `format`, which must be `"RGB"`, `"RGBA"`, `"BGRA"` or `"ARGB"`; frames in other formats are dropped and an error is logged. `video_out_framerate` governs how often frames are drawn. Per-destination video routing (multiple named output tracks, as supported by Daily's `camera_out_enabled`/`register_video_destination`) is not yet implemented for LiveKit.
 
 `video_out_codec` selects the published video codec (`"VP8"`, `"H264"`, `"VP9"`, `"AV1"` or `"H265"`); LiveKit picks one when unset.
 
@@ -38545,18 +38556,18 @@ Video output publishes a single `"pipecat-video"` camera track when `video_out_e
 </ParamField>
 
 <ParamField path="video_out_max_bitrate" type="int | None" default="None">
-  Maximum bitrate of the published video track, in bits per second, capped at
-  `video_out_framerate`. LiveKit chooses the encoding from the track resolution
-  when unset.
+  Maximum bitrate of the published video track, in bits per second. When set,
+  `video_out_framerate` is also sent as the track's maximum framerate. LiveKit
+  chooses the encoding from the track resolution when unset.
 </ParamField>
 
 ### Video input
 
 With `video_in_enabled`, a participant's camera (`"camera"`) and screen share (`"screenVideo"`) are received separately, and each `UserImageRawFrame` carries its source in `transport_source`. Without `video_in_sources`, every frame of every video track is passed on. With it, only the listed sources are, each at its own framerate (see [TransportParams](/api-reference/server/services/transport/transport-params)).
 
-A `UserImageRequestFrame` is answered with the next frame of the requested source, so image-request tools such as `fetch_user_image` work with LiveKit. A request for a source the participant isn't sending, or one still waiting when the participant stops sending it or leaves, completes with an error result.
+A `UserImageRequestFrame` is answered with the next frame of the requested source, so image-request tools such as `fetch_user_image` work with LiveKit. A request for a source the participant isn't sending, for a source not listed in `video_in_sources` (when it is set) and not captured with `capture_participant_video()`, or one still waiting when the participant stops sending it or leaves, completes with an error result. Without `video_in_enabled=True`, no frames are received, so a request waits until the participant stops sending the source or leaves.
 
-`capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a source at a framerate and takes precedence over `video_in_sources`. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on frames only to answer image requests. Get the `participant_id` with `transport.get_client_id(client)`. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
+`capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` is a coroutine that captures a source at a framerate and takes precedence over `video_in_sources`. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on frames only to answer image requests. Get the `participant_id` with `transport.get_client_id(client)`. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
 
 ## Usage
 
@@ -38580,7 +38591,6 @@ LiveKitTransport provides event handlers for room lifecycle, participant managem
 | `on_connected`                | Connected to the room               |
 | `on_disconnected`             | Disconnected from the room          |
 | `on_before_disconnect`        | About to disconnect (sync)          |
-| `on_call_state_updated`       | Call state changed                  |
 | `on_first_participant_joined` | First participant joined            |
 | `on_participant_connected`    | A participant connected             |
 | `on_participant_disconnected` | A participant disconnected          |
@@ -38651,23 +38661,6 @@ async def on_before_disconnect(transport):
   handlers complete. Keep handlers fast.
 </Note>
 
-#### on_call_state_updated
-
-Fired when the call state changes.
-
-```python
-@transport.event_handler("on_call_state_updated")
-async def on_call_state_updated(transport, state):
-    print(f"Call state: {state}")
-```
-
-**Parameters:**
-
-| Parameter   | Type               | Description            |
-| ----------- | ------------------ | ---------------------- |
-| `transport` | `LiveKitTransport` | The transport instance |
-| `state`     | `str`              | The new call state     |
-
 ### Participants
 
 <Note>
@@ -38675,12 +38668,14 @@ async def on_call_state_updated(transport, state):
   field set when creating access tokens), not session IDs. Methods like
   `get_participants()`, `get_participant_metadata()`, `mute_participant()`, and
   `unmute_participant()` all use identities, as do all participant-related event
-  handlers.
+  handlers. `mute_participant()` and `unmute_participant()` stop and resume the
+  bot receiving that participant's audio; they don't mute the participant for
+  anyone else in the room.
 </Note>
 
 #### on_first_participant_joined
 
-Fired when the first participant (other than the bot) joins the room. This is commonly used to start the conversation.
+Fired when the first participant (other than the bot) joins the room, or is already in it when the bot connects. It fires again for the next participant after the room empties. This is commonly used to start the conversation.
 
 ```python
 @transport.event_handler("on_first_participant_joined")
@@ -38697,7 +38692,7 @@ async def on_first_participant_joined(transport, participant_id):
 
 #### on_participant_connected
 
-Fired when a participant connects to the room.
+Fired when a participant connects to the room, and for each participant already in the room when the bot connects.
 
 ```python
 @transport.event_handler("on_participant_connected")
@@ -38855,10 +38850,10 @@ async def on_dtmf_event(transport, data):
 
 **Parameters:**
 
-| Parameter   | Type               | Description                                                                                              |
-| ----------- | ------------------ | -------------------------------------------------------------------------------------------------------- |
-| `transport` | `LiveKitTransport` | The transport instance                                                                                   |
-| `data`      | `dict`             | DTMF data with keys `tone`/`digit` (str), `code` (int), and `participant_id` (str, the LiveKit identity) |
+| Parameter   | Type               | Description                                                                                                                                                |
+| ----------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `transport` | `LiveKitTransport` | The transport instance                                                                                                                                     |
+| `data`      | `dict`             | DTMF data with keys `tone`/`digit` (str), `code` (int), and `participant_id` (str, the LiveKit identity, or `None` when the packet carries no participant) |
 
 <Note>
   The transport pushes `InputDTMFFrame` automatically, so you only need this
@@ -39090,7 +39085,7 @@ Set `response_path` and `request_path` to bypass the namespace entirely and give
 
 ### MOQParams
 
-Extends [`TransportParams`](/api-reference/server/services/transport/transport-params), so the standard audio, VAD, and turn-analyzer options apply too.
+Extends [`TransportParams`](/api-reference/server/services/transport/transport-params), so the standard audio options apply too.
 
 **Connection**
 
@@ -40783,11 +40778,11 @@ See the [complete example](https://github.com/pipecat-ai/pipecat-examples/tree/m
 # TransportParams
 Source: https://docs.pipecat.ai/api-reference/server/services/transport/transport-params.md
 
-TransportParams is the base configuration class shared by all Pipecat transports: audio, video, and VAD settings.
+TransportParams is the base configuration class shared by all Pipecat transports: audio input, audio output, and video settings.
 
 ## Overview
 
-`TransportParams` is the base configuration class for all Pipecat transports. It controls audio input/output settings, video settings, and voice activity detection. Every transport's params class (`DailyParams`, `LiveKitParams`, `SingleClientWebsocketServerParams`, etc.) inherits from `TransportParams`.
+`TransportParams` is the base configuration class for all Pipecat transports. It controls audio input/output settings and video settings. Every transport's params class (`DailyParams`, `LiveKitParams`, `SingleClientWebsocketServerParams`, etc.) inherits from `TransportParams`.
 
 You typically pass these via the transport's `params` argument:
 
@@ -40816,8 +40811,8 @@ transport = DailyTransport(
 </ParamField>
 
 <ParamField path="audio_out_sample_rate" type="int" default="None">
-  Output audio sample rate in Hz. When `None`, uses the default rate from the
-  TTS service.
+  Output audio sample rate in Hz. When `None`, uses
+  `PipelineParams.audio_out_sample_rate` (24000 by default).
 </ParamField>
 
 <ParamField path="audio_out_channels" type="int" default="1">
@@ -40825,7 +40820,7 @@ transport = DailyTransport(
 </ParamField>
 
 <ParamField path="audio_out_bitrate" type="int" default="96000">
-  Output audio bitrate in bits per second.
+  Output audio bitrate in bits per second. Only `DailyTransport` uses it.
 </ParamField>
 
 <ParamField path="audio_out_10ms_chunks" type="int" default="4">
@@ -40847,11 +40842,12 @@ transport = DailyTransport(
 
 <ParamField
   path="audio_out_mixer"
-  type="BaseAudioMixer | Mapping[str, BaseAudioMixer]"
+  type="BaseAudioMixer | Mapping[str | None, BaseAudioMixer]"
   default="None"
 >
   Audio mixer instance for combining audio streams, or a mapping of destination
-  names to mixer instances.
+  names to mixer instances. In a mapping, the `None` key sets the mixer for the
+  default destination.
 </ParamField>
 
 <ParamField path="audio_out_destinations" type="List[str]" default="[]">
@@ -40867,7 +40863,7 @@ transport = DailyTransport(
   Insert silence frames when the audio output queue is empty. When `False`, the
   transport waits for audio data instead of inserting silence, which is useful
   for scenarios that require uninterrupted audio playback without artificial
-  gaps.
+  gaps. Only `DailyTransport` and `SmallWebRTCTransport` use it.
 </ParamField>
 
 <ParamField path="audio_out_write_timeout_secs" type="float" default="10.0">
@@ -40884,7 +40880,8 @@ transport = DailyTransport(
 </ParamField>
 
 <ParamField path="audio_in_sample_rate" type="int" default="None">
-  Input audio sample rate in Hz. When `None`, uses the transport's native rate.
+  Input audio sample rate in Hz. When `None`, uses
+  `PipelineParams.audio_in_sample_rate` (16000 by default).
 </ParamField>
 
 <ParamField path="audio_in_channels" type="int" default="1">
@@ -40897,12 +40894,14 @@ transport = DailyTransport(
 
 <ParamField path="audio_in_stream_on_start" type="bool" default="True">
   Start audio input streaming immediately when the transport starts. Set to
-  `False` to manually control when audio input begins.
+  `False` to manually control when audio input begins. Only `DailyTransport`
+  uses it.
 </ParamField>
 
 <ParamField path="audio_in_passthrough" type="bool" default="True">
-  Pass input audio frames downstream through the pipeline. When `False`, audio
-  is consumed by VAD but not forwarded.
+  Pass input audio frames downstream through the pipeline. When `False`, input
+  audio is not pushed downstream, so processors after the input transport, such
+  as STT, receive none.
 </ParamField>
 
 ## Video Output
@@ -40912,8 +40911,9 @@ transport = DailyTransport(
 </ParamField>
 
 <ParamField path="video_out_is_live" type="bool" default="False">
-  Enable real-time video output. When `True`, frames are sent as they arrive
-  rather than buffered.
+  Enable real-time video output. When `True`, each `OutputImageRawFrame` is
+  queued and sent at `video_out_framerate`. When `False`, the latest image is
+  redrawn repeatedly at `video_out_framerate`.
 </ParamField>
 
 <ParamField path="video_out_width" type="int" default="1024">
@@ -41004,7 +41004,7 @@ params = DailyParams(
 
 ### Capturing video on demand
 
-`BaseTransport.capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a user's video source on demand and takes precedence over `video_in_sources` for that source. It is implemented by `DailyTransport`, `SmallWebRTCTransport` and `LiveKitTransport`; other transports log a warning. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on only the frames that answer image requests. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
+`BaseTransport.capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a user's video source on demand and takes precedence over `video_in_sources` for that source. It is implemented by `DailyTransport`, `SmallWebRTCTransport` and `LiveKitTransport`. `TavusTransport` and `LemonSliceTransport` define it with a different signature: `(participant_id, callback, framerate=30, video_source="camera", color_format="RGB")`. Other transports log a warning. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on only the frames that answer image requests. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
 
 `BaseTransport.get_client_id(client)` returns the `participant_id` for the client passed to `on_client_connected`: the participant id on Daily, the participant identity on LiveKit, the peer connection id on SmallWebRTC and the stream id on Vonage. Transports without client events log a warning and return an empty string.
 
@@ -41019,13 +41019,13 @@ On `SmallWebRTCTransport`, calling `capture_participant_video()` without a `part
 
 Each transport extends `TransportParams` with provider-specific fields:
 
-| Transport                                                                                         | Params Class                        | Additional Fields                                                                          |
-| ------------------------------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------ |
-| [DailyTransport](/api-reference/server/services/transport/daily)                                  | `DailyParams`                       | `api_key`, `api_url`, `dialin_settings`, `transcription_enabled`, `transcription_settings` |
-| [LiveKitTransport](/api-reference/server/services/transport/livekit)                              | `LiveKitParams`                     | (no additional fields)                                                                     |
-| [SmallWebRTCTransport](/api-reference/server/services/transport/small-webrtc)                     | `TransportParams`                   | Uses base class directly                                                                   |
-| [SingleClientWebsocketServerTransport](/api-reference/server/services/transport/websocket-server) | `SingleClientWebsocketServerParams` | `add_wav_header`, `serializer`, `session_timeout`                                          |
-| [FastAPIWebsocketTransport](/api-reference/server/services/transport/fastapi-websocket)           | `FastAPIWebsocketParams`            | `serializer`, `session_timeout`                                                            |
+| Transport                                                                                         | Params Class                        | Additional Fields                                                                                                                                                                                                                                        |
+| ------------------------------------------------------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [DailyTransport](/api-reference/server/services/transport/daily)                                  | `DailyParams`                       | `api_key`, `api_url`, `audio_in_user_tracks`, `camera_out_enabled`, `camera_out_send_settings`, `custom_audio_track_params`, `custom_video_track_params`, `dialin_settings`, `microphone_out_enabled`, `transcription_enabled`, `transcription_settings` |
+| [LiveKitTransport](/api-reference/server/services/transport/livekit)                              | `LiveKitParams`                     | `audio_in_user_tracks`, `audio_out_queue_size_ms`, `video_out_max_bitrate`                                                                                                                                                                               |
+| [SmallWebRTCTransport](/api-reference/server/services/transport/small-webrtc)                     | `TransportParams`                   | Uses base class directly                                                                                                                                                                                                                                 |
+| [SingleClientWebsocketServerTransport](/api-reference/server/services/transport/websocket-server) | `SingleClientWebsocketServerParams` | `add_wav_header`, `serializer`, `session_timeout`, `allowed_origins`                                                                                                                                                                                     |
+| [FastAPIWebsocketTransport](/api-reference/server/services/transport/fastapi-websocket)           | `FastAPIWebsocketParams`            | `add_wav_header`, `serializer`, `session_timeout`, `fixed_audio_packet_size`, `allowed_origins`, `ws_close_timeout`                                                                                                                                      |
 
 # Frame Serializer Overview
 Source: https://docs.pipecat.ai/api-reference/server/services/serializers/introduction.md
@@ -41844,6 +41844,11 @@ Wire the serializer into a `FastAPIWebsocketTransport`:
 
 ```python
 from pipecat_didlogic import DidlogicFrameSerializer
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
     FastAPIWebsocketParams,
@@ -41855,9 +41860,13 @@ transport = FastAPIWebsocketTransport(
         audio_in_enabled=True,
         audio_out_enabled=True,
         add_wav_header=False,
-        vad_analyzer=SileroVADAnalyzer(),
         serializer=DidlogicFrameSerializer(),
     ),
+)
+
+context_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
 )
 ```
 
@@ -43133,7 +43142,8 @@ Before using AssemblyAI STT services, you need:
   No UserStarted/StoppedSpeakingFrame emitted from STT. When `False` (AssemblyAI
   turn detection mode): AssemblyAI's model controls turn endings using built-in
   turn detection. Uses AssemblyAI API defaults for all parameters unless
-  explicitly set. Emits UserStarted/StoppedSpeakingFrame from STT.
+  explicitly set. Broadcasts `ProposedUserStartedSpeakingFrame` and
+  `ProposedUserStoppedSpeakingFrame` from STT.
 </ParamField>
 
 <ParamField path="should_interrupt" type="bool" default="True">
@@ -43225,15 +43235,15 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | Parameter                          | Type                                                 | Default               | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ---------------------------------- | ---------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `model`                            | `str`                                                | `"universal-3-6-pro"` | STT model identifier. Set to `"universal-3-6-pro"` or `"universal-3-5-pro"` (Universal-3 Pro models). Both share the full U3 Pro feature set; `universal-3-6-pro` covers 32 declared languages against `universal-3-5-pro`'s 19. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `language`                         | `Language \| str`                                    | `Language.EN`         | Language for speech recognition. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `language`                         | `Language \| str`                                    | `Language.EN`         | Not sent to AssemblyAI, so it doesn't affect transcription; use `language_codes` instead. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `formatted_finals`                 | `bool`                                               | `True`                | Whether to enable transcript formatting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `format_turns`                     | `bool`                                               | `True`                | Whether to format turn transcripts. When `True`, a turn is final only once its formatted transcript arrives. Applies to the `universal-streaming-english` and `universal-streaming-multilingual` models; U3 Pro models format automatically.                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `word_finalization_max_wait_time`  | `int`                                                | `None`                | Maximum time to wait for word finalization in milliseconds.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `end_of_turn_confidence_threshold` | `float`                                              | `None`                | Confidence threshold for end-of-turn detection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `min_turn_silence`                 | `int`                                                | `None`                | Silence duration (ms) before a speculative end-of-turn check. If terminal punctuation is found, the turn ends; otherwise a partial is emitted and the turn continues. Clamped to 50–10000 ms. Server default is mode-dependent (set by the `mode` preset).                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `max_turn_silence`                 | `int`                                                | `None`                | Maximum silence (ms) before the turn is forced to end, regardless of punctuation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `min_turn_silence`                 | `int`                                                | `None`                | Silence duration (ms) before a speculative end-of-turn check. If terminal punctuation is found, the turn ends; otherwise a partial is emitted and the turn continues. Clamped to 50–10000 ms. Server default is mode-dependent (set by the `mode` preset). In Pipecat mode (`vad_force_turn_endpoint=True`), Pipecat sends `100` on U3 Pro models when unset, and always `160` on other models.                                                                                                                                                                                                                                                                                |
+| `max_turn_silence`                 | `int`                                                | `None`                | Maximum silence (ms) before the turn is forced to end, regardless of punctuation. In Pipecat mode on U3 Pro models, any value is replaced with `min_turn_silence`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `keyterms_prompt`                  | `List[str]`                                          | `None`                | A list of words and phrases to improve recognition accuracy for. Maximum 100 terms. May be combined with `prompt` on U3 Pro models.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `prompt`                           | `str`                                                | `None`                | A contextual prompt describing what the audio is about — its domain, scenario, or conversation details — so the model better recognizes likely vocabulary. Carries context about your audio, not transcription instructions; formatting or behavioral commands are not supported. Maximum ~1500 characters. Only applicable to U3 Pro models; may be combined with `keyterms_prompt` on those models.                                                                                                                                                                                                                                                                          |
+| `prompt`                           | `str`                                                | `None`                | A contextual prompt describing what the audio is about (its domain, scenario, or conversation details) so the model better recognizes likely vocabulary. Carries context about your audio, not transcription instructions; formatting or behavioral commands are not supported. Maximum ~1500 characters. U3 Pro models only: setting it with another model raises `ValueError` at construction. May be combined with `keyterms_prompt`.                                                                                                                                                                                                                                       |
 | `language_code`                    | `str`                                                | `None`                | Older single-language form of `language_codes`: one ISO code, such as `"es"`. Prefer `language_codes`. If both are set, `language_codes` is used and this setting is ignored.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `language_codes`                   | `List[Language]`                                     | `None`                | Languages to steer transcription toward, on Universal-3 Pro models only. `universal-3-6-pro` supports 32 languages and `universal-3-5-pro` supports 19 ([full list](https://www.assemblyai.com/docs/streaming/multilingual-transcription#supported-languages)). Pass one language (e.g. `[Language.ES]`) to pin the session to it, or several (e.g. `[Language.EN, Language.ES]`) to limit code-switching to that set. Order matters. You can declare up to 10 distinct languages; regional variants such as `Language.ES_MX` count as their base language. This setting can be changed mid-session without reconnecting; pass `[]` to clear it. It's ignored on other models. |
 | `language_detection`               | `bool \| None`                                       | `None`                | Whether to detect the spoken language and report it on each turn, on `universal-streaming-multilingual` only. `None` is not sent. Independent of `language_codes`, which steers transcription instead.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -43520,7 +43530,7 @@ await stt.warm()
   - **AssemblyAI mode** (`vad_force_turn_endpoint=False`, U3 Pro models only): AssemblyAI's model controls turn endings using built-in turn detection. The service proposes each turn boundary and automatically requests `ExternalUserTurnStrategies`, so you don't need to configure turn strategies manually. See [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the interruption controls.
 - **Context carryover** (U3 Pro models only): Seed the agent's most recent reply, improving transcription of the user's next turn — short answers, spelled-out entities, disambiguation. `update_agent_context()` is automatically invoked each time an assistant turn is completed. Control the window size with `previous_context_n_turns` (0–100, default 3); set to 0 to disable carryover entirely.
 - **Voice focus** (U3 Pro models only): Set `voice_focus` to `"near-field"` or `"far-field"` to isolate the primary voice and suppress background noise. Tune suppression strength with `voice_focus_threshold` (0.0–1.0, higher values suppress more).
-- **Speaker diarization**: Enable `speaker_labels=True` in Settings to automatically identify different speakers. Final transcripts will include a speaker field (e.g., "Speaker A", "Speaker B"). Use the `speaker_format` parameter to format transcripts with speaker labels.
+- **Speaker diarization**: Enable `speaker_labels=True` in Settings to automatically identify different speakers. The speaker label (e.g., "Speaker A", "Speaker B") replaces `user_id` on interim and final transcription frames. Use the `speaker_format` parameter to format transcripts with speaker labels.
 - **Prompting** (U3 Pro models only): The `prompt` parameter allows you to guide transcription for specific names, terms, or domain vocabulary. May be combined with `keyterms_prompt` on U3 Pro models. AssemblyAI recommends testing without a prompt first.
 - **Dynamic settings updates**: Most settings can be updated at runtime using `STTUpdateSettingsFrame`. `agent_context` and `language_codes` are hot-updatable without reconnecting; other settings require a reconnect.
 
@@ -44398,7 +44408,7 @@ To use Deepgram STT services, install the required dependencies:
 uv add "pipecat-ai[deepgram]"
 ```
 
-For the SageMaker variant, install both the Deepgram and SageMaker dependencies:
+For the SageMaker variant, install both the Deepgram and SageMaker dependencies. The `sagemaker` extra requires Python 3.12 or later:
 
 ```bash
 uv add "pipecat-ai[deepgram,sagemaker]"
@@ -44424,7 +44434,7 @@ Before using `DeepgramSageMakerSTTService` or `DeepgramFluxSageMakerSTTService`,
 
 1. **AWS Account**: With credentials configured (via environment variables, AWS CLI, or instance metadata)
 2. **SageMaker Endpoint**: A deployed SageMaker endpoint with a [Deepgram model](https://developers.deepgram.com/docs/deploy-amazon-sagemaker) (Nova for standard service, Flux for advanced turn detection)
-3. **Deepgram SDK**: The Deepgram SDK may be needed for certain advanced configurations
+3. **Deepgram SDK**: `DeepgramSageMakerSTTService` requires the `deepgram` extra; `DeepgramFluxSageMakerSTTService` does not
 
 ## DeepgramSTTService
 
@@ -44552,7 +44562,7 @@ stt = DeepgramSTTService(
 
 ### Event Handlers
 
-Supports the standard [service connection events](/api-reference/server/events/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`).
+Fires the [`on_connection_error`](/api-reference/server/events/service-events#on_connection_error) service event when a reconnect after a settings update fails.
 
 ## DeepgramFluxSTTService
 
@@ -44636,19 +44646,19 @@ Supports the standard [service connection events](/api-reference/server/events/s
 
 Runtime-configurable settings passed via the `settings` constructor argument using `DeepgramFluxSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter             | Type              | Default             | Description                                                                                                                                               | Update behavior |
-| --------------------- | ----------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
-| `model`               | `str`             | `"flux-general-en"` | Deepgram Flux model to use. _(Inherited from base STT settings.)_                                                                                         | reconnect       |
-| `language`            | `Language \| str` | `None`              | Recognition language. _(Inherited from base STT settings.)_                                                                                               |                 |
-| `eager_eot_threshold` | `float`           | `None`              | EagerEndOfTurn threshold. Lower values trigger faster responses with more LLM calls; higher values are more conservative. `None` disables EagerEndOfTurn. | configure       |
-| `eot_threshold`       | `float`           | `None`              | End-of-turn confidence threshold (default 0.7). Lower = faster turn endings.                                                                              | configure       |
-| `eot_timeout_ms`      | `int`             | `None`              | Time in ms after speech to finish a turn regardless of confidence (default 5000).                                                                         | configure       |
-| `keyterm`             | `list`            | `[]`                | Key terms to boost recognition accuracy for specialized terminology.                                                                                      | configure       |
-| `min_confidence`      | `float`           | `None`              | Minimum average confidence required to produce a `TranscriptionFrame`.                                                                                    | local           |
-| `numerals`            | `bool`            | `None`              | Convert spoken numbers to numeral form (e.g. "twenty three" → "23").                                                                                      | configure       |
-| `profanity_filter`    | `bool`            | `None`              | Mask recognized profanity in the transcript.                                                                                                              | configure       |
-| `redact`              | `str`             | `None`              | Remove sensitive numbers from the transcript: `"numbers"` or `"aggressive_numbers"`.                                                                      | reconnect       |
-| `language_hints`      | `list[Language]`  | `None`              | Languages to bias transcription toward. Only honored by `flux-general-multi`. Empty list clears hints; `None` means auto-detect.                          | configure       |
+| Parameter             | Type              | Default             | Description                                                                                                                                                                                            | Update behavior |
+| --------------------- | ----------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
+| `model`               | `str`             | `"flux-general-en"` | Deepgram Flux model to use. _(Inherited from base STT settings.)_                                                                                                                                      | reconnect       |
+| `language`            | `Language \| str` | `None`              | Not sent to Flux. Use `model="flux-general-multi"` with `language_hints` to choose languages. _(Inherited from base STT settings.)_                                                                    |                 |
+| `eager_eot_threshold` | `float`           | `None`              | Confidence at which Flux sends an EagerEndOfTurn prediction. Lower values predict earlier and are withdrawn more often. `None` sends no predictions; `enable_eager_end_of_turn=True` sets it to `0.5`. | configure       |
+| `eot_threshold`       | `float`           | `None`              | End-of-turn confidence threshold (default 0.7). Lower = faster turn endings.                                                                                                                           | configure       |
+| `eot_timeout_ms`      | `int`             | `None`              | Time in ms after speech to finish a turn regardless of confidence (default 5000).                                                                                                                      | configure       |
+| `keyterm`             | `list`            | `[]`                | Key terms to boost recognition accuracy for specialized terminology.                                                                                                                                   | configure       |
+| `min_confidence`      | `float`           | `None`              | Minimum average confidence required to produce a `TranscriptionFrame`.                                                                                                                                 | local           |
+| `numerals`            | `bool`            | `None`              | Convert spoken numbers to numeral form (e.g. "twenty three" → "23").                                                                                                                                   | configure       |
+| `profanity_filter`    | `bool`            | `None`              | Mask recognized profanity in the transcript.                                                                                                                                                           | configure       |
+| `redact`              | `str`             | `None`              | Remove sensitive numbers from the transcript: `"numbers"` or `"aggressive_numbers"`.                                                                                                                   | reconnect       |
+| `language_hints`      | `list[Language]`  | `None`              | Languages to bias transcription toward. Only honored by `flux-general-multi`. Empty list clears hints; `None` means auto-detect.                                                                       | configure       |
 
 <Note>
   **configure**: Updated via `Configure` message over the existing connection
@@ -44674,6 +44684,7 @@ from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 
 stt = DeepgramFluxSTTService(
     api_key=os.getenv("DEEPGRAM_API_KEY"),
+    enable_eager_end_of_turn=True,
     settings=DeepgramFluxSTTService.Settings(
         eager_eot_threshold=0.5,
         eot_threshold=0.8,
@@ -44732,7 +44743,7 @@ This sends a `Configure` message to Deepgram over the existing WebSocket connect
 ### Notes
 
 - **Turn management**: Flux provides its own turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on) to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
-- **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`) in your transport is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
+- **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`, set with `LLMUserAggregatorParams(vad_analyzer=...)`) is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
 - **Settings updates**: The `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, `numerals`, `profanity_filter`, and `language_hints` settings are sent as `Configure` messages over the existing connection without reconnecting. The `model` and `redact` settings trigger a reconnection since Flux only reads them from the connection URL; reconnection waits until the user stops speaking to avoid audio loss. The `min_confidence` setting is applied locally without connection changes.
 - **Connection error handling**: When a connection cannot be established (for example, if the endpoint rejects a setting), the service fails with an error instead of hanging indefinitely. Connection establishment is bounded by a 10-second timeout.
 - **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers Flux's predicted end of turn (`EagerEndOfTurn` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`TurnResumed` event) or the committed transcript differs from the eager one. Each Flux `Update` event pushes an `InterimTranscriptionFrame` holding the transcript of the turn so far, and also fires the `on_update` event.
@@ -44742,13 +44753,13 @@ This sends a `Configure` message to Deepgram over the existing WebSocket connect
 
 Supports the standard [service connection events](/api-reference/server/events/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`), plus turn-level events for more granular conversation tracking:
 
-| Event                  | Description                                                                         |
-| ---------------------- | ----------------------------------------------------------------------------------- |
-| `on_start_of_turn`     | Start of a new turn detected                                                        |
-| `on_turn_resumed`      | A previously paused turn has resumed (only emitted when `enable_eager_end_of_turn`) |
-| `on_end_of_turn`       | End of turn detected                                                                |
-| `on_eager_end_of_turn` | Early end-of-turn prediction (only emitted when `enable_eager_end_of_turn`)         |
-| `on_update`            | Transcript updated                                                                  |
+| Event                  | Description                                                                           |
+| ---------------------- | ------------------------------------------------------------------------------------- |
+| `on_start_of_turn`     | Start of a new turn detected                                                          |
+| `on_turn_resumed`      | A previously paused turn has resumed (only emitted when `eager_eot_threshold` is set) |
+| `on_end_of_turn`       | End of turn detected                                                                  |
+| `on_eager_end_of_turn` | Early end-of-turn prediction (only emitted when `eager_eot_threshold` is set)         |
+| `on_update`            | Transcript updated                                                                    |
 
 ```python
 @stt.event_handler("on_start_of_turn")
@@ -44822,9 +44833,9 @@ Turn events receive `(service, transcript)` where `transcript` is the current tr
 
 ### Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `DeepgramSageMakerSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+Settings passed via the `settings` constructor argument using `DeepgramSageMakerSTTService.Settings(...)`. Changes sent with `STTUpdateSettingsFrame` aren't applied at runtime: the session keeps the settings it was opened with. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-The SageMaker service inherits all settings from `DeepgramSTTService.Settings`. See [DeepgramSTTService Settings](#settings) above for the full list.
+The SageMaker service inherits all settings from `DeepgramSTTService.Settings`, except that `model` defaults to `"nova-3"`. See [DeepgramSTTService Settings](#settings) above for the full list. `keyterm`, `keywords`, `redact`, `replace`, and `search` each take a single string; list values aren't supported.
 
 ### Usage
 
@@ -44848,6 +44859,7 @@ stt = DeepgramSageMakerSTTService(
 - **Finalize on VAD stop**: Like `DeepgramSTTService`, the SageMaker service sends a [finalize](https://developers.deepgram.com/docs/finalize) request when the pipeline's VAD detects the user has stopped speaking.
 - **SageMaker deployment**: Requires a Deepgram model deployed to an AWS SageMaker endpoint. See the [Deepgram SageMaker deployment guide](https://developers.deepgram.com/docs/deploy-amazon-sagemaker) for setup instructions.
 - **Keepalive**: Automatically sends KeepAlive messages every 5 seconds to maintain the connection during periods of silence.
+- **No automatic reconnection**: If the SageMaker session fails to start or the stream ends mid-call, the service doesn't reconnect, so transcription stops for the rest of the session.
 
 ### Event Handlers
 
@@ -44927,19 +44939,19 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 The Flux SageMaker service inherits all settings from `DeepgramFluxSTTService.Settings` with the same on-the-fly configuration support:
 
-| Parameter             | Type              | Default             | Description                                                                                                                                               | Update behavior |
-| --------------------- | ----------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
-| `model`               | `str`             | `"flux-general-en"` | Deepgram Flux model to use. _(Inherited from base STT settings.)_                                                                                         | reconnect       |
-| `language`            | `Language \| str` | `None`              | Recognition language. _(Inherited from base STT settings.)_                                                                                               |                 |
-| `eager_eot_threshold` | `float`           | `None`              | EagerEndOfTurn threshold. Lower values trigger faster responses with more LLM calls; higher values are more conservative. `None` disables EagerEndOfTurn. | configure       |
-| `eot_threshold`       | `float`           | `None`              | End-of-turn confidence threshold (default 0.7). Lower = faster turn endings.                                                                              | configure       |
-| `eot_timeout_ms`      | `int`             | `None`              | Time in ms after speech to finish a turn regardless of confidence (default 5000).                                                                         | configure       |
-| `keyterm`             | `list`            | `[]`                | Key terms to boost recognition accuracy for specialized terminology.                                                                                      | configure       |
-| `min_confidence`      | `float`           | `None`              | Minimum average confidence required to produce a `TranscriptionFrame`.                                                                                    | local           |
-| `numerals`            | `bool`            | `None`              | Convert spoken numbers to numeral form (e.g. "twenty three" → "23").                                                                                      | configure       |
-| `profanity_filter`    | `bool`            | `None`              | Mask recognized profanity in the transcript.                                                                                                              | configure       |
-| `redact`              | `str`             | `None`              | Remove sensitive numbers from the transcript: `"numbers"` or `"aggressive_numbers"`.                                                                      | reconnect       |
-| `language_hints`      | `list[Language]`  | `None`              | Languages to bias transcription toward. Only honored by `flux-general-multi`. Empty list clears hints; `None` means auto-detect.                          | configure       |
+| Parameter             | Type              | Default             | Description                                                                                                                                                                                            | Update behavior |
+| --------------------- | ----------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
+| `model`               | `str`             | `"flux-general-en"` | Deepgram Flux model to use. _(Inherited from base STT settings.)_                                                                                                                                      | reconnect       |
+| `language`            | `Language \| str` | `None`              | Not sent to Flux. Use `model="flux-general-multi"` with `language_hints` to choose languages. _(Inherited from base STT settings.)_                                                                    |                 |
+| `eager_eot_threshold` | `float`           | `None`              | Confidence at which Flux sends an EagerEndOfTurn prediction. Lower values predict earlier and are withdrawn more often. `None` sends no predictions; `enable_eager_end_of_turn=True` sets it to `0.5`. | configure       |
+| `eot_threshold`       | `float`           | `None`              | End-of-turn confidence threshold (default 0.7). Lower = faster turn endings.                                                                                                                           | configure       |
+| `eot_timeout_ms`      | `int`             | `None`              | Time in ms after speech to finish a turn regardless of confidence (default 5000).                                                                                                                      | configure       |
+| `keyterm`             | `list`            | `[]`                | Key terms to boost recognition accuracy for specialized terminology.                                                                                                                                   | configure       |
+| `min_confidence`      | `float`           | `None`              | Minimum average confidence required to produce a `TranscriptionFrame`.                                                                                                                                 | local           |
+| `numerals`            | `bool`            | `None`              | Convert spoken numbers to numeral form (e.g. "twenty three" → "23").                                                                                                                                   | configure       |
+| `profanity_filter`    | `bool`            | `None`              | Mask recognized profanity in the transcript.                                                                                                                                                           | configure       |
+| `redact`              | `str`             | `None`              | Remove sensitive numbers from the transcript: `"numbers"` or `"aggressive_numbers"`.                                                                                                                   | reconnect       |
+| `language_hints`      | `list[Language]`  | `None`              | Languages to bias transcription toward. Only honored by `flux-general-multi`. Empty list clears hints; `None` means auto-detect.                                                                       | configure       |
 
 <Note>
   **configure**: Updated via `Configure` message over the existing connection
@@ -45000,13 +45012,14 @@ await worker.queue_frame(
 ### Notes
 
 - **Turn management**: Flux provides native turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on) to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
-- **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`) in your transport is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
+- **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`, set with `LLMUserAggregatorParams(vad_analyzer=...)`) is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
 - **Settings updates**: The `keyterm`, `eot_threshold`, `eager_eot_threshold`, `eot_timeout_ms`, `numerals`, `profanity_filter`, and `language_hints` settings are sent as `Configure` messages over the existing connection without reconnecting. The `model` and `redact` settings trigger a reconnection since Flux only reads them from the connection URL; reconnection waits until the user stops speaking to avoid audio loss. The `min_confidence` setting is applied locally without connection changes.
 - **Connection error handling**: When a SageMaker session or Flux connection cannot be established (for example, if the endpoint rejects a setting), the service fails with an error instead of hanging indefinitely. Session establishment and connection confirmation are each bounded by a 10-second timeout.
 - **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers Flux's predicted end of turn (`EagerEndOfTurn` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`TurnResumed` event) or the committed transcript differs from the eager one. Each Flux `Update` event pushes an `InterimTranscriptionFrame` holding the transcript of the turn so far, and also fires the `on_update` event.
 - **Multilingual support**: Use the `flux-general-multi` model with `language_hints` to bias transcription toward specific languages (EN, ES, FR, DE, HI, RU, PT, JA, IT, NL). `TranscriptionFrame.language` reflects the detected language for each turn. Omit hints for auto-detection or pass a subset to bias toward expected languages.
 - **SageMaker deployment**: Requires a Deepgram Flux model deployed to an AWS SageMaker endpoint. Unlike Nova models, Flux provides native turn detection and does not require external VAD.
 - **No KeepAlive needed**: The Flux protocol uses a dynamic watchdog mechanism that sends silence when needed to maintain the connection (threshold: `max(chunk_duration * 2, watchdog_min_timeout)`), so manual KeepAlive messages are not required.
+- **No automatic reconnection**: If the SageMaker session fails to start or the stream ends mid-call, the service doesn't reconnect, so transcription stops for the rest of the session.
 
 ### Event Handlers
 
@@ -49197,7 +49210,7 @@ Before using Sarvam STT services, you need:
 </ParamField>
 
 <ParamField path="sample_rate" type="int" default="None">
-  Audio sample rate in Hz. Defaults to 16000 if not specified.
+  Audio sample rate in Hz. When `None`, uses the pipeline's input sample rate.
 </ParamField>
 
 <ParamField
@@ -49250,7 +49263,7 @@ Before using Sarvam STT services, you need:
 
 ### Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `SarvamSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+Runtime-configurable settings passed via the `settings` constructor argument using `SarvamSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`, except `model`, `vad_signals`, and `high_vad_sensitivity`, which aren't applied at runtime. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
 | Parameter                       | Type              | Default       | Description                                                                                                                                                                                                                  |
 | ------------------------------- | ----------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -49335,7 +49348,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 ### Realtime Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `SarvamRealtimeSTTService.Settings(...)`. These can be updated mid-conversation via `config.update()` or `STTUpdateSettingsFrame`.
+Runtime-configurable settings passed via the `settings` constructor argument using `SarvamRealtimeSTTService.Settings(...)`. These can be updated mid-conversation via `update_config()` or `STTUpdateSettingsFrame`, except `model`, which isn't applied at runtime.
 
 | Parameter                | Type                                                                    | Default              | Description                                                                                                                                                                                               |
 | ------------------------ | ----------------------------------------------------------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -49426,6 +49439,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.transcriptions.language import Language
 
 # With manual endpointing, the pipeline drives turn boundaries
 stt = SarvamRealtimeSTTService(
@@ -49474,6 +49488,7 @@ await stt.update_config(
 - **VAD analyzer required**: A VAD analyzer is required in either endpointing mode. Under `vad` it times transcription latency; under `manual` it also marks the turn for Sarvam.
 - **In-band configuration updates**: Settings can be updated mid-conversation via `update_config()` without reconnecting. Connection-only values (`sample_rate`, `return_timestamps`, `keyterms`, `prefix_padding_ms`, `endpointing`) cannot be updated at runtime.
 - **Stream types**: `fast` provides lowest latency, `balanced` provides moderate latency with better quality, and `simulated` is for testing. The stream type controls server-side flush cadence; the client always sends audio in 50ms chunks.
+- **No reconnection**: The service doesn't reconnect, and passing `reconnect_on_error` raises `TypeError`. If the connection drops, transcription stops for the rest of the session.
 
 <Tip>
   The `InputParams` / `params=` pattern is deprecated as of v0.0.105. Use
@@ -49483,13 +49498,15 @@ await stt.update_config(
 
 ## Event Handlers
 
-In addition to the standard [service connection events](/api-reference/server/events/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`), Sarvam STT provides:
+`SarvamRealtimeSTTService` supports the standard [service connection events](/api-reference/server/events/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`).
 
-| Event               | Description                         |
-| ------------------- | ----------------------------------- |
-| `on_speech_started` | Speech detected in the audio stream |
-| `on_speech_stopped` | Speech stopped                      |
-| `on_utterance_end`  | End of utterance detected           |
+`SarvamSTTService` provides these events only when constructed with `settings=SarvamSTTService.Settings(vad_signals=True)`:
+
+| Event               | Description                               |
+| ------------------- | ----------------------------------------- |
+| `on_speech_started` | Sarvam's VAD detected the start of speech |
+| `on_speech_stopped` | Sarvam's VAD detected the end of speech   |
+| `on_utterance_end`  | A transcript message arrived from Sarvam  |
 
 ```python
 @stt.event_handler("on_speech_started")
@@ -50240,9 +50257,9 @@ SpeechmaticsSTTService delivers real-time STT with partial and final results, sp
   proposes each turn boundary and those strategies resolve it, so
   `should_interrupt` is the control for barge-in. See [User Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies)
-  for more details. A VAD in the transport (such as `SileroVADAnalyzer`) is
-  optional when Speechmatics drives turn detection; include it if you want
-  useful STT metrics.
+  for more details. A VAD (such as `SileroVADAnalyzer`, set with
+  `LLMUserAggregatorParams(vad_analyzer=...)`) is optional when Speechmatics
+  drives turn detection; include it if you want useful STT metrics.
 </Note>
 
 <CardGroup cols={2}>
@@ -50281,7 +50298,7 @@ SpeechmaticsSTTService delivers real-time STT with partial and final results, sp
 To use Speechmatics services, install the required dependencies:
 
 ```bash
-uv add "pipecat-ai[speechmatics]~=1.10.0"
+uv add "pipecat-ai[speechmatics]"
 ```
 
 ## Prerequisites
@@ -50403,10 +50420,19 @@ The Speechmatics Agent STT service supports two turn detection modes:
 The default `TurnDetectionMode.EXTERNAL` hands endpointing to the caller. The service does not endpoint on its own; instead, the caller drives turns by calling `finalize()`, typically from Pipecat's own VAD. Use this mode when you want Pipecat's VAD to control turn boundaries.
 
 ```python
-transport_params = TransportParams(
-    audio_in_enabled=True,
-    audio_out_enabled=True,
-    vad_analyzer=SileroVADAnalyzer(),  # Use Pipecat's VAD
+import os
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
+from pipecat.transcriptions.language import Language
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),  # Use Pipecat's VAD
 )
 
 ...
@@ -50422,7 +50448,7 @@ stt = SpeechmaticsSTTService(
 
 ### VAD mode
 
-`TurnDetectionMode.VAD` lets the Speechmatics service run its own VAD and close turns itself. The service emits `StartOfTurn` and `EndOfTurn` events, proposes turn boundaries to Pipecat's turn strategies, and handles endpointing server-side. In this mode, you do not need a VAD in the transport — the service manages turn detection.
+`TurnDetectionMode.VAD` lets the Speechmatics service run its own VAD and close turns itself. The service emits `StartOfTurn` and `EndOfTurn` events, proposes turn boundaries to Pipecat's turn strategies, and handles endpointing server-side.
 
 ```python
 stt = SpeechmaticsSTTService(
@@ -50435,15 +50461,9 @@ stt = SpeechmaticsSTTService(
 )
 ```
 
-<Note>
-  When using `VAD` mode, remove any `vad_analyzer` or `turn_analyzer` from your
-  transport configuration to avoid conflicts — Speechmatics handles turn
-  detection itself.
-</Note>
-
 ## Speaker Diarization
 
-Speechmatics STT supports speaker diarization, which separates out different speakers in the audio. The identity of each speaker is returned in the TranscriptionFrame objects in the `user_id` attribute.
+Speechmatics STT supports speaker diarization, which separates out different speakers in the audio. The `user_id` attribute of each TranscriptionFrame holds the Speechmatics speaker label (empty when there is none), never the transport's user ID.
 
 If `speaker_active_format` is provided, then the text output for the TranscriptionFrame will be formatted to this specification. Your system context can then be updated to include information about this format to understand which speaker spoke which words.
 
@@ -50454,12 +50474,12 @@ Examples:
 
 ### Available attributes
 
-| Attribute    | Description                           | Example         |
-| ------------ | ------------------------------------- | --------------- |
-| `speaker_id` | The label of the speaker              | `S1`            |
-| `text`       | The transcribed text                  | `Good morning.` |
-| `ts`         | Start time of the segment, in seconds | `12.34`         |
-| `lang`       | The language of the transcription     | `en`            |
+| Attribute    | Description                                          | Example         |
+| ------------ | ---------------------------------------------------- | --------------- |
+| `speaker_id` | The label of the speaker, or `UU` when there is none | `S1`            |
+| `text`       | The transcribed text                                 | `Good morning.` |
+| `ts`         | Start time of the segment, in seconds                | `12.34`         |
+| `lang`       | The language of the transcription                    | `en`            |
 
 ## Language Support
 
@@ -50500,7 +50520,6 @@ Setting a language can be done using the `language` parameter when creating the 
 | `Language.HE`  | Hebrew      | -                         |
 | `Language.HI`  | Hindi       | -                         |
 | `Language.HU`  | Hungarian   | -                         |
-| `Language.IA`  | Interlingua | -                         |
 | `Language.IT`  | Italian     | -                         |
 | `Language.ID`  | Indonesian  | -                         |
 | `Language.GA`  | Irish       | -                         |
@@ -50510,7 +50529,7 @@ Setting a language can be done using the `language` parameter when creating the 
 | `Language.LT`  | Lithuanian  | -                         |
 | `Language.MS`  | Malay       | -                         |
 | `Language.MT`  | Maltese     | -                         |
-| `Language.CMN` | Mandarin    | `cmn-Hans`, `cmn-Hant`    |
+| `Language.CMN` | Mandarin    | -                         |
 | `Language.MR`  | Marathi     | -                         |
 | `Language.MN`  | Mongolian   | -                         |
 | `Language.NO`  | Norwegian   | -                         |
@@ -50546,9 +50565,9 @@ For bilingual transcription, use the `language` and `domain` parameters as follo
 
 Examples are included in the Pipecat project:
 
-- Using Speechmatics STT service -> [07a-interruptible-speechmatics.py](https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-speechmatics.py)
-- Using Speechmatics STT service with VAD -> [07a-interruptible-speechmatics-vad.py](https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-speechmatics-vad.py)
-- Transcribing with Speechmatics STT -> [13h-speechmatics-transcription.py](https://github.com/pipecat-ai/pipecat/blob/main/examples/transcription/transcription-speechmatics.py)
+- Using Speechmatics STT service -> [voice-speechmatics.py](https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-speechmatics.py)
+- Using Speechmatics STT service with VAD -> [voice-speechmatics-vad.py](https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-speechmatics-vad.py)
+- Transcribing with Speechmatics STT -> [transcription-speechmatics.py](https://github.com/pipecat-ai/pipecat/blob/main/examples/transcription/transcription-speechmatics.py)
 
 Sample projects:
 
@@ -50619,7 +50638,6 @@ pipeline = Pipeline([
 ## Additional Notes
 
 - **Connection Management**: Automatically handles WebSocket connections and reconnections with exponential backoff. Transient failures trigger automatic reconnection while audio is buffered; permanent errors (auth rejection, bad configuration) mark the service unusable.
-- **Sample Rate**: The default sample rate is `16000` Hz in `pcm_s16le` format
 - **VAD Integration**: Server-side VAD and turn detection are available in `VAD` mode
 
 <Tip>
@@ -50630,11 +50648,11 @@ pipeline = Pipeline([
 
 ## Event Handlers
 
-In addition to the standard [service connection events](/api-reference/server/events/service-events) (`on_connected`, `on_disconnected`, `on_connection_error`), Speechmatics provides:
+In addition to the [`on_disconnected`](/api-reference/server/events/service-events#on_disconnected) service event, Speechmatics provides:
 
-| Event                | Description                            |
-| -------------------- | -------------------------------------- |
-| `on_speakers_result` | Speaker identification result received |
+| Event                | Description                                                                                                       |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `on_speakers_result` | Speaker identification result received. Fires only if `enable_diarization` was `True` when the session connected. |
 
 ```python
 @stt.event_handler("on_speakers_result")
@@ -51545,12 +51563,14 @@ Before using Anthropic LLM services, you need:
 ## Configuration
 
 <ParamField path="api_key" type="str" required>
-  Anthropic API key for authentication.
+  Anthropic API key for authentication. Required even with a custom `client`,
+  which doesn't use it, so pass a placeholder with `AsyncAnthropicBedrock` or
+  `AsyncAnthropicVertex`.
 </ParamField>
 
 <ParamField path="model" type="str" default="None" deprecated>
   Claude model name to use (e.g., `"claude-sonnet-4-5-20250929"`,
-  `"claude-opus-4-6-20250929"`). *Deprecated in v0.0.105. Use
+  `"claude-opus-4-6"`). *Deprecated in v0.0.105. Use
   `settings=AnthropicLLMService.Settings(...)` instead.*
 </ParamField>
 
@@ -51585,18 +51605,19 @@ Before using Anthropic LLM services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `AnthropicLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter                 | Type                                                 | Default               | Description                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ------------------------- | ---------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                   | `str`                                                | `"claude-sonnet-4-6"` | Anthropic model identifier. _(Inherited from base settings.)_                                                                                                                                                                                                                                                                                                                                                          |
-| `system_instruction`      | `str`                                                | `None`                | System instruction/prompt for the model. _(Inherited from base settings.)_                                                                                                                                                                                                                                                                                                                                             |
-| `max_tokens`              | `int`                                                | `4096`                | Maximum tokens to generate.                                                                                                                                                                                                                                                                                                                                                                                            |
-| `temperature`             | `float`                                              | `NOT_GIVEN`           | Sampling temperature (0.0 to 1.0). Lower values are more focused, higher values more creative.                                                                                                                                                                                                                                                                                                                         |
-| `top_k`                   | `int`                                                | `NOT_GIVEN`           | Top-k sampling parameter. Limits tokens to the top k most likely.                                                                                                                                                                                                                                                                                                                                                      |
-| `top_p`                   | `float`                                              | `NOT_GIVEN`           | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                                                                                                                                                                                                                                                                                                                                   |
-| `enable_prompt_caching`   | `bool`                                               | `False`               | Whether to enable Anthropic's prompt caching feature. Reduces costs for repeated context.                                                                                                                                                                                                                                                                                                                              |
-| `system_prompt_cache_ttl` | `Literal["5m", "1h"] \| None`                        | `None`                | Lifetime of the system prompt's cache entry when prompt caching is enabled: `"5m"` (Anthropic's default) or `"1h"`. A 1-hour entry keeps a system prompt shared by many conversations cached across gaps between them, at twice the base input price per cache write instead of 1.25 times. Anthropic caches nothing when the tools and system prompt together fall below the model's minimum cacheable prompt length. |
-| `thinking`                | `AnthropicThinkingConfig`                            | `NOT_GIVEN`           | Thinking configuration. If neither `thinking` nor `effort` is set, Pipecat sends the lowest thinking setting Anthropic documents for the model and logs what it sent; models Pipecat doesn't list, and any model when `use_provider_thinking_default` is `True`, run at Anthropic's default. See [AnthropicThinkingConfig](#anthropicthinkingconfig) below.                                                            |
-| `effort`                  | `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | `None`                | How much the model spends on its response, thinking included. Sent as `output_config.effort`; `None` uses the model's default. Lowering it is Anthropic's recommended way to reduce thinking, and the only way on models whose thinking can't be turned off.                                                                                                                                                           |
+| Parameter                       | Type                                                 | Default               | Description                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------- | ---------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                         | `str`                                                | `"claude-sonnet-4-6"` | Anthropic model identifier. _(Inherited from base settings.)_                                                                                                                                                                                                                                                                                                                                                          |
+| `system_instruction`            | `str`                                                | `None`                | System instruction/prompt for the model. _(Inherited from base settings.)_                                                                                                                                                                                                                                                                                                                                             |
+| `max_tokens`                    | `int`                                                | `4096`                | Maximum tokens to generate.                                                                                                                                                                                                                                                                                                                                                                                            |
+| `temperature`                   | `float`                                              | `NOT_GIVEN`           | Sampling temperature (0.0 to 1.0). Lower values are more focused, higher values more creative.                                                                                                                                                                                                                                                                                                                         |
+| `top_k`                         | `int`                                                | `NOT_GIVEN`           | Top-k sampling parameter. Limits tokens to the top k most likely.                                                                                                                                                                                                                                                                                                                                                      |
+| `top_p`                         | `float`                                              | `NOT_GIVEN`           | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                                                                                                                                                                                                                                                                                                                                   |
+| `enable_prompt_caching`         | `bool`                                               | `False`               | Whether to enable Anthropic's prompt caching feature. Reduces costs for repeated context.                                                                                                                                                                                                                                                                                                                              |
+| `system_prompt_cache_ttl`       | `Literal["5m", "1h"] \| None`                        | `None`                | Lifetime of the system prompt's cache entry when prompt caching is enabled: `"5m"` (Anthropic's default) or `"1h"`. A 1-hour entry keeps a system prompt shared by many conversations cached across gaps between them, at twice the base input price per cache write instead of 1.25 times. Anthropic caches nothing when the tools and system prompt together fall below the model's minimum cacheable prompt length. |
+| `thinking`                      | `AnthropicThinkingConfig`                            | `NOT_GIVEN`           | Thinking configuration. If neither `thinking` nor `effort` is set, Pipecat sends the lowest thinking setting Anthropic documents for the model and logs what it sent; models Pipecat doesn't list run at Anthropic's default. See [AnthropicThinkingConfig](#anthropicthinkingconfig) below.                                                                                                                           |
+| `effort`                        | `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | `None`                | How much the model spends on its response, thinking included. Sent as `output_config.effort`; `None` uses the model's default unless `thinking` is also unset, when Pipecat may send its own (see `thinking`). Lowering it is Anthropic's recommended way to reduce thinking, and the only way on models whose thinking can't be turned off.                                                                           |
+| `use_provider_thinking_default` | `bool`                                               | `False`               | When `True`, a model with neither `thinking` nor `effort` set runs at Anthropic's default instead of Pipecat's lowest setting. _(Inherited from base settings.)_                                                                                                                                                                                                                                                       |
 
 <Note>
   `NOT_GIVEN` values are omitted from the API request entirely, letting the
@@ -51624,7 +51645,7 @@ from pipecat.services.anthropic.llm import AnthropicLLMService
 
 llm = AnthropicLLMService(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
-    model="claude-sonnet-4-5-20250929",
+    settings=AnthropicLLMService.Settings(model="claude-sonnet-4-5-20250929"),
 )
 ```
 
@@ -51653,7 +51674,7 @@ from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicThinkin
 llm = AnthropicLLMService(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
     settings=AnthropicLLMService.Settings(
-        model="claude-sonnet-4-7-20250929",
+        model="claude-opus-4-7",
         max_tokens=16384,
         thinking=AnthropicThinkingConfig(
             type="adaptive",
@@ -51703,20 +51724,21 @@ await worker.queue_frame(
 ## Notes
 
 - **Prompt caching**: When `enable_prompt_caching` is enabled, cache control markers are automatically added to the system prompt and the most recent user messages, so tools and system instructions are cached once and reused across conversations. Set `system_prompt_cache_ttl="1h"` to keep a shared system prompt cached across gaps between conversations, at a higher cache-write price (the default is `"5m"`). Caching helps most with large system prompts or long histories.
-- **Thinking**: Enabling thinking increases response quality for complex tasks but adds latency. Use `type="adaptive"` (preferred for Claude 4.7+) to let the model decide when to think, or `type="enabled"` (legacy mode for Claude 4.5 and earlier, requires `budget_tokens` with minimum 1024). Claude 4.7+ models default to `display="omitted"`, so set `display="summarized"` to receive readable thinking text in `LLMThoughtTextFrame`. When neither `thinking` nor `effort` is set, Pipecat sends the lowest thinking setting Anthropic documents for the model to keep latency low for real-time voice: `thinking` disabled (`between_tools` on Sonnet 5.5), or `effort="low"` on Opus 5.5 and Fable models, whose thinking can't be turned off. It logs the setting at INFO, and logs a warning for a Claude model it doesn't list, which runs at Anthropic's default. Set `use_provider_thinking_default=True` in `settings` to send no default and run every model at Anthropic's default.
+- **Thinking**: Enabling thinking increases response quality for complex tasks but adds latency. Use `type="adaptive"` (preferred for Claude 4.7+) to let the model decide when to think, or `type="enabled"` (legacy mode for Claude 4.5 and earlier, requires `budget_tokens` with minimum 1024). Claude 4.7+ models default to `display="omitted"`, so set `display="summarized"` to receive readable thinking text in `LLMThoughtTextFrame`. When neither `thinking` nor `effort` is set, Pipecat sends the lowest thinking setting Anthropic documents for the model to keep latency low for real-time voice: `thinking` disabled (`between_tools` on Sonnet 5.5), or `effort="low"` on Opus 5.5 and Fable models, whose thinking can't be turned off. It logs the setting at INFO, and logs a warning for a Claude model it doesn't list, which runs at Anthropic's default.
 - **Prompt-elicited `<thinking>` tags**: If your system prompt asks the model to reason inside inline tags rather than enabling thinking via the `thinking` parameter, that reasoning is ordinary text and will be spoken by TTS. Prefer the `thinking` parameter; for inline tags you deliberately keep, see [Removing Tagged Content](/api-reference/server/utilities/text/pattern-pair-aggregator#removing-tagged-content).
 - **Custom clients**: You can pass custom Anthropic client instances (e.g., `AsyncAnthropicBedrock` or `AsyncAnthropicVertex`) via the `client` parameter to use Anthropic models through other cloud providers. `AsyncAnthropicBedrock` requires an explicit `aws_region=` argument or `AWS_REGION` environment variable.
 - **Retry behavior**: When `retry_on_timeout=True`, the first attempt uses the `retry_timeout_secs` timeout. If it times out, a second attempt is made with no timeout limit.
-- **System instruction precedence**: If both `system_instruction` (from the constructor) and a system message in the context are set, the constructor's `system_instruction` takes precedence and a warning is logged.
+- **System instruction precedence**: If both `system_instruction` (from `settings`) and a system message in the context are set, the `settings` value takes precedence and a warning is logged.
 
 ## Event Handlers
 
 `AnthropicLLMService` supports the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
-| Event                       | Description                                                             |
-| --------------------------- | ----------------------------------------------------------------------- |
-| `on_completion_timeout`     | Called when an LLM completion request times out                         |
-| `on_function_calls_started` | Called when function calls are received and execution is about to start |
+| Event                         | Description                                                             |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `on_completion_timeout`       | Called when an LLM completion request times out                         |
+| `on_function_calls_started`   | Called when function calls are received and execution is about to start |
+| `on_function_calls_cancelled` | Called after one or more async function calls are cancelled             |
 
 ```python
 @llm.event_handler("on_completion_timeout")
@@ -51938,7 +51960,7 @@ await worker.queue_frame(
 - **No-op tool handling**: AWS Bedrock requires at least one tool to be defined when tool content exists in the conversation. The service automatically adds a placeholder tool when needed to prevent API errors.
 - **Model-specific parameters**: Some models (e.g., Claude Sonnet 4.5) don't allow certain parameter combinations. The service only includes explicitly set parameters in the inference config to avoid conflicts.
 - **Retry behavior**: When `retry_on_timeout=True`, the first attempt uses the `retry_timeout_secs` timeout. If it times out, a second attempt is made with no timeout limit.
-- **System instruction precedence**: If both `system_instruction` (from the constructor) and a system message in the context are set, the constructor's `system_instruction` takes precedence and a warning is logged.
+- **System instruction precedence**: If both the `system_instruction` setting and an initial system message in the context are set, `system_instruction` takes precedence, the context system message isn't sent, and a warning is logged.
 
 ## Event Handlers
 
@@ -53131,11 +53153,12 @@ Before using Google Gemini LLM services, you need:
 </ParamField>
 
 <ParamField path="tools" type="List[Dict[str, Any]]" default="None">
-  List of available tools/functions for the model to call.
+  List of available tools/functions for the model to call. Used only when the
+  context carries no tools, and ignored by `run_inference()`.
 </ParamField>
 
 <ParamField path="tool_config" type="Dict[str, Any]" default="None">
-  Configuration for tool usage behavior.
+  Configuration for tool usage behavior. Ignored by `run_inference()`.
 </ParamField>
 
 <ParamField path="http_options" type="HttpOptions" default="None">
@@ -53169,19 +53192,20 @@ Before using Google Gemini LLM services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `GoogleLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter            | Type                           | Default            | Description                                                                                                                                          |
-| -------------------- | ------------------------------ | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`              | `str`                          | `gemini-3.6-flash` | Gemini model identifier. _(Inherited from base settings.)_                                                                                           |
-| `system_instruction` | `str`                          | `None`             | System instruction/prompt for the model. _(Inherited from base settings.)_                                                                           |
-| `max_tokens`         | `int`                          | `4096`             | Maximum number of tokens to generate.                                                                                                                |
-| `temperature`        | `float`                        | `None`             | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher values are more creative.                                                   |
-| `top_k`              | `int`                          | `None`             | Top-k sampling parameter. Limits tokens to the top k most likely.                                                                                    |
-| `top_p`              | `float`                        | `None`             | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                                                                 |
-| `frequency_penalty`  | `float`                        | `None`             | Frequency penalty (0.0 to 2.0). _(Inherited from base settings.)_                                                                                    |
-| `presence_penalty`   | `float`                        | `None`             | Presence penalty (0.0 to 2.0). _(Inherited from base settings.)_                                                                                     |
-| `seed`               | `int`                          | `None`             | Random seed for reproducibility. _(Inherited from base settings.)_                                                                                   |
-| `thinking`           | `GoogleThinkingConfig \| None` | `None`             | Thinking configuration. If not provided, Pipecat sends the model's lowest thinking setting. See [GoogleThinkingConfig](#googlethinkingconfig) below. |
-| `safety_settings`    | `list[SafetySetting]`          | `None`             | Content safety filters. Each entry pairs a harm category with a blocking threshold.                                                                  |
+| Parameter                       | Type                           | Default            | Description                                                                                                                                          |
+| ------------------------------- | ------------------------------ | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                         | `str`                          | `gemini-3.6-flash` | Gemini model identifier. _(Inherited from base settings.)_                                                                                           |
+| `system_instruction`            | `str`                          | `None`             | System instruction/prompt for the model. _(Inherited from base settings.)_                                                                           |
+| `max_tokens`                    | `int`                          | `4096`             | Maximum number of tokens to generate.                                                                                                                |
+| `temperature`                   | `float`                        | `None`             | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher values are more creative.                                                   |
+| `top_k`                         | `int`                          | `None`             | Top-k sampling parameter. Limits tokens to the top k most likely.                                                                                    |
+| `top_p`                         | `float`                        | `None`             | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                                                                 |
+| `frequency_penalty`             | `float`                        | `None`             | Frequency penalty (0.0 to 2.0). Not sent by this service, so it has no effect. _(Inherited from base settings.)_                                     |
+| `presence_penalty`              | `float`                        | `None`             | Presence penalty (0.0 to 2.0). Not sent by this service, so it has no effect. _(Inherited from base settings.)_                                      |
+| `seed`                          | `int`                          | `None`             | Random seed for reproducibility. _(Inherited from base settings.)_                                                                                   |
+| `thinking`                      | `GoogleThinkingConfig \| None` | `None`             | Thinking configuration. If not provided, Pipecat sends the model's lowest thinking setting. See [GoogleThinkingConfig](#googlethinkingconfig) below. |
+| `safety_settings`               | `list[SafetySetting]`          | `None`             | Content safety filters. Each entry pairs a harm category with a blocking threshold.                                                                  |
+| `use_provider_thinking_default` | `bool`                         | `False`            | When `True`, a model with no `thinking` configured runs at Google's default instead of Pipecat's lowest setting. _(Inherited from base settings.)_   |
 
 <Note>
   `None` values are omitted from the API request, letting the Gemini API use its
@@ -53191,8 +53215,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
   a `thinking_level` on later models (`"low"` for Gemini 3.1 Pro, 3.7 Flash, 3.8
   Flash and 4 Argon, which reject `"minimal"`; `"minimal"` for the rest). A
   model that can think but isn't listed runs at Google's default and logs a
-  warning. With `use_provider_thinking_default=True`, Pipecat sends no default
-  and every model runs at Google's default.
+  warning.
 </Note>
 
 ### GoogleThinkingConfig
@@ -53222,7 +53245,7 @@ from pipecat.services.google.llm import GoogleLLMService
 
 llm = GoogleLLMService(
     api_key=os.getenv("GOOGLE_API_KEY"),
-    model="gemini-3.5-flash",
+    settings=GoogleLLMService.Settings(model="gemini-3.5-flash"),
 )
 ```
 
@@ -53347,16 +53370,17 @@ await worker.queue_frame(
 - **Seed parameter**: Gemini treats the `seed` parameter as best effort. Identical seeds usually but not always produce identical responses.
 - **Multimodal support**: Gemini models natively support image and audio inputs through Google's Content/Part format. Images and audio are automatically converted from OpenAI-style contexts. An `image_url` content part holding a `data:` URI is inlined; any other URL is passed to Gemini as an external reference, so an image already hosted somewhere doesn't have to be fetched and re-encoded into the context.
 - **Grounding with Google Search**: When grounding metadata is present in the response (e.g., from Google Search tool), the service emits `LLMSearchResponseFrame` with search results and source attributions.
-- **Context format**: The service automatically converts between OpenAI-style message formats and Google's native Content/Part format, so you can use either.
+- **Context format**: The service automatically converts OpenAI-style messages to Google's native Content/Part format. To add a message already in Google's format, wrap it with `llm.create_llm_specific_message(...)`; a bare Google-format dict in the context is dropped.
 
 ## Event Handlers
 
 `GoogleLLMService` supports the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
-| Event                       | Description                                                                                                |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `on_completion_timeout`     | Called when an LLM completion request times out (Google `DeadlineExceeded` or stream idle timeout reached) |
-| `on_function_calls_started` | Called when function calls are received and execution is about to start                                    |
+| Event                         | Description                                                                                                |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `on_completion_timeout`       | Called when an LLM completion request times out (Google `DeadlineExceeded` or stream idle timeout reached) |
+| `on_function_calls_started`   | Called when function calls are received and execution is about to start                                    |
+| `on_function_calls_cancelled` | Called after one or more async function calls are cancelled                                                |
 
 ```python
 @llm.event_handler("on_completion_timeout")
@@ -54975,8 +54999,8 @@ await worker.queue_frame(
 
 - **OpenAI-compatible providers**: Many third-party LLM providers offer OpenAI-compatible APIs. You can use `OpenAILLMService` with them by setting `base_url` to the provider's endpoint.
 - **Retry behavior**: When `retry_on_timeout=True`, the first attempt uses the `retry_timeout_secs` timeout. If it times out, a second attempt is made with no timeout limit.
-- **Function calling**: Supports OpenAI's tool/function calling format. Register function handlers on the pipeline worker to handle tool calls automatically.
-- **System instruction precedence**: If both `system_instruction` (from the constructor) and a system message in the context are set, the constructor's `system_instruction` takes precedence and a warning is logged.
+- **Function calling**: Supports OpenAI's tool/function calling format. Register function handlers with `llm.register_function()` to handle tool calls automatically.
+- **System instruction precedence**: If both the `system_instruction` setting and an initial system message in the context are set, both are sent, with `system_instruction` first, and a warning is logged.
 
 ## Event Handlers
 
@@ -55097,19 +55121,23 @@ These parameters are available for both `OpenAIResponsesLLMService` and `OpenAIR
 
 <ParamField path="base_url" type="str" default="None">
   Custom base URL for the OpenAI API. Override for proxied or self-hosted
-  deployments.
+  deployments. The WebSocket variant uses it only for `run_inference()`; set
+  `ws_url` for its streaming connection.
 </ParamField>
 
 <ParamField path="organization" type="str" default="None">
-  OpenAI organization ID.
+  OpenAI organization ID. The WebSocket variant sends it only with
+  `run_inference()` requests.
 </ParamField>
 
 <ParamField path="project" type="str" default="None">
-  OpenAI project ID.
+  OpenAI project ID. The WebSocket variant sends it only with `run_inference()`
+  requests.
 </ParamField>
 
 <ParamField path="default_headers" type="Mapping[str, str]" default="None">
-  Additional HTTP headers to include in every request.
+  Additional HTTP headers to include in every request. The WebSocket variant
+  sends them only with `run_inference()` requests.
 </ParamField>
 
 <ParamField path="service_tier" type="str" default="None">
@@ -55122,6 +55150,16 @@ These parameters are available for both `OpenAIResponsesLLMService` and `OpenAIR
 
 <ParamField path="settings" type="OpenAIResponsesLLMSettings" default="None">
   Runtime-configurable model settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField path="retry_timeout_secs" type="float | None" default="5.0">
+  How long a request may go without producing output before it is abandoned and
+  re-issued, when `retry_on_timeout` is set.
+</ParamField>
+
+<ParamField path="retry_on_timeout" type="bool | None" default="False">
+  Whether to re-issue the request once if it produces no output within
+  `retry_timeout_secs`. The retry has no timeout.
 </ParamField>
 
 ### WebSocket-Specific Parameters
@@ -55140,17 +55178,18 @@ The following parameter is only available for `OpenAIResponsesLLMService` (WebSo
 
 Runtime-configurable settings passed via the `settings` constructor argument using `OpenAIResponsesLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter               | Type                             | Default     | Description                                                                                                                                                                                     |
-| ----------------------- | -------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                 | `str`                            | `"gpt-4.1"` | OpenAI model identifier. _(Inherited from base settings.)_                                                                                                                                      |
-| `system_instruction`    | `str`                            | `None`      | System instruction/prompt for the model. _(Inherited from base settings.)_                                                                                                                      |
-| `temperature`           | `float`                          | `NOT_GIVEN` | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher values are more creative.                                                                                              |
-| `top_p`                 | `float`                          | `NOT_GIVEN` | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                                                                                                            |
-| `frequency_penalty`     | `float`                          | `None`      | Penalty for frequent tokens (-2.0 to 2.0). Positive values discourage repetition. Not sent by this service, so it has no effect.                                                                |
-| `presence_penalty`      | `float`                          | `None`      | Penalty for new topics (-2.0 to 2.0). Positive values encourage the model to talk about new topics. Not sent by this service, so it has no effect.                                              |
-| `seed`                  | `int`                            | `None`      | Random seed for deterministic outputs. Not sent by this service, so it has no effect.                                                                                                           |
-| `max_completion_tokens` | `int`                            | `NOT_GIVEN` | Maximum completion tokens to generate.                                                                                                                                                          |
-| `reasoning`             | `OpenAIResponsesReasoningConfig` | `None`      | Reasoning configuration for reasoning-capable models. If not provided, Pipecat sends the lowest effort OpenAI documents for the model. See [Reasoning Configuration](#reasoning-configuration). |
+| Parameter                       | Type                             | Default     | Description                                                                                                                                                                                     |
+| ------------------------------- | -------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                         | `str`                            | `"gpt-4.1"` | OpenAI model identifier. _(Inherited from base settings.)_                                                                                                                                      |
+| `system_instruction`            | `str`                            | `None`      | System instruction/prompt for the model. _(Inherited from base settings.)_                                                                                                                      |
+| `temperature`                   | `float`                          | `NOT_GIVEN` | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher values are more creative.                                                                                              |
+| `top_p`                         | `float`                          | `NOT_GIVEN` | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                                                                                                            |
+| `frequency_penalty`             | `float`                          | `None`      | Penalty for frequent tokens (-2.0 to 2.0). Positive values discourage repetition. Not sent by this service, so it has no effect.                                                                |
+| `presence_penalty`              | `float`                          | `None`      | Penalty for new topics (-2.0 to 2.0). Positive values encourage the model to talk about new topics. Not sent by this service, so it has no effect.                                              |
+| `seed`                          | `int`                            | `None`      | Random seed for deterministic outputs. Not sent by this service, so it has no effect.                                                                                                           |
+| `max_completion_tokens`         | `int`                            | `NOT_GIVEN` | Maximum completion tokens to generate.                                                                                                                                                          |
+| `reasoning`                     | `OpenAIResponsesReasoningConfig` | `None`      | Reasoning configuration for reasoning-capable models. If not provided, Pipecat sends the lowest effort OpenAI documents for the model. See [Reasoning Configuration](#reasoning-configuration). |
+| `use_provider_thinking_default` | `bool`                           | `False`     | When `True`, a model with no `reasoning` configured runs at OpenAI's default instead of Pipecat's lowest effort. _(Inherited from base settings.)_                                              |
 
 <Note>
   `NOT_GIVEN` and `None` values are omitted from the API request entirely,
@@ -55161,7 +55200,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 The `reasoning` parameter accepts an `OpenAIResponsesReasoningConfig` object that controls reasoning behavior for reasoning-capable models (GPT-5.x series and o-series models like o1, o3). The default model `gpt-4.1` does not support reasoning.
 
-When `reasoning` is not set, Pipecat sends each listed model the lowest effort OpenAI documents for it (`"none"` on most GPT-5.1 and later models, `"minimal"` on the original GPT-5 models, `"low"` on the o-series, `"medium"` on the GPT-5.2 and later `-pro` models, `"high"` on `gpt-5-pro`) and logs what it sent. A reasoning model it doesn't list runs at OpenAI's default and logs a warning. With `use_provider_thinking_default=True`, Pipecat sends no default and every model runs at OpenAI's default.
+When `reasoning` is not set, Pipecat sends each listed model the lowest effort OpenAI documents for it (`"none"` on most GPT-5.1 and later models, `"minimal"` on the original GPT-5 models, `"low"` on the o-series, `"medium"` on the GPT-5.2 and later `-pro` models, `"high"` on `gpt-5-pro`) and logs what it sent. A reasoning model it doesn't list runs at OpenAI's default and logs a warning.
 
 Reasoning models use internal reasoning tokens before producing a response. This configuration controls how much reasoning they do and whether a human-readable summary is returned.
 
@@ -55248,7 +55287,6 @@ llm = OpenAIResponsesLLMService(
         model="gpt-4.1",
         temperature=0.7,
         max_completion_tokens=1000,
-        frequency_penalty=0.5,
     ),
 )
 ```
@@ -55285,7 +55323,7 @@ Run a one-shot inference without pushing frames through the pipeline:
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 context = LLMContext()
-context.add_user_message("What is the capital of France?")
+context.add_message({"role": "user", "content": "What is the capital of France?"})
 
 response = await llm.run_inference(
     context=context,
@@ -55318,30 +55356,32 @@ The Responses API enforces the schema on models that support it (gpt-4o-mini and
 
 ## Notes
 
-- **WebSocket is the new default**: As of Pipecat version with PR #4141, `OpenAIResponsesLLMService` uses WebSocket transport by default. If you need the HTTP streaming behavior, use `OpenAIResponsesHttpLLMService` instead. Both have identical constructor args and settings.
-- **Persistent WebSocket connection**: The WebSocket variant maintains a persistent connection to `wss://api.openai.com/v1/responses` and automatically reconnects on connection loss. Connection lifetime is limited to 60 minutes server-side, after which automatic reconnection occurs.
+- **Persistent WebSocket connection**: `OpenAIResponsesLLMService` keeps a WebSocket connection open and reconnects automatically when it drops, including at OpenAI's 60-minute connection limit. For HTTP streaming, use `OpenAIResponsesHttpLLMService`.
 - **Incremental context optimization**: The WebSocket variant uses `previous_response_id` to send only incremental context when the conversation prefix hasn't changed, reducing latency and costs. This works with `store=False` (no server-side storage) via a connection-local cache.
 - **Responses API vs Chat Completions API**: The Responses API has a different request/response structure compared to the Chat Completions API. Use `OpenAILLMService` for the Chat Completions API and `OpenAIResponsesLLMService` or `OpenAIResponsesHttpLLMService` for the Responses API.
 - **Universal LLM Context**: Both services work with the universal `LLMContext` and `LLMContextAggregatorPair`, making it easy to switch between different LLM providers.
-- **Function calling**: Supports OpenAI's tool/function calling format. Register function handlers on the pipeline worker to handle tool calls automatically.
+- **Function calling**: Supports OpenAI's tool/function calling format. Register function handlers with `llm.register_function()` to handle tool calls automatically.
 - **Usage metrics**: Automatically tracks token usage, including cached tokens and reasoning tokens.
 - **Service tiers**: Supports OpenAI's service tier system for prioritizing requests.
 
 ## Event Handlers
 
-Both `OpenAIResponsesLLMService` and `OpenAIResponsesHttpLLMService` support the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
+`OpenAIResponsesLLMService` and `OpenAIResponsesHttpLLMService` support the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
-| Event                       | Description                                                             |
-| --------------------------- | ----------------------------------------------------------------------- |
-| `on_completion_timeout`     | Called when an LLM completion request times out                         |
-| `on_function_calls_started` | Called when function calls are received and execution is about to start |
-| `on_connection_error`       | Called when a WebSocket connection error occurs                         |
+| Event                         | Description                                                                            |
+| ----------------------------- | -------------------------------------------------------------------------------------- |
+| `on_completion_timeout`       | Called when an LLM completion request times out. `OpenAIResponsesHttpLLMService` only. |
+| `on_function_calls_started`   | Called when function calls are received and execution is about to start                |
+| `on_function_calls_cancelled` | Called after one or more async function calls are cancelled                            |
+| `on_connection_error`         | Called when a WebSocket connection error occurs. `OpenAIResponsesLLMService` only.     |
 
 ```python
+# OpenAIResponsesHttpLLMService
 @llm.event_handler("on_completion_timeout")
 async def on_completion_timeout(service):
     print("LLM completion timed out")
 
+# OpenAIResponsesLLMService
 @llm.event_handler("on_connection_error")
 async def on_connection_error(service, error):
     print(f"LLM connection error: {error}")
@@ -58100,7 +58140,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `speed`        | `float \| None`                    | `None`              | Speech-rate multiplier, from 0.5 to 1.5 in steps of 0.05. `None` leaves Flux at its default rate. Applied to the open connection via Flux's `Configure` message, so a speed change keeps the cross-turn acoustic state. |
 | `expressivity` | `Literal[-2, -1, 0, 1, 2] \| None` | `None`              | Expressive range on a calm-to-animated axis. `None` leaves Flux at its default range. Flux fixes expressivity when the connection opens, so a change reconnects.                                                        |
 | `model`        | `str`                              | _(synced to voice)_ | Model identifier. Automatically set to match `voice`. _(Inherited.)_                                                                                                                                                    |
-| `language`     | `Language \| str`                  | `None`              | Language for synthesis. _(Inherited.)_                                                                                                                                                                                  |
+| `language`     | `Language \| str`                  | `None`              | Language used to split text into sentences; not sent to Deepgram. A change reconnects. _(Inherited.)_                                                                                                                   |
 
 <Note>
   The `model` field is automatically kept in sync with `voice` for metrics
@@ -58164,7 +58204,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `speed`        | `float \| None`                    | `None`              | Speech-rate multiplier, from 0.5 to 1.5 in steps of 0.05. `None` leaves Flux at its default rate. Applied to the open connection via Flux's `Configure` message, so a speed change keeps the cross-turn acoustic state. |
 | `expressivity` | `Literal[-2, -1, 0, 1, 2] \| None` | `None`              | Expressive range on a calm-to-animated axis. `None` leaves Flux at its default range. Flux fixes expressivity when the connection opens, so a change reconnects.                                                        |
 | `model`        | `str`                              | _(synced to voice)_ | Model identifier. Automatically set to match `voice`. _(Inherited.)_                                                                                                                                                    |
-| `language`     | `Language \| str`                  | `None`              | Language for synthesis. _(Inherited.)_                                                                                                                                                                                  |
+| `language`     | `Language \| str`                  | `None`              | Language used to split text into sentences; not sent to Deepgram. A change reconnects. _(Inherited.)_                                                                                                                   |
 
 <Note>
   The `model` field is automatically kept in sync with `voice` for metrics
@@ -58199,6 +58239,8 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 <ParamField path="encoding" type="str" default="linear16">
   Audio encoding format. Must be one of: `"linear16"`, `"mulaw"`, `"alaw"`.
+  Pipecat passes the returned audio on as 16-bit PCM without decoding it, so
+  only `"linear16"` plays correctly.
 </ParamField>
 
 <ParamField path="mip_opt_out" type="bool | None" default="None">
@@ -58215,7 +58257,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | ---------- | ----------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`    | `str`             | `None`               | Model identifier. _(Inherited.)_                                                                                                                                        |
 | `voice`    | `str`             | `"aura-2-helena-en"` | Voice identifier. _(Inherited.)_                                                                                                                                        |
-| `language` | `Language \| str` | `None`               | Language for synthesis. _(Inherited.)_                                                                                                                                  |
+| `language` | `Language \| str` | `None`               | Language used to split text into sentences; not sent to Deepgram. _(Inherited.)_                                                                                        |
 | `speed`    | `float \| None`   | `None`               | Speech-rate multiplier, from 0.7 to 1.5. `None` leaves Aura at its default rate. Supported by Aura-2 English and Spanish voices; Deepgram recommends ≥ 0.9 for Spanish. |
 
 ### DeepgramHttpTTSService
@@ -58252,7 +58294,8 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 </ParamField>
 
 <ParamField path="encoding" type="str" default="linear16">
-  Audio encoding format.
+  Audio encoding format. Pipecat passes the returned audio on as 16-bit PCM
+  without decoding it, so only `"linear16"` plays correctly.
 </ParamField>
 
 <ParamField path="mip_opt_out" type="bool | None" default="None">
@@ -58269,7 +58312,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | ---------- | ----------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`    | `str`             | `None`               | Model identifier. _(Inherited.)_                                                                                                                                        |
 | `voice`    | `str`             | `"aura-2-helena-en"` | Voice identifier. _(Inherited.)_                                                                                                                                        |
-| `language` | `Language \| str` | `None`               | Language for synthesis. _(Inherited.)_                                                                                                                                  |
+| `language` | `Language \| str` | `None`               | Language used to split text into sentences; not sent to Deepgram. _(Inherited.)_                                                                                        |
 | `speed`    | `float \| None`   | `None`               | Speech-rate multiplier, from 0.7 to 1.5. `None` leaves Aura at its default rate. Supported by Aura-2 English and Spanish voices; Deepgram recommends ≥ 0.9 for Spanish. |
 
 ### DeepgramSageMakerTTSService
@@ -58292,7 +58335,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
   type="DeepgramSageMakerTTSService.Settings"
   default="None"
 >
-  Runtime-configurable settings. See [DeepgramSageMakerTTSService
+  Service settings. See [DeepgramSageMakerTTSService
   Settings](#deepgramsagemakerttsservice-settings) below.
 </ParamField>
 
@@ -58302,18 +58345,19 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 </ParamField>
 
 <ParamField path="encoding" type="str" default="linear16">
-  Audio encoding format.
+  Audio encoding format. Pipecat passes the returned audio on as 16-bit PCM
+  without decoding it, so only `"linear16"` plays correctly.
 </ParamField>
 
 #### DeepgramSageMakerTTSService Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `DeepgramSageMakerTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+Settings passed via the `settings` constructor argument using `DeepgramSageMakerTTSService.Settings(...)`. A `voice` change sent with `TTSUpdateSettingsFrame` isn't applied: the session keeps the voice it was opened with. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter  | Type              | Default | Description                            |
-| ---------- | ----------------- | ------- | -------------------------------------- |
-| `model`    | `str`             | `None`  | Model identifier. _(Inherited.)_       |
-| `voice`    | `str`             | `None`  | Voice identifier. _(Inherited.)_       |
-| `language` | `Language \| str` | `None`  | Language for synthesis. _(Inherited.)_ |
+| Parameter  | Type              | Default              | Description                                                                      |
+| ---------- | ----------------- | -------------------- | -------------------------------------------------------------------------------- |
+| `model`    | `str`             | `None`               | Model identifier. _(Inherited.)_                                                 |
+| `voice`    | `str`             | `"aura-2-helena-en"` | Voice identifier. _(Inherited.)_                                                 |
+| `language` | `Language \| str` | `None`               | Language used to split text into sentences; not sent to Deepgram. _(Inherited.)_ |
 
 ## Usage
 
@@ -85780,7 +85824,7 @@ You can customize this behavior by providing your own strategies for more sophis
 
    - Marks the start of a user turn
    - Optionally emits `UserStartedSpeakingFrame`
-   - Optionally emits an interruption frame (if the bot is speaking)
+   - Optionally emits an interruption frame (when the strategy's `enable_interruptions` is `True`)
 
 2. **During User Turn**: The aggregator collects transcriptions and audio frames.
 
@@ -85790,7 +85834,7 @@ You can customize this behavior by providing your own strategies for more sophis
    - Emits `UserStoppedSpeakingFrame`
    - Pushes the aggregated user message to the LLM context
 
-4. **Timeout Handling**: If no stop strategy triggers within `user_turn_stop_timeout` seconds (default: 5.0), the turn is automatically ended. This timeout is configurable via `LLMUserAggregatorParams` (see [Configuration](#configuration) below). When the timeout fires, the [`on_user_turn_stop_timeout`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_stop_timeout) event is emitted.
+4. **Timeout Handling**: If a turn stays open for `user_turn_stop_timeout` seconds (default: 5.0) while the user isn't speaking, with no speech, transcription, or turn activity in that time, the turn is automatically ended. This timeout is configurable via `LLMUserAggregatorParams` (see [Configuration](#configuration) below). When the timeout fires, the [`on_user_turn_stop_timeout`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_stop_timeout) event is emitted.
 
 ### When a user turn ends
 
@@ -85798,19 +85842,19 @@ A **user turn stop strategy** decides when the user is done talking and the bot 
 
 Whatever the strategy, closing a turn takes two ingredients:
 
-1. **A transcript.** Every stop strategy waits for the STT service to transcribe what the user said (`wait_for_transcript`, on by default). This is usually the largest and most variable part of the delay, and it's dominated by your STT provider's latency — see the [STT benchmark](https://github.com/pipecat-ai/stt-benchmark) to compare services.
+1. **A transcript.** The stop strategies that take `wait_for_transcript` (on by default) wait for the STT service to transcribe what the user said. This is usually the largest and most variable part of the delay, and it's dominated by your STT provider's latency. See the [STT benchmark](https://github.com/pipecat-ai/stt-benchmark) to compare services.
 2. **The strategy's own end-of-turn criteria.** Once the transcript is in, the strategy applies its logic to decide whether the turn is actually complete.
 
 The turn closes only when both are satisfied.
 
 #### Choosing a strategy
 
-| Strategy                             | How it decides the turn is complete                                                           |
-| ------------------------------------ | --------------------------------------------------------------------------------------------- |
-| `SpeechTimeoutUserTurnStopStrategy`  | A fixed silence window (`user_speech_timeout`, default `0.6s`) elapses after the user pauses. |
-| `TurnAnalyzerUserTurnStopStrategy`   | A turn-detection ("smart turn") model predicts end-of-turn from the audio and transcript.     |
-| `FilterIncompleteUserTurnStrategies` | An LLM assesses whether the user's utterance is semantically complete.                        |
-| Custom                               | Your own logic implementing the stop-strategy interface.                                      |
+| Strategy                             | How it decides the turn is complete                                                                                     |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `SpeechTimeoutUserTurnStopStrategy`  | A fixed silence window (`user_speech_timeout`, default `0.6s`) elapses after the VAD reports the user stopped speaking. |
+| `TurnAnalyzerUserTurnStopStrategy`   | A turn-detection ("smart turn") model predicts end-of-turn from the audio and transcript.                               |
+| `FilterIncompleteUserTurnStrategies` | An LLM assesses whether the user's utterance is semantically complete.                                                  |
+| Custom                               | Your own logic implementing the stop-strategy interface.                                                                |
 
 This is also where you tune responsiveness. For example, raise or lower `user_speech_timeout` on `SpeechTimeoutUserTurnStopStrategy` to give users more or less time to resume before the bot replies.
 
@@ -85828,7 +85872,10 @@ Then the strategy's criteria run (the silence window, the turn model, or the LLM
   user's speech plus the STT service's `ttfs_p99_latency` — so the VAD's
   `stop_secs` and the time a turn model spends on inference both fall inside
   that budget rather than extending it. What a user notices is the deadline
-  itself, or a finalized transcript arriving sooner.
+  itself, or a finalized transcript arriving sooner. The exception is the
+  `SpeechTimeoutUserTurnStopStrategy` silence window, which starts when the VAD
+  reports the stop, so the shortest wait after the user pauses is `stop_secs`
+  plus `user_speech_timeout` (0.8s by default).
 
 If your STT service is slow to return transcripts, that delay shows up in
 every turn regardless of which strategy you use. Adjust responsiveness in the
@@ -85869,8 +85916,9 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 In addition to `user_turn_strategies`, `LLMUserAggregatorParams` accepts these turn-related parameters:
 
 <ParamField path="user_turn_stop_timeout" type="float" default="5.0">
-  Safety-net timeout in seconds. If a user turn starts but no stop strategy
-  triggers within this duration, the turn is automatically ended and the
+  Safety-net timeout in seconds. If a user turn stays open this long while the
+  user isn't speaking, with no speech, transcription, or turn activity, the turn
+  is automatically ended and the
   [`on_user_turn_stop_timeout`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_stop_timeout)
   event is emitted.
 </ParamField>
@@ -86021,7 +86069,8 @@ strategy = MinWordsUserTurnStartStrategy(min_words=3)
 <Note>
   When the bot is not speaking, this strategy will trigger after just 1 word.
   The `min_words` threshold only applies when the bot is actively speaking,
-  preventing short affirmations from interrupting the bot.
+  preventing short affirmations from interrupting the bot. A shorter transcript
+  while the bot is speaking is discarded, so it doesn't reach the context.
 </Note>
 
 ### WakePhraseUserTurnStartStrategy
@@ -86039,8 +86088,9 @@ Requires a wake phrase to be detected before allowing interaction. This strategy
 </ParamField>
 
 <ParamField path="single_activation" type="bool" default="False">
-  If True, the wake phrase is required before every turn. The strategy returns
-  to IDLE after each turn completes.
+  If True, activity doesn't extend the wake window: the strategy returns to IDLE
+  `timeout` seconds after the wake phrase, and turns that start within that
+  window don't need the wake phrase again.
 </ParamField>
 
 ```python
@@ -86052,7 +86102,7 @@ strategy = WakePhraseUserTurnStartStrategy(
     timeout=10.0,
 )
 
-# Single activation: wake phrase required before every turn
+# Single activation: wake phrase unlocks interaction for 10 seconds, not extended by activity
 strategy = WakePhraseUserTurnStartStrategy(
     phrases=["hey pipecat"],
     single_activation=True,
@@ -86063,10 +86113,10 @@ strategy = WakePhraseUserTurnStartStrategy(
 
 The strategy provides event handlers for wake phrase detection:
 
-| Event                     | Signature                                  | Description                                                    |
-| ------------------------- | ------------------------------------------ | -------------------------------------------------------------- |
-| `on_wake_phrase_detected` | `async def handler(strategy, phrase: str)` | Called when a wake phrase is matched                           |
-| `on_wake_phrase_timeout`  | `async def handler(strategy)`              | Called when the inactivity timeout expires (timeout mode only) |
+| Event                     | Signature                                  | Description                                                      |
+| ------------------------- | ------------------------------------------ | ---------------------------------------------------------------- |
+| `on_wake_phrase_detected` | `async def handler(strategy, phrase: str)` | Called when a wake phrase is matched                             |
+| `on_wake_phrase_timeout`  | `async def handler(strategy)`              | Called when the timeout expires and the strategy returns to IDLE |
 
 ```python
 @strategy.event_handler("on_wake_phrase_detected")
@@ -86093,7 +86143,9 @@ This strategy is designed to work alongside other start strategies (e.g., `Trans
 
 <ParamField path="model_path" type="Optional[str]" default="None">
   Path to the Krisp VIVA IP model file (.kef extension). If None, uses the
-  `KRISP_VIVA_IP_MODEL_PATH` environment variable.
+  `KRISP_VIVA_IP_MODEL_PATH` environment variable. Raises `ValueError` if
+  neither is set or the path doesn't end in `.kef`, and `FileNotFoundError` if
+  the file doesn't exist.
 </ParamField>
 
 <ParamField path="threshold" type="float" default="0.5">
@@ -86116,6 +86168,7 @@ from pipecat.turns.user_start import (
     KrispVivaIPUserTurnStartStrategy,
     TranscriptionUserTurnStartStrategy,
 )
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 strategy = KrispVivaIPUserTurnStartStrategy(
     model_path="/path/to/ip_model.kef",
@@ -86132,7 +86185,8 @@ strategies = UserTurnStrategies(
 ```
 
 <Note>
-  Requires the Krisp Python SDK. See the [Krisp VIVA
+  Requires the Krisp Python SDK. Without it, `KrispVivaIPUserTurnStartStrategy`
+  imports as `None`, so constructing it raises `TypeError`. See the [Krisp VIVA
   guide](/pipecat/features/krisp-viva) for installation instructions.
 </Note>
 
@@ -86431,8 +86485,9 @@ Container for configuring user turn start and stop strategies.
   default="None"
 >
   List of strategies used to detect when the user starts speaking. The first
-  strategy to trigger will signal the start of the user's turn. `None` uses
-  `[VADUserTurnStartStrategy(), TranscriptionUserTurnStartStrategy()]`.
+  strategy to trigger will signal the start of the user's turn. `None` or an
+  empty list uses `[VADUserTurnStartStrategy(),
+  TranscriptionUserTurnStartStrategy()]`.
 </ParamField>
 
 <ParamField
@@ -86441,7 +86496,7 @@ Container for configuring user turn start and stop strategies.
   default="None"
 >
   List of strategies used to detect when the user stops speaking and expects a
-  response. `None` uses AI-powered turn detection:
+  response. `None` or an empty list uses AI-powered turn detection:
   `[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]`.
 </ParamField>
 
@@ -86475,10 +86530,10 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 </ParamField>
 
 <Note>
-  When an STT service acts as the turn controller, you can optionally include a
-  VAD (such as `SileroVADAnalyzer`) in your transport. The VAD is not required
-  for core turn management functionality, but it does enable useful STT metrics.
-  Omit it if you don't need those metrics.
+  When an STT service acts as the turn controller, you can optionally set a VAD
+  (such as `SileroVADAnalyzer`) with `LLMUserAggregatorParams.vad_analyzer`. The
+  VAD is not required for core turn management functionality, but it does enable
+  useful STT metrics. Omit it if you don't need those metrics.
 </Note>
 
 <Warning>
@@ -86570,6 +86625,11 @@ The default configuration uses VAD for turn start detection and AI-powered Smart
 
 ```python
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.turns.user_start import (
+    TranscriptionUserTurnStartStrategy,
+    VADUserTurnStartStrategy,
+)
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 # This is equivalent to the default behavior
@@ -87417,7 +87477,7 @@ async def on_user_turn_message_added(aggregator, message: UserTurnMessageAddedMe
 
 ### on_user_turn_stop_timeout
 
-Fired when a user turn times out without any stop strategy triggering. This is a fallback mechanism that ends the turn after a configurable timeout period (default: 5.0 seconds) when the user has stopped speaking according to VAD but no transcription-based stop has occurred.
+Fired when an active user turn ends on inactivity: the user isn't speaking and no VAD event or transcript has arrived for `user_turn_stop_timeout` seconds (default: 5.0).
 
 ```python
 @user_aggregator.event_handler("on_user_turn_stop_timeout")
@@ -87970,8 +88030,8 @@ Setting `realtime_service_mode=True` adapts the pair's behavior in three ways:
 </ParamField>
 
 <ParamField path="user_turn_stop_timeout" type="float" default="5.0">
-  Timeout in seconds to automatically stop a user turn if no stop strategy
-  triggers.
+  Seconds of inactivity after which an active user turn stops. The timer runs
+  while the user isn't speaking and resets on each VAD event and transcript.
 </ParamField>
 
 <ParamField path="user_idle_timeout" type="float" default="0">
@@ -88004,7 +88064,7 @@ async def on_user_turn_stopped(processor, strategy):
 
 @user_turn_processor.event_handler("on_user_turn_stop_timeout")
 async def on_user_turn_stop_timeout(processor):
-    # Called if no stop strategy triggers before timeout
+    # Called when a user turn stops after user_turn_stop_timeout of inactivity
     pass
 ```
 
@@ -88206,7 +88266,7 @@ Events on context aggregators from [`LLMContextAggregatorPair`](/api-reference/s
 
 ### STT Services
 
-Events on STT service instances. Available on all WebSocket-based STT services. See [Service Events](/api-reference/server/events/service-events) for details.
+Events on STT service instances. Available on WebSocket-based STT services, though `DeepgramSTTService`, `SarvamSTTService`, and `SpeechmaticsSTTService` don't emit all three. See [Service Events](/api-reference/server/events/service-events) for details.
 
 | Event                 | Description                         |
 | --------------------- | ----------------------------------- |
@@ -88215,13 +88275,6 @@ Events on STT service instances. Available on all WebSocket-based STT services. 
 | `on_connection_error` | WebSocket connection error occurred |
 
 Some STT services have additional events:
-
-**Deepgram STT:**
-
-| Event               | Description                     |
-| ------------------- | ------------------------------- |
-| `on_speech_started` | Speech detected in audio stream |
-| `on_utterance_end`  | End of utterance detected       |
 
 **Deepgram Flux STT:**
 
@@ -88239,7 +88292,7 @@ Some STT services have additional events:
 | -------------------- | -------------------------------------- |
 | `on_speakers_result` | Speaker identification result received |
 
-**Sarvam STT:**
+**Sarvam STT** (`SarvamSTTService` with `vad_signals=True` in its settings):
 
 | Event               | Description               |
 | ------------------- | ------------------------- |
@@ -88324,7 +88377,6 @@ Events on [`LiveKitTransport`](/api-reference/server/services/transport/livekit#
 | `on_video_track_subscribed`   | Video track subscribed     |
 | `on_video_track_unsubscribed` | Video track unsubscribed   |
 | `on_data_received`            | Data message received      |
-| `on_call_state_updated`       | Call state changed         |
 | `on_before_disconnect`        | About to disconnect (sync) |
 
 ### WebSocket Transports
@@ -88628,7 +88680,7 @@ Pipecat services emit events for connection lifecycle management and service-spe
 
 ## Connection Events
 
-All WebSocket-based STT and TTS services share a common set of connection events. These are emitted by the base `STTService` and `TTSService` classes, so they work the same way regardless of which provider you use.
+WebSocket-based STT and TTS services share a common set of connection events. Not every STT service emits all three: `DeepgramSTTService` emits only `on_connection_error`, `SpeechmaticsSTTService` doesn't emit `on_connected`, and `SarvamSTTService` emits none.
 
 ### Events Summary
 
@@ -89272,7 +89324,7 @@ The `RTVIObserver` primarily serves to convert internal pipeline frames into to 
 
 ## Automatic Setup
 
-`RTVIObserver` is automatically created and attached when you create a `PipelineWorker`. No manual setup is required for standard usage.
+`RTVIObserver` is automatically created and attached when you create a `PipelineWorker`, unless the worker has `enable_rtvi=False` or is bridged (where `enable_rtvi` defaults to off). No manual setup is required for standard usage. If you add your own `RTVIProcessor` to the pipeline, also pass an `RTVIObserver` in `observers`: the worker uses the pair instead of its defaults, and sets up no RTVI at all when only one of them is present.
 
 To customize the observer's behavior, pass `RTVIObserverParams` to the worker:
 
@@ -89386,6 +89438,14 @@ worker = PipelineWorker(
   types as bot output messages. Only sent to clients of protocol 2.2.0 or later.
 </ParamField>
 
+<ParamField path="ignored_sources" type="list[FrameProcessor]" default="[]">
+  Processors whose frames the observer ignores, so no RTVI messages are sent for
+  their activity (for example, a silent evaluation LLM in a parallel branch).
+  Add and remove sources at runtime with
+  `observer.add_ignored_source(processor)` and
+  `observer.remove_ignored_source(processor)`.
+</ParamField>
+
 <ParamField path="skip_text_types" default="None">
   List of text types to skip sending as tts/output messages. This also hides the
   words of skipped text that the TTS service reports with timestamps. Text of
@@ -89422,33 +89482,50 @@ The legacy 2-parameter signature `(text, text_type) -> str` is deprecated but st
 **Example:**
 
 ```python
-from pipecat.processors.frameworks.rtvi import BotOutputTransformResult
+from pipecat.processors.frameworks.rtvi import (
+    BotOutputTransformResult,
+    RTVIObserverParams,
+)
 
 async def redact_sensitive(
-        text: str,
-        text_type: str,
-        accumulated_text: str | None = None,
-        remaining_text: str | None = None,
-    ) -> BotOutputTransformResult:
-        transformed = "XXXX-XXXX-XXXX-" + text[-4:]
-        if accumulated_text is not None and remaining_text is not None:
-            ratio = len(accumulated_text) / max(len(text), 1)
-            split = int(ratio * len(transformed))
-            return BotOutputTransformResult(
-                text=transformed,
-                accumulated_text=transformed[:split],
-                remaining_text=transformed[split:],
-            )
-        return BotOutputTransformResult(text=transformed)
+    text: str,
+    text_type: str,
+    accumulated_text: str | None = None,
+    remaining_text: str | None = None,
+) -> BotOutputTransformResult:
+    transformed = "XXXX-XXXX-XXXX-" + text[-4:]
+    if accumulated_text is not None and remaining_text is not None:
+        ratio = len(accumulated_text) / max(len(text), 1)
+        split = int(ratio * len(transformed))
+        return BotOutputTransformResult(
+            text=transformed,
+            accumulated_text=transformed[:split],
+            remaining_text=transformed[split:],
+        )
+    return BotOutputTransformResult(text=transformed)
+
+async def uppercase(
+    text: str,
+    text_type: str,
+    accumulated_text: str | None = None,
+    remaining_text: str | None = None,
+) -> BotOutputTransformResult:
+    if accumulated_text is not None and remaining_text is not None:
+        return BotOutputTransformResult(
+            text=text.upper(),
+            accumulated_text=accumulated_text.upper(),
+            remaining_text=remaining_text.upper(),
+        )
+    return BotOutputTransformResult(text=text.upper())
 
 bot_output_transforms = [
     ("credit_card", redact_sensitive),  # Only for 'credit_card' type
-    ("*", lambda text, agg_type: text.upper()),  # For all types, make uppercase
+    ("*", uppercase),  # For all types, make uppercase
 ]
 
-observer = RTVIObserver(
-    rtvi,
-    params=RTVIObserverParams(bot_output_transforms=bot_output_transforms),
+worker = PipelineWorker(
+    pipeline,
+    rtvi_observer_params=RTVIObserverParams(bot_output_transforms=bot_output_transforms),
 )
 ```
 
@@ -89467,7 +89544,7 @@ observer = RTVIObserver(
 **Levels:**
 
 - `DISABLED`: No events emitted for this function
-- `NONE`: Events with `tool_call_id` only (most secure when events are needed)
+- `NONE`: Events with `tool_call_id` only (most secure when events are needed). `llm-function-call-started` carries no `tool_call_id`, so its data is empty at this level
 - `NAME`: Adds function name to events
 - `ARGUMENTS`: Adds function name and arguments, no results
 - `FULL`: Adds function name, arguments, and results
@@ -89495,51 +89572,55 @@ worker = PipelineWorker(
 
 The observer maps Pipecat's internal frames to RTVI protocol messages:
 
-| Pipeline Frame                | RTVI Message                                               |
-| ----------------------------- | ---------------------------------------------------------- |
+| Pipeline Frame                | RTVI Message                                                             |
+| ----------------------------- | ------------------------------------------------------------------------ |
 | **Speech Events**             |
-| `UserStartedSpeakingFrame`    | `RTVIUserStartedSpeakingMessage`                           |
-| `UserStoppedSpeakingFrame`    | `RTVIUserStoppedSpeakingMessage`                           |
-| `VADUserStartedSpeakingFrame` | `VADUserStartedSpeakingMessage`                            |
-| `VADUserStoppedSpeakingFrame` | `VADUserStoppedSpeakingMessage`                            |
-| `BotStartedSpeakingFrame`     | `RTVIBotStartedSpeakingMessage`                            |
-| `BotStoppedSpeakingFrame`     | `RTVIBotStoppedSpeakingMessage`                            |
+| `UserStartedSpeakingFrame`    | `UserStartedSpeakingMessage`                                             |
+| `UserStoppedSpeakingFrame`    | `UserStoppedSpeakingMessage`                                             |
+| `VADUserStartedSpeakingFrame` | `VADUserStartedSpeakingMessage`                                          |
+| `VADUserStoppedSpeakingFrame` | `VADUserStoppedSpeakingMessage`                                          |
+| `BotStartedSpeakingFrame`     | `BotStartedSpeakingMessage`                                              |
+| `BotStoppedSpeakingFrame`     | `BotStoppedSpeakingMessage`                                              |
+| `InterruptionFrame`           | `BotInterruptedMessage` (`bot-interrupted`, when `bot_speaking_enabled`) |
 | **User Mute**                 |
-| `UserMuteStartedFrame`        | `RTVIUserMuteStartedMessage`                               |
-| `UserMuteStoppedFrame`        | `RTVIUserMuteStoppedMessage`                               |
+| `UserMuteStartedFrame`        | `UserMuteStartedMessage`                                                 |
+| `UserMuteStoppedFrame`        | `UserMuteStoppedMessage`                                                 |
 | **Transcription**             |
-| `TranscriptionFrame`          | `RTVIUserTranscriptionMessage(final=true)` (deprecated)    |
-| `InterimTranscriptionFrame`   | `RTVIUserTranscriptionMessage(final=false)` (deprecated)   |
-| `TranscriptionFrame`          | `stt-raw-text` (`final=true`, when enabled)                |
-| `InterimTranscriptionFrame`   | `stt-raw-text` (`final=false`, when enabled)               |
-| `TranscriptionFrame`          | `user-input` (`input_type="transcription"`, `final=true`)  |
-| `InterimTranscriptionFrame`   | `user-input` (`input_type="transcription"`, `final=false`) |
-| `UserBackchannelFrame`        | `user-input` (`input_type="backchannel"`)                  |
-| `RTVISendTextFrame`           | `user-input` (`input_type="chat"`)                         |
+| `TranscriptionFrame`          | `UserTranscriptionMessage(final=true)` (deprecated)                      |
+| `InterimTranscriptionFrame`   | `UserTranscriptionMessage(final=false)` (deprecated)                     |
+| `TranscriptionFrame`          | `stt-raw-text` (`final=true`, when enabled)                              |
+| `InterimTranscriptionFrame`   | `stt-raw-text` (`final=false`, when enabled)                             |
+| `TranscriptionFrame`          | `user-input` (`input_type="transcription"`, `final=true`)                |
+| `InterimTranscriptionFrame`   | `user-input` (`input_type="transcription"`, `final=false`)               |
+| `UserBackchannelFrame`        | `user-input` (`input_type="backchannel"`)                                |
+| `RTVISendTextFrame`           | `user-input` (`input_type="chat"`)                                       |
 | **Bot Output**                |
-| `AggregatedTextFrame`         | `RTVIBotOutputMessage`                                     |
+| `AggregatedTextFrame`         | `BotOutputMessage`                                                       |
 | **LLM Processing**            |
-| `LLMFullResponseStartFrame`   | `RTVIBotLLMStartedMessage`                                 |
-| `LLMFullResponseEndFrame`     | `RTVIBotLLMStoppedMessage`                                 |
-| `LLMTextFrame`                | `RTVIBotLLMTextMessage` (deprecated)                       |
-| `LLMTextFrame`                | `llm-raw-text` (when enabled)                              |
-| `LLMMarkerResponseFrame`      | `bot-llm-marker` (when enabled)                            |
+| `LLMFullResponseStartFrame`   | `BotLLMStartedMessage`                                                   |
+| `LLMFullResponseEndFrame`     | `BotLLMStoppedMessage`                                                   |
+| `LLMTextFrame`                | `BotLLMTextMessage` (deprecated)                                         |
+| `LLMTextFrame`                | `llm-raw-text` (when enabled)                                            |
+| `LLMMarkerResponseFrame`      | `bot-llm-marker` (when enabled)                                          |
 | **TTS Events**                |
-| `TTSStartedFrame`             | `RTVIBotTTSStartedMessage`                                 |
-| `TTSStoppedFrame`             | `RTVIBotTTSStoppedMessage`                                 |
-| `TTSTextFrame`                | `RTVIBotTTSTextMessage` (deprecated)                       |
-| `AggregatedTextFrame`         | `tts-raw-text` (when enabled)                              |
+| `TTSStartedFrame`             | `BotTTSStartedMessage`                                                   |
+| `TTSStoppedFrame`             | `BotTTSStoppedMessage`                                                   |
+| `TTSTextFrame`                | `BotTTSTextMessage` (deprecated)                                         |
+| `TTSTextFrame`                | `tts-raw-text` (when enabled)                                            |
 | **Function Calls**            |
-| `FunctionCallsStartedFrame`   | `llm-function-call-started`                                |
-| `FunctionCallInProgressFrame` | `llm-function-call-in-progress`                            |
-| `FunctionCallResultFrame`     | `llm-function-call-stopped`                                |
+| `FunctionCallsStartedFrame`   | `llm-function-call-started`                                              |
+| `FunctionCallInProgressFrame` | `llm-function-call-in-progress`                                          |
+| `FunctionCallResultFrame`     | `llm-function-call-stopped` (final results only)                         |
+| `FunctionCallCancelFrame`     | `llm-function-call-stopped` (`cancelled=true`)                           |
+| `ExternalFunctionCall*Frame`  | Same messages as the matching `FunctionCall*Frame`                       |
 | **Context/Metrics**           |
-| `LLMContextFrame`             | `RTVIUserLLMTextMessage`                                   |
-| `MetricsFrame`                | `RTVIMetricsMessage`                                       |
-| `RTVIServerMessageFrame`      | `RTVIServerMessage`                                        |
+| `LLMContextFrame`             | `UserLLMTextMessage`                                                     |
+| `MetricsFrame`                | `MetricsMessage`                                                         |
+| `RTVIServerMessageFrame`      | `ServerMessage`                                                          |
+| `RTVIServerResponseFrame`     | `server-response`, or `error-response` when `error` is set               |
 | **User Interface**            |
-| `RTVIUICommandFrame`          | `UICommandMessage` (`ui-command`)                          |
-| `RTVIUIJobGroupFrame`         | `UIJobGroupMessage` (`ui-job-group`)                       |
+| `RTVIUICommandFrame`          | `UICommandMessage` (`ui-command`)                                        |
+| `RTVIUIJobGroupFrame`         | `UIJobGroupMessage` (`ui-job-group`)                                     |
 
 The [User Interface](/client/rtvi-standard#user-interface) frames are emitted by `PipelineWorker` when a [`UIWorker`](/api-reference/server/workers/ui-worker) sends a command or runs a job group; the observer translates them into the outbound `ui-command` / `ui-job-group` messages the client renders.
 
@@ -90086,7 +90167,7 @@ Inherits from `OutputImageRawFrame`.
 
 ### SpriteFrame
 
-An animated sprite composed of multiple image frames. The transport plays the images at the framerate specified by the transport's `camera_out_framerate` parameter.
+An animated sprite composed of multiple image frames. The transport plays the images at the framerate specified by the transport's `video_out_framerate` parameter, and only when `video_out_enabled` is set.
 
 <ParamField path="images" type="List[OutputImageRawFrame]" required>
   Ordered list of image frames that make up the sprite animation.
@@ -90175,6 +90256,12 @@ Inherits from `TextFrame`.
   Identifier for the TTS context associated with this text.
 </ParamField>
 
+<ParamField path="raw_text" type="str | None" default="None">
+  The full matched text including its start and end delimiters, set when the
+  frame was produced from a pattern match (such as a `<code>...</code>` block).
+  `None` for ordinary sentence aggregations.
+</ParamField>
+
 ### VisionTextFrame
 
 Text output from a vision model. Functionally identical to `LLMTextFrame` but distinguished by type for routing purposes.
@@ -90183,7 +90270,7 @@ Inherits from `LLMTextFrame`.
 
 ### TTSTextFrame
 
-Text that has been sent to a TTS service for synthesis.
+Text generated by a TTS service: the text it speaks.
 
 Inherits from `AggregatedTextFrame`.
 
@@ -90381,7 +90468,7 @@ Frames that modify or trigger processing of the LLM conversation context.
 
 Appends messages to the current conversation context without replacing existing ones.
 
-<ParamField path="messages" type="List[dict]" required>
+<ParamField path="messages" type="list[LLMContextMessage]" required>
   List of message dictionaries to append.
 </ParamField>
 
@@ -90394,7 +90481,7 @@ Appends messages to the current conversation context without replacing existing 
 
 Replaces the current context messages entirely with a new set.
 
-<ParamField path="messages" type="List[dict]" required>
+<ParamField path="messages" type="list[LLMContextMessage]" required>
   List of message dictionaries to replace the current context.
 </ParamField>
 
@@ -90435,15 +90522,16 @@ Changes the set of tools advertised to the LLM mid-conversation.
 
 <ParamField
   path="tools"
-  type="list[dict] | list[FunctionSchema | DirectFunction] | ToolsSchema | NotGiven"
+  type="list[FunctionSchema | DirectFunction] | ToolsSchema | NotGiven"
   required
 >
   The tools to advertise. May be a `ToolsSchema`, a plain list of direct
-  functions and/or `FunctionSchema` objects, a list of provider-specific tool
-  dicts, or `NOT_GIVEN` to clear all tools. Direct functions and
-  `FunctionSchema`s with a bundled `handler` are auto-registered with the LLM
-  service, meaning no manual handler registration is needed. Any such tool
-  dropped from the advertised set is automatically unregistered.
+  functions and/or `FunctionSchema` objects, or `NOT_GIVEN` to clear all tools.
+  Provider-specific tool dicts go in the `ToolsSchema`'s `custom_tools`; a dict
+  in a plain list raises `TypeError`. Direct functions and `FunctionSchema`s
+  with a bundled `handler` are auto-registered with the LLM service, meaning no
+  manual handler registration is needed. Any such tool dropped from the
+  advertised set is automatically unregistered.
 </ParamField>
 
 ### LLMSetToolChoiceFrame
@@ -90558,7 +90646,7 @@ Used for pipeline health monitoring. Processors can observe these to detect stal
 
 While a processor is paused, incoming frames accumulate in its internal queue rather than being dropped. Once the processor is resumed, it drains the queue and processes all buffered frames in the order they arrived.
 
-For example, the TTS service pauses itself while synthesizing a `TTSSpeakFrame`. If new text frames arrive during synthesis, they queue up instead of producing overlapping audio. The TTS resumes when `BotStoppedSpeakingFrame` (a `SystemFrame`) arrives, and the buffered frames are processed in order.
+For example, a TTS service created with `pause_frame_processing=True` pauses itself while its audio is playing. If new text frames arrive during playback, they queue up instead of producing overlapping audio. The TTS resumes when `BotStoppedSpeakingFrame` (a `SystemFrame`) arrives, and the buffered frames are processed in order.
 
 Internally, each processor has two queues: a high-priority input queue for SystemFrames and a process queue for everything else. Pausing blocks the process queue, but SystemFrames continue to flow through the input queue. This is why the typical pattern is for a processor to pause itself and then resume in response to a `SystemFrame`.
 
@@ -90594,17 +90682,13 @@ These frames bracket LLM output, letting downstream processors (aggregators, TTS
 
 Marks the beginning of an LLM response. Followed by one or more `TextFrame`s and terminated by `LLMFullResponseEndFrame`.
 
-<ParamField path="skip_tts" type="bool | None" default="None">
-  Whether the response should be skipped by the TTS service.
-</ParamField>
+The `skip_tts` attribute (`bool | None`, initially `None`) tells the TTS service to skip the response. It isn't a constructor argument, so set it on the frame after construction.
 
 ### LLMFullResponseEndFrame
 
 Marks the end of an LLM response.
 
-<ParamField path="skip_tts" type="bool | None" default="None">
-  Whether the response should be skipped by the TTS service.
-</ParamField>
+The `skip_tts` attribute (`bool | None`, initially `None`) tells the TTS service to skip the response. It isn't a constructor argument, so set it on the frame after construction.
 
 ### VisionFullResponseStartFrame
 
@@ -90647,7 +90731,8 @@ Internal request from the aggregator to the LLM service, asking it to produce a 
 </ParamField>
 
 <ParamField path="target_context_tokens" type="int">
-  Target token count for the summarized context.
+  Maximum token size of the generated summary, passed to the LLM as
+  `max_tokens`.
 </ParamField>
 
 <ParamField path="summarization_prompt" type="str">
@@ -90655,7 +90740,8 @@ Internal request from the aggregator to the LLM service, asking it to produce a 
 </ParamField>
 
 <ParamField path="summarization_timeout" type="float | None">
-  Optional timeout in seconds for the summarization request.
+  Timeout in seconds for the summarization request. `None` applies a default
+  timeout of 120 seconds.
 </ParamField>
 
 ### LLMContextSummaryResultFrame
@@ -90921,7 +91007,7 @@ Request that a service re-emit its metadata. Useful after switching services to 
 
 ## Pipeline Worker Frames
 
-Pipeline worker frames are pushed upstream to the pipeline worker, which converts them into the appropriate downstream frame. This indirection lets processors request pipeline-level actions without needing direct access to the pipeline worker.
+Pipeline worker frames are handled by the pipeline worker, which converts them into the appropriate downstream frame. Push `WorkerFrame`s downstream (the default) so frames queued ahead of them are processed first; pushing them upstream also works. This indirection lets processors request pipeline-level actions without needing direct access to the pipeline worker.
 
 ### WorkerFrame
 
@@ -93269,16 +93355,11 @@ Signals shutdown, which `run()` answers by cancelling every worker still going a
 @runner.event_handler("on_ready")
 async def on_ready(runner):
     print("All agents started")
-
-@runner.event_handler("on_error")
-async def on_error(runner, error):
-    print(f"Runner error: {error}")
 ```
 
 | Event      | Description                                                                 |
 | ---------- | --------------------------------------------------------------------------- |
 | `on_ready` | Fired after the runner has finished setup and any added agents have started |
-| `on_error` | Fired when starting an added agent fails                                    |
 
 # Types
 Source: https://docs.pipecat.ai/api-reference/server/workers/types.md
@@ -93846,6 +93927,7 @@ PipelineWorker manages Pipecat pipeline execution and lifecycle inside the multi
 ## Basic Usage
 
 ```python
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.workers.runner import WorkerRunner
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -93968,7 +94050,9 @@ await runner.run(worker)
 </ParamField>
 
 <ParamField path="enable_tracing" type="bool" default="False">
-  Whether to enable OpenTelemetry tracing. See [The OpenTelemetry
+  Whether to enable OpenTelemetry tracing. Has no effect when OpenTelemetry
+  isn't installed, and turn and conversation spans also require
+  `enable_turn_tracking=True`. See [The OpenTelemetry
   guide](/api-reference/server/utilities/opentelemetry) for details.
 </ParamField>
 
@@ -93982,6 +94066,10 @@ await runner.run(worker)
   unless the pipeline is bridged: a bridged worker has no client of its own, and
   its RTVI would report every frame a second time as it crosses the bridge. Pass
   `True` to enable RTVI on a bridged worker, or `False` to disable it entirely.
+  If the pipeline already contains an `RTVIProcessor` and `observers` contains
+  an `RTVIObserver`, the worker uses that pair and ignores `enable_rtvi`,
+  `rtvi_processor` and `rtvi_observer_params`. If only one of the two is
+  present, the worker logs an error and sets up no RTVI.
 </ParamField>
 
 <ParamField path="rtvi_processor" type="RTVIProcessor | None" default="None">
@@ -94059,7 +94147,7 @@ await runner.run(worker)
 <ResponseField name="capabilities" type="BotCapabilities">
 Property returning what the bot does in the session. It is derived from the media the pipeline's transports send and receive and from `PipelineParams.enable_metrics`, then the `capabilities` constructor argument is applied on top. RTVI sends it to the client in the `bot-ready` message.
 
-`BotCapabilities` (from `pipecat.pipeline.capabilities`) has these optional fields: `audio_in`, `audio_out`, `video_in`, `video_out` and `metrics`. `None` means unknown, so the client keeps its default; `False` means the bot doesn't do it.
+`BotCapabilities` (from `pipecat.pipeline.capabilities`) has these optional fields: `audio_in`, `audio_out`, `video_in`, `screen_in`, `video_out` and `metrics`. `None` means unknown, so the client keeps its default; `False` means the bot doesn't do it.
 
 ```python
 from pipecat.pipeline.capabilities import BotCapabilities
@@ -94073,14 +94161,15 @@ print(worker.capabilities.video_out)
 ### Worker Lifecycle Management
 
 <Note>
-  `end()` and `activate_worker()` wait for in-flight frames to be processed
-  before they take effect, so a closing line is heard rather than cut off and a
-  worker handing over stops talking before the one taking over starts. A
-  pipeline that never started, or one that has already finished, is left alone.
+  `end()`, and `activate_worker()` with `deactivate_self=True`, wait for
+  in-flight frames to be processed before they take effect, so a closing line is
+  heard rather than cut off and a worker handing over stops talking before the
+  one taking over starts. A pipeline that never started, or one that has already
+  finished, is left alone.
 </Note>
 
-<ResponseField name="run()" type="async">
-Starts and manages the pipeline execution until completion or cancellation. Typically called via `WorkerRunner` rather than directly:
+<ResponseField name="run(params)" type="async">
+Starts and manages the pipeline execution until completion or cancellation. `params` is a `WorkerParams` (from `pipecat.workers.base_worker`) carrying the task manager. Typically called via `WorkerRunner`, which supplies it, rather than directly:
 
 ```python
 runner = WorkerRunner()
@@ -94108,8 +94197,8 @@ Requests a graceful end of the session, draining the pipeline first. Whatever th
 
 </ResponseField>
 
-<ResponseField name="cancel()" type="async">
-Stops the running pipeline immediately by sending a CancelFrame.
+<ResponseField name="cancel(*, reason=None)" type="async">
+Stops the running pipeline immediately by sending a CancelFrame. `reason` is an optional string saying why.
 
 ```python
   await worker.cancel()
@@ -94129,13 +94218,13 @@ if worker.has_finished(): print("Worker is complete")
 ### Frame Management
 
 <ResponseField name="flush_pipeline(timeout=5.0)" type="async">
-Wait for in-flight frames to be processed. Pushes a flush probe downstream; the sink bounces it back upstream and the source sets its event once it completes the round-trip, signalling that every frame queued ahead of it has been processed. The probe goes on the worker's push queue, behind whatever is already waiting there.
+Wait for in-flight frames to be processed. Pushes a flush probe downstream; the sink bounces it back upstream, the source sends it down again, and its event is set when it reaches the sink a second time, signalling that every frame queued ahead of it has been processed, along with any work a processor started by pushing a frame upstream. The probe goes on the worker's push queue, behind whatever is already waiting there.
 
 **Parameters:**
 
-| Parameter | Type    | Default | Description                                                                                                                                               |
-| --------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timeout` | `float` | `5.0`   | Seconds of no frames reaching the sink before giving up. A pipeline still working keeps the wait alive; one that is stuck gives up after this much quiet. |
+| Parameter | Type    | Default | Description                                                                                                                                                                                                                            |
+| --------- | ------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout` | `float` | `5.0`   | Seconds of no progress (a frame reaching the sink, or a progress report from another worker the probe crossed into) before giving up. A pipeline still working keeps the wait alive; one that is stuck gives up after this much quiet. |
 
 ```python
 drained = await worker.flush_pipeline(timeout=10.0)
@@ -94164,6 +94253,7 @@ Downstream frames are pushed from the beginning of the pipeline. Upstream frames
 await worker.queue_frame(TTSSpeakFrame("Hello!"))
 
 # Push a frame upstream from the end of the pipeline
+from pipecat.frames.frames import UserStoppedSpeakingFrame
 from pipecat.processors.frame_processor import FrameDirection
 await worker.queue_frame(UserStoppedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
 ```
@@ -94189,8 +94279,13 @@ frames = [TTSSpeakFrame("Hello!"), TTSSpeakFrame("How are you?")]
 await worker.queue_frames(frames)
 
 # Push frames upstream from the end of the pipeline
+from pipecat.frames.frames import TranscriptionFrame, UserStoppedSpeakingFrame
 from pipecat.processors.frame_processor import FrameDirection
-frames = [TranscriptionFrame("user input"), UserStoppedSpeakingFrame()]
+from pipecat.utils.time import time_now_iso8601
+frames = [
+    TranscriptionFrame("user input", user_id="user", timestamp=time_now_iso8601()),
+    UserStoppedSpeakingFrame(),
+]
 await worker.queue_frames(frames, direction=FrameDirection.UPSTREAM)
 ```
 
@@ -94231,9 +94326,11 @@ async def on_pipeline_started(worker, frame):
 
 ### on_pipeline_finished
 
-Fired after the pipeline reaches any terminal state. This includes normal completion (`EndFrame`), explicit stop (`StopFrame`), or cancellation (`CancelFrame`). Use this event for cleanup, logging, or post-processing.
+Fired after the pipeline reaches any terminal state. This includes normal completion (`EndFrame`), explicit stop (`StopFrame`), or cancellation (`CancelFrame`). It doesn't fire when setup or the `StartFrame` times out (`on_setup_timeout`, or `on_pipeline_timeout` with a `StartFrame`). Use this event for cleanup, logging, or post-processing.
 
 ```python
+from pipecat.frames.frames import CancelFrame, EndFrame, StopFrame
+
 @worker.event_handler("on_pipeline_finished")
 async def on_pipeline_finished(worker, frame):
     if isinstance(frame, EndFrame):
@@ -94374,7 +94471,7 @@ async def on_heartbeat_timeout(worker):
 <Note>
   Heartbeat monitoring must be enabled by setting `enable_heartbeats=True` in
   `PipelineParams`. The timeout period is controlled by
-  `heartbeats_monitor_secs` (default: 5 seconds). See
+  `heartbeats_monitor_secs` (default: 10 seconds). See
   [PipelineParams](/api-reference/server/pipeline/pipeline-params) for
   configuration details.
 </Note>
@@ -94384,6 +94481,9 @@ async def on_heartbeat_timeout(worker):
 Fired when no activity frames (as specified by `idle_timeout_frames`) have been received within the idle timeout period. See [Pipeline Idle Detection](/api-reference/server/pipeline/pipeline-idle-detection) for configuration details.
 
 ```python
+# Keep the worker running after the timeout so the prompt is heard
+worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
+
 @worker.event_handler("on_idle_timeout")
 async def on_idle_timeout(worker):
     print("Pipeline has been idle too long")
@@ -94398,8 +94498,9 @@ async def on_idle_timeout(worker):
 
 <Note>
   If `cancel_on_idle_timeout` is `True` (the default), the pipeline will be
-  automatically cancelled after this handler runs. Set it to `False` if you want
-  to handle idle timeouts yourself.
+  automatically cancelled after this handler runs, before anything the handler
+  queued is heard. Set it to `False` if you want to handle idle timeouts
+  yourself.
 </Note>
 
 # Pipeline Idle Detection
