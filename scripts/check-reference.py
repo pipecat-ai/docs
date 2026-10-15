@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Compare the server API reference pages with the pipecat source.
+r"""Compare the API reference pages and code samples with the pipecat source.
 
 A reference page drifts from the code without anything noticing: a constructor
 gains a parameter the page never lists, a default changes, a setting is
@@ -14,7 +14,12 @@ From the source (parsed with `ast`, nothing is imported or installed):
   - events registered with `self._register_event_handler("on_...")`
   - deprecations, from pipecat's generated `scripts/deprecations/deprecations.json`
 
-From each page under api-reference/server:
+From every page's Python code samples (except the migration guides):
+  - calls to pipecat classes: constructor keywords, required arguments, and
+    deprecated arguments; methods called on the objects they return; the
+    event names given to `event_handler`
+
+From each page under api-reference/server and api-reference/pipecat-flows:
   - `<ParamField>` entries, grouped by the heading they sit under
   - Markdown tables whose first column names fields (`| \`name\` | ... |`)
   - event names (`on_...`) mentioned anywhere on the page
@@ -30,7 +35,13 @@ Findings, most to least certain:
   default-mismatch   documented default differs from the code's
   unmarked-deprecation  deprecated in source, not marked on the page
   missing-event      event the class registers that the page never names
+  unfired-event      event the page names that the class registers but nothing fires
   type-mismatch      documented type differs from the annotation
+  sample-unknown-arg     sample passes a keyword the constructor doesn't take
+  sample-missing-arg     sample leaves out a required argument
+  sample-unknown-attr    sample calls a method the object doesn't have
+  sample-unknown-event   sample handles an event the class never registers
+  sample-deprecated-arg  sample passes a deprecated argument
 
 Usage:
   python3 scripts/check-reference.py [--pipecat PATH] [--json FILE]
@@ -56,7 +67,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PAGES_DIR = "api-reference/server"
+PAGE_DIRS = ("api-reference/server", "api-reference/pipecat-flows")
+# Code samples are checked on every page except these: migration guides show
+# the old API on purpose.
+SAMPLE_SKIP = ("node_modules", "pipecat/migration")
 
 
 # Parameters every page may leave out: framework plumbing, not configuration.
@@ -74,6 +88,7 @@ class Param:
     annotation: str | None
     default: str | None  # unparsed source; None when required
     owner: str  # class that declares it
+    init: bool = True  # False for a dataclass `field(init=False)`
 
 
 @dataclass
@@ -85,7 +100,15 @@ class Cls:
     var_kwargs: bool = False
     settings_ref: str | None = None
     default_settings: dict[str, str] = field(default_factory=dict)
+    # Settings `__init__` fills in when the caller left them unset:
+    # `if not is_given(self._settings.x): self._settings.x = value`
+    fill_settings: dict[str, str] = field(default_factory=dict)
     events: set[str] = field(default_factory=set)
+    fired: dict[str, set[str]] = field(default_factory=dict)  # event -> methods that fire it
+    fires_dynamic: bool = False  # fires an event whose name isn't a literal
+    registers_dynamic: bool = False  # registers an event whose name isn't a literal
+    is_dataclass: bool = False
+    var_args: bool = False  # `__init__` takes `*args`
     fields: dict[str, Param] = field(default_factory=dict)  # dataclass/BaseModel
     constants: dict[str, str] = field(default_factory=dict)
     members: set[str] = field(default_factory=set)  # methods, properties, self.* attributes
@@ -130,6 +153,11 @@ class SourceIndex:
         self.module_constants: dict[str, dict[str, str]] = {}
         self.module_imports: dict[str, dict[str, tuple[str, str]]] = {}
         self.type_aliases: dict[str, str] = {}
+        # Names each module mentions (`self._on_x`, `on_x=...`, a string), to
+        # tell a private method something calls from one nothing does.
+        self.refs: dict[str, Counter] = defaultdict(Counter)
+        # Events fired on another object (`transport._call_event_handler(...)`).
+        self.external_fired: set[str] = set()
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if d not in ("tests", "__pycache__")]
             for fn in filenames:
@@ -168,6 +196,23 @@ class SourceIndex:
             elif isinstance(value, ast.Subscript) and target.id[:1].isupper():
                 self.type_aliases[target.id] = unparse(value)
         self.module_constants[module] = consts
+        refs = self.refs[module]
+        for sub in ast.walk(tree):
+            if isinstance(sub, ast.Attribute):
+                refs[sub.attr] += 1
+            elif isinstance(sub, ast.Name):
+                refs[sub.id] += 1
+            elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.isidentifier():
+                refs[sub.value] += 1
+            elif (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "_call_event_handler"
+                and getattr(sub.func.value, "id", None) != "self"
+                and sub.args
+                and isinstance(sub.args[0], ast.Constant)
+            ):
+                self.external_fired.add(sub.args[0].value)
         imports = {}
         for node in tree.body:
             if isinstance(node, ast.ImportFrom):
@@ -190,10 +235,22 @@ class SourceIndex:
             module=module,
             bases=[unparse(b) for b in node.bases],
             constants=consts,  # replaced by constants_for() once all modules are read
+            is_dataclass=any("dataclass" in unparse(d) for d in node.decorator_list),
         )
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 c.members.add(item.name)
+                for sub in ast.walk(item):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr == "_call_event_handler"
+                        and getattr(sub.func.value, "id", None) == "self"
+                    ):
+                        if sub.args and isinstance(sub.args[0], ast.Constant):
+                            c.fired.setdefault(sub.args[0].value, set()).add(item.name)
+                        else:
+                            c.fires_dynamic = True
                 for sub in ast.walk(item):
                     if (
                         isinstance(sub, ast.Attribute)
@@ -204,6 +261,7 @@ class SourceIndex:
         for item in node.body:
             if isinstance(item, ast.FunctionDef) and item.name == "__init__":
                 c.params, c.var_kwargs = self._init_params(item, c.name)
+                c.var_args = item.args.vararg is not None
                 for sub in ast.walk(item):
                     if (
                         isinstance(sub, ast.Assign)
@@ -214,6 +272,23 @@ class SourceIndex:
                         for kw in sub.value.keywords:
                             if kw.arg:
                                 c.default_settings[kw.arg] = unparse(kw.value)
+                    elif (
+                        isinstance(sub, ast.If)
+                        and isinstance(sub.test, ast.UnaryOp)
+                        and isinstance(sub.test.op, ast.Not)
+                        and isinstance(sub.test.operand, ast.Call)
+                        and getattr(sub.test.operand.func, "id", None) == "is_given"
+                        and sub.test.operand.args
+                        and unparse(sub.test.operand.args[0]).startswith("self._settings.")
+                    ):
+                        name = unparse(sub.test.operand.args[0]).split(".")[-1]
+                        for st in sub.body:
+                            if (
+                                isinstance(st, ast.Assign)
+                                and len(st.targets) == 1
+                                and unparse(st.targets[0]) == f"self._settings.{name}"
+                            ):
+                                c.fill_settings[name] = unparse(st.value)
             elif isinstance(item, ast.Assign) and len(item.targets) == 1:
                 t = item.targets[0]
                 if isinstance(t, ast.Name) and t.id == "Settings" and isinstance(item.value, ast.Name):
@@ -226,7 +301,13 @@ class SourceIndex:
                     isinstance(item.annotation, ast.Subscript)
                     and unparse(item.annotation.value).endswith("ClassVar")
                 ):
-                    c.fields[name] = Param(name, unparse(item.annotation), field_default(item.value), c.name)
+                    v = item.value
+                    init = not (
+                        isinstance(v, ast.Call)
+                        and getattr(v.func, "id", getattr(v.func, "attr", "")) == "field"
+                        and any(kw.arg == "init" and getattr(kw.value, "value", True) is False for kw in v.keywords)
+                    )
+                    c.fields[name] = Param(name, unparse(item.annotation), field_default(v), c.name, init)
             elif isinstance(item, ast.ClassDef):
                 self._add_class(item, module, consts, prefix=c.name + ".")
         for sub in ast.walk(node):
@@ -235,9 +316,11 @@ class SourceIndex:
                 and isinstance(sub.func, ast.Attribute)
                 and sub.func.attr == "_register_event_handler"
                 and sub.args
-                and isinstance(sub.args[0], ast.Constant)
             ):
-                c.events.add(sub.args[0].value)
+                if isinstance(sub.args[0], ast.Constant):
+                    c.events.add(sub.args[0].value)
+                else:
+                    c.registers_dynamic = True
         self.by_name[c.name].append(c)
 
     @staticmethod
@@ -267,7 +350,9 @@ class SourceIndex:
         return public[0] if len(public) == 1 else None
 
     def base(self, c, name):
-        """Resolve a base class expression: `Foo`, `mod.Foo`, or `Foo.Settings`."""
+        """Resolve a base class expression: `Foo`, `mod.Foo`, `Foo.Settings`,
+        or a parametrized generic like `Foo[Bar]`."""
+        name = name.split("[")[0]
         if "." in name:
             head, attr = name.rsplit(".", 1)
             outer = self.get(head, c.module) or self.get(head)
@@ -329,7 +414,8 @@ class SourceIndex:
         return out
 
     def effective_default_settings(self, c, seen=None):
-        seen = seen or set()
+        top = seen is None
+        seen = seen if seen is not None else set()
         if c.name in seen:
             return {}
         seen.add(c.name)
@@ -339,6 +425,11 @@ class SourceIndex:
             if bc:
                 out.update(self.effective_default_settings(bc, seen))
         out.update(c.default_settings)
+        if top:  # apply fills from the whole hierarchy
+            for k in self.mro(c):
+                for name, v in k.fill_settings.items():
+                    if out.get(name) in (None, "NOT_GIVEN"):
+                        out[name] = v
         return out
 
     def effective_events(self, c, seen=None):
@@ -358,6 +449,90 @@ class SourceIndex:
             if bc and bc.module == c.module:
                 out |= self.effective_events(bc, seen)
         return out
+
+    def mro(self, c, seen=None):
+        """`c` and every base class that resolves."""
+        seen = seen if seen is not None else set()
+        if c.name in seen:
+            return []
+        seen.add(c.name)
+        out = [c]
+        for b in c.bases:
+            bc = self.base(c, b)
+            if bc:
+                out += self.mro(bc, seen)
+        return out
+
+    def registers(self, c, event):
+        return any(event in k.events or k.registers_dynamic for k in self.mro(c))
+
+    def constructor(self, c):
+        """What `c(...)` accepts: (params by name, positional order, required
+        names, closed), or None when it can't be told. `closed` is False when
+        unlisted keywords may still be accepted (`**kwargs` into an unknown
+        base)."""
+        mro = self.mro(c)
+        for k in mro:
+            if k.params is not None:
+                spec = self.effective_params(c)
+                closed = not k.var_args and self._closed(k)
+                required = {p.name for p in k.params if p.default is None}
+                return spec, [p.name for p in k.params], required, closed
+            if k.is_dataclass:
+                fields = {n: f for n, f in self.effective_fields(c).items() if f.init}
+                order = list(fields)
+                required = {n for n, f in fields.items() if f.default is None}
+                return fields, order, required, True
+            if any(b.split("[")[0].endswith("BaseModel") for b in k.bases):
+                fields = self.effective_fields(c)
+                required = {n for n, f in fields.items() if f.default is None}
+                return fields, [], required, True
+        return None
+
+    def _closed(self, k, seen=None):
+        seen = seen or set()
+        if k.name in seen:
+            return True
+        seen.add(k.name)
+        if not k.var_kwargs:
+            return True
+        bases = [self.base(k, b) for b in k.bases if b not in ("object", "ABC")]
+        if not bases or any(b is None for b in bases):
+            return False
+        for bc in bases:
+            first = next((x for x in self.mro(bc) if x.params is not None or x.is_dataclass), None)
+            if first is None or (first.params is not None and not self._closed(first, seen)):
+                return False
+        return True
+
+    def has_attr(self, c, name):
+        """Whether `obj.name` can resolve on an instance of `c`."""
+        mro = self.mro(c)
+        if any("__getattr__" in k.members for k in mro):
+            return True
+        if any(not (self.base(k, b) or b in ("object", "ABC")) for k in mro for b in k.bases):
+            return True  # a base outside pipecat may define it
+        return self.has_member(c, name) or self.has_member(c, name.lstrip("_"))
+
+    def fires(self, c, event):
+        """Whether anything can fire `event` on a `c`: a method of `c` or a
+        base calls `_call_event_handler` with it, and that method is public or
+        referenced in the module of `c` or one of its bases. A class that overrides
+        `add_event_handler` hands its handlers to something else, so it is
+        taken to fire everything it registers."""
+        if event in self.external_fired:
+            return True
+        mro = self.mro(c)
+        modules = {k.module for k in mro}
+        for k in mro:
+            if k.fires_dynamic or (k.name != "BaseObject" and "add_event_handler" in k.members):
+                return True
+            for m in k.fired.get(event, ()):
+                if not m.startswith("_") or m.startswith("__"):
+                    return True
+                if any(self.refs[mod][m] for mod in modules):
+                    return True
+        return False
 
     def constants_for(self, module):
         """Constants visible in `module`: its own, plus ones it imports."""
@@ -433,6 +608,9 @@ class Page:
     groups: list[Group]
     classes: dict[str, str | None]  # class name -> module hint from imports
     events: set[str]
+    # event -> the classes whose sections name it (`## FooService` above an
+    # Event Handlers heading); None for a mention outside any class section
+    event_sections: dict[str, set[str | None]] = field(default_factory=dict)
 
 
 def split_row(line):
@@ -549,10 +727,18 @@ def parse_page(path):
             groups[("table", start)] = Group("table", ht, hl, entries, chain)
 
     events = set()
+    event_sections = defaultdict(set)
     for i, ln in enumerate(lines):
-        events.update(EVENT_RE.findall(ln))
+        found = EVENT_RE.findall(ln)
+        if not found:
+            continue
+        events.update(found)
+        _, _, chain = heading_at(i + 1)
+        section = next((h.strip("` ") for h in chain if re.fullmatch(r"[A-Z]\w+", h.strip("` "))), None)
+        for ev in found:
+            event_sections[ev].add(section)
     community = "CommunityMaintained" in text
-    return Page(community, os.path.relpath(path, ROOT), list(groups.values()), classes, events)
+    return Page(community, os.path.relpath(path, ROOT), list(groups.values()), classes, events, dict(event_sections))
 
 
 # --------------------------------------------------------------------------
@@ -601,7 +787,10 @@ def type_bases(t, aliases=None, depth=0, code=False):
     if not t:
         return None
     t = re.sub(r"\s*\((?:optional|required)\)", "", t, flags=re.I)
-    t = t.replace("typing.", "").replace("`", "").replace("\\|", "|")
+    t = t.replace("typing.", "").replace("`", "").replace("\\|", "|").strip()
+    if code and re.fullmatch(r"([\"']).*\1", t):
+        t = t[1:-1]  # the whole annotation is a forward reference
+    t = re.sub(r"^(?:Not)?Required\[(.*)\]$", r"\1", t)  # TypedDict keys
     t = re.sub(r"^Optional\[(.*)\]$", r"\1", t.strip())
     m = re.fullmatch(r"Union\[(.*)\]", t.replace(" ", ""))
     if m:
@@ -827,6 +1016,10 @@ class Checker:
     def completeness(self):
         homes = self.home_pages()
         done = set()
+        # (page, event) -> the page's classes that register it. A page that
+        # documents a WebSocket and an HTTP variant names their events once,
+        # so an event is unfired only when none of them fires it.
+        unfired = defaultdict(list)
         for page, g, t in self.matches:
             if homes.get(t.cls.name) != page.path or (t.key, page.path) in done or t.mode == "fields":
                 continue
@@ -854,7 +1047,16 @@ class Checker:
                     kind = "missing-deprecated" if dep else "missing-param"
                     self.add(kind, page.path, line, c.name, p.name, f"`{c.name}.__init__` takes `{p.name}`")
                 for ev in sorted(self.idx.effective_events(c) - self.page_events[page.path]):
+                    if not self.idx.fires(c, ev):
+                        continue  # never fired: leaving it off the page is right
                     self.add("missing-event", page.path, 0, c.name, ev, f"`{c.name}` registers `{ev}`")
+                for ev, sections in page.event_sections.items():
+                    if not self.idx.registers(c, ev):
+                        continue
+                    if c.name in sections and not self.idx.fires(c, ev):
+                        self.add("unfired-event", page.path, 0, c.name, ev, f"`{c.name}` registers it, but nothing fires it")
+                    if None in sections:
+                        unfired[(page.path, ev)].append(c)
             elif t.mode == "settings":
                 for name, p in t.spec.items():
                     if name in documented:
@@ -867,6 +1069,304 @@ class Checker:
                     dep = self.idx.deprecation(t.owner, name)
                     kind = "missing-deprecated" if dep else "missing-setting"
                     self.add(kind, page.path, line, t.cls.name, name, f"`{t.owner.name}` has field `{name}`")
+        for (path, ev), classes in sorted(unfired.items()):
+            if not any(self.idx.fires(c, ev) for c in classes):
+                names = ", ".join(f"`{c.name}`" for c in classes)
+                self.add("unfired-event", path, 0, classes[0].name, ev, f"registered by {names}, but nothing fires it")
+
+
+# --------------------------------------------------------------------------
+# Code samples
+# --------------------------------------------------------------------------
+
+
+CODE_RE = re.compile(r"^([ \t]*)```(?:python|py)\b[^\n]*\n(.*?)^[ \t]*```", re.S | re.M)
+SAMPLE_IMPORT_RE = re.compile(r"^\s*from\s+(pipecat[\w.]*)\s+import\s+(\([^)]*\)|[^\n]*)", re.M)
+
+
+def samples(text):
+    """(first line number, source) of each Python code block."""
+    out = []
+    for m in CODE_RE.finditer(text):
+        indent, body = m.group(1), m.group(2)
+        if indent:
+            body = "\n".join(ln[len(indent):] if ln.startswith(indent) else ln for ln in body.split("\n"))
+        out.append((text.count("\n", 0, m.start(2)) + 1, body))
+    return out
+
+
+def check_samples(checker, page, text):
+    """Check each Python sample's calls against the source: keywords a
+    constructor doesn't accept, required arguments left out, attributes an
+    object doesn't have, events a class never registers."""
+    idx = checker.idx
+    imported = {}  # local name -> (class name, module)
+    for m in SAMPLE_IMPORT_RE.finditer(text):
+        for name in m.group(2).strip("()").replace("\n", " ").split(","):
+            name = name.strip()
+            if not name or name.startswith("#"):
+                continue
+            orig, _, alias = name.partition(" as ")
+            imported[(alias or orig).strip()] = (orig.strip(), m.group(1))
+
+    def resolve(name):
+        if name in imported:
+            orig, mod = imported[name]
+            return idx.get(orig, mod) or idx.get(orig)
+        # Samples often leave out imports; a name only one pipecat class has
+        # is still that class, unless the sample defines it.
+        if name[:1].isupper() and name not in local and name not in checker.generic:
+            cands = idx.by_name.get(name, [])
+            return cands[0] if len(cands) == 1 else None
+        return None
+
+    def class_of(node, bound):
+        """The class a call's callee names: `Foo`, `Foo.Settings`, `Foo.InputParams`."""
+        if isinstance(node, ast.Name):
+            return resolve(node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            outer = resolve(node.value.id)
+            if outer is None:
+                return None
+            if node.attr == "Settings":
+                return idx.settings_class(outer)
+            return idx.get(f"{outer.name}.{node.attr}")
+        return None
+
+    local = set()  # names the page's samples define themselves
+    trees = []
+    for start, src in samples(text):
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        trees.append((start, tree))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                local.add(node.name)
+    for start, tree in trees:
+        bound = {}  # variable -> class of the object assigned to it
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                c = class_of(node.value.func, bound)
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        if c:
+                            bound[t.id] = c
+                        else:
+                            bound.pop(t.id, None)
+        for node in ast.walk(tree):
+            line = start + getattr(node, "lineno", 1) - 1
+            if isinstance(node, ast.Call):
+                c = class_of(node.func, bound)
+                if c:
+                    check_call(checker, page, line, c, node)
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in bound
+                ):
+                    c = bound[node.func.value.id]
+                    attr = node.func.attr
+                    if attr == "event_handler" and node.args and isinstance(node.args[0], ast.Constant):
+                        ev = node.args[0].value
+                        if isinstance(ev, str) and not idx.registers(c, ev):
+                            checker.add("sample-unknown-event", page, line, c.name, ev, f"`{c.name}` never registers `{ev}`")
+                    elif not attr.startswith("__") and not idx.has_attr(c, attr):
+                        checker.add("sample-unknown-attr", page, line, c.name, attr, f"`{c.name}` has no `{attr}`")
+
+
+def check_call(checker, page, line, c, call):
+    idx = checker.idx
+    ctor = idx.constructor(c)
+    if ctor is None:
+        return
+    spec, order, required, closed = ctor
+    if any(isinstance(a, ast.Starred) for a in call.args) or any(kw.arg is None for kw in call.keywords):
+        return  # `*args` / `**kwargs`: can't tell what is passed
+    if any(isinstance(a, ast.Constant) and a.value is Ellipsis for a in call.args):
+        return  # `Frame(...)`: a placeholder, not a call
+    given = set(order[: len(call.args)]) | {kw.arg for kw in call.keywords}
+    for kw in call.keywords:
+        if kw.arg not in spec:
+            if closed:
+                checker.add("sample-unknown-arg", page, line, c.name, kw.arg, f"`{c.name}(...)` takes no `{kw.arg}`")
+            continue
+        dep = idx.deprecation(c, kw.arg)
+        if dep:
+            checker.add(
+                "sample-deprecated-arg", page, line, c.name, kw.arg,
+                f"deprecated in {dep.get('deprecated_in')}" + (f"; use {dep['replacement']}" if dep.get("replacement") else ""),
+            )
+    if order or not call.args:
+        for name in sorted(required - given):
+            checker.add("sample-missing-arg", page, line, c.name, name, f"`{c.name}(...)` requires `{name}`")
+
+
+# --------------------------------------------------------------------------
+# CLI reference
+# --------------------------------------------------------------------------
+
+# CLI pages documented from pipecat's own Typer app (src/pipecat/cli). A page
+# whose headings don't name a command documents the command named like it.
+CLI_PAGES = ("api-reference/cli/init.mdx", "api-reference/cli/eval.mdx")
+
+
+@dataclass
+class CliOption:
+    flags: set[str]  # every spelling: `--name`, `-n`, `--no-recording`
+    default: str | None  # unparsed; None when not set
+    deprecated: bool
+
+
+def _typer_call(node, kind):
+    return (
+        isinstance(node, ast.Call)
+        and getattr(node.func, "attr", getattr(node.func, "id", None)) == kind
+    )
+
+
+def cli_commands(pipecat):
+    """{"eval run": {long flag: CliOption}} for pipecat's own CLI commands."""
+    root = os.path.join(pipecat, "src", "pipecat", "cli")
+    funcs, registrations, groups = {}, [], {}
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(dirpath, fn), encoding="utf-8").read())
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    funcs[node.name] = node
+                    for d in node.decorator_list:
+                        if _typer_call(d, "command") and isinstance(d.func, ast.Attribute):
+                            registrations.append((unparse(d.func.value), d, node.name))
+                elif (
+                    isinstance(node, ast.Call)
+                    and _typer_call(node.func, "command")
+                    and isinstance(node.func.func, ast.Attribute)
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)
+                ):  # `app.command("init")(init_command)`
+                    registrations.append((unparse(node.func.func.value), node.func, node.args[0].id))
+                elif _typer_call(node, "add_typer") and isinstance(node.func, ast.Attribute) and node.args:
+                    name = next((getattr(kw.value, "value", None) for kw in node.keywords if kw.arg == "name"), None)
+                    if isinstance(name, str):
+                        groups[unparse(node.args[0])] = name
+    out = {}
+    for app, call, fname in registrations:
+        if any(kw.arg == "hidden" and getattr(kw.value, "value", False) for kw in call.keywords):
+            continue
+        name = call.args[0].value if call.args and isinstance(call.args[0], ast.Constant) else next(
+            (getattr(kw.value, "value", None) for kw in call.keywords if kw.arg == "name"), fname.replace("_", "-")
+        )
+        if not isinstance(name, str):
+            continue
+        fn = funcs.get(fname)
+        if fn is None:
+            continue
+        path = f"{groups[app]} {name}" if app in groups else name
+        out[path] = cli_options(fn)
+    return out
+
+
+def cli_options(fn):
+    a = fn.args
+    args = a.posonlyargs + a.args + a.kwonlyargs
+    defaults = [None] * (len(a.posonlyargs + a.args) - len(a.defaults)) + list(a.defaults) + list(a.kw_defaults)
+    opts = {}
+    for arg, d in zip(args, defaults):
+        call = d if _typer_call(d, "Option") else None
+        if call is None and isinstance(arg.annotation, ast.Subscript) and unparse(arg.annotation.value).endswith("Annotated"):
+            call = next((e for e in getattr(arg.annotation.slice, "elts", []) if _typer_call(e, "Option")), None)
+        if call is None:
+            continue  # an Argument, or not a CLI parameter
+        kw = {k.arg: k.value for k in call.keywords}
+        if getattr(kw.get("hidden"), "value", False):
+            continue
+        decls = [x.value for x in call.args if isinstance(x, ast.Constant) and isinstance(x.value, str) and x.value.startswith("-")]
+        if call is d and call.args and not (isinstance(call.args[0], ast.Constant) and str(call.args[0].value).startswith("-")):
+            default = unparse(call.args[0])
+        else:
+            default = unparse(kw["default"]) if "default" in kw else (unparse(d) if call is not d and d is not None else None)
+        flags = {f.strip() for decl in decls for f in decl.split("/")} or {"--" + arg.arg.replace("_", "-")}
+        help_ = kw.get("help")
+        deprecated = getattr(kw.get("deprecated"), "value", False) or (
+            isinstance(help_, ast.Constant) and str(help_.value).lower().startswith("deprecated")
+        )
+        long = next((f for f in sorted(flags) if f.startswith("--") and not f.startswith("--no-")), sorted(flags)[0])
+        opts[long] = CliOption(flags, default, bool(deprecated))
+    return opts
+
+
+def cli_page_sections(path):
+    """{command heading or None: [(line, flags, default, deprecated)]} from a CLI page."""
+    text = open(os.path.join(ROOT, path), encoding="utf-8").read()
+    heads = [(text.count("\n", 0, m.start()) + 1, m.group(1).strip("` ")) for m in re.finditer(r"^#{2,3}\s+(.+)$", text, re.M)]
+    out = defaultdict(list)
+    for m in PARAMFIELD_RE.finditer(text):
+        attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        flags = {f.strip() for f in attrs.get("path", "").split("/")}
+        if not any(f.startswith("-") for f in flags):
+            continue  # a positional argument
+        line = text.count("\n", 0, m.start()) + 1
+        section = None
+        for hl, h in heads:
+            if hl < line:
+                section = h
+        out[section].append((line, {f for f in flags if f.startswith("-")}, attrs.get("default"), bool(re.search(r"\bdeprecated\b", m.group(1)))))
+    return out
+
+
+def norm_cli_default(v):
+    if v is None:
+        return None
+    v = v.strip().strip("\"'")
+    return {"false": "False", "true": "True", "none": "None"}.get(v.lower(), v)
+
+
+def check_cli(checker, pipecat):
+    commands = cli_commands(pipecat)
+    for page in CLI_PAGES:
+        if not os.path.exists(os.path.join(ROOT, page)):
+            continue
+        stem = os.path.splitext(os.path.basename(page))[0]
+        sections = cli_page_sections(page)
+        documented = set()
+        for section, entries in sections.items():
+            cmd = section if section in commands else (stem if stem in commands else None)
+            if cmd is None:
+                continue
+            documented.add(cmd)
+            opts = commands[cmd]
+            seen = set()
+            for line, flags, default, deprecated in entries:
+                o = next((o for o in opts.values() if flags & o.flags), None)
+                if o is None:
+                    checker.add("cli-stale-option", page, line, cmd, " / ".join(sorted(flags)), f"`pipecat {cmd}` has no such option")
+                    continue
+                seen.add(id(o))
+                for f in sorted(flags - o.flags):
+                    checker.add("cli-stale-option", page, line, cmd, f, f"`pipecat {cmd}` has no `{f}`")
+                missing_short = {f for f in o.flags if not f.startswith("--")} - flags
+                for f in sorted(missing_short):
+                    checker.add("cli-missing-option", page, line, cmd, f, f"`pipecat {cmd}` also accepts `{f}`")
+                dd, sd = norm_cli_default(default), norm_cli_default(checker.consts.get(o.default, o.default))
+                try:
+                    same = float(dd) == float(sd)
+                except (TypeError, ValueError):
+                    same = dd == sd
+                if dd and sd and sd not in ("None", "...") and not same:
+                    checker.add("cli-default-mismatch", page, line, cmd, sorted(flags)[0], f"page `{default}`, code `{o.default}`")
+                if o.deprecated and not deprecated:
+                    checker.add("cli-unmarked-deprecation", page, line, cmd, sorted(flags)[0], "deprecated in the CLI's help")
+            for long, o in sorted(opts.items()):
+                if id(o) not in seen and not o.deprecated:
+                    checker.add("cli-missing-option", page, 0, cmd, long, f"`pipecat {cmd}` takes `{long}`")
+        group = stem
+        for cmd in sorted(commands):
+            if cmd.split(" ")[0] == group and cmd not in documented:
+                checker.add("cli-missing-command", page, 0, cmd, cmd, f"`pipecat {cmd}` has no section")
 
 
 KINDS = [
@@ -877,8 +1377,19 @@ KINDS = [
     "default-mismatch",
     "unmarked-deprecation",
     "missing-event",
+    "unfired-event",
     "missing-deprecated",
     "type-mismatch",
+    "sample-unknown-arg",
+    "sample-missing-arg",
+    "sample-unknown-attr",
+    "sample-unknown-event",
+    "sample-deprecated-arg",
+    "cli-stale-option",
+    "cli-missing-option",
+    "cli-missing-command",
+    "cli-default-mismatch",
+    "cli-unmarked-deprecation",
 ]
 
 TYPE_WORDS = {"string": "str", "integer": "int", "boolean": "bool", "number": "float"}
@@ -917,12 +1428,26 @@ def main():
     checker = Checker(SourceIndex(a.pipecat))
 
     pages = 0
-    for dirpath, _, filenames in os.walk(os.path.join(ROOT, PAGES_DIR)):
+    for dirpath, _, filenames in (w for d in PAGE_DIRS for w in os.walk(os.path.join(ROOT, d))):
         for fn in sorted(filenames):
             if fn.endswith(".mdx"):
                 pages += 1
-                checker.check_page(parse_page(os.path.join(dirpath, fn)))
+                path = os.path.join(dirpath, fn)
+                page = parse_page(path)
+                checker.check_page(page)
+    # Samples on every page, community ones included: they still call
+    # pipecat's own classes, and only those are checked.
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        rel = os.path.relpath(dirpath, ROOT)
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and os.path.normpath(os.path.join(rel, d)) not in SAMPLE_SKIP]
+        for fn in sorted(filenames):
+            if fn.endswith(".mdx"):
+                path = os.path.join(dirpath, fn)
+                if not any(os.path.relpath(dirpath, ROOT).startswith(d) for d in PAGE_DIRS):
+                    pages += 1
+                check_samples(checker, os.path.relpath(path, ROOT), open(path, encoding="utf-8").read())
     checker.completeness()
+    check_cli(checker, a.pipecat)
 
     findings = checker.findings
     if a.page:
