@@ -36,6 +36,13 @@ node scripts/docs-meta-lint.mjs
 # CI accepts. --fix rewrites unambiguous renames.
 node scripts/check-imports.mjs [--pipecat PATH]
 
+# Compare the API reference, code samples and CLI pages with pipecat's source
+# (also runs in CI). Maintainer guide: scripts/check-reference.md
+python3 scripts/check-reference.py [--pipecat PATH]
+
+# The reference checker's own tests (also run in CI when it changes)
+python3 -m unittest discover -s scripts/tests
+
 # Regenerate llms.txt (tiered index) and llms-full.txt (full content dump)
 # after adding, moving, retitling, or editing pages
 # (CI fails if the checked-in files are stale)

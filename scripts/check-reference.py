@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 r"""Compare the API reference pages and code samples with the pipecat source.
 
+Maintainer guide (rules, ignore entries, tests, the decay alarm, CI):
+scripts/check-reference.md. Tests: python3 -m unittest discover -s scripts/tests
+
 A reference page drifts from the code without anything noticing: a constructor
 gains a parameter the page never lists, a default changes, a setting is
 renamed, an event is added. The page still renders, and the link checker and
@@ -44,6 +47,7 @@ Findings, most to least certain:
   unmarked-deprecation  deprecated in source, not marked on the page
   missing-event      event the class registers that the page never names
   unfired-event      event the page names that the class registers but nothing fires
+  missing-deprecated deprecated parameter or field the page omits
   type-mismatch      documented type differs from the annotation
   sample-unknown-arg     sample passes a keyword the constructor doesn't take
   sample-missing-arg     sample leaves out a required argument
@@ -55,6 +59,8 @@ Findings, most to least certain:
   sample-unknown-env     sample reads an API key pipecat's env.example and examples never use
   prose-unknown-name     prose names a class pipecat doesn't have
   unknown-extra          install extra pipecat's pyproject.toml doesn't declare
+  cli-*                  api-reference/cli pages against pipecat's Typer commands
+  stale-ignore           ignore-file entry no finding matches (full runs only)
 
 Usage:
   python3 scripts/check-reference.py [--pipecat PATH] [--json FILE]
@@ -65,8 +71,11 @@ Usage:
   --pages-from F  report only on the pages listed in F (CI passes a PR's pages)
   --ignore FILE   confirmed false positives (default:
                   scripts/check-reference-ignore.txt)
+  --docs-root D   docs tree to check (default: this repo; the tests' fixtures)
 
-Exit code: 1 if any finding is reported, else 0. Standard library only.
+Exit code: 1 if any finding is reported, 2 if the decay alarm fires (pipecat's
+code no longer looks like what the checker reads), else 0. Standard library
+only.
 """
 
 import argparse
@@ -79,7 +88,8 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = REPO  # the docs tree checked; --docs-root points it elsewhere (the tests' fixtures)
 PAGE_DIRS = ("api-reference/server", "api-reference/pipecat-flows")
 # Code samples are checked on every page except these: migration guides show
 # the old API on purpose.
@@ -127,6 +137,15 @@ class Cls:
     members: set[str] = field(default_factory=set)  # methods, properties, self.* attributes
     methods: dict[str, list[str]] = field(default_factory=dict)  # method -> positional parameter names
     class_constants: dict[str, str] = field(default_factory=dict)
+
+
+def walk(top):
+    """`os.walk` in sorted order. Which class a group matches can come down to
+    the order classes and pages are read in; a file system's listing order
+    must not decide it."""
+    for dirpath, dirnames, filenames in os.walk(top):
+        dirnames.sort()
+        yield dirpath, dirnames, sorted(filenames)
 
 
 def unparse(node):
@@ -180,7 +199,7 @@ def env_names(pipecat):
     roots = [os.path.join(pipecat, d) for d in ("src", "examples")]
     files = [os.path.join(pipecat, "env.example")]
     for root in roots:
-        for dirpath, dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in walk(root):
             files += [os.path.join(dirpath, fn) for fn in filenames if fn.endswith((".py", ".example", ".md", ".toml", ".env"))]
     for f in files:
         try:
@@ -188,6 +207,53 @@ def env_names(pipecat):
         except (OSError, UnicodeDecodeError):
             pass
     return out
+
+
+DEPRECATIONS = "scripts/deprecations/deprecations.json"
+DEPRECATIONS_SCHEMA = 1
+# Registry kinds the checker reads (parameter, class, method) or knowingly
+# leaves alone (the rest).
+DEPRECATION_KINDS = {"parameter", "class", "method", "property", "module", "function", "attribute"}
+# Share of the registry's entries the checker must understand. Below it, the
+# registry's format has changed and the deprecation rules are reading little.
+DEPRECATIONS_UNDERSTOOD = 0.9
+
+
+def understood_deprecation(d):
+    """Whether a registry entry has the shape the deprecation rules read: a
+    string subject and message, and a known kind (`Class.member` for members)."""
+    if not (isinstance(d, dict) and isinstance(d.get("subject"), str) and isinstance(d.get("message"), str)):
+        return False
+    if d.get("kind") in ("parameter", "method", "property"):
+        return "." in d["subject"]
+    return d.get("kind") in DEPRECATION_KINDS
+
+
+def load_deprecations(pipecat):
+    """({subject: entry} for the entries the checker understands, a problem
+    for the decay alarm or None). A registry with few entries is fine (pipecat
+    2.0 removes most); one the checker can't read is not."""
+    path = os.path.join(pipecat, *DEPRECATIONS.split("/"))
+    if not os.path.exists(path):
+        return {}, f"{DEPRECATIONS}: not found"
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (ValueError, UnicodeDecodeError) as e:
+        return {}, f"{DEPRECATIONS}: not valid JSON ({e})"
+    entries = data.get("deprecations") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return {}, f"{DEPRECATIONS}: no top-level `deprecations` list"
+    out = {d["subject"]: d for d in entries if understood_deprecation(d)}
+    understood = sum(understood_deprecation(d) for d in entries)
+    if data.get("schema_version") != DEPRECATIONS_SCHEMA:
+        return out, f"{DEPRECATIONS}: schema_version {data.get('schema_version')!r}, expected {DEPRECATIONS_SCHEMA}"
+    if entries and understood < DEPRECATIONS_UNDERSTOOD * len(entries):
+        return out, (
+            f"{DEPRECATIONS}: understood {understood} of {len(entries)} entries, "
+            f"expected at least {DEPRECATIONS_UNDERSTOOD:.0%}"
+        )
+    return out, None
 
 
 def package_of(module):
@@ -213,13 +279,13 @@ class SourceIndex:
         # Classes and functions defined at the top of a pipecat module: what a
         # sample has to import.
         self.top_level: set[str] = set()
-        for dirpath, dirnames, filenames in os.walk(self.root):
+        for dirpath, dirnames, filenames in walk(self.root):
             dirnames[:] = [d for d in dirnames if d not in ("tests", "__pycache__")]
             for fn in filenames:
                 if fn.endswith(".py"):
                     self._index(os.path.join(dirpath, fn))
         # Names pipecat's examples define are real too: pages describe them.
-        for dirpath, dirnames, filenames in os.walk(os.path.join(pipecat, "examples")):
+        for dirpath, dirnames, filenames in walk(os.path.join(pipecat, "examples")):
             for fn in filenames:
                 if fn.endswith(".py"):
                     try:
@@ -228,11 +294,7 @@ class SourceIndex:
                         continue
                     self.identifiers |= identifiers_in(tree)
         self.env_names = env_names(pipecat)
-        self.deprecated: dict[str, dict] = {}
-        dep = os.path.join(pipecat, "scripts", "deprecations", "deprecations.json")
-        if os.path.exists(dep):
-            for d in json.load(open(dep))["deprecations"]:
-                self.deprecated[d["subject"]] = d
+        self.deprecated, self.deprecations_problem = load_deprecations(pipecat)
 
     def _index(self, path):
         rel = os.path.relpath(path, os.path.dirname(self.root))
@@ -734,7 +796,9 @@ def parse_page(path):
             name = name.strip().split(" as ")[0].strip()
             if name:
                 classes[name] = m.group(1)
-    for tok in set(CLASSLIKE_RE.findall(text)):
+    # In order of first mention, not set order: a tie between two classes'
+    # targets goes to the first in this dict, so it must not vary by run.
+    for tok in dict.fromkeys(CLASSLIKE_RE.findall(text)):
         classes.setdefault(tok, None)
 
     groups: dict[tuple, Group] = {}
@@ -1438,7 +1502,10 @@ def pipecat_extras(pipecat):
     """The extras pipecat's pyproject.toml declares, normalized."""
     import tomllib
 
-    with open(os.path.join(pipecat, "pyproject.toml"), "rb") as f:
+    path = os.path.join(pipecat, "pyproject.toml")
+    if not os.path.exists(path):
+        return set()  # the decay alarm reports it
+    with open(path, "rb") as f:
         deps = tomllib.load(f).get("project", {}).get("optional-dependencies", {})
     return {norm_extra(k) for k in deps}
 
@@ -1551,7 +1618,7 @@ def cli_commands(pipecat):
     """{"eval run": {long flag: CliOption}} for pipecat's own CLI commands."""
     root = os.path.join(pipecat, "src", "pipecat", "cli")
     funcs, registrations, groups = {}, [], {}
-    for dirpath, _, filenames in os.walk(root):
+    for dirpath, _, filenames in walk(root):
         for fn in filenames:
             if not fn.endswith(".py"):
                 continue
@@ -1646,8 +1713,7 @@ def norm_cli_default(v):
     return {"false": "False", "true": "True", "none": "None"}.get(v.lower(), v)
 
 
-def check_cli(checker, pipecat):
-    commands = cli_commands(pipecat)
+def check_cli(checker, commands):
     for page in CLI_PAGES:
         if not os.path.exists(os.path.join(ROOT, page)):
             continue
@@ -1690,6 +1756,63 @@ def check_cli(checker, pipecat):
                 checker.add("cli-missing-command", page, 0, cmd, cmd, f"`pipecat {cmd}` has no section")
 
 
+# --------------------------------------------------------------------------
+# Decay alarm
+# --------------------------------------------------------------------------
+
+# Every rule depends on a pipecat convention: `Settings = ...` on a service,
+# `default_settings = self.Settings(...)`, `_register_event_handler` and
+# `_call_event_handler`, deprecations.json, pyproject extras, the Typer CLI. If
+# pipecat changes one, the rules built on it find nothing and the check passes
+# without checking. So the checker counts what it read and fails when a count
+# drops below its floor: about half the count against pipecat main on
+# 2026-10-15 (in the comments). Deprecations have no floor, as pipecat removes
+# them in bulk at a major release; load_deprecations() checks the registry's
+# format instead. See scripts/check-reference.md, "Decay alarm".
+FLOORS = {
+    "classes": 870,  # 1748
+    "constructors": 235,  # 472
+    "classes with a Settings class": 70,  # 138
+    "Settings fields": 600,  # 1218
+    "default_settings assignments": 65,  # 132
+    "registered events": 130,  # 264
+    "fired events": 185,  # 375
+    "public top-level names": 850,  # 1708
+    "API key names": 33,  # 66
+    "install extras": 45,  # 90
+    "CLI commands": 2,  # 3
+    "CLI options": 27,  # 55
+}
+
+
+def pipecat_counts(idx, extras, commands):
+    """How much of each convention the checker found in pipecat."""
+    classes = [c for cs in idx.by_name.values() for c in cs]
+    settings = {}
+    for c in classes:
+        if c.settings_ref and (s := idx.settings_class(c)):
+            settings[(s.module, s.name)] = s
+    return {
+        "classes": len(classes),
+        "constructors": sum(c.params is not None for c in classes),
+        "classes with a Settings class": sum(bool(c.settings_ref) for c in classes),
+        "Settings fields": sum(len(idx.effective_fields(s)) for s in settings.values()),
+        "default_settings assignments": sum(bool(c.default_settings) for c in classes),
+        "registered events": sum(len(c.events) for c in classes),
+        "fired events": sum(len(c.fired) for c in classes) + len(idx.external_fired),
+        "public top-level names": len(idx.top_level),
+        "API key names": sum(n.endswith("_API_KEY") for n in idx.env_names),
+        "install extras": len(extras),
+        "CLI commands": len(commands),
+        "CLI options": sum(len(opts) for opts in commands.values()),
+    }
+
+
+def decayed(counts, floors):
+    """(what, count, floor) for each count below its floor."""
+    return [(k, counts.get(k, 0), n) for k, n in floors.items() if counts.get(k, 0) < n]
+
+
 KINDS = [
     "stale-param",
     "stale-setting",
@@ -1716,27 +1839,35 @@ KINDS = [
     "cli-missing-command",
     "cli-default-mismatch",
     "cli-unmarked-deprecation",
+    "stale-ignore",
 ]
 
 TYPE_WORDS = {"string": "str", "integer": "int", "boolean": "bool", "number": "float"}
 
 
 def load_ignore(path):
-    """Confirmed false positives: `page kind name  # why`, one per line."""
-    out = set()
+    """Confirmed false positives: `page kind name  # why`, one per line.
+    Returns {(page, kind, name): line number}."""
+    out = {}
     if not os.path.exists(path):
         return out
-    for line in open(path, encoding="utf-8"):
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    for n, line in enumerate(lines, 1):
         line = line.split("#", 1)[0].strip()
         if line:
-            page, kind, name = line.split()
-            out.add((page, kind, name))
+            try:
+                page, kind, name = line.split()
+            except ValueError:
+                sys.exit(f"{path}:{n}: expected `<page> <kind> <name>  # why`")
+            out[(page, kind, name)] = n
     return out
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--pipecat", default=os.path.join(ROOT, "..", "pipecat"))
+    ap.add_argument("--pipecat", default=os.path.join(REPO, "..", "pipecat"))
+    ap.add_argument("--docs-root", default=REPO, help="docs tree to check (default: this repo)")
     ap.add_argument("--json")
     ap.add_argument("--page", help="glob, relative to the repo root")
     ap.add_argument(
@@ -1746,16 +1877,40 @@ def main():
     )
     ap.add_argument("--only", help="comma-separated finding kinds")
     ap.add_argument("--format", choices=["text", "github", "summary"], default="text")
-    ap.add_argument("--ignore", default=os.path.join(ROOT, "scripts", "check-reference-ignore.txt"))
-    a = ap.parse_args()
+    ap.add_argument("--ignore", default=os.path.join(REPO, "scripts", "check-reference-ignore.txt"))
+    ap.add_argument(
+        "--no-decay-alarm",
+        action="store_true",
+        help="check even if pipecat's code doesn't look as expected (an old or partial checkout); not for CI",
+    )
+    a = ap.parse_args(argv)
 
+    global ROOT
+    ROOT = os.path.abspath(a.docs_root)
     if not os.path.isdir(os.path.join(a.pipecat, "src", "pipecat")):
         sys.exit(f"pipecat source not found at {a.pipecat}; pass --pipecat")
     checker = Checker(SourceIndex(a.pipecat))
-
     extras = pipecat_extras(a.pipecat)
+    commands = cli_commands(a.pipecat)
+
+    # Checked before any page: what the source parse found doesn't depend on
+    # which pages are reported.
+    low = decayed(pipecat_counts(checker.idx, extras, commands), FLOORS)
+    lines = [f"{what}: found {n}, expected at least {floor}" for what, n, floor in low]
+    if checker.idx.deprecations_problem:
+        lines.append(checker.idx.deprecations_problem)
+    if lines and not a.no_decay_alarm:
+        msg = (
+            "pipecat's code no longer looks like what the checker reads, so the checker probably "
+            "no longer understands it and its rules would pass without checking. "
+            + "; ".join(lines)
+            + ". See scripts/check-reference.md, \"Decay alarm\"."
+        )
+        print(f"::error::{msg}" if a.format == "github" else f"decay-alarm: {msg}")
+        return 2
+
     pages = 0
-    for dirpath, _, filenames in (w for d in PAGE_DIRS for w in os.walk(os.path.join(ROOT, d))):
+    for dirpath, _, filenames in (w for d in PAGE_DIRS for w in walk(os.path.join(ROOT, d))):
         for fn in sorted(filenames):
             if fn.endswith(".mdx"):
                 pages += 1
@@ -1764,7 +1919,7 @@ def main():
                 checker.check_page(page)
     # Samples on every page, community ones included: they still call
     # pipecat's own classes, and only those are checked.
-    for dirpath, dirnames, filenames in os.walk(ROOT):
+    for dirpath, dirnames, filenames in walk(ROOT):
         rel = os.path.relpath(dirpath, ROOT)
         dirnames[:] = [d for d in dirnames if not d.startswith(".") and os.path.normpath(os.path.join(rel, d)) not in SAMPLE_SKIP]
         for fn in sorted(filenames):
@@ -1777,15 +1932,27 @@ def main():
                 check_prose(checker, os.path.relpath(path, ROOT), text)
                 check_extras(checker, os.path.relpath(path, ROOT), text, extras)
     checker.completeness()
-    check_cli(checker, a.pipecat)
+    check_cli(checker, commands)
+
+    # An ignore entry no finding matches is stale: the page or pipecat changed.
+    # Matched against every finding, before the report is narrowed, but only
+    # reported on a full run, as a PR's scoped run is no place to clean up.
+    ignored = load_ignore(a.ignore)
+    if not a.pages_from:
+        found = {(f["page"], f["kind"], f["name"]) for f in checker.findings}
+        rel = os.path.relpath(a.ignore, ROOT)
+        rel = a.ignore if rel.startswith("..") else rel
+        for (page, kind, name), n in ignored.items():
+            if (page, kind, name) not in found:
+                checker.add("stale-ignore", rel, n, kind, name, f"no `{kind}` finding for `{name}` on {page}; remove the entry")
 
     findings = checker.findings
     if a.page:
         findings = [f for f in findings if fnmatch.fnmatch(f["page"], a.page)]
     if a.pages_from:
-        wanted = {line.strip() for line in open(a.pages_from) if line.strip()}
+        with open(a.pages_from) as f:
+            wanted = {line.strip() for line in f if line.strip()}
         findings = [f for f in findings if f["page"] in wanted]
-    ignored = load_ignore(a.ignore)
     findings = [f for f in findings if (f["page"], f["kind"], f["name"]) not in ignored]
     if a.only:
         keep = set(a.only.split(","))
@@ -1798,7 +1965,8 @@ def main():
     findings.sort(key=lambda f: (f["page"], KINDS.index(f["kind"]), f["line"]))
 
     if a.json:
-        json.dump(findings, open(a.json, "w"), indent=1)
+        with open(a.json, "w") as f:
+            json.dump(findings, f, indent=1)
     if a.format == "summary":
         by_kind = Counter(f["kind"] for f in findings)
         by_page = Counter(f["page"] for f in findings)
