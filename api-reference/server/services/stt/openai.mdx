@@ -58,7 +58,7 @@ Before using OpenAI STT services, you need:
 
 1. **OpenAI Account**: Sign up at [OpenAI Platform](https://platform.openai.com/)
 2. **API Key**: Generate an API key from your account dashboard
-3. **Model Access**: Ensure access to GPT-4o transcription and Whisper models
+3. **Model Access**: Ensure access to GPT transcription and Whisper models
 
 ### Required Environment Variables
 
@@ -117,6 +117,13 @@ Uses VAD-based audio segmentation with HTTP transcription requests. Records spee
   deployment.
 </ParamField>
 
+<ParamField path="include_prob_metrics" type="bool" default="False">
+  Request log probabilities with each transcription, returned in the
+  `TranscriptionFrame`'s `result`: per-token for GPT transcription models,
+  per-segment for Whisper models. Diarization models support neither, so the
+  service logs a warning and requests none.
+</ParamField>
+
 <ParamField path="push_empty_transcripts" type="bool" default="False">
   If true, allow empty `TranscriptionFrame` frames to be pushed downstream
   instead of discarding them. This is intended for situations where VAD fires
@@ -140,6 +147,8 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 ### Usage
 
 ```python
+import os
+
 from pipecat.services.openai.stt import OpenAISTTService
 
 stt = OpenAISTTService(
@@ -154,8 +163,7 @@ stt = OpenAISTTService(
 
 - **Segmented transcription**: Processes complete audio segments (after VAD detects silence) via HTTP. Only produces final transcriptions, not interim results.
 - Does not have WebSocket connection events since it uses per-request HTTP calls.
-- **Probability metrics**: With `include_prob_metrics=True`, GPT transcription models report per-token logprobs and Whisper models report per-segment logprobs. Diarization models support neither, so they report no probabilities.
-- **Multilingual support**: Whisper and GPT transcription models support many languages. The default is `Language.EN` (English). Set `language=None` in settings to enable automatic language detection, which will transcribe whatever language the user speaks.
+- **Multilingual support**: Whisper and GPT transcription models support many languages. The default is `Language.EN` (English). This service requires a language: with `language=None` in settings, every transcription fails with an `ErrorFrame`.
 
 ## OpenAIRealtimeSTTService
 
@@ -201,17 +209,12 @@ Real-time streaming speech-to-text using OpenAI's Realtime API WebSocket transcr
 </ParamField>
 
 <ParamField path="turn_detection" type="dict | Literal[False]" default="False">
-  Server-side VAD configuration. Defaults to `False` (disabled), which relies on a local VAD processor in the pipeline. Pass a dict to enable it: at minimum `{"type": "server_vad"}`, optionally with custom settings (e.g. `{"type": "server_vad", "threshold": 0.5}`). Requires a model that supports turn detection — `gpt-transcribe` does, the default `gpt-realtime-whisper` does not. `None` omits the field entirely, leaving the session's own default in place.
+  Server-side VAD configuration. Defaults to `False` (disabled), which relies on a local VAD processor in the pipeline. Pass a dict to enable it: at minimum `{"type": "server_vad"}`, optionally with custom settings (e.g. `{"type": "server_vad", "threshold": 0.5}`). Requires a model that supports turn detection: `gpt-transcribe` does, the default `gpt-realtime-whisper` does not. `None` omits the field entirely, leaving the session's own default in place; the service then behaves as in server-side VAD mode and doesn't commit audio on local VAD events.
 </ParamField>
 
-<ParamField path="noise_reduction" type="str" default="None">
-  Noise reduction mode. `"near_field"` for close microphones, `"far_field"` for
-  distant microphones, or `None` to disable.
-
-  <Note>
-    **Deprecated in v0.0.106.** Use
-    `settings=OpenAIRealtimeSTTService.Settings(noise_reduction=...)` instead.
-  </Note>
+<ParamField path="noise_reduction" type="str" default="None" deprecated>
+  _Deprecated since 0.0.106, removed in 2.0.0._ Use
+  `settings=OpenAIRealtimeSTTService.Settings(noise_reduction=...)` instead.
 </ParamField>
 
 <ParamField path="should_interrupt" type="bool" default="True">
@@ -234,18 +237,21 @@ Real-time streaming speech-to-text using OpenAI's Realtime API WebSocket transcr
 
 Runtime-configurable settings passed via the `settings` constructor argument using `OpenAIRealtimeSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter  | Type                                                   | Default                  | Description                                                                                                                            |
-| ---------- | ------------------------------------------------------ | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`    | `str`                                                  | `"gpt-realtime-whisper"` | Transcription model to use. _(Inherited from base STT settings.)_                                                                      |
-| `language` | `Language \| str`                                      | `Language.EN`            | Language of the audio input. _(Inherited from base STT settings.)_                                                                     |
-| `prompt`   | `str`                                                  | `None`                   | Optional prompt text to guide transcription style or keyword hints. Not supported by `"gpt-realtime-whisper"`.                         |
-| `delay`    | `Literal["minimal", "low", "medium", "high", "xhigh"]` | `None`                   | How long the model waits before emitting transcription text, trading latency for accuracy. Only supported by `"gpt-realtime-whisper"`. |
+| Parameter         | Type                                                   | Default                  | Description                                                                                                                                                                      |
+| ----------------- | ------------------------------------------------------ | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`           | `str`                                                  | `"gpt-realtime-whisper"` | Transcription model to use. _(Inherited from base STT settings.)_                                                                                                                |
+| `language`        | `Language \| str`                                      | `Language.EN`            | Language of the audio input. _(Inherited from base STT settings.)_                                                                                                               |
+| `prompt`          | `str`                                                  | `None`                   | Optional prompt text to guide transcription style or keyword hints. Not supported by `"gpt-realtime-whisper"`: with that model, the service drops the prompt and logs a warning. |
+| `noise_reduction` | `Literal["near_field", "far_field"]`                   | `None`                   | Noise reduction mode: `"near_field"` for close microphones, `"far_field"` for distant microphones, or `None` to disable.                                                         |
+| `delay`           | `Literal["minimal", "low", "medium", "high", "xhigh"]` | `None`                   | How long the model waits before emitting transcription text, trading latency for accuracy. Only supported by `"gpt-realtime-whisper"`.                                           |
 
 ### Usage
 
 #### With Local VAD
 
 ```python
+import os
+
 from pipecat.services.openai.stt import OpenAIRealtimeSTTService
 
 # Local VAD mode (default) - use with a VAD processor in the pipeline
@@ -278,7 +284,7 @@ stt = OpenAIRealtimeSTTService(
 - **Local VAD vs Server-side VAD**: Defaults to local VAD mode (`turn_detection=False`), where a local VAD processor in the pipeline controls when audio is committed for transcription. Pass `turn_detection={"type": "server_vad"}` for server-side VAD, but do not use a separate VAD processor in the pipeline in that mode.
 - **Turn management**: With server-side VAD enabled, the service proposes each turn boundary and automatically requests `ExternalUserTurnStrategies`, so you don't need to configure turn strategies manually. Those strategies resolve the proposals into `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame` and own the interruption. See [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the interruption controls.
 - **Automatic resampling**: Automatically resamples audio to 24 kHz as required by the Realtime API, regardless of the pipeline's sample rate.
-- **Interim transcriptions**: Produces interim transcriptions via delta events for real-time feedback.
+- **Interim transcriptions**: Produces interim transcriptions via delta events for real-time feedback. Each `InterimTranscriptionFrame` carries only the text added since the previous one, not the transcript so far.
 - **Model selection**: The default `"gpt-realtime-whisper"` model provides low-latency streaming transcription but supports neither the `prompt` parameter nor server-side turn detection. If you need prompt hints for keywords or style guidance, use `"gpt-transcribe"` or `"gpt-live-transcribe"` instead; for server-side VAD, use `"gpt-transcribe"`.
 - **Multilingual support**: GPT transcription models support many languages. The default is `Language.EN` (English). Set `language=None` in settings to enable automatic language detection, which will transcribe whatever language the user speaks.
 
@@ -286,10 +292,11 @@ stt = OpenAIRealtimeSTTService(
 
 Supports the standard [service connection events](/api-reference/server/events/service-events):
 
-| Event             | Description                                 |
-| ----------------- | ------------------------------------------- |
-| `on_connected`    | Connected to OpenAI Realtime WebSocket      |
-| `on_disconnected` | Disconnected from OpenAI Realtime WebSocket |
+| Event                 | Description                                 |
+| --------------------- | ------------------------------------------- |
+| `on_connected`        | Connected to OpenAI Realtime WebSocket      |
+| `on_disconnected`     | Disconnected from OpenAI Realtime WebSocket |
+| `on_connection_error` | OpenAI Realtime WebSocket connection error  |
 
 ```python
 @stt.event_handler("on_connected")

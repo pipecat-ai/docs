@@ -97,8 +97,8 @@ Before using Cartesia STT services, you need:
   Audio encoding format.
 </ParamField>
 
-<ParamField path="sample_rate" type="int" default="None">
-  Audio sample rate in Hz.
+<ParamField path="sample_rate" type="int | None" default="None">
+  Audio sample rate in Hz. If `None`, uses the pipeline sample rate.
 </ParamField>
 
 <ParamField
@@ -107,9 +107,9 @@ Before using Cartesia STT services, you need:
   default="None"
   deprecated
 >
-  Configuration options for the transcription service. *Deprecated in v0.0.105.
-  Use `settings=CartesiaSTTService.Settings(...)` for model/language and direct
-  init parameters for encoding/sample_rate instead.*
+  _Deprecated since 0.0.105, removed in 2.0.0._ Use
+  `settings=CartesiaSTTService.Settings(...)` for model/language and direct init
+  parameters for encoding/sample_rate instead.
 </ParamField>
 
 <ParamField path="settings" type="CartesiaSTTService.Settings" default="None">
@@ -117,7 +117,11 @@ Before using Cartesia STT services, you need:
   below.
 </ParamField>
 
-<ParamField path="ttfs_p99_latency" type="float" default="CARTESIA_TTFS_P99">
+<ParamField
+  path="ttfs_p99_latency"
+  type="float | None"
+  default="CARTESIA_TTFS_P99"
+>
   P99 latency from speech end to final transcript in seconds. Override for your
   deployment.
 </ParamField>
@@ -176,25 +180,20 @@ stt = CartesiaSTTService(
 ### Notes
 
 - **Inactivity timeout**: Cartesia disconnects WebSocket connections after 3 minutes of inactivity. The timeout resets with each message sent. Silence-based keepalive is enabled by default to prevent disconnections.
-- **Auto-reconnect on send**: If the connection is closed (e.g., due to timeout), the service automatically reconnects when the next audio data is sent.
+- **Auto-reconnect**: If the connection drops (e.g., due to timeout), the service reconnects automatically, retrying up to three times. Audio that arrives while it is disconnected is dropped.
 - **Runtime settings updates**: Changing settings (e.g., `language`, `model`, or `keyterm`) via `STTUpdateSettingsFrame` triggers a reconnection with the new parameters. To avoid audio loss, reconnection is deferred until the current user turn ends (i.e., until `UserStoppedSpeakingFrame` is received). Audio frames arriving during the reconnect are buffered and replayed once the new connection is ready. This enables safe dynamic language switching and keyterm updates mid-conversation.
 - **Keyterm model support**: Keyterms are only supported by `ink-2` and `ink-preview` models. If keyterms are set for any other model (e.g., `ink-whisper`), they are ignored with a warning.
 - **Finalize on VAD stop**: When the pipeline's VAD detects the user has stopped speaking, the service sends a `"finalize"` command to flush the transcription session and produce a final result.
-
-<Tip>
-  The `InputParams` / `params=` / `live_options=` pattern is deprecated as of
-  v0.0.105. Use `Settings` / `settings=` instead. See the [Service Settings
-  guide](/pipecat/fundamentals/service-settings) for migration details.
-</Tip>
 
 ### Event Handlers
 
 Cartesia STT supports the standard [service connection events](/api-reference/server/events/service-events):
 
-| Event             | Description                          |
-| ----------------- | ------------------------------------ |
-| `on_connected`    | Connected to Cartesia WebSocket      |
-| `on_disconnected` | Disconnected from Cartesia WebSocket |
+| Event                 | Description                          |
+| --------------------- | ------------------------------------ |
+| `on_connected`        | Connected to Cartesia WebSocket      |
+| `on_disconnected`     | Disconnected from Cartesia WebSocket |
+| `on_connection_error` | Connection error occurred            |
 
 ```python
 @stt.event_handler("on_connected")
@@ -242,6 +241,18 @@ The server drives turn boundaries with the `ink-2` model, pushing structured eve
   confirmed, and discarded if the user resumes speaking or the committed
   transcript differs from the predicted one. Requests `EagerUserTurnStrategies`
   in place of `ExternalUserTurnStrategies` when enabled. See [User Turn
+  Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
+</ParamField>
+
+<ParamField
+  path="eager_match_policy"
+  type="EagerMatchPolicy | None"
+  default="None"
+>
+  Decides whether the committed transcript is close enough to the predicted one
+  to keep the response, when `enable_eager_end_of_turn` is on. `None` uses
+  `NormalizedMatch()`. Passed to the recommended `EagerUserTurnStrategies`, so
+  it has no effect if you pass your own `user_turn_strategies`. See [User Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
 </ParamField>
 
@@ -358,9 +369,9 @@ connected → turn.start → turn.update* → (turn.eager_end → turn.resume?)*
 - **`turn.update`**: Incremental transcript update. Pushes `InterimTranscriptionFrame`.
 - **`turn.eager_end`**: Server eagerly predicted the end of turn. Available via event handler for speculative downstream processing.
 - **`turn.resume`**: User resumed speaking after an eager end. Available via event handler.
-- **`turn.end`**: Final transcript for the completed turn. Pushes `TranscriptionFrame` and proposes a turn stop, which the user turn strategies resolve into a `UserStoppedSpeakingFrame`.
+- **`turn.end`**: Final transcript for the completed turn. Pushes `TranscriptionFrame` (unless the transcript is empty) and proposes a turn stop, which the user turn strategies resolve into a `UserStoppedSpeakingFrame`.
 
-Transcripts are cumulative per turn. There is no `is_final` flag and no `finalize` command — closing the socket ends the session.
+Transcripts are cumulative per turn. There is no `is_final` flag and no `finalize` command: closing the socket ends the session.
 
 ### Notes
 
@@ -375,16 +386,16 @@ Transcripts are cumulative per turn. There is no `is_final` flag and no `finaliz
 
 Cartesia Turns STT supports the following event handlers:
 
-| Event                 | Handler Signature                     | Description                                                                             |
-| --------------------- | ------------------------------------- | --------------------------------------------------------------------------------------- |
-| `on_connected`        | `async def(service)`                  | Connected to Cartesia WebSocket                                                         |
-| `on_disconnected`     | `async def(service)`                  | Disconnected from Cartesia WebSocket                                                    |
-| `on_connection_error` | `async def(service, error_msg)`       | Connection error occurred                                                               |
-| `on_turn_start`       | `async def(service, transcript: str)` | Server detected start of a turn                                                         |
-| `on_turn_update`      | `async def(service, transcript: str)` | Incremental transcript update                                                           |
-| `on_turn_eager_end`   | `async def(service, transcript: str)` | Server eagerly predicted end of turn (only emitted when `enable_eager_end_of_turn`)     |
-| `on_turn_resume`      | `async def(service)`                  | User resumed speaking after an eager end (only emitted when `enable_eager_end_of_turn`) |
-| `on_turn_end`         | `async def(service, transcript: str)` | Final transcript for the completed turn                                                 |
+| Event                 | Handler Signature                     | Description                              |
+| --------------------- | ------------------------------------- | ---------------------------------------- |
+| `on_connected`        | `async def(service)`                  | Connected to Cartesia WebSocket          |
+| `on_disconnected`     | `async def(service)`                  | Disconnected from Cartesia WebSocket     |
+| `on_connection_error` | `async def(service, error_msg)`       | Connection error occurred                |
+| `on_turn_start`       | `async def(service, transcript: str)` | Server detected start of a turn          |
+| `on_turn_update`      | `async def(service, transcript: str)` | Incremental transcript update            |
+| `on_turn_eager_end`   | `async def(service, transcript: str)` | Server eagerly predicted end of turn     |
+| `on_turn_resume`      | `async def(service)`                  | User resumed speaking after an eager end |
+| `on_turn_end`         | `async def(service, transcript: str)` | Final transcript for the completed turn  |
 
 Example:
 
