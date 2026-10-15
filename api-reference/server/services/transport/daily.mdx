@@ -282,6 +282,163 @@ See the [complete example](https://github.com/pipecat-ai/pipecat/blob/main/examp
 - Pipeline integration with participant event handling
 - Advanced features like recording and dial-out
 
+## Frames
+
+**Sent to the transport:**
+
+| Frame                                    | Fields                                                 | Effect                                                                                                                                                                                                                                                                                              |
+| ---------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DailySIPTransferFrame`                  | `settings`                                             | Transfers the phone or SIP call to `settings["toEndPoint"]`, a phone number or SIP URI, once the audio queued before it has played. Without a `sessionId` in `settings`, it transfers the dial-out session, else the dial-in session.                                                               |
+| `DailySIPReferFrame`                     | `settings`                                             | Sends a SIP REFER for the call in `settings["sessionId"]` to `settings["toEndPoint"]`, once the audio queued before it has played.                                                                                                                                                                  |
+| `DailyUpdateRemoteParticipantsFrame`     | `remote_participants`                                  | Applies Daily's [remote participant updates](https://reference-python.daily.co/api_reference.html#daily.CallClient.update_remote_participants), such as permissions, once the audio queued before it has played.                                                                                    |
+| `DailyOutputDTMFFrame`                   | `buttons`, `session_id`, `digit_duration_ms`, `method` | Sends DTMF tones once the audio queued before it has played. Without `session_id`, it sends to the dial-out session, else the dial-in session, and with neither it sends nothing. `None` for `digit_duration_ms` or `method` (`"telephone-event"`, `"sip-info"`, or `"auto"`) uses Daily's default. |
+| `DailyOutputDTMFUrgentFrame`             | `buttons`, `session_id`, `digit_duration_ms`, `method` | Sends DTMF tones at once, as `DailyOutputDTMFFrame` does.                                                                                                                                                                                                                                           |
+| `DailyOutputTransportMessageFrame`       | `message`, `participant_id`                            | Sends an app message to `participant_id`, or to everyone when it is `None`, once the audio queued before it has played.                                                                                                                                                                             |
+| `DailyOutputTransportMessageUrgentFrame` | `message`, `participant_id`                            | Sends an app message at once, as `DailyOutputTransportMessageFrame` does.                                                                                                                                                                                                                           |
+
+When Daily rejects a transfer, REFER, or participant update, the transport pushes an `ErrorFrame`. [`OutputDTMFFrame`](/api-reference/server/frames/data-frames#outputdtmfframe) and [`OutputDTMFUrgentFrame`](/api-reference/server/frames/system-frames#outputdtmfurgentframe) also go over Daily's DTMF channel rather than as audio tones, to the dial-out session, else the dial-in session.
+
+**Pushed by the transport:**
+
+| Frame                             | Fields                      | Meaning                                                                                                                                                                                                |
+| --------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `DailyInputTransportMessageFrame` | `message`, `participant_id` | An app message from participant `participant_id`, pushed both upstream and downstream. It is an [`InputTransportMessageFrame`](/api-reference/server/frames/system-frames#inputtransportmessageframe). |
+
+Queue a goodbye and a transfer together, and the transfer waits for the goodbye to finish playing:
+
+```python
+from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.transports.daily.transport import DailySIPTransferFrame
+
+goodbye = TTSSpeakFrame("Transferring you to our billing team now.")
+transfer = DailySIPTransferFrame(settings={"toEndPoint": "+15551234567"})
+# Otherwise the caller talking over the goodbye drops the transfer
+goodbye.interruptible = False
+transfer.interruptible = False
+
+await worker.queue_frames([goodbye, transfer])
+```
+
+For a transfer the LLM decides on, see [Implementing a cold transfer](/pipecat/telephony/daily-pstn#implementing-a-cold-transfer).
+
+## Methods
+
+### capture_participant_transcription()
+
+```python
+async def capture_participant_transcription(participant_id: str)
+```
+
+Requests Daily's built-in transcription for a participant. Does nothing unless `transcription_enabled` is set; see [Using built-in transcription](#using-built-in-transcription).
+
+### capture_participant_audio()
+
+```python
+async def capture_participant_audio(
+    participant_id: str,
+    audio_source: str = "microphone",
+    sample_rate: int = 16000,
+)
+```
+
+Captures one of a participant's audio sources (`"microphone"`, `"screenAudio"`, or a custom track name) and pushes it as `UserAudioRawFrame`s with `user_id` set to the participant and `transport_source` set to `audio_source`. With `audio_in_user_tracks=True`, the default, each participant's microphone is captured as they join, so call this for other sources. Requires `audio_in_enabled=True` and `transport.input()` in the pipeline.
+
+### capture_participant_video()
+
+```python
+async def capture_participant_video(
+    participant_id: str,
+    framerate: int | None = 30,
+    video_source: str = "camera",
+    color_format: str = "RGB",
+    *,
+    on_request_only: bool = False,
+)
+```
+
+Captures one of a participant's video sources and pushes its frames as `UserImageRawFrame`s in `color_format`. The other arguments work as in [Capturing video on demand](/api-reference/server/services/transport/transport-params#capturing-video-on-demand). Requires `video_in_enabled=True` and `transport.input()` in the pipeline.
+
+### start_dialout()
+
+```python
+async def start_dialout(
+    settings: Mapping[str, Any] | None = None,
+) -> tuple[str, str | None]
+```
+
+Dials out from the room and returns `(session_id, error)`, where `error` is `None` on success. `settings` takes Daily's [dial-out settings](https://reference-python.daily.co/api_reference.html#daily.CallClient.start_dialout), such as `phoneNumber` or `sipUri`. The room needs dial-out enabled; see [Daily PSTN](/pipecat/telephony/daily-pstn#dial-out) and [Daily SIP](/pipecat/telephony/daily-sip#dial-out).
+
+### stop_dialout()
+
+```python
+async def stop_dialout(participant_id: str) -> str | None
+```
+
+Hangs up the dial-out call to a participant and returns an error description, or `None` on success.
+
+### start_recording()
+
+```python
+async def start_recording(
+    streaming_settings: Mapping[str, Any] | None = None,
+    stream_id: str | None = None,
+    force_new: bool | None = None,
+) -> tuple[str, str | None]
+```
+
+Starts Daily's cloud recording and returns `(stream_id, error)`, where `error` is `None` on success. Cloud recording must be enabled on the room or token via `enable_recording`; see [DailyRESTHelper](/api-reference/server/utilities/daily/rest-helper). The recording events are under [Recording](#recording).
+
+```python
+@transport.event_handler("on_first_participant_joined")
+async def on_first_participant_joined(transport, participant):
+    stream_id, error = await transport.start_recording()
+    if error:
+        logger.error(f"Failed to start recording: {error}")
+```
+
+To record from the moment the bot joins instead, configure the meeting token with `DailyRESTHelper`:
+
+```python
+from pipecat.transports.daily.utils import (
+    DailyMeetingTokenParams,
+    DailyMeetingTokenProperties,
+)
+
+token = await helper.get_token(
+    room_url="https://your-domain.daily.co/my-room",
+    params=DailyMeetingTokenParams(
+        properties=DailyMeetingTokenProperties(
+            enable_recording="cloud",
+            start_cloud_recording=True,
+        )
+    ),
+)
+```
+
+### stop_recording()
+
+```python
+async def stop_recording(stream_id: str | None = None) -> str | None
+```
+
+Stops a cloud recording and returns an error description, or `None` on success.
+
+### update_publishing()
+
+```python
+async def update_publishing(publishing_settings: Mapping[str, Any]) -> str | None
+```
+
+Updates the bot's [publishing settings](https://reference-python.daily.co/types.html#publishingsettings), such as camera encodings, and returns an error description, or `None` on success.
+
+### participants()
+
+```python
+def participants() -> Mapping[str, Any]
+```
+
+Returns the participants in the room as Daily reports them, keyed by participant ID, with the bot under the key `"local"`.
+
 ## Notes
 
 ### Using built-in transcription
@@ -689,61 +846,7 @@ async def on_transcription_message(transport, message):
 
 ### Recording
 
-Daily supports two ways to record a call: start and stop it imperatively from
-the transport, or configure a meeting token to start cloud recording
-automatically when the bot joins.
-
-#### start_recording / stop_recording
-
-Start and stop Daily's cloud recording during a session.
-
-```python
-async def start_recording(
-    streaming_settings=None, stream_id=None, force_new=None
-) -> tuple[str, CallClientError | None]
-
-async def stop_recording(stream_id=None) -> CallClientError | None
-```
-
-Typically triggered from an event handler once the session is underway:
-
-```python
-@transport.event_handler("on_first_participant_joined")
-async def on_first_participant_joined(transport, participant):
-    stream_id, error = await transport.start_recording()
-    if error:
-        logger.error(f"Failed to start recording: {error}")
-
-# Later, to stop recording:
-await transport.stop_recording()
-```
-
-<Note>
-  Cloud recording must be enabled on the room or token via `enable_recording`.
-  See [DailyRESTHelper](/api-reference/server/utilities/daily/rest-helper).
-</Note>
-
-#### Start recording automatically on join
-
-Instead of calling `start_recording()`, configure a meeting token to begin
-cloud recording as soon as the bot joins, using `DailyRESTHelper`:
-
-```python
-from pipecat.transports.daily.utils import (
-    DailyMeetingTokenParams,
-    DailyMeetingTokenProperties,
-)
-
-token = await helper.get_token(
-    room_url="https://your-domain.daily.co/my-room",
-    params=DailyMeetingTokenParams(
-        properties=DailyMeetingTokenProperties(
-            enable_recording="cloud",
-            start_cloud_recording=True,
-        )
-    ),
-)
-```
+To start and stop a recording, see [start_recording()](#start_recording) and [stop_recording()](#stop_recording).
 
 #### on_recording_started / on_recording_stopped / on_recording_error
 

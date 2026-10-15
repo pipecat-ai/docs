@@ -181,6 +181,38 @@ async def on_pause(serializer, message):
     logger.info("Audio paused (caller on hold)")
 ```
 
+## Frames
+
+**Sent to the serializer:**
+
+| Frame                                                              | Fields    | Effect                                                                                                                             |
+| ------------------------------------------------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `EndFrame`, `CancelFrame`                                          |           | Sends a `disconnect` message with reason `"completed"`, action `"transfer"`, and the output variables                              |
+| `InterruptionFrame`                                                |           | Sends a barge-in event, so Genesys stops playing the audio it has queued                                                           |
+| `OutputTransportMessageFrame`, `OutputTransportMessageUrgentFrame` | `message` | Sends `message` as JSON when it is a `dict` with a `"version"` field, as the serializer's messages are. Other messages are dropped |
+
+**Pushed by the serializer:**
+
+| Frame            | Fields   | Meaning                         |
+| ---------------- | -------- | ------------------------------- |
+| `InputDTMFFrame` | `button` | The caller pressed a keypad key |
+
+## Methods
+
+### create_resumed_response()
+
+```python
+def create_resumed_response() -> dict[str, Any]
+```
+
+Returns a `resumed` message for Genesys and ends the pause, so the serializer passes audio again. Send it in an `OutputTransportMessageUrgentFrame`:
+
+```python
+await worker.queue_frame(
+    OutputTransportMessageUrgentFrame(message=serializer.create_resumed_response())
+)
+```
+
 ## Protocol Details
 
 ### AudioHook v2 Protocol
@@ -211,8 +243,6 @@ A typical session follows this sequence:
 
 - **Fixed packet size**: Set `fixed_audio_packet_size=1600` on your transport parameters. This batches outbound audio into consistent chunks and prevents 429 rate limiting from Genesys.
 - **No extra dependencies**: The serializer uses Pipecat's built-in audio conversion utilities (`pcm_to_ulaw`, `ulaw_to_pcm`) and SOXR resampler.
-- **Barge-in**: When the pipeline emits an `InterruptionFrame`, the serializer automatically sends a barge-in event to Genesys, which stops any queued audio playback on the Genesys side.
 - **Pause/resume**: When Genesys sends a `pause` message (e.g., caller placed on hold), audio processing is suspended. The serializer drops incoming and outgoing audio while paused. Use the `on_pause` event handler and `create_resumed_response()` to control when streaming resumes.
 - **Output variables**: Variables set via `set_output_variables()` are included in the `closed` response when Genesys terminates the session. These variables become available in the Architect flow for routing decisions.
-- **DTMF support**: Phone keypad events are converted to `InputDTMFFrame` objects and can be processed in your pipeline.
 - **L16 format**: The serializer accepts `AudioHookMediaFormat.L16` as a configuration option but drops all audio in both directions with it. Use PCMU (the default).

@@ -358,21 +358,31 @@ A cold transfer hands the caller off to another number and the bot exits.
 
 ### Implementing a cold transfer
 
-Call transfers are typically implemented as LLM function calls that your bot can invoke:
+Call transfers are typically implemented as LLM function calls that your bot can invoke. The handler pushes the announcement and then a [`DailySIPTransferFrame`](/api-reference/server/services/transport/daily#frames), and the transport transfers the call once the announcement has played:
 
 ```python bot.py
-async def dial_operator(transport: BaseTransport, params: FunctionCallParams):
-    """Function the bot can call to transfer to an operator."""
+from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.transports.daily.transport import DailySIPTransferFrame
+
+async def dial_operator(params: FunctionCallParams):
+    """Transfer the caller to a supervisor when they ask for a human."""
     operator_number = os.getenv("OPERATOR_NUMBER", "+1234567890")
 
-    # Inform the user about the transfer
-    content = "I'm transferring you to a supervisor now. Please hold while I connect you."
-    message = {"role": "developer", "content": content}
-    await params.llm.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+    announcement = TTSSpeakFrame("I'm transferring you to a supervisor now. Please hold.")
+    transfer = DailySIPTransferFrame(settings={"toEndPoint": operator_number})
+    # The caller talking over the announcement must not cancel the transfer
+    announcement.interruptible = False
+    transfer.interruptible = False
 
-    # Execute the SIP call transfer
-    transfer_params = {"toEndPoint": operator_number}
-    await transport.sip_call_transfer(transfer_params)
+    await params.llm.push_frame(announcement)
+    await params.llm.push_frame(transfer)
+
+    # The bot has nothing more to say
+    await params.result_callback(
+        {"status": "transferring"},
+        properties=FunctionCallResultProperties(run_llm=False),
+    )
 ```
 
 ### Handling Transfer Events
