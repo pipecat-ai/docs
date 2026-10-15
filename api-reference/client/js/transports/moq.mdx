@@ -5,11 +5,11 @@ sidebarTitle: "MoQ"
 description: "MoqTransport for the JavaScript SDK: Media over QUIC audio and RTVI messaging to a Pipecat bot, over WebTransport."
 ---
 
-`MoqTransport` connects a `PipecatClient` to a Pipecat bot over [Media over QUIC](https://quic.video) — either through a relay both sides dial, or directly to a bot serving its own socket.
+`MoqTransport` connects a `PipecatClient` to a Pipecat bot over [Media over QUIC](https://quic.video), either through a relay both sides dial, or directly to a bot serving its own socket.
 
 It publishes the microphone as an Opus broadcast and consumes the bot's, discovering codec and sample rate from the bot's catalog at connect time rather than pinning them in code. RTVI messages travel in both directions over a dedicated JSON stream track, so this is a full RTVI transport rather than an audio-only path. The transport automatically deduplicates messages across reconnects, preventing redelivery of messages such as `client-ready` when either side replays its log.
 
-Connection uses WebTransport with a WebSocket fallback (raced by `@moq/net`), with auto-reconnect via `Connection.Reload`. Once the session reaches `ready`, relay reconnects happen in the background without changing the state — messages sent during a reconnect are queued and replayed to the bot when it resubscribes.
+Connection uses WebTransport with a WebSocket fallback (raced by `@moq/net`), and reconnects automatically. Once the session reaches `ready`, relay reconnects happen in the background without changing the state: messages sent during a reconnect are queued and replayed to the bot when it resubscribes.
 
 ## Installation
 
@@ -36,33 +36,28 @@ const pcClient = new PipecatClient({ transport });
 await pcClient.connect();
 ```
 
-### With the development runner
+### With the Development Runner
 
-The Pipecat development runner returns everything the transport needs from `POST /start`, under a `moq` key — the relay URL, the certificate hash in serve mode, the namespace, and the participant ids. Pass it straight through:
+The Pipecat development runner returns everything the transport needs from `POST /start`, under a `moq` key: the relay URL, the certificate hash in serve mode, the namespace, the participant ids, and the transcript track. Pass the response straight through to `connect()`, which `startBotAndConnect()` does for you:
 
 ```javascript
-const { moq } = await fetch("/start", { method: "POST" }).then((r) => r.json());
-
-const transport = new MoqTransport({
-  relayUrl: moq.relayUrl,
-  namespace: moq.namespace,
-  clientId: moq.clientId,
-  botId: moq.botId,
-  serverCertificateHashes: moq.certHash
-    ? [{ algorithm: "sha-256", value: moq.certHash }]
-    : undefined,
+const pcClient = new PipecatClient({
+  // relayUrl is required by the type; the /start response replaces it
+  transport: new MoqTransport({ relayUrl: "" }),
 });
+
+await pcClient.startBotAndConnect({ endpoint: "/start" });
 ```
 
 <Warning>
   Constructing the transport by hand, take care with `clientId` and `botId`. The
   defaults here are `client0` and `bot0`, while a Pipecat bot publishes under
   `response` and listens on `request`. With defaults on both sides the two never
-  find each other — so set `clientId: "request"` and `botId: "response"`, or
-  take the values from `/start` as above.
+  find each other, so set `clientId: "request"` and `botId: "response"`, or take
+  the values from `/start` as above.
 </Warning>
 
-### Self-signed development relay
+### Self-Signed Development Relay
 
 A bot in serve mode mints its own certificate and reports the fingerprint. Pin it rather than disabling verification:
 
@@ -112,9 +107,9 @@ const transport = new MoqTransport({
 <ParamField path="audioBufferMaxMs" type="number | 'real-time'" default="30000">
   Ceiling for buffered playback. A bot writes TTS audio faster than real time
   with future-dated timestamps, and the player buffers it rather than skipping
-  ahead — this caps how much may build up. An interruption flushes it early.
-  Pass `"real-time"` to collapse to the floor instead, which only makes sense
-  against a genuinely live publisher.
+  ahead; this caps how much may build up. An interruption flushes it early. Pass
+  `"real-time"` to collapse to the floor instead, which only makes sense against
+  a genuinely live publisher.
 </ParamField>
 
 <ParamField path="audioSampleRate" type="number" default="48000">
@@ -132,7 +127,11 @@ const transport = new MoqTransport({
   time the balancer takes to remove a lost relay from rotation.
 </ParamField>
 
-### Broadcast paths
+### TransportConnectionParams
+
+`connect()` takes either a `Partial<MoqTransportOptions>`, merged over the constructor options, or the bot's `/start` response `{ moq: {...} }`. For the `/start` response, the transport reads `relayUrl`, `namespace`, `clientId`, `botId`, and `transcriptTrack` from `moq`, and decodes the base64 `certHash` into `serverCertificateHashes`. With no params, `connect()` uses the constructor options.
+
+### Broadcast Paths
 
 Each side publishes on one path and subscribes to the other's:
 
@@ -141,11 +140,11 @@ client publishes   <namespace>/<clientId>
 client subscribes  <namespace>/<botId>
 ```
 
-Audio track names within a broadcast come from the bot's catalog, so they aren't configured here. The transcript track is the exception — it's a JSON stream rather than a media rendition, so the catalog doesn't describe it and both sides agree on the name by convention.
+Audio track names within a broadcast come from the bot's catalog, so they aren't configured here. The transcript track is the exception: it's a JSON stream rather than a media rendition, so the catalog doesn't describe it and both sides agree on the name by convention.
 
-### Transcript records
+### Transcript Records
 
-Each transcript track is a single group that a subscriber reads from its first record, so a reconnect on either side, including the automatic one from `@moq/net`, replays the whole log. Every record the transport sends is the RTVI message plus `seq`, its position in the connection's log, and `epoch`, an id minted per connection. Incoming records at or below the last `seq` accepted for the bot's current `epoch` are dropped, a different `epoch` is a new bot whose count starts over, and both fields are removed before the message reaches `PipecatClient`. A record without `seq` is delivered unchanged, so a bot that predates the fields keeps working. The bot side of the same format is described with the [server transport](/api-reference/server/services/transport/moq#transcript-records); `acceptTranscriptRecord` and the `TranscriptRecord` type are exported for other implementations of the stream.
+Each transcript track is a single group that a subscriber reads from its first record, so a reconnect on either side, including the automatic one from `@moq/net`, replays the whole log. Every record the transport sends is the RTVI message plus `seq`, its position in the connection's log, and `epoch`, an id minted per connection. Incoming records at or below the last `seq` accepted for the bot's current `epoch` are dropped, a different `epoch` is a new bot whose count starts over, and both fields are removed before the message reaches `PipecatClient`. A record without `seq` is delivered unchanged, so a bot that predates the fields keeps working. The bot side of the same format is described with the [server transport](/api-reference/server/services/transport/moq#transcript-records); `acceptTranscriptRecord(watermark, record)` and the `TranscriptRecord` and `TranscriptWatermark` types are exported for other implementations of the stream.
 
 Each side also sends a `session-ending` marker on its transcript before it leaves. The bot's tracks ending after the marker is a hangup and the transport disconnects. Ending without it may be a relay between the peers failing, which looks the same on the wire, so the transport redials: the bot either reappears on the new session or is never announced on it. `disconnect()` sends the marker from this side, so the bot ends the call at once.
 
@@ -155,7 +154,7 @@ Each side also sends a `session-ending` marker on its transcript before it leave
 
 ## Events
 
-`MoqTransport` reports connection state through the standard [`PipecatClient` callbacks](/api-reference/client/js/callbacks) — there are no MoQ-specific events.
+`MoqTransport` reports connection state through the standard [`PipecatClient` callbacks](/api-reference/client/js/callbacks). There are no MoQ-specific events.
 
 ## More Information
 
