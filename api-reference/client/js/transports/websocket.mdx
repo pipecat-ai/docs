@@ -5,7 +5,7 @@ sidebarTitle: "WebSocket"
 description: "WebSocketTransport for the JavaScript SDK: a lightweight, purely WebSocket-based connection between clients and a Pipecat bot."
 ---
 
-`WebSocketTransport` enables a purely WebSocket based connection between clients and your Pipecat application. It implements bidirectional audio and video streaming using a WebSocket for real-time communication.
+`WebSocketTransport` enables a purely WebSocket based connection between clients and your Pipecat application. It implements bidirectional audio streaming using a WebSocket for real-time communication.
 
 This transport is intended for lightweight implementations, particularly for local development and testing. It expects your Pipecat server to include the corresponding [`WebSocketTransport` server-side](/api-reference/server/services/transport/websocket-server) implementation.
 
@@ -78,11 +78,31 @@ export interface WebSocketTransportConstructorOptions extends WebSocketTransport
   default="ProtobufFrameSerializer"
 >
   The serializer to use for encoding/decoding messages sent over the WebSocket
-  connection. The websocket-transport package provides two serializer options: -
-  `ProtobufFrameSerializer`: Uses Protocol Buffers for serialization. -
-  `TwilioSerializer`: Uses Twilio's serialization format. The main purpose of
-  the TwilioSerializer is to allow testing the bots built to work with Twilio
-  without having to make phone calls.
+  connection. The websocket-transport package provides two serializer options:
+  `ProtobufFrameSerializer`, which uses Protocol Buffers, and `TwilioSerializer`,
+  which uses Twilio's format so you can test bots built for Twilio without
+  making phone calls. To write your own, implement the exported
+  `WebSocketSerializer` interface:
+
+```typescript
+type DeserializedData =
+  | { type: "audio"; audio: Int16Array }
+  | { type: "message"; message: RTVIMessage }
+  | { type: "interruption" }
+  | { type: "raw"; message: any };
+
+interface WebSocketSerializer {
+  serialize(data: any): any;
+  serializeAudio(
+    data: ArrayBuffer,
+    sampleRate: number,
+    numChannels: number,
+  ): any;
+  serializeMessage(msg: RTVIMessage): any;
+  deserialize(data: any): Promise<DeserializedData>;
+}
+```
+
 </ParamField>
 
 <ParamField name="recorderSampleRate" type="number">
@@ -100,17 +120,17 @@ export interface WebSocketTransportConstructorOptions extends WebSocketTransport
   media manager. The default is `DailyMediaManager`, which is suitable for most
   use cases. Note that the `DailyMediaManager` does not use any of Daily's
   services, it simply takes advantage of vast media support provided by the
-  Daily library.
+  Daily library. The package exports `DailyMediaManager` and `WavMediaManager`.
 </ParamField>
 
 ### TransportConnectionParams
 
-`connect()` accepts `WebSocketTransportOptions` — `wsUrl` (or the deprecated `ws_url`) and `token`. Either overrides the value set in the constructor. Any other key raises an `RTVIError`, so the serializer, media manager and sample rates are constructor-only.
+`connect()` accepts `WebSocketTransportOptions`: `wsUrl` (or the deprecated `ws_url`) and `token`. `wsUrl` overrides the value set in the constructor. `token` is appended to the URL as a URL-encoded `token` query parameter; it is read only from `connect()`, so a `token` passed to the constructor is ignored. Any other key raises an `RTVIError`, so the serializer, media manager and sample rates are constructor-only.
 
 <CodeGroup>
 ```typescript client
 pcClient.connect({
-  wsUrl: 'http://localhost:7860/ws'
+  wsUrl: 'ws://localhost:7860/ws'
 });
 // OR...
 pcClient.startBotAndConnect({
@@ -161,7 +181,7 @@ async def run_bot(websocket_client):
 
     llm = ... # Initialize your LLM here, e.g., OpenAI, HuggingFace, etc.
 
-    messages = [{ role: "system", content: "You are a helpful assistant." }]
+    messages = [{"role": "system", "content": "You are a helpful assistant."}]
     context = LLMContext(messages)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
@@ -191,18 +211,35 @@ async def run_bot(websocket_client):
 
 ### Methods
 
-For most operations, you will not interact with the transport directly. Most methods have an equivalent in the `PipecatClient` and should be called from the `PipecatClient`. However, there is one transport-specific methods that you may need to call directly. When doing so, be sure to access your transport via the `transport` property of the `PipecatClient` instance.
+For most operations, you will not interact with the transport directly. Most methods have an equivalent in the `PipecatClient` and should be called from the `PipecatClient`. However, there are a few transport-specific methods that you may need to call directly. When doing so, be sure to access your transport via the `transport` property of the `PipecatClient` instance.
 
 <ResponseField name="handleUserAudioStream" type="method">
-  If implementing your own serializer, you will need to pass the user audio
-  stream to the transport via this method, which takes an `ArrayBuffer` of audio
-  data.
+  Sends an `ArrayBuffer` of user audio to the bot through the serializer,
+  queuing it until the transport is `ready`. The transport registers this method
+  as the media manager's audio callback, so microphone audio is sent without
+  calling it; call it only for audio from another source.
 
 ```javascript
 transport.handleUserAudioStream(chunk.data);
 ```
 
 </ResponseField>
+
+<ResponseField name="sendRawMessage" type="method">
+  Sends a message that is not an RTVI message, encoded with the serializer's
+  `serialize()`. Use it to send Twilio media stream events, such as `connected`
+  and `start`, with `TwilioSerializer`.
+
+```javascript
+transport.sendRawMessage({
+  event: "connected",
+  protocol: "Call",
+  version: "1.0.0",
+});
+```
+
+</ResponseField>
+
 ## Media Support
 
 `WebSocketTransport` carries audio only. `cam`, `screenShare`, and `botVideo` are `false`, and `mic` follows the configured media manager. See [`mediaSupport`](/api-reference/client/js/client-methods#mediasupport).
@@ -213,7 +250,7 @@ The transport implements the various [`PipecatClient` event handlers](/api-refer
 
 ## Reconnection Handling
 
-The WebSocketTransport does provide reconnection handling. If the WebSocket connection is lost, it will attempt to reconnect twice. If all reconnection attempts fail, the transport will gracefully disconnect.
+`WebSocketTransport` does not reconnect. If the WebSocket connection closes unexpectedly, the transport reports a fatal error through [`onError`](/api-reference/client/js/callbacks) and the `PipecatClient` disconnects.
 
 ## More Information
 
