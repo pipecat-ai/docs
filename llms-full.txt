@@ -1520,21 +1520,21 @@ Several frame classes were renamed or removed. Update any direct references in y
 
 Individual services renamed or removed configuration parameters. Find your service below to see what changed.
 
-| Service                    | Removed param                | Replacement                            |
-| -------------------------- | ---------------------------- | -------------------------------------- |
-| `DeepgramSTTService`       | `url`                        | `base_url`                             |
-| `DeepgramSTTService`       | `vad_events`                 | Removed                                |
-| `FishAudioTTSService`      | `model`                      | `reference_id`                         |
-| `GladiaSTTService`         | `InputParams.language`       | Removed                                |
-| `GladiaSTTService`         | `InputParams.confidence`     | Removed                                |
-| `GeminiTTSService`         | `api_key`                    | Removed                                |
-| `GeminiLiveLLMService`     | `base_url`                   | `http_options`                         |
-| `GoogleVertexLLMService`   | `InputParams`                | Removed (`project_id` now required)    |
-| `MiniMaxHttpTTSService`    | `english_normalization`      | `text_normalization`                   |
-| `SimliVideoService`        | `simli_config`               | `api_key` and `face_id` (required str) |
-| `AnthropicLLMService`      | `enable_prompt_caching_beta` | `enable_prompt_caching`                |
-| `AWSNovaSonicLLMService`   | `send_transcription_frames`  | Removed                                |
-| `OpenAIRealtimeLLMService` | `send_transcription_frames`  | Removed                                |
+| Service                    | Removed param                      | Replacement                                        |
+| -------------------------- | ---------------------------------- | -------------------------------------------------- |
+| `DeepgramSTTService`       | `url`                              | `base_url`                                         |
+| `DeepgramSTTService`       | `vad_events`                       | Removed                                            |
+| `FishAudioTTSService`      | `model` (the voice's reference ID) | `settings=FishAudioTTSService.Settings(voice=...)` |
+| `GladiaSTTService`         | `InputParams.language`             | Removed                                            |
+| `GladiaSTTService`         | `InputParams.confidence`           | Removed                                            |
+| `GeminiTTSService`         | `api_key`                          | Removed                                            |
+| `GeminiLiveLLMService`     | `base_url`                         | `http_options`                                     |
+| `GoogleVertexLLMService`   | `InputParams`                      | Removed (`project_id` now required)                |
+| `MiniMaxHttpTTSService`    | `english_normalization`            | `text_normalization`                               |
+| `SimliVideoService`        | `simli_config`                     | `api_key` and `face_id` (required str)             |
+| `AnthropicLLMService`      | `enable_prompt_caching_beta`       | `enable_prompt_caching`                            |
+| `AWSNovaSonicLLMService`   | `send_transcription_frames`        | Removed                                            |
+| `OpenAIRealtimeLLMService` | `send_transcription_frames`        | Removed                                            |
 
 ## 8. Transport Parameters
 
@@ -1589,7 +1589,7 @@ Smaller breaking changes across the rest of the API.
 
 - Deprecated RTVI models (`RTVIConfig`, `RTVIServiceConfig`) removed
 - `RTVIActionFrame` removed
-- `RTVIProcessor.handle_function_call` and `handle_function_call_start` removed
+- `RTVIProcessor.handle_function_call_start` removed. `RTVIProcessor.handle_function_call` is deprecated and will be removed in 2.0.0: `RTVIObserver` sends function call events to the client as `llm-function-call-in-progress`
 
 ### Other
 
@@ -2427,8 +2427,7 @@ For client/server applications using room-based WebRTC, a handshake ensures both
 ```python
 @rtvi.event_handler("on_client_ready")
 async def on_client_ready(rtvi):
-    await rtvi.set_bot_ready()  # Confirm readiness to client
-    # Start the conversation
+    # PipelineWorker has already sent bot-ready; start the conversation
     await worker.queue_frames([LLMRunFrame()])
 ```
 
@@ -3547,14 +3546,13 @@ This ensures all audio processors use consistent sample rates without manual con
 
 Many STT services in Pipecat default to `Language.EN` (English). If you need to transcribe speech in other languages or let the model auto-detect the spoken language, you can enable multilingual support. However, providers implement this differently:
 
-**`language=None`** — Whisper-based services (Groq, OpenAI, local Whisper) and ElevenLabs support automatic language detection when no language is specified:
+**`language=None`**: local Whisper (`WhisperSTTService`) and ElevenLabs support automatic language detection when no language is specified; `GroqSTTService` and `OpenAISTTService` require a language:
 
 ```python
-from pipecat.services.groq.stt import GroqSTTService
+from pipecat.services.whisper.stt import WhisperSTTService
 
-stt = GroqSTTService(
-    api_key=os.getenv("GROQ_API_KEY"),
-    settings=GroqSTTService.Settings(
+stt = WhisperSTTService(
+    settings=WhisperSTTService.Settings(
         language=None,  # Auto-detect language
     ),
 )
@@ -4269,6 +4267,7 @@ async def on_function_calls_started(service, function_calls):
 
 - **`on_completion_timeout`**: Triggered when LLM requests timeout
 - **`on_function_calls_started`**: Triggered when function calls are initiated
+- **`on_function_calls_cancelled`**: Triggered after one or more in-progress function calls are cancelled
 
 These handlers enable you to provide user feedback and implement error recovery strategies.
 
@@ -8921,11 +8920,12 @@ await llm.queue_frame(
     LLMSummarizeContextFrame(
         config=LLMContextSummaryConfig(
             target_context_tokens=2000,
-            min_messages_after_summary=2,
         )
     )
 )
 ```
+
+Keep a per-request `min_messages_after_summary` at or above the value in `auto_context_summarization_config` (4 by default): with a lower value, the summary is usually discarded instead of applied.
 
 See the [complete example](https://github.com/pipecat-ai/pipecat/blob/main/examples/context-summarization/context-summarization-manual-openai.py) for a full working implementation.
 
@@ -9668,7 +9668,11 @@ async def on_service_usage(observer, record):
     if record.kind == "llm":
         print(f"LLM: {record.total_tokens} tokens")
 
-worker = PipelineWorker(pipeline, observers=[observer])
+worker = PipelineWorker(
+    pipeline,
+    params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    observers=[observer],
+)
 ```
 
 Records arrive per piece of work (not summed), allowing flexible grouping by turn, session, or model. See the [Service Metrics Observer](/api-reference/server/utilities/observers/service-metrics-observer) reference for full details.
@@ -9682,7 +9686,7 @@ from pipecat.observers.startup_timing_observer import StartupTimingObserver
 
 startup_observer = StartupTimingObserver()
 
-@observer.event_handler("on_startup_timing_report")
+@startup_observer.event_handler("on_startup_timing_report")
 async def on_startup_timing_report(observer, report):
     print(f"Total startup: {report.total_duration_secs:.3f}s")
     for timing in report.processor_timings:
@@ -9692,11 +9696,12 @@ async def on_startup_timing_report(observer, report):
 Additionally, it tracks the time taken to connect to the transport and the time taken to connect to the client.
 
 ```python
-@observer.event_handler("on_transport_timing_report")
+@startup_observer.event_handler("on_transport_timing_report")
 async def on_transport_timing_report(observer, report):
     if report.bot_connected_secs is not None:
         print(f"Bot connected: {report.bot_connected_secs:.3f}s")
-    print(f"Client connected: {report.client_connected_secs:.3f}s")
+    if report.client_connected_secs is not None:
+        print(f"Client connected: {report.client_connected_secs:.3f}s")
 ```
 
 ### UserBotLatencyObserver
@@ -10841,7 +10846,7 @@ The worker gets its bus from the runner when added with `runner.add_workers()`. 
 
 ## Named bridges
 
-When you have multiple bridges in a system, you can name them to control which agents receive frames from which bridge. This is useful with [parallel pipelines](/server/pipeline/parallel-pipeline) where each branch has its own bridge (for example, separate audio and video branches):
+When you have multiple bridges in a system, you can name them to control which agents receive frames from which bridge. This is useful with [parallel pipelines](/api-reference/server/pipeline/parallel-pipeline) where each branch has its own bridge (for example, separate audio and video branches):
 
 ```python
 voice_bridge = BusBridgeProcessor(
@@ -17507,10 +17512,10 @@ The Pipecat development runner provides built-in webhook handling for Daily PSTN
 #### 1. Run your bot with dial-in support
 
 ```bash
-uv run bot.py -t daily --dialin
+uv run bot.py -t daily
 ```
 
-This starts a FastAPI server on port 7860 with a `/daily-dialin-webhook` endpoint. `--dialin` no longer requires `-t daily`; passing `-t daily` simply restricts the runner to the Daily transport.
+This starts a FastAPI server on port 7860 with a `/daily-dialin-webhook` endpoint. The runner mounts the endpoint by default; `--no-dialin` turns it off.
 
 #### 2. Expose your bot to the internet
 
@@ -17721,12 +17726,13 @@ async def bot(args: RunnerArguments):
             audio_in_enabled=True,
             audio_out_enabled=True,
             video_out_enabled=False,
-            transcription_enabled=True,
         )
     )
 
-    # Start the dial-out call
-    await transport.start_dialout(args.phone_number)
+    # Dial out once the bot has joined the room
+    @transport.event_handler("on_joined")
+    async def on_joined(transport, data):
+        await transport.start_dialout({"phoneNumber": args.phone_number})
 
     # Pass transport to your bot pipeline
     # Your bot setup and pipeline creation here...
@@ -18006,7 +18012,6 @@ async def run_bot(room_url: str, token: str, call_sid: str, sip_endpoint: str):
             audio_in_enabled=True,
             audio_out_enabled=True,
             video_out_enabled=False,
-            transcription_enabled=True,
         ),
     )
 
@@ -18060,7 +18065,6 @@ async def run_bot(room_url: str, token: str, target_number: str, sip_uri: str):
             audio_in_enabled=True,
             audio_out_enabled=True,
             video_out_enabled=False,
-            transcription_enabled=True,
         ),
     )
 
@@ -18284,7 +18288,6 @@ async def run_bot(room_url: str, token: str, call_sid: str, sip_endpoint: str):
             audio_in_enabled=True,
             audio_out_enabled=True,
             video_out_enabled=False,
-            transcription_enabled=True,
         )
     )
 
@@ -18416,12 +18419,13 @@ async def run_bot(room_url: str, token: str, target_number: str, sip_uri: str):
             audio_in_enabled=True,
             audio_out_enabled=True,
             video_out_enabled=False,
-            transcription_enabled=True,
         )
     )
 
-    # Initiate the outbound call through Twilio SIP
-    await transport.start_dialout(sip_uri)
+    # Dial out through Twilio SIP once the bot has joined the room
+    @transport.event_handler("on_joined")
+    async def on_joined(transport, data):
+        await transport.start_dialout({"sipUri": sip_uri})
 
     # Your bot pipeline setup here...
 ```
@@ -19000,13 +19004,13 @@ async def run_bot(websocket: WebSocket):
     # Extract call information (automatically provided by Telnyx)
     # Data format: {
     #     "stream_id": str,
-    #     "call_control_id": str,
+    #     "call_id": str,  # Telnyx's call_control_id
     #     "outbound_encoding": str,
     #     "from": str,
     #     "to": str,
     # }
     stream_id = call_data["stream_id"]
-    call_control_id = call_data["call_control_id"]
+    call_control_id = call_data["call_id"]
     outbound_encoding = call_data["outbound_encoding"]
     from_number = call_data["from"]  # Caller's number
     to_number = call_data["to"]      # Your Telnyx number
@@ -19152,7 +19156,7 @@ transport_type, call_data = await parse_telephony_websocket(websocket)
 
 # Extract call information
 stream_id = call_data["stream_id"]
-call_control_id = call_data["call_control_id"]
+call_control_id = call_data["call_id"]
 from_number = call_data["from"]  # Your Telnyx number
 to_number = call_data["to"]      # Target number you're calling
 
@@ -20215,7 +20219,7 @@ Behind `uv run bot.py` the runner is doing a fair amount of work depending on th
 - **Daily** — calls Daily's REST API to create a room and issue tokens, then either redirects the browser to the room (via `GET /daily`) or returns the room URL + token via `POST /start`.
 - **Telephony** — returns the carrier-specific XML stub (TwiML for Twilio, the equivalent for Telnyx/Plivo/Exotel) on `POST /`, then accepts the bidirectional media WebSocket at `/ws` and hands it to your bot wrapped in a `WebSocketRunnerArguments`.
 - **Plain WebSocket** — for non-telephony clients (e.g. browser apps using protobuf framing). `POST /start` with `"transport": "websocket"` returns a `wsUrl` for the `/ws-client` endpoint; the bot receives a `WebSocketRunnerArguments` with `transport_type="websocket"`.
-- **Daily PSTN dial-in** (`--dialin`) — handles Daily's pinless dial-in webhook, creates a SIP-enabled room, and dispatches the bot with full dial-in context.
+- **Daily PSTN dial-in** — handles Daily's pinless dial-in webhook at `POST /daily-dialin-webhook`, creates a SIP-enabled room, and dispatches the bot with full dial-in context. On by default; `--no-dialin` turns it off.
 
 `GET /` redirects to the prebuilt client UI at `/client/`, and `GET /status` reports which transports the running instance accepts. The `POST /start` and `/sessions/{id}/...` endpoints exposed by the runner are deliberately shaped the same way as [Pipecat Cloud](/pipecat-cloud/introduction)'s session API. That means a client built against the development runner works against PCC unchanged, and a custom production dispatcher can offer the same contract if you want clients to remain portable.
 
@@ -33293,8 +33297,8 @@ The generic WebSocket endpoint is a protocol-agnostic way to connect a WebSocket
   WebSocket, but we recommend WebRTC instead. WebRTC handles varying network
   conditions, media quality, and reconnect behavior better than raw WebSocket.
   See the [Daily WebRTC guide](/pipecat-cloud/guides/daily-webrtc) or the
-  SmallWebRTC [client SDKs](/client/js/introduction) for recommended web and
-  mobile options.
+  SmallWebRTC [client SDKs](/api-reference/client/js/overview) for recommended
+  web and mobile options.
 </Note>
 
 ## Endpoint
@@ -44750,6 +44754,18 @@ Fires the [`on_connection_error`](/api-reference/server/events/service-events#on
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
 </ParamField>
 
+<ParamField
+  path="eager_match_policy"
+  type="EagerMatchPolicy | None"
+  default="None"
+>
+  Decides whether the committed transcript is close enough to the predicted one
+  to keep the response, when `enable_eager_end_of_turn` is on. `None` uses
+  `NormalizedMatch()`. Passed to the recommended `EagerUserTurnStrategies`, so
+  it has no effect if you pass your own `user_turn_strategies`. See [User Turn
+  Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
+</ParamField>
+
 ### Settings
 
 Runtime-configurable settings passed via the `settings` constructor argument using `DeepgramFluxSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
@@ -45030,6 +45046,18 @@ Supports the standard [service connection events](/api-reference/server/events/s
   resumes speaking or the committed transcript differs from the predicted one.
   Requests `EagerUserTurnStrategies` in place of `ExternalUserTurnStrategies`
   when enabled. See [User Turn
+  Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
+</ParamField>
+
+<ParamField
+  path="eager_match_policy"
+  type="EagerMatchPolicy | None"
+  default="None"
+>
+  Decides whether the committed transcript is close enough to the predicted one
+  to keep the response, when `enable_eager_end_of_turn` is on. `None` uses
+  `NormalizedMatch()`. Passed to the recommended `EagerUserTurnStrategies`, so
+  it has no effect if you pass your own `user_turn_strategies`. See [User Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
 </ParamField>
 
@@ -51903,7 +51931,7 @@ await worker.queue_frame(
 | ----------------------------- | ----------------------------------------------------------------------- |
 | `on_completion_timeout`       | Called when an LLM completion request times out                         |
 | `on_function_calls_started`   | Called when function calls are received and execution is about to start |
-| `on_function_calls_cancelled` | Called after one or more async function calls are cancelled             |
+| `on_function_calls_cancelled` | Called after one or more in-progress function calls are cancelled       |
 
 ```python
 @llm.event_handler("on_completion_timeout")
@@ -52126,7 +52154,6 @@ await worker.queue_frame(
 
 ## Notes
 
-- **Credential resolution**: Credentials are resolved via a fallback chain: explicit parameters → environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) → botocore credential provider chain (instance profiles, IRSA, ECS task roles, SSO, credential files), so services running with IAM roles don't need to export static credentials.
 - **No-op tool handling**: AWS Bedrock requires at least one tool to be defined when tool content exists in the conversation. The service automatically adds a placeholder tool when needed to prevent API errors.
 - **Model-specific parameters**: Some models (e.g., Claude Sonnet 4.5) don't allow certain parameter combinations. The service only includes explicitly set parameters in the inference config to avoid conflicts.
 - **Retry behavior**: When `retry_on_timeout=True`, the first attempt uses the `retry_timeout_secs` timeout. If it times out, a second attempt is made with no timeout limit.
@@ -52813,7 +52840,7 @@ await worker.queue_frame(
 
 ## Event Handlers
 
-`CrusoeLLMService` supports the following event handlers, inherited from [LLMService](/server/events/service-events):
+`CrusoeLLMService` supports the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
 | Event                         | Description                                                             |
 | ----------------------------- | ----------------------------------------------------------------------- |
@@ -53572,7 +53599,7 @@ await worker.queue_frame(
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `on_completion_timeout`       | Called when an LLM completion request times out (Google `DeadlineExceeded` or stream idle timeout reached) |
 | `on_function_calls_started`   | Called when function calls are received and execution is about to start                                    |
-| `on_function_calls_cancelled` | Called after one or more async function calls are cancelled                                                |
+| `on_function_calls_cancelled` | Called after one or more in-progress function calls are cancelled                                          |
 
 ```python
 @llm.event_handler("on_completion_timeout")
@@ -54482,7 +54509,7 @@ The constructor also accepts `default_headers`, `service_tier`,
 
 ### Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `NebiusLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/guides/fundamentals/service-settings) for details.
+Runtime-configurable settings passed via the `settings` constructor argument using `NebiusLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
 | Parameter               | Type    | Default                              | Description                                                                            |
 | ----------------------- | ------- | ------------------------------------ | -------------------------------------------------------------------------------------- |
@@ -54558,7 +54585,7 @@ await worker.queue_frame(
 
 ## Event Handlers
 
-`NebiusLLMService` supports the following event handlers, inherited from [LLMService](/server/events/service-events):
+`NebiusLLMService` supports the following event handlers, inherited from [LLMService](/api-reference/server/events/service-events):
 
 | Event                         | Description                                                             |
 | ----------------------------- | ----------------------------------------------------------------------- |
@@ -55152,7 +55179,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `temperature`           | `float` | `NOT_GIVEN` | Sampling temperature (0.0 to 2.0). Lower values are more focused, higher values are more creative.  |
 | `max_tokens`            | `int`   | `NOT_GIVEN` | Maximum tokens to generate.                                                                         |
 | `top_p`                 | `float` | `NOT_GIVEN` | Top-p (nucleus) sampling (0.0 to 1.0). Controls diversity of output.                                |
-| `top_k`                 | `int`   | `None`      | Top-k sampling parameter. Not sent to OpenAI, which doesn't support it.                             |
+| `top_k`                 | `int`   | `None`      | Top-k sampling parameter. Not sent by this service, so it has no effect.                            |
 | `frequency_penalty`     | `float` | `NOT_GIVEN` | Penalty for frequent tokens (-2.0 to 2.0). Positive values discourage repetition.                   |
 | `presence_penalty`      | `float` | `NOT_GIVEN` | Penalty for new topics (-2.0 to 2.0). Positive values encourage the model to talk about new topics. |
 | `seed`                  | `int`   | `NOT_GIVEN` | Random seed for deterministic outputs.                                                              |
@@ -55597,7 +55624,7 @@ The Responses API enforces the schema on models that support it (gpt-4o-mini and
 | ----------------------------- | -------------------------------------------------------------------------------------- |
 | `on_completion_timeout`       | Called when an LLM completion request times out. `OpenAIResponsesHttpLLMService` only. |
 | `on_function_calls_started`   | Called when function calls are received and execution is about to start                |
-| `on_function_calls_cancelled` | Called after one or more async function calls are cancelled                            |
+| `on_function_calls_cancelled` | Called after one or more in-progress function calls are cancelled                      |
 | `on_connection_error`         | Called when a WebSocket connection error occurs. `OpenAIResponsesLLMService` only.     |
 
 ```python
@@ -66787,7 +66814,7 @@ class CachedGoogleTTS(TTSCacheMixin, GoogleHttpTTSService):
 
 # 2. Initialize with a memory backend
 tts = CachedGoogleTTS(
-    voice_id="en-US-Chirp3-HD-Charon",
+    settings=GoogleHttpTTSService.Settings(voice="en-US-Chirp3-HD-Charon"),
     cache_backend=MemoryCacheBackend(max_size=1000),
     cache_ttl=86400,  # Cache for 24 hours
 )
@@ -66803,7 +66830,7 @@ class CachedGoogleTTS(TTSCacheMixin, GoogleHttpTTSService):
     pass
 
 tts = CachedGoogleTTS(
-    voice_id="en-US-Chirp3-HD-Charon",
+    settings=GoogleHttpTTSService.Settings(voice="en-US-Chirp3-HD-Charon"),
     cache_backend=RedisCacheBackend(
         redis_url="redis://localhost:6379/0",
         key_prefix="pipecat:tts:",
@@ -68970,15 +68997,14 @@ _Deprecated since 0.0.105, removed in 2.0.0._ Use `settings=GeminiLiveLLMService
 </ParamField>
 
 <ParamField path="params" type="InputParams" default="InputParams()" deprecated>
-  Runtime-configurable generation and session settings. See
-  [Settings](#settings) below.
+  Generation and session settings.
 
 _Deprecated since 0.0.105, removed in 2.0.0._ Use `settings=GeminiLiveLLMService.Settings(...)` instead.
 
 </ParamField>
 
 <ParamField path="settings" type="GeminiLiveLLMService.Settings" default="None">
-  Runtime-configurable settings. See [Settings](#settings) below.
+  Generation and session settings. See [Settings](#settings) below.
 </ParamField>
 
 <ParamField path="start_audio_paused" type="bool" default="False">
@@ -69970,13 +69996,13 @@ Before using Inworld Realtime services, you need:
 
 ### Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `InworldRealtimeLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+Runtime-configurable settings passed via the `settings` constructor argument using `InworldRealtimeLLMService.Settings(...)`. `model`, `system_instruction`, and `session_properties` can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
 | Parameter            | Type                | Default                  | Description                                                                                                                                                                                                                                  |
 | -------------------- | ------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`              | `str`               | `"openai/gpt-4.1-mini"`  | Model identifier. _(Inherited from base settings.)_                                                                                                                                                                                          |
 | `system_instruction` | `str`               | `None`                   | System instruction/prompt. _(Inherited from base settings.)_                                                                                                                                                                                 |
-| `temperature`        | `float`             | `None`                   | Temperature for response generation. Not applied at runtime. _(Inherited from base settings.)_                                                                                                                                               |
+| `temperature`        | `float`             | `None`                   | Temperature for response generation. A runtime update to `temperature` alone isn't sent; the new value goes out with the next `model`, `system_instruction`, or `session_properties` update. _(Inherited from base settings.)_               |
 | `session_properties` | `SessionProperties` | `SessionProperties(...)` | Session-level configuration (voice, audio config, tools, etc.). Pipecat's default uses semantic VAD turn detection, `inworld/inworld-stt-1` transcription, `inworld-tts-2` with voice `Clive`, and PCM audio at the pipeline's sample rates. |
 
 <Note>
@@ -70749,7 +70775,7 @@ _Deprecated since 0.0.105, removed in 2.0.0._ Use `settings=OpenAIRealtimeLLMSer
 
 ### Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `OpenAIRealtimeLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+Runtime-configurable settings passed via the `settings` constructor argument using `OpenAIRealtimeLLMService.Settings(...)`. `system_instruction` and `session_properties` can be updated mid-conversation with `LLMUpdateSettingsFrame`; `model` is fixed for the session. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
 | Parameter            | Type                | Default               | Description                                                                                                                                                    |
 | -------------------- | ------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -70974,6 +71000,7 @@ await worker.queue_frame(
 - **Turn detection options**: Use `TurnDetection` for traditional VAD, `SemanticTurnDetection` for AI-based turn detection, or `False` to disable server-side detection and manage turns manually.
 - **Manual turn detection pre-roll**: When server-side turn detection is disabled (`turn_detection=False`), the service maintains a rolling audio buffer that is replayed after interruptions to preserve speech onsets. Configure the buffer duration with `user_audio_preroll_secs` or let it auto-size from the upstream VAD's `start_secs`.
 - **Audio sample rates**: Output audio frames are always labeled 24 kHz mono PCM, so leave `audio.output.format` unset or use `PCMAudioFormat()`. Input audio is sent without resampling and OpenAI reads PCM input as 24 kHz, so audio at the pipeline's default `audio_in_sample_rate` of 16000 reaches the model as if it were 24 kHz.
+- **G.711 formats**: The service passes audio through without converting it, and pipeline audio frames are 16-bit PCM, so use `PCMAudioFormat` rather than `PCMUAudioFormat` or `PCMAAudioFormat`; for telephony, the transport's serializer converts to and from G.711.
 - **Video support**: Video frames can be sent to the model for multimodal input, at most one per second; frames in between are dropped. Control the detail level with `video_frame_detail` and pause/resume with `set_video_input_paused()`.
 - **Transcription frames**: User speech transcription frames are always emitted upstream when input audio transcription is configured.
 - **System instruction precedence**: The `system_instruction` from service settings takes precedence over an initial system message in the LLM context. A warning is logged when both are set.
@@ -83342,8 +83369,8 @@ python bot.py -t daily
 # Direct connection for testing (bypasses web server)
 python bot.py -d
 
-# Enable PSTN dial-in webhook handling
-python bot.py --dialin
+# Leave out the PSTN dial-in webhook, which is mounted by default
+python bot.py --no-dialin
 ```
 
 **Runner Arguments**: `DailyRunnerArguments`
@@ -83740,7 +83767,7 @@ The development runner handles Daily PSTN dial-in webhooks unless started with `
 ### Enabling Dial-In Support
 
 ```bash
-python bot.py -t daily --dialin
+python bot.py -t daily
 # Webhook endpoint available at:
 # POST http://localhost:7860/daily-dialin-webhook
 ```
@@ -83825,8 +83852,8 @@ ngrok http 7860
 
 <Note>
   Dial-in is a Daily feature and requires a valid `DAILY_API_KEY` environment
-  variable. `--dialin` no longer requires `-t daily`, but you can still pass it
-  to restrict the runner to Daily.
+  variable. The webhook doesn't require `-t daily`, but you can pass it to
+  restrict the runner to Daily.
 </Note>
 
 ## Error Handling and Debugging
@@ -83860,7 +83887,7 @@ All transports are available from `python bot.py`; the `-t` form below restricts
 | WebRTC        | `python bot.py -t webrtc`                   | http://localhost:7860/client    | None                                                                  |
 | Daily         | `python bot.py -t daily`                    | `GET /daily`, `POST /start`     | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
 | Daily Direct  | `python bot.py -d`                          | Direct connection               | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
-| Daily Dial-In | `python bot.py --dialin`                    | Phone calls via Daily PSTN      | `DAILY_API_KEY` (Required)                                            |
+| Daily Dial-In | `python bot.py`                             | Phone calls via Daily PSTN      | `DAILY_API_KEY` (Required)                                            |
 | LiveKit       | `python bot.py -t livekit`                  | `POST /start`                   | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (All required) |
 | Twilio        | `python bot.py -t twilio -x proxy.ngrok.io` | Phone calls                     | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`                             |
 | Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io` | Phone calls                     | `TELNYX_API_KEY`                                                      |
@@ -88740,10 +88767,11 @@ Events on TTS service instances. Available on all WebSocket-based TTS services. 
 
 Events on LLM service instances. See [Service Events](/api-reference/server/events/service-events) for details.
 
-| Event                       | Description                                |
-| --------------------------- | ------------------------------------------ |
-| `on_function_calls_started` | LLM has started making function/tool calls |
-| `on_completion_timeout`     | LLM response timed out                     |
+| Event                         | Description                                |
+| ----------------------------- | ------------------------------------------ |
+| `on_function_calls_started`   | LLM has started making function/tool calls |
+| `on_function_calls_cancelled` | In-progress function calls were cancelled  |
+| `on_completion_timeout`       | LLM response timed out                     |
 
 **OpenAI Realtime / Grok Realtime:**
 
@@ -88857,7 +88885,7 @@ Events on WebSocket transport instances.
 | -------------------- | ------------------------------------------------------- |
 | `on_summary_applied` | A summary has been successfully applied to the context. |
 
-**ServiceSwitcher:**
+**ServiceSwitcherStrategy** (`switcher.strategy` on a `ServiceSwitcher`):
 
 | Event                 | Description                 |
 | --------------------- | --------------------------- |
@@ -89220,6 +89248,24 @@ async def on_function_calls_started(service, function_calls):
 | ---------------- | ------------ | ------------------------------------------ |
 | `service`        | `LLMService` | The LLM service instance                   |
 | `function_calls` | `list`       | List of function call objects from the LLM |
+
+### on_function_calls_cancelled
+
+Fired after one or more in-progress function calls are cancelled: by an interruption (for calls registered with `cancel_on_interruption=True`), a function call timeout, the model cancelling a `cancellable_by_llm=True` call, or `cancel_function_calls()`.
+
+```python
+@llm.event_handler("on_function_calls_cancelled")
+async def on_function_calls_cancelled(service, function_calls):
+    for call in function_calls:
+        print(f"Cancelled function: {call.function_name}")
+```
+
+**Parameters:**
+
+| Parameter        | Type         | Description                            |
+| ---------------- | ------------ | -------------------------------------- |
+| `service`        | `LLMService` | The LLM service instance               |
+| `function_calls` | `list`       | The function calls that were cancelled |
 
 ### on_completion_timeout
 
@@ -89584,15 +89630,15 @@ The processor handles `send-file` client messages (protocol 2.2.0) that send a f
 }
 ```
 
-| Field                     | Description                                                                                                                        |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `content`                 | Text to accompany the file.                                                                                                        |
-| `file.format`             | MIME type of the file, e.g. `application/pdf`.                                                                                     |
-| `file.name`               | Optional file name.                                                                                                                |
-| `file.source`             | Either `{"type": "bytes", "bytes": "<base64>"}` (images may also include `width` and `height`) or `{"type": "url", "url": "..."}`. |
-| `options.run_immediately` | Interrupt the bot and run the LLM right away. Defaults to `true`.                                                                  |
-| `options.audio_response`  | Speak the response. When `false`, TTS is skipped for this response. Defaults to `true`.                                            |
-| `options.custom_options`  | Provider-specific options, e.g. `detail` for OpenAI or `citations` for Bedrock.                                                    |
+| Field                     | Description                                                                                                                               |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `content`                 | Text to accompany the file.                                                                                                               |
+| `file.format`             | MIME type of the file, e.g. `application/pdf`.                                                                                            |
+| `file.name`               | Optional file name.                                                                                                                       |
+| `file.source`             | Either `{"type": "bytes", "bytes": "<base64>"}` (images may also include `width` and `height`) or `{"type": "url", "url": "..."}`.        |
+| `options.run_immediately` | Interrupt the bot and run the LLM right away. Defaults to `true`.                                                                         |
+| `options.audio_response`  | Speak the response. When `false`, TTS is skipped for this response. Defaults to `true`.                                                   |
+| `options.custom_options`  | Provider-specific options, such as `detail` for OpenAI or `citations` for Bedrock. Not passed to the LLM service, so they have no effect. |
 
 Image files sent as bytes are pushed downstream as a `UserImageRawFrame`; all other files are pushed as a [`UserFileRawFrame`](/api-reference/server/frames/system-frames#userfilerawframe), both appended to the context.
 
@@ -94916,10 +94962,10 @@ async def on_idle_timeout(worker):
 | `worker`  | `PipelineWorker` | The pipeline worker instance |
 
 <Note>
-  If `cancel_on_idle_timeout` is `True` (the default), the pipeline will be
-  automatically cancelled after this handler runs, before anything the handler
-  queued is heard. Set it to `False` if you want to handle idle timeouts
-  yourself.
+  If `cancel_on_idle_timeout` is `True` (the default), the worker is cancelled
+  as soon as this event fires, without waiting for the handler to finish, so
+  anything the handler queues isn't heard. Set it to `False` if you want to
+  handle idle timeouts yourself.
 </Note>
 
 # Pipeline Idle Detection
