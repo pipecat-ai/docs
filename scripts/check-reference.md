@@ -20,8 +20,10 @@ python3 -m unittest discover -s scripts/tests
 ```
 
 Other options: `--page GLOB`, `--only KIND,...`, `--json FILE`,
-`--format text|github|summary`, `--ignore FILE`, and `--docs-root DIR` (the
-docs tree to check; the tests point it at their fixtures).
+`--format text|github|summary`, `--ignore FILE`, `--docs-root DIR` (the docs
+tree to check; the tests point it at their fixtures), and `--no-decay-alarm`
+(check anyway when pipecat's code doesn't look as expected, for example an old
+or partial checkout; never in CI).
 
 Exit codes: `0` no findings, `1` findings, `2` the decay alarm fired (see
 below).
@@ -178,14 +180,17 @@ findings. The floors are about half of the counts against pipecat main on
 | default_settings assignments  | 132        | 65    |
 | registered events             | 264        | 130   |
 | fired events                  | 375        | 185   |
-| deprecated parameters         | 318        | 155   |
-| deprecated classes            | 103        | 50    |
-| deprecated methods            | 30         | 15    |
 | public top-level names        | 1708       | 850   |
 | API key names                 | 66         | 33    |
 | install extras                | 90         | 45    |
 | CLI commands                  | 3          | 2     |
 | CLI options                   | 55         | 27    |
+
+Deprecations have no floor, because pipecat removes them in bulk at a major
+release. Instead, `scripts/deprecations/deprecations.json` must exist, have
+`schema_version` 1 and a top-level `deprecations` list, and the checker must
+understand at least 90% of its entries (a string `subject` and `message`, and a
+known `kind`). An emptier registry is fine; one in a new format is not.
 
 The counts come from the pipecat source alone, so `--pages-from` can't set the
 alarm off.
@@ -197,10 +202,28 @@ When it fires:
 2. If the convention changed, teach the checker the new one. Change the fake
    pipecat in `scripts/tests/fixtures/pipecat` to the new convention first, so
    the tests show the rule working again, then change the parser.
-3. If pipecat really has less of something (pipecat 2.0 will remove most
-   deprecations, for example), lower that floor and update the table above with
-   the new count and date. Don't lower a floor without knowing why the count
-   fell.
+3. If pipecat really has less of something, lower that floor and update the
+   table above with the new count and date. Don't lower a floor without knowing
+   why the count fell.
+
+## Known Gaps
+
+Found while writing the tests and left as they are. Each can miss a problem or
+report one wrongly:
+
+- Parameters and Settings fields share one "documented" set per class, so a
+  deprecated `model` parameter is never reported missing once the Settings
+  table has a `model` row.
+- The word "deprecated" anywhere in an entry or table row counts as marking it,
+  which can hide an `unmarked-deprecation`.
+- When `deprecations.json` lists a subject twice, only the last entry is kept
+  (`AudioBufferProcessor` has two).
+- CLI page headings are matched inside code blocks too, and a syntax error in
+  any file under pipecat's `src/pipecat/cli` stops the checker.
+- Community pages get the first-sample import check but not the API key or
+  prose checks.
+- Some files are opened without being closed (harmless in a short run; the
+  tests silence the warnings).
 
 ## CI
 

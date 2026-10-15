@@ -527,10 +527,45 @@ class TestDecayAlarm(unittest.TestCase):
         with open(path, "w") as f:
             f.write(text.replace(old, new))
 
+    REGISTRY = os.path.join("scripts", "deprecations", "deprecations.json")
+
     def test_deprecation_registry_gone(self):
-        code, out, _ = self.decay(lambda r: os.remove(os.path.join(r, "scripts", "deprecations", "deprecations.json")))
+        code, out, _ = self.decay(lambda r: os.remove(os.path.join(r, self.REGISTRY)))
         self.assertEqual(code, 2)
-        self.assertIn("deprecated parameters: found 0", out)
+        self.assertIn("deprecations.json: not found", out)
+
+    def test_deprecation_registry_key_renamed(self):
+        code, out, _ = self.decay(lambda r: self.rewrite(r, self.REGISTRY, '"subject":', '"target":'))
+        self.assertEqual(code, 2)
+        self.assertIn("deprecations.json: understood 0 of", out)
+
+    def test_deprecation_registry_schema_bumped(self):
+        code, out, _ = self.decay(lambda r: self.rewrite(r, self.REGISTRY, '"schema_version": 1', '"schema_version": 2'))
+        self.assertEqual(code, 2)
+        self.assertIn("schema_version 2, expected 1", out)
+
+    def test_deprecations_removed_in_bulk(self):
+        """A major release removes most deprecations: an emptier registry is
+        not decay."""
+
+        def empty(root):
+            path = os.path.join(root, self.REGISTRY)
+            with open(path) as f:
+                data = json.load(f)
+            data["deprecations"] = []
+            with open(path, "w") as f:
+                json.dump(data, f)
+
+        code, out, _ = self.decay(empty)
+        self.assertNotEqual(code, 2)
+        self.assertNotIn("decay-alarm", out)
+
+    def test_no_decay_alarm_flag(self):
+        floors = {**self.counts, "install extras": 1000}
+        code, out, findings = run_checker(DOCS_TMP, "--no-decay-alarm", floors=floors)
+        self.assertEqual(code, 1)  # the fixtures' findings, reported anyway
+        self.assertNotIn("decay-alarm", out)
+        self.assertTrue(findings)
 
     def test_settings_convention_changed(self):
         rel = os.path.join("src", "pipecat", "services", "acme", "tts.py")
