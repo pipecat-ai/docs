@@ -72,12 +72,15 @@ EXPECTED = {
     (GUIDE, "sample-unknown-event", "on_acme_bogus"),
     (GUIDE, "sample-deprecated-arg", "voice_id"),
     (GUIDE, "sample-deprecated-arg", "set_voice(legacy)"),
+    (GUIDE, "sample-deprecated-arg", "tool(timeout)"),
     (GUIDE, "sample-deprecated-call", "old_flush"),
     (GUIDE, "sample-deprecated-call", "OldAcmeTTSService"),
     (GUIDE, "sample-undefined-name", "os"),
     (GUIDE, "sample-undefined-name", "TextFrame"),
     (GUIDE, "sample-unknown-env", "ACME_TTS_API_KEY"),
     (GUIDE, "prose-unknown-name", "AcmeTurboTTSService"),
+    (GUIDE, "prose-unknown-name", "AcmeVoiceTransport"),
+    (GUIDE, "prose-unknown-name", "AcmeStreamTransport"),
     (GUIDE, "unknown-extra", "bogus-extra"),
     (EVAL, "cli-stale-option", "--bogus-flag"),
     (EVAL, "cli-missing-option", "-v"),
@@ -294,7 +297,25 @@ class TestSamples(Case):
 
     def test_sample_deprecated_arg_skips_current_args(self):
         args = {f["name"] for f in FINDINGS if f["page"] == GUIDE and f["kind"] == "sample-deprecated-arg"}
-        self.assertEqual(args, {"voice_id", "set_voice(legacy)"})
+        self.assertEqual(args, {"voice_id", "set_voice(legacy)", "tool(timeout)"})
+
+    def test_sample_deprecated_arg_in_decorators(self):
+        # `@tool(timeout=60)` and `@tool_decorator.tool(timeout=30)`: the
+        # registry's `tool.timeout`, a parameter of a function, not a class.
+        found = [f for f in FINDINGS if f["kind"] == "sample-deprecated-arg" and f["name"] == "tool(timeout)"]
+        with open(os.path.join(DOCS_TMP, GUIDE)) as f:
+            text = f.read().split("\n")
+        self.assertEqual(
+            sorted(text[f["line"] - 1] for f in found),
+            ["@tool(cancel_on_interruption=False, timeout=60)", "@tool_decorator.tool(timeout=30)"],
+        )
+        self.assertEqual({f["class"] for f in found}, {"tool"})
+
+    def test_sample_deprecated_arg_in_decorators_skips_current_and_other_packages(self):
+        # Not `@tool(..., timeout_secs=60)` (current), `@tool` (no call), or
+        # `@mcp.tool(timeout=60)` (`mcp` isn't imported from pipecat).
+        found = [f for f in FINDINGS if f["kind"] == "sample-deprecated-arg" and f["name"].startswith("tool(")]
+        self.assertEqual(len(found), 2, found)
 
     def test_sample_deprecated_call(self):
         self.flagged(GUIDE, "sample-deprecated-call", "OldAcmeTTSService")
@@ -345,6 +366,20 @@ class TestProse(Case):
     def test_prose_unknown_name(self):
         self.flagged(GUIDE, "prose-unknown-name", "AcmeTurboTTSService")
 
+    def test_prose_unknown_name_in_frontmatter(self):
+        self.flagged(GUIDE, "prose-unknown-name", "AcmeVoiceTransport")  # title, no backticks
+        self.flagged(GUIDE, "prose-unknown-name", "AcmeStreamTransport")  # description, no backticks
+        lines = {f["name"]: f["line"] for f in FINDINGS if f["kind"] == "prose-unknown-name"}
+        self.assertEqual((lines["AcmeVoiceTransport"], lines["AcmeStreamTransport"]), (2, 3))
+
+    def test_prose_unknown_name_in_frontmatter_exclusions(self):
+        self.not_flagged(GUIDE, "prose-unknown-name", "AcmeTTSService")  # real
+        self.not_flagged(GUIDE, "prose-unknown-name", "MyCustomProcessor")  # the page's sample defines it
+        self.not_flagged(GUIDE, "prose-unknown-name", "AcmePlainTransport")  # body text without backticks
+        self.not_flagged(OLD, "prose-unknown-name", "AcmeRetiredTransport")  # "replaced"
+        self.not_flagged(CLIENT, "prose-unknown-name", "AcmeWebSocketTransport")  # client SDK page
+        self.not_flagged(COMMUNITY, "prose-unknown-name", "CommunityAcmeTTSService")  # community page
+
     def test_prose_unknown_name_exclusions(self):
         for name in (
             "AcmeLegacyTTSService",  # a line about a removed API
@@ -358,7 +393,8 @@ class TestProse(Case):
         ):
             self.not_flagged(GUIDE, "prose-unknown-name", name)
         names = {f["name"] for f in FINDINGS if f["kind"] == "prose-unknown-name"}
-        self.assertEqual(names, {"AcmeTurboTTSService"})  # also not on client or community pages
+        # Also not on client or community pages.
+        self.assertEqual(names, {"AcmeTurboTTSService", "AcmeVoiceTransport", "AcmeStreamTransport"})
 
     def test_client_pages_skipped(self):
         self.page_clean(CLIENT)

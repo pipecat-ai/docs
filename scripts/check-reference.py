@@ -15,19 +15,23 @@ From the source (parsed with `ast`, nothing is imported or installed):
   - the class's `Settings` dataclass fields, and the Pipecat defaults set in
     `__init__` by `default_settings = self.Settings(...)`
   - events registered with `self._register_event_handler("on_...")`
+  - top-level functions' parameters, following re-exports
   - deprecations, from pipecat's generated `scripts/deprecations/deprecations.json`
 
 From every page's Python code samples (except the migration guides):
   - calls to pipecat classes: constructor keywords, required arguments, and
     deprecated arguments; methods called on the objects they return; the
     event names given to `event_handler`
+  - calls to pipecat functions the page imports, decorators included
+    (`@tool(timeout=60)`): deprecated arguments
   - in the page's first sample, which has complete imports (STYLE.md):
     standard-library modules and pipecat classes it uses without importing
   - API keys handed to pipecat classes under names pipecat never uses
 
 From every page's text (except the migration guides):
-  - backticked class names outside code blocks, on pages about the Python
-    framework (not the client SDKs or the Pipecat Cloud SDK)
+  - backticked class names outside code blocks, and class names in the
+    frontmatter title and description (backticked or not), on pages about the
+    Python framework (not the client SDKs or the Pipecat Cloud SDK)
   - `pipecat-ai[...]` install extras, against pipecat's pyproject.toml
 
 From each page under api-reference/server and api-reference/pipecat-flows:
@@ -53,11 +57,11 @@ Findings, most to least certain:
   sample-missing-arg     sample leaves out a required argument
   sample-unknown-attr    sample calls a method the object doesn't have
   sample-unknown-event   sample handles an event the class never registers
-  sample-deprecated-arg  sample passes a deprecated argument
+  sample-deprecated-arg  sample passes a deprecated argument (constructor, method, function, decorator)
   sample-deprecated-call sample uses a deprecated class or method
   sample-undefined-name  first sample uses a module or pipecat class it doesn't import
   sample-unknown-env     sample reads an API key pipecat's env.example and examples never use
-  prose-unknown-name     prose names a class pipecat doesn't have
+  prose-unknown-name     prose, title or description names a class pipecat doesn't have
   unknown-extra          install extra pipecat's pyproject.toml doesn't declare
   cli-*                  api-reference/cli pages against pipecat's Typer commands
   stale-ignore           ignore-file entry no finding matches (full runs only)
@@ -279,6 +283,9 @@ class SourceIndex:
         # Classes and functions defined at the top of a pipecat module: what a
         # sample has to import.
         self.top_level: set[str] = set()
+        # Top-level functions: name -> {module: positional parameter names}.
+        # A sample's `@tool(...)` resolves to one through its import.
+        self.functions: dict[str, dict[str, list[str]]] = defaultdict(dict)
         for dirpath, dirnames, filenames in walk(self.root):
             dirnames[:] = [d for d in dirnames if d not in ("tests", "__pycache__")]
             for fn in filenames:
@@ -328,6 +335,9 @@ class SourceIndex:
             for node in tree.body:
                 if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
                     self.top_level.add(node.name)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+                    a = node.args
+                    self.functions[node.name][module] = [x.arg for x in a.posonlyargs + a.args]
         refs = self.refs[module]
         for sub in ast.walk(tree):
             if isinstance(sub, ast.Attribute):
@@ -692,6 +702,18 @@ class SourceIndex:
         if name in c.members or name in c.fields:
             return True
         return any(self.has_member(bc, name, seen) for b in c.bases if (bc := self.base(c, b)))
+
+    def function(self, name, module, depth=0):
+        """(defining module, name there, positional parameter names) of the
+        function `from module import name` binds, following re-exports; None
+        when it isn't a pipecat function."""
+        defs = self.functions.get(name, {})
+        if module in defs:
+            return module, name, defs[module]
+        src = self.module_imports.get(module, {}).get(name)
+        if src and depth < 5:
+            return self.function(src[1], src[0], depth + 1)
+        return None
 
     def deprecation(self, cls, param):
         """Registry entry for `cls.param`, looked up through the class's bases."""
@@ -1224,6 +1246,7 @@ class Checker:
 
 CODE_RE = re.compile(r"^([ \t]*)```(?:python|py)\b[^\n]*\n(.*?)^[ \t]*```", re.S | re.M)
 SAMPLE_IMPORT_RE = re.compile(r"^\s*from\s+(pipecat[\w.]*)\s+import\s+(\([^)]*\)|[^\n]*)", re.M)
+SAMPLE_MODULE_IMPORT_RE = re.compile(r"^\s*import\s+(pipecat[\w.]*)\s+as\s+(\w+)", re.M)
 
 
 def samples(text):
@@ -1250,6 +1273,13 @@ def check_samples(checker, page, text):
                 continue
             orig, _, alias = name.partition(" as ")
             imported[(alias or orig).strip()] = (orig.strip(), m.group(1))
+    # Local names for pipecat modules (`from pipecat.workers.llm import
+    # tool_decorator`, `import pipecat.workers.llm as llm_pkg`), for
+    # `module.name(...)` calls.
+    modules = {n: f"{mod}.{orig}" for n, (orig, mod) in imported.items() if f"{mod}.{orig}" in idx.module_imports}
+    for m in SAMPLE_MODULE_IMPORT_RE.finditer(text):
+        if m.group(1) in idx.module_imports:
+            modules[m.group(2)] = m.group(1)
 
     def resolve(name):
         if name in imported:
@@ -1267,12 +1297,25 @@ def check_samples(checker, page, text):
         if isinstance(node, ast.Name):
             return resolve(node.id)
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in modules and node.value.id not in bound:
+                return idx.get(node.attr, modules[node.value.id])
             outer = resolve(node.value.id)
             if outer is None:
                 return None
             if node.attr == "Settings":
                 return idx.settings_class(outer)
             return idx.get(f"{outer.name}.{node.attr}")
+        return None
+
+    def function_of(node, bound):
+        """The pipecat function a call's callee names, through the page's
+        imports: `tool`, `tool_decorator.tool`. Decorators are calls too."""
+        if isinstance(node, ast.Name) and node.id in imported and node.id not in bound:
+            orig, mod = imported[node.id]
+            return idx.function(orig, mod)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in modules and node.value.id not in bound:
+                return idx.function(node.attr, modules[node.value.id])
         return None
 
     own = frozenset(re.findall(r"[A-Z]\w+", " ".join(re.findall(r"^(?:#+ |title: ).*$", text, re.M))))
@@ -1322,6 +1365,8 @@ def check_samples(checker, page, text):
                         checker.add("sample-unknown-attr", page, line, c.name, attr, f"`{c.name}` has no `{attr}`")
                     else:
                         check_method_call(checker, page, line, c, attr, node)
+                elif fn := function_of(node.func, bound):
+                    check_function_call(checker, page, line, fn, node)
 
 
 # Standard-library modules a sample may use as `mod.attr`. A sample can't use
@@ -1453,6 +1498,19 @@ def check_method_call(checker, page, line, c, name, call):
             checker.add("sample-deprecated-arg", page, line, c.name, f"{name}({p})", deprecated_detail(dep))
 
 
+def check_function_call(checker, page, line, fn, call):
+    """A call to a pipecat function, a decorator's included
+    (`@tool(timeout=60)`): an argument passed to it may be deprecated. The
+    registry records one as `function.param`, with the function's module."""
+    module, name, params = fn
+    passed = [p for p, a in zip(params, call.args) if not isinstance(a, ast.Starred)]
+    passed += [kw.arg for kw in call.keywords if kw.arg]
+    for p in passed:
+        dep = checker.idx.deprecated.get(f"{name}.{p}")
+        if dep and dep.get("kind") == "parameter" and dep.get("module") == module:
+            checker.add("sample-deprecated-arg", page, line, name, f"{name}({p})", deprecated_detail(dep))
+
+
 def check_call(checker, page, line, c, call, own=frozenset()):
     idx = checker.idx
     dep = idx.deprecated.get(c.name)
@@ -1542,11 +1600,28 @@ PROSE_NAME_RE = re.compile(r"(?<![\w*<>{}$-])[A-Z]\w*(?![\w*<>{}])")
 HISTORY_RE = re.compile(r"\b(?:remov|renam|replac|deprecat|formerly|previously|no longer|legacy|migrat|used to)", re.I)
 
 CLIENT_LANG_RE = re.compile(r"\b(?:JavaScript|TypeScript|React|Swift|Kotlin|Android|iOS)\b")
+# Frontmatter keys whose value names the page's classes without backticks
+# (CLAUDE.md: a description names the classes the page documents).
+FRONTMATTER_NAME_RE = re.compile(r"^(?:title|description):\s*(.*)$")
+NEGATED_RE = re.compile(r"\b(?:not|instead of|rather than)\s*$")
+
+
+def unknown_class(name, idx, defined):
+    """Whether `name` looks like a pipecat class (an ending like `Service`)
+    that pipecat's source and examples never mention."""
+    return (
+        name.endswith(CLASS_SUFFIXES)
+        and name not in CLASS_SUFFIXES
+        and re.search(r"[a-z]", name) is not None
+        and name not in idx.identifiers
+        and name not in defined
+    )
 
 
 def check_prose(checker, page, text):
     """Flag a backticked class name in the page's prose, tables, or
-    ParamFields that pipecat has nowhere in its source or examples."""
+    ParamFields, or a class name in its frontmatter title or description
+    (backticked or not), that pipecat has nowhere in its source or examples."""
     if page.startswith(PROSE_SKIP) or "CommunityMaintained" in text:
         return
     idx = checker.idx
@@ -1557,6 +1632,16 @@ def check_prose(checker, page, text):
         except SyntaxError:
             continue
         defined |= bound_names(tree) or set()
+    if text.startswith("---\n"):
+        end = text.find("\n---", 3)
+        for i, ln in enumerate(text[: max(end, 0)].split("\n"), 1):
+            m = FRONTMATTER_NAME_RE.match(ln)
+            if not m or HISTORY_RE.search(m.group(1)) or CLIENT_LANG_RE.search(m.group(1)):
+                continue
+            value = m.group(1).replace("`", "")
+            for n in PROSE_NAME_RE.finditer(value):
+                if not NEGATED_RE.search(value[: n.start()]) and unknown_class(n.group(), idx, defined):
+                    checker.add("prose-unknown-name", page, i, n.group(), n.group(), f"pipecat has no `{n.group()}`")
     headings = {}  # level -> heading text
     fence = False
     for i, ln in enumerate(text.split("\n"), 1):
@@ -1578,16 +1663,10 @@ def check_prose(checker, page, text):
         for span in CODE_SPAN_RE.finditer(ln):
             # "`MiniMaxHttpTTSService`, not `MiniMaxTTSService`" names the
             # wrong spelling on purpose.
-            if re.search(r"\b(?:not|instead of|rather than)\s*$", ln[: span.start()]):
+            if NEGATED_RE.search(ln[: span.start()]):
                 continue
             for name in PROSE_NAME_RE.findall(span.group(1)):
-                if (
-                    name.endswith(CLASS_SUFFIXES)
-                    and name not in CLASS_SUFFIXES
-                    and re.search(r"[a-z]", name)
-                    and name not in idx.identifiers
-                    and name not in defined
-                ):
+                if unknown_class(name, idx, defined):
                     checker.add("prose-unknown-name", page, i, name, name, f"pipecat has no `{name}`")
 
 
