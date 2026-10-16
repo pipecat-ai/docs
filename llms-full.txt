@@ -63979,11 +63979,11 @@ tts = QuickdialTTSService(
 # Rime Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/rime.md
 
-TTS with RimeTTSService (WebSocket streaming with word timing and interruptions) and RimeHttpTTSService for batch synthesis.
+TTS with RimeTTSService and RimeV1TTSService (WebSocket streaming with interruptions) and RimeHttpTTSService for batch synthesis.
 
 ## Overview
 
-Rime AI provides two TTS service implementations: `RimeTTSService` (WebSocket-based) with word-level timing and interruption support, and `RimeHttpTTSService` (HTTP-based) for simpler use cases. `RimeTTSService` is recommended for real-time interactive applications.
+Rime AI provides three TTS service implementations: `RimeTTSService` (WebSocket-based) with word-level timing and interruption support, `RimeV1TTSService` (WebSocket v1 API) with interruption support and no word timing, and `RimeHttpTTSService` (HTTP-based) for simpler use cases. `RimeTTSService` and `RimeV1TTSService` are recommended for real-time interactive applications.
 
 <CardGroup cols={2}>
   <Card
@@ -64123,6 +64123,51 @@ Before using Rime TTS services, you need:
   `language` to `"eng"`.
 </ParamField>
 
+### RimeV1TTSService
+
+<ParamField path="api_key" type="str" required>
+  Rime API key for authentication.
+</ParamField>
+
+<ParamField path="websocket_url" type="str" default="wss://api.rime.ai/coda/ws">
+  Rime WebSocket v1 endpoint. The path must end with `/ws` and selects the
+  model: `/coda/ws` uses `coda`, `/mist/ws` uses `mistv3`, and `/{model}/ws`
+  uses that model. A dedicated endpoint whose path is only `/ws` requires
+  `settings=RimeV1TTSService.Settings(model=...)`. Raises `ValueError` when the
+  path does not end with `/ws`, when a dedicated endpoint has no `model`, or
+  when `model` differs from the endpoint's model.
+</ParamField>
+
+<ParamField
+  path="websocket_protocol"
+  type='Literal["binary", "json"]'
+  default='"binary"'
+>
+  Encoding of the protobuf messages exchanged with Rime. Raises `ValueError` for
+  any other value.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None" default="None">
+  Output audio sample rate in Hz. When `None`, uses the pipeline's configured
+  sample rate.
+</ParamField>
+
+<ParamField
+  path="text_aggregation_mode"
+  type="TextAggregationMode | None"
+  default="None"
+>
+  Controls how incoming text is aggregated before synthesis. `SENTENCE` (used
+  when `None`) sends whole sentences. `TOKEN` sends LLM tokens as they arrive,
+  and Rime accumulates them into sentences. Import from
+  `pipecat.services.tts_service`.
+</ParamField>
+
+<ParamField path="settings" type="RimeV1TTSService.Settings" default="None">
+  Runtime-configurable settings. See [RimeV1TTSService
+  Settings](#rimev1ttsservice-settings) below.
+</ParamField>
+
 ### RimeNonJsonTTSService
 
 _Deprecated since 0.0.102, removed in 2.0.0._ A non-JSON WebSocket service that uses plain-text
@@ -64206,6 +64251,23 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `top_p`                    | `float`           | `None`   | Cumulative probability threshold (coda only, 0.0-1.0).                                                       |
 | `timeScaleFactor`          | `float`           | `None`   | Audio playback speed factor (coda only). Values above 1.0 slow down the audio; values below 1.0 speed it up. |
 
+#### RimeV1TTSService Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `RimeV1TTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`, and each synthesis context uses the settings in effect when it starts. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter                    | Type              | Default          | Description                                                                                                                |
+| ---------------------------- | ----------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `model`                      | `str`             | endpoint's model | Model identifier, taken from the `websocket_url` path. _(Inherited.)_                                                      |
+| `voice`                      | `str`             | `None`           | Voice identifier, also accepted as `speaker`. _(Inherited.)_                                                               |
+| `language`                   | `Language \| str` | `None`           | Language for synthesis, sent as a base language tag such as `"en"`. _(Inherited.)_                                         |
+| `time_scale_factor`          | `float`           | `None`           | Audio playback speed factor. Values above 1.0 slow down the audio; values below 1.0 speed it up. Not applied for `mistv2`. |
+| `text_lookahead_tokens`      | `int`             | `None`           | Number of input tokens to collect before audio starts. Applied only for `coda`.                                            |
+| `pause_between_brackets`     | `bool`            | `None`           | Pause between brackets. Applied only for Mist models.                                                                      |
+| `phonemize_between_brackets` | `bool`            | `None`           | Phonemize bracketed content. Applied only for Mist models.                                                                 |
+| `save_oovs`                  | `bool`            | `None`           | Save out-of-vocabulary words. Applied only for Mist models.                                                                |
+
+A setting the endpoint's model does not accept is left out of the request and logs a warning. `None` leaves a setting unsent, so Rime's default applies.
+
 #### RimeNonJsonTTSService Settings
 
 Runtime-configurable settings passed via the `settings` constructor argument using `RimeNonJsonTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
@@ -64256,6 +64318,20 @@ tts = RimeTTSService(
 )
 ```
 
+### WebSocket v1 Service
+
+```python
+from pipecat.services.rime.tts_v1 import RimeV1TTSService
+
+tts = RimeV1TTSService(
+    api_key=os.getenv("RIME_API_KEY"),
+    settings=RimeV1TTSService.Settings(
+        voice="luna",
+        text_lookahead_tokens=4,
+    ),
+)
+```
+
 ### HTTP Service
 
 ```python
@@ -64279,7 +64355,7 @@ async with aiohttp.ClientSession() as session:
 
 ### RimeTTSService.SPELL(text: str) -> str
 
-Static method that implements [Rime's spell function](https://docs.rime.ai/api-reference/spell) to spell out text character by character. Call this method on the class, not on an instance.
+Static method that implements [Rime's spell function](https://docs.rime.ai/api-reference/spell) to spell out text character by character. Call this method on the class, not on an instance. `RimeV1TTSService.SPELL()` works the same way.
 
 ```python
 # Text transformers for TTS
@@ -64297,7 +64373,7 @@ tts = RimeTTSService(
 
 ### RimeTTSService.PAUSE_TAG(seconds: float) -> str
 
-Static method that implements [Rime's custom pause functionality](https://docs.rime.ai/api-reference/custom-pauses) to generate a properly formatted pause tag you can insert into the text. Call this method on the class, not on an instance.
+Static method that implements [Rime's custom pause functionality](https://docs.rime.ai/api-reference/custom-pauses) to generate a properly formatted pause tag you can insert into the text. Call this method on the class, not on an instance. `RimeV1TTSService.PAUSE_TAG()` works the same way.
 
 ```python
 # Text transformers for TTS
@@ -64364,6 +64440,7 @@ tts = RimeTTSService(
 
 - **Word-level timestamps**: `RimeTTSService` provides word-level timing information, enabling synchronized text highlighting.
 - **WebSocket vs HTTP**: The WebSocket service supports word-level timestamps, interruption handling, and maintains context across messages within a turn. The HTTP service is simpler but lacks these features.
+- **WebSocket v1**: `RimeV1TTSService` does not provide word-level timestamps. Interruptions cancel the current synthesis context without reconnecting.
 - **Non-JSON WebSocket**: `RimeNonJsonTTSService` is the deprecated plain-text and raw-audio WebSocket implementation. It does not support word-level timestamps.
 
 ## Event Handlers
