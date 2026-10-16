@@ -157,29 +157,41 @@ else.
 
 ### Frames and Methods
 
-Pipecat's public interface is frames. A frame pushed into the pipeline keeps
-its place in order with the frames around it, such as the audio of the bot's
-last sentence; a method call acts at once, out of that order. Some classes
-also have methods, for work that has no place in the frame stream or that
-crosses a boundary the pipeline doesn't, such as from the transport to the
-call or the client.
+Pipecat's public interface is frames. Most frames pushed into the pipeline keep
+their place in order with the frames around them: a `DailySIPTransferFrame`
+pushed after a `TTSSpeakFrame` acts once that speech has played. System frames,
+such as `ErrorFrame` and the `Urgent` frame variants, act as soon as they arrive.
+A method call skips the processors in front of its class, so it can act ahead of
+frames pushed before it. Some classes also have methods, for work that has no
+place in the frame stream or that crosses a boundary the pipeline doesn't, such
+as from the transport to the call or the client.
 
 - **When a frame does the job, document the frame** and use it in samples.
   Leave out a method that does the same thing, and replace it where a page
-  already shows it.
+  already shows it. Compare the two in the source first: a method that converts
+  a value the frame passes raw, raises where the frame warns, or returns a
+  result the frame can't is not doing the same thing.
 - **Document a method when no frame does the same job**: session and
   connection control a reader calls from an event handler (capturing a
-  participant, starting a recording, dialing out), lookups
+  participant, starting a Daily recording, dialing out), lookups
   (`participants()`), and calls across the transport or client boundary.
 - **Leave out methods meant for subclasses or for the framework itself**
-  (`process_frame()`, `setup()`, `write_audio_frame()`). They belong on pages
-  about extending Pipecat.
+  (`process_frame()`, `setup()`, `write_audio_frame()`). A name without a
+  leading underscore doesn't make a method the reader's: check who calls it.
+  `set_bot_ready()` is public, but the worker already calls it, and a second
+  call sends a second bot-ready. Methods for subclasses belong on pages about
+  extending Pipecat.
 
 List the frames a reader pushes to a class, and the frames it pushes that a
 reader acts on, in a `## Frames` section with a "Sent to" table and a "Pushed
 by" table (Frame | Fields | Effect). Include the class's own frames and any
-generic frame whose effect is specific to the class. Frames documented on the
+generic frame whose effect is specific to the class. When a frame acts on
+arrival rather than in order, say so in its Effect. Frames documented on the
 frame reference pages need only a link.
+
+When a sample pushes a frame that must act after the bot speaks, such as a
+transfer, set `interruptible = False` on both the `TTSSpeakFrame` and the
+frame, so the caller talking over the bot can't drop either one.
 
 ### Service Pages
 
