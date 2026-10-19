@@ -213,7 +213,7 @@ A simulation's `simulator:` block, the LLM that plays the caller, takes the same
 
 ### Judging with a classifier
 
-An LLM works as a judge, but a judge only ever picks an answer, which is what a dedicated classifier does faster. [`JevClassifier`](/api-reference/server/classifiers/jev) asks Jev, TypeSafe's hosted classification model, which answers each check in a few hundred milliseconds. Its probabilities are calibrated, so a close call looks like one. Pipecat's own release evals judge with it. It needs the `jev` extra (`uv add "pipecat-ai[jev]"`) and a `TYPESAFE_API_KEY`, and a factory builds it:
+An LLM works as a judge, but a judge only ever picks an answer, which is what a dedicated classifier does faster. [`JevClassifier`](/api-reference/server/classifiers/jev) asks Jev, TypeSafe's hosted classification model, which answers each check in a few hundred milliseconds. Its probabilities are calibrated, so a close call looks like one. Pipecat's own release evals judge with it. It needs the `typesafe` extra (`uv add "pipecat-ai[typesafe]"`) and a `TYPESAFE_API_KEY`, and a factory builds it:
 
 ```yaml
 judge:
@@ -229,7 +229,7 @@ judge:
 ```python my_evals.py
 import os
 
-from pipecat.classifiers.jev.classifier import JevClassifier
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
 
 
 def jev_judge(config):
@@ -240,12 +240,12 @@ A factory may return any `BaseClassifier`, so a classifier of your own judges th
 
 ### Reasons from the explainer
 
-A classifier answers with probabilities, not reasons. So the judge asks an LLM, the **explainer**, for the reason behind every `no`, and behind any verdict less sure than `explain_below` (`0.75` by default). It never asks about a `continue`, which is only a request to wait for more of the reply. The explainer answers the same question on its own, which costs one LLM call per verdict it explains, or one per simulation run when any of the run's verdicts needs a reason. Its answer never changes a verdict: the classifier's stands, and when the two disagree the reason says so ("the explainer judged yes: ...").
+A classifier answers with probabilities, not reasons. So the judge asks an LLM, the **explainer**, for the reason behind every `no`, and behind any verdict less sure than `explain_below` (`0.75` by default). It never asks about a `continue`, which is only a request to wait for more of the reply. The explainer is told the classifier's verdict and says what in the conversation supports it, so it never changes or argues with a verdict. That costs one LLM call per verdict it explains, or one per simulation run when any of the run's verdicts needs a reason.
 
-A verdict's reason ends with the probabilities the classifier gave, and a verdict that wasn't explained has only those:
+An explained verdict's reason is the explainer's sentence. A verdict that wasn't explained, or whose explanation failed, has the classifier's probabilities as its reason. The probabilities and the `confidence` are also reported in fields of their own:
 
 ```
-judge said no: the reply says the capital is Berlin, not Madrid (P(yes)=0.02, P(no)=0.97, P(continue)=0.01)
+judge said no: the reply says the capital is Berlin, not Madrid
 judge said yes: P(yes)=0.98, P(no)=0.01, P(continue)=0.01
 ```
 
@@ -253,7 +253,7 @@ Which LLM explains depends on the block:
 
 - With the default judge, or an LLM from a factory, the LLM that judges also explains.
 - With a classifier from a factory, the default Ollama model explains, unless an `explainer:` block names another LLM. The block takes the same `service`, `model`, `endpoint`, `extra`, and `factory` keys as an LLM `judge.eval:` block.
-- `explainer: false` turns reasons off, so every verdict carries its probabilities alone, and a judge like Jev needs no LLM beside it.
+- `explainer: false` turns reasons off, so every verdict's reason is its probabilities alone, and a judge like Jev needs no LLM beside it.
 
 `explain_below: 0` limits the reasons to the `no` verdicts, and a value above `1` explains every verdict, which is how to compare a classifier's verdicts against an LLM's. An LLM's probabilities are its own guess rather than calibrated, and rarely fall below `0.75`, so with an LLM judge it's in practice the `no` verdicts that get explained.
 
@@ -286,15 +286,15 @@ user:
   modality: audio
   speech:
     factory: my_evals.voice
-    voice: luna
+    voice: 71a7ad14-091c-4e8e-a314-022ece01c121
 ```
 
 ```python my_evals.py
 import os
 
+from pipecat.services.cartesia.tts import CartesiaHttpTTSService
 from pipecat.services.fal.stt import FalSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.rime.tts import RimeHttpTTSService
 
 
 def judge(config):
@@ -309,9 +309,9 @@ def transcriber(config):
 
 
 def voice(config):
-    return RimeHttpTTSService(
-        api_key=os.environ["RIME_API_KEY"],
-        settings=RimeHttpTTSService.Settings(voice=config["voice"]),
+    return CartesiaHttpTTSService(
+        api_key=os.environ["CARTESIA_API_KEY"],
+        settings=CartesiaHttpTTSService.Settings(voice=config["voice"]),
     )
 ```
 
@@ -350,7 +350,7 @@ A scenario file has a `name:`; an included fragment has none, which is how a dir
 
 ## Running scenarios back to back
 
-By default the bot keeps running between scenarios. When a scenario ends its eval connection closes, but the eval transport suppresses the bot's `on_client_disconnected` handler, so the pipeline stays up to serve the next scenario. This is what lets `pipecat eval run a.yaml b.yaml c.yaml` drive a whole list, scripted scenarios and simulations mixed, against one bot instance with no reboot between them, which keeps a run fast. A file that holds several scenarios runs them the same way, one after another on the same bot.
+Each scenario connects to the dev runner's `/ws` route and gets a fresh `bot()` and pipeline. The harness ends the bot's session when a run finishes, whatever the bot's `on_client_disconnected` handler does, so `pipecat eval run a.yaml b.yaml c.yaml` drives a whole list, scripted scenarios and simulations mixed, against one running bot process. A file that holds several scenarios runs them the same way, one after another.
 
 The trade-off is that anything the bot accumulated in one scenario is still there for the next. For results to be independent, each scenario has to start from a clean slate, and clearing that state is split between the harness and your bot:
 
@@ -361,7 +361,7 @@ A [suite](/pipecat/evals/suites) avoids the problem by starting a fresh bot for 
 
 ## Exercising the disconnect path
 
-Some bots do meaningful work in `on_client_disconnected`, like a goodbye message, session teardown, or resource cleanup. Because the eval transport suppresses that handler by default, set `trigger_disconnect: true` on a scenario of either kind to fire it when that scenario ends:
+Some bots do meaningful work in `on_client_disconnected`, like a goodbye message, session teardown, or resource cleanup. The handler fires whenever the eval client disconnects, so the disconnect path runs at the end of every scenario. `trigger_disconnect:` and `--trigger-disconnect` are deprecated and only affect a bot serving the server `EvalTransport`, such as one started with `-t eval` on an earlier Pipecat version:
 
 ```yaml
 name: test_goodbye_on_disconnect
@@ -378,14 +378,7 @@ scenarios:
       # send a goodbye message or clean up resources.
 ```
 
-Bots often cancel their pipeline in `on_client_disconnected`, so a scenario with `trigger_disconnect: true` usually ends the bot process. Treat it as a terminal run, last in a list.
-
-<Note>
-  Enable it for every scenario in a run with `pipecat eval run
-  --trigger-disconnect`; a scenario's own `trigger_disconnect` field still takes
-  precedence. This is independent of `--stop-bot`, which tears the bot down via
-  an `eval-cancel` message regardless of the disconnect handler.
-</Note>
+Only a bot serving the server `EvalTransport` (for example, one run with `-t eval` on an earlier Pipecat version) honors the field, and such a bot exits after its first scenario.
 
 ## Next steps
 

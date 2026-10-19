@@ -23,9 +23,11 @@ Turn events provide hooks into the conversation turn lifecycle, allowing you to 
 | `on_user_turn_idle`                | `user_aggregator`      | User has been idle (not speaking) for timeout       |
 | `on_user_mute_started`             | `user_aggregator`      | User input was muted                                |
 | `on_user_mute_stopped`             | `user_aggregator`      | User input was unmuted                              |
+| `on_user_backchannel`              | `user_aggregator`      | User acknowledged the bot without interrupting      |
 | `on_assistant_turn_started`        | `assistant_aggregator` | Assistant begins responding                         |
 | `on_assistant_turn_stopped`        | `assistant_aggregator` | Assistant finishes responding (includes transcript) |
 | `on_assistant_thought`             | `assistant_aggregator` | Assistant produced a thought (reasoning models)     |
+| `on_assistant_backchannel`         | `assistant_aggregator` | Assistant said a short acknowledgment               |
 | `on_summary_applied`               | `assistant_aggregator` | Context summarization was applied                   |
 
 ## User Turn Events
@@ -110,9 +112,10 @@ async def on_user_turn_stopped(aggregator, strategy, message: UserTurnStoppedMes
 | `message`    | `UserTurnStoppedMessage`   | Contains the user's transcript and metadata |
 
 <Note>
-  In realtime mode (`realtime_service_mode=True` on
-  [`LLMContextAggregatorPair`](/api-reference/server/utilities/turn-management/external-turn-management#realtime-speech-to-speech-services)),
-  the user message isn't finalized at turn-stop time, so `message.content` is
+  In [realtime
+  mode](/api-reference/server/utilities/turn-management/external-turn-management#realtime-speech-to-speech-services),
+  which `LLMContextAggregatorPair` turns on with a speech-to-speech service, the
+  user message isn't finalized at turn-stop time, so `message.content` is
   `None`. Subscribe to
   [`on_user_turn_message_added`](#on_user_turn_message_added) instead to get the
   finalized user text. Behavior in cascade (STT → LLM → TTS) pipelines is
@@ -121,7 +124,7 @@ async def on_user_turn_stopped(aggregator, strategy, message: UserTurnStoppedMes
 
 ### on_user_turn_message_added
 
-Fired when a user message is written to the LLM context, carrying the finalized turn text. In cascade pipelines this coincides with `on_user_turn_stopped`. In realtime mode (`realtime_service_mode=True`) the write is triggered by the assistant response start rather than the user-turn-end frame, so this event — not `on_user_turn_stopped` — is the canonical way to subscribe to "context just updated, here's the user text."
+Fired when a user message is written to the LLM context, carrying the finalized turn text. In cascade pipelines this coincides with `on_user_turn_stopped`. In realtime mode (with a speech-to-speech service) the write is triggered by the assistant response start rather than the user-turn-end frame, so this event, not `on_user_turn_stopped`, is the canonical way to subscribe to "context just updated, here's the user text."
 
 ```python
 @user_aggregator.event_handler("on_user_turn_message_added")
@@ -139,7 +142,7 @@ async def on_user_turn_message_added(aggregator, message: UserTurnMessageAddedMe
 
 ### on_user_turn_stop_timeout
 
-Fired when a user turn times out without any stop strategy triggering. This is a fallback mechanism that ends the turn after a configurable timeout period (default: 5.0 seconds) when the user has stopped speaking according to VAD but no transcription-based stop has occurred.
+Fired when an active user turn ends on inactivity: the user isn't speaking and no VAD event or transcript has arrived for `user_turn_stop_timeout` seconds (default: 5.0).
 
 ```python
 @user_aggregator.event_handler("on_user_turn_stop_timeout")
@@ -227,6 +230,23 @@ async def on_user_mute_stopped(aggregator):
 | ------------ | ------------------- | ---------------------------- |
 | `aggregator` | `LLMUserAggregator` | The user aggregator instance |
 
+### on_user_backchannel
+
+Fired when the user says a short acknowledgment while the bot talks, such as "mhm". It is reported from a `UserBackchannelFrame`, which is pushed in place of a transcription: the bot keeps talking, and the acknowledgment stays out of the LLM context and the turn events above. It doesn't fire while the user is muted.
+
+```python
+@user_aggregator.event_handler("on_user_backchannel")
+async def on_user_backchannel(aggregator, message: UserBackchannelMessage):
+    print(f"User backchannel: {message.content}")
+```
+
+**Parameters:**
+
+| Parameter    | Type                     | Description                                   |
+| ------------ | ------------------------ | --------------------------------------------- |
+| `aggregator` | `LLMUserAggregator`      | The user aggregator instance                  |
+| `message`    | `UserBackchannelMessage` | Contains what the user said and its timestamp |
+
 ## Assistant Turn Events
 
 Assistant turn events are registered on the `assistant_aggregator` from an `LLMContextAggregatorPair`.
@@ -269,9 +289,9 @@ async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMes
 
 <Note>
   This event fires when the LLM response completes, when the user interrupts, or
-  when a user image is appended to context. The event always fires when a turn
-  ends, even if `content` is empty (e.g., the turn was interrupted before any
-  tokens were generated).
+  when the pipeline ends. The event always fires when a turn ends, even if
+  `content` is empty (e.g., the turn was interrupted before any tokens were
+  generated).
 </Note>
 
 ### on_assistant_thought
@@ -290,6 +310,23 @@ async def on_assistant_thought(aggregator, message: AssistantThoughtMessage):
 | ------------ | ------------------------- | ------------------------------------------ |
 | `aggregator` | `LLMAssistantAggregator`  | The assistant aggregator instance          |
 | `message`    | `AssistantThoughtMessage` | Contains the thought content and timestamp |
+
+### on_assistant_backchannel
+
+Fired when the assistant starts saying text of type `backchannel`, such as a `BotBackchannelFrame` ("Mm-hmm."). Backchannels stay out of the LLM context and the assistant turn events.
+
+```python
+@assistant_aggregator.event_handler("on_assistant_backchannel")
+async def on_assistant_backchannel(aggregator, message: AssistantBackchannelMessage):
+    print(f"Assistant backchannel: {message.content}")
+```
+
+**Parameters:**
+
+| Parameter    | Type                          | Description                                        |
+| ------------ | ----------------------------- | -------------------------------------------------- |
+| `aggregator` | `LLMAssistantAggregator`      | The assistant aggregator instance                  |
+| `message`    | `AssistantBackchannelMessage` | Contains what the assistant said and its timestamp |
 
 ### on_summary_applied
 
@@ -336,7 +373,7 @@ from pipecat.processors.aggregators.llm_response_universal import UserTurnStoppe
 
 <ParamField path="content" type="str | None">
   The complete transcribed text from the user's turn. `None` in realtime mode
-  (`realtime_service_mode=True`), where the user message isn't finalized at
+  (with a speech-to-speech service), where the user message isn't finalized at
   turn-stop time — subscribe to
   [`on_user_turn_message_added`](#on_user_turn_message_added) for the finalized
   text instead.
@@ -364,6 +401,26 @@ from pipecat.processors.aggregators.llm_response_universal import UserTurnMessag
 
 <ParamField path="timestamp" type="str">
   ISO 8601 timestamp indicating when the user turn started.
+</ParamField>
+
+<ParamField path="user_id" type="str | None">
+  Optional identifier for the user, if available from the transport.
+</ParamField>
+
+### UserBackchannelMessage
+
+Accompanies `on_user_backchannel`, carrying a short acknowledgment the user said while the bot talks.
+
+```python
+from pipecat.processors.aggregators.llm_response_universal import UserBackchannelMessage
+```
+
+<ParamField path="content" type="str">
+  What the user said.
+</ParamField>
+
+<ParamField path="timestamp" type="str">
+  ISO 8601 timestamp indicating when the user said it.
 </ParamField>
 
 <ParamField path="user_id" type="str | None">
@@ -407,6 +464,22 @@ from pipecat.processors.aggregators.llm_response_universal import AssistantThoug
 
 <ParamField path="timestamp" type="str">
   ISO 8601 timestamp indicating when the thought started.
+</ParamField>
+
+### AssistantBackchannelMessage
+
+Accompanies `on_assistant_backchannel`, carrying a short acknowledgment the assistant said while the user talks.
+
+```python
+from pipecat.processors.aggregators.llm_response_universal import AssistantBackchannelMessage
+```
+
+<ParamField path="content" type="str">
+  What the assistant said.
+</ParamField>
+
+<ParamField path="timestamp" type="str">
+  ISO 8601 timestamp indicating when the assistant started saying it.
 </ParamField>
 
 ## Related

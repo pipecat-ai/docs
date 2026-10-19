@@ -118,18 +118,19 @@ Before using GPT-Live, you need:
 
 Settings passed via the `settings` constructor argument using `OpenAILiveLLMService.Settings(...)`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter            | Type  | Default     | Description                                                                                  |
-| -------------------- | ----- | ----------- | -------------------------------------------------------------------------------------------- |
-| `model`              | `str` | `NOT_GIVEN` | GPT-Live model identifier. _(Inherited from base settings.)_                                 |
-| `system_instruction` | `str` | `NOT_GIVEN` | Instructions for the GPT-Live model. _(Inherited from base settings.)_                       |
-| `voice`              | `str` | `NOT_GIVEN` | Output voice name (for example `"marin"` or `"cedar"`). `None` leaves the choice to the API. |
+| Parameter            | Type   | Default        | Description                                                                                                                                                                                                                                        |
+| -------------------- | ------ | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`              | `str`  | `"gpt-live-1"` | GPT-Live model identifier. _(Inherited from base settings.)_                                                                                                                                                                                       |
+| `system_instruction` | `str`  | `None`         | Instructions for the GPT-Live model. _(Inherited from base settings.)_                                                                                                                                                                             |
+| `voice`              | `str`  | `None`         | Output voice name (for example `"marin"` or `"cedar"`). `None` leaves the choice to the API.                                                                                                                                                       |
+| `store`              | `bool` | `None`         | Whether the API keeps the session for 30 days as a stereo recording (`GET /v1/live/sessions/{id}/content`) and as a source a later session can fork from. `False` at the API by default; requires a project whose data policy permits persistence. |
 
 <Note>
-  `NOT_GIVEN` values are omitted, letting the service use its own defaults
-  (`"gpt-live-1"` for model). The API fixes `model`, `voice` and
-  `system_instruction` when the session starts, so a change sent with
-  `LLMUpdateSettingsFrame` is stored, logged as unsupported for the session in
-  progress, and applied to the next session started by `reset_conversation()`.
+  `None` values are omitted, letting the service use its own defaults. The API
+  fixes `model`, `voice`, `store` and `system_instruction` when the session
+  starts, so a change sent with `LLMUpdateSettingsFrame` is stored, logged as
+  unsupported for the session in progress, and applied to the next session
+  started by `reset_conversation()`.
 </Note>
 
 ### ResponsesDelegation
@@ -143,7 +144,9 @@ OpenAI hosts the backend model. Passed as `delegation=OpenAILiveLLMService.Respo
   instructions, `max_completion_tokens` its `max_output_tokens`, and `reasoning`
   is sent when configured. Fields the GPT-Live API does not accept for a
   delegated model (`temperature`, `top_p`, the penalties, `seed`, `top_k`,
-  `max_tokens`) are dropped with a warning.
+  `max_tokens`, `user_turn_completion_config`, `filter_incomplete_user_turns`)
+  are dropped with a warning. `extra` is merged into the delegation
+  configuration.
 </ParamField>
 
 <ParamField path="service_tier" type="str | None" default="None">
@@ -157,11 +160,12 @@ The backend model's tools and `tool_choice` come from the pipeline's `LLMContext
 
 A Pipecat worker is the backend. Passed as `delegation=OpenAILiveLLMService.ClientDelegation(...)`.
 
-<ParamField path="backend" type="BaseWorker" required>
+<ParamField path="backend" type="BackendLLMWorker | str" required>
   The worker that runs delegated tasks, normally a
   [`BackendLLMWorker`](#backendllmworker) wrapping any LLM service. The service
   registers it as a child of the pipeline worker at setup, so the pipeline must
-  run under a `WorkerRunner`.
+  run under a `WorkerRunner`. A string names a backend worker registered
+  elsewhere, in the app or in another process on a shared bus.
 </ParamField>
 
 <ParamField path="timeout_secs" type="float" default="120.0">
@@ -169,7 +173,7 @@ A Pipecat worker is the backend. Passed as `delegation=OpenAILiveLLMService.Clie
   the delegated work could not be completed.
 </ParamField>
 
-A delegation names no task: the GPT-Live model signals only that it is handing work over. The service sends the backend the transcript of the conversation since the previous delegation, and the backend works out the request from it. What comes back is appended to the live session according to each output's `prefers_spoken` flag: text the backend wants heard is appended as commentary, which the model relays in its own words, and the rest as silent context the model can draw on.
+A delegation names no task: the GPT-Live model signals only that it is handing work over. The service sends the backend the transcript of the conversation since the previous delegation, and the backend works out the request from it. Delegations run one at a time: one created while another is in progress waits for it to finish. Each turn the backend's model writes is sent as soon as it is produced and appended to the live session according to its `prefers_spoken` flag: text the backend wants heard is appended as commentary, which the model relays in its own words, and the rest as silent context the model can draw on.
 
 ### BackendLLMWorker
 
@@ -185,17 +189,31 @@ A delegation names no task: the GPT-Live model signals only that it is handing w
 </ParamField>
 
 <ParamField path="name" type="str" default="None">
-  Worker name; auto-generated when omitted.
+  Worker name; auto-generated when omitted. Give one when the backend runs in
+  another process, where the frontend addresses it by name.
 </ParamField>
 
 <ParamField
   path="transform_output"
-  type="Callable[[BackendOutput], Awaitable[BackendOutput]]"
+  type="Callable[[BackendOutput], Awaitable[BackendOutput | None]]"
   default="None"
 >
-  Called with each [`BackendOutput`](#backendoutput) before it is sent, to
-  adjust its text or whether the user may hear it. Without one, only the final
-  answer asks to be spoken.
+  Called with each [`BackendOutput`](#backendoutput) the model produces before
+  it is sent, to adjust its text or whether the user may hear it. Return `None`
+  to send nothing for an output.
+</ParamField>
+
+<ParamField
+  path="pairing_instruction"
+  type="str"
+  default="BACKEND_PAIRING_INSTRUCTION"
+>
+  Text appended to the backend LLM's system instruction about working as the
+  backend of a voice assistant, including how to mark what the user should hear.
+  Rarely worth replacing: a replacement that leaves out the marking leaves
+  nothing spoken. To shape what the user hears, use the backend's own system
+  instruction instead (see [Choosing What the User
+  Hears](#choosing-what-the-user-hears)).
 </ParamField>
 
 <ParamField path="user_params" type="LLMUserAggregatorParams" default="None">
@@ -211,6 +229,8 @@ A delegation names no task: the GPT-Live model signals only that it is handing w
   Parameters for the backend's assistant aggregator.
 </ParamField>
 
+`send_output(output, *, apply_transform_output=False)` sends a `BackendOutput` of the app's own, such as from a tool, alongside the model's. It skips `transform_output` unless `apply_transform_output=True`. See [Choosing What the User Hears](#choosing-what-the-user-hears).
+
 ### BackendOutput
 
 One piece of output from a backend, on its way to the GPT-Live model.
@@ -219,7 +239,6 @@ One piece of output from a backend, on its way to the GPT-Live model.
 | ---------------- | ------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `text`           | `str`  |         | The text the backend produced.                                                                                                                                    |
 | `is_thought`     | `bool` | `False` | Whether this is a reasoning summary rather than a response.                                                                                                       |
-| `is_final`       | `bool` | `False` | Whether this is the backend's answer to the delegation, as opposed to progress on the way to it.                                                                  |
 | `prefers_spoken` | `bool` | `True`  | Whether the backend would like the user to hear this. A hint: the GPT-Live model takes it into consideration but decides what to speak based on the conversation. |
 
 ## Usage
@@ -329,26 +348,25 @@ The service adds `backend` to the runner as a child of the pipeline worker, so t
 
 ### Choosing What the User Hears
 
-By default only the backend's final answer asks to be spoken. A `transform_output` callback sees every `BackendOutput` before it leaves the worker and can change that, or rewrite the text:
+The backend's model decides which of what it writes the user hears. It speaks up for a result, a question it cannot proceed without, or news the user should have now, and works through the steps in between in silence. What it chooses to say arrives with `prefers_spoken=True`. To shape that judgment, say in the backend's own system instruction, in plain words, what the user should and should not be told.
+
+When something must be said as given, such as a booking system's confirmation code, a tool can send it itself with `send_output`, whatever the model would have chosen to say:
 
 ```python
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.workers.llm import BackendLLMWorker, BackendOutput
 
 
-async def transform_output(output: BackendOutput) -> BackendOutput:
-    # Let the user hear progress the backend marks with a leading ">>".
-    if output.text.startswith(">>"):
-        return BackendOutput(
-            text=output.text[2:].strip(),
-            is_thought=output.is_thought,
-            is_final=output.is_final,
-            prefers_spoken=True,
-        )
-    return output
-
-
-backend = BackendLLMWorker(llm=..., context=..., transform_output=transform_output)
+async def rebook_flight(params: FunctionCallParams, flight_number: str):
+    booking = await booking_system.rebook(flight_number)
+    told = f"You're booked on {booking.flight}. Your confirmation code is {booking.code}."
+    backend = params.pipeline_worker
+    assert isinstance(backend, BackendLLMWorker)
+    await backend.send_output(BackendOutput(text=told))
+    await params.result_callback({"status": "confirmed", "user_told": told})
 ```
+
+The result lets the model know the user has already been told. For code that should see every output the model produces, `transform_output` can drop one, rewrite it, or change whether it is spoken.
 
 ### Restoring a Conversation
 
@@ -368,17 +386,27 @@ async def load_conversation(params: FunctionCallParams, filename: str):
     await params.llm.reset_conversation()
 ```
 
+## Methods
+
+### reset_conversation()
+
+```python
+async def reset_conversation()
+```
+
+Drops the session and starts a new one configured from the context as it is now. See [Restoring a Conversation](#restoring-a-conversation).
+
 ## Notes
 
 - **Turn taking is the model's**: The service proposes user turn boundaries from the API's transcript stream, and `LLMContextAggregatorPair` resolves them with the recommended `ExternalUserTurnStrategies(enable_interruptions=False)`. No `InterruptionFrame` is broadcast: the model handles being talked over itself, and a delegation keeps running when that happens. As a consequence every tool behaves as `cancel_on_interruption=False`; use `cancellable_by_llm=True` for tools the model should be able to cancel on request.
 - **No local VAD**: The model detects the user's turns itself, so the pipeline needs no VAD analyzer and no `realtime_service_mode` on the aggregators. The user aggregator writes each user turn to the context as it ends, before any tool calls it triggers.
-- **Session start**: The session starts on the first `LLMContextFrame`, typically queued as an `LLMRunFrame`. The context's leading system message (or `Settings.system_instruction`) becomes the model's instructions and the remaining text messages seed the session as prior conversation. At most 128 messages are kept, dropping the oldest; tool calls, tool results and non-text content have no representation in the startup history and are skipped.
+- **Session start**: The session starts on the first `LLMContextFrame`, typically queued as an `LLMRunFrame`. The context's leading system message (or `Settings.system_instruction`) becomes the model's instructions and the remaining text messages seed the session as prior conversation. At most 128 messages are kept, dropping the oldest; tool calls, tool results and non-text content have no representation in the startup history and are skipped. Input audio is dropped until the session has started.
 - **Opening the conversation**: A trailing developer message in the context is delivered to the model once the session starts, as the request to speak first. Omit it to have the model wait for the user.
 - **System instruction precedence**: `system_instruction` from service settings takes precedence over an initial system message in the LLM context. A warning is logged when both are set.
 - **Tools belong to the backend**: The GPT-Live model calls no tools of its own. In Responses delegation mode this is invisible to your code: register functions and write their handlers as for any other LLM service, and the backend model calls them through the pipeline. In client delegation mode the `BackendLLMWorker`'s own context carries the tools, and its pipeline runs them.
 - **Audio format**: Input audio is resampled to 24 kHz; output is 24 kHz PCM, pushed as `SpeechOutputAudioRawFrame` so the output transport derives bot speaking state from the audio itself.
-- **Usage metrics**: GPT-Live usage is reported as cumulative session seconds. Token usage comes from the backend model's completed responses in Responses delegation.
-- **Delegation failures**: When a client delegation fails or times out, the model is told the delegated work could not be completed and the detail is pushed as an `ErrorFrame`. A delegation that finishes without producing any text is reported to the model as having no answer, so the conversation moves on.
+- **Usage metrics**: GPT-Live usage, in cumulative session seconds, is logged at debug level and not reported as a metric. Token usage metrics come from the backend model's completed responses in Responses delegation.
+- **Delegation failures**: When a client delegation fails, the model is told the delegated work could not be completed and the detail is pushed as an `ErrorFrame`. A delegation that times out pushes no `ErrorFrame`. A delegation that finishes without producing any output meant to be spoken is reported to the model as having no answer, so the conversation moves on.
 
 ## Event Handlers
 

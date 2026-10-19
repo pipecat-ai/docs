@@ -19,6 +19,7 @@ description: "PipelineWorker manages Pipecat pipeline execution and lifecycle in
 ## Basic Usage
 
 ```python
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.workers.runner import WorkerRunner
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -34,7 +35,8 @@ await worker.queue_frame(TTSSpeakFrame("Hello, how can I help you today?"))
 
 # Run the pipeline
 runner = WorkerRunner()
-await runner.run(worker)
+await runner.add_workers(worker)
+await runner.run()
 ```
 
 ## Constructor Parameters
@@ -48,7 +50,7 @@ await runner.run(worker)
   [PipelineParams](/api-reference/server/pipeline/pipeline-params) for details.
 </ParamField>
 
-<ParamField path="observers" type="List[BaseObserver]" default="[]">
+<ParamField path="observers" type="list[BaseObserver] | None" default="None">
   List of observers for monitoring pipeline execution. See
   [Observers](/api-reference/server/utilities/observers/observer-pattern) for
   details.
@@ -67,6 +69,32 @@ await runner.run(worker)
   Whether to warn about tasks left running when the worker finishes. Only
   applies when the worker owns its task manager; otherwise the runner reports
   dangling tasks.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Worker name, used to address the worker on the bus. If `None`, a name is
+  generated.
+</ParamField>
+
+<ParamField path="active" type="bool" default="True">
+  Whether the worker starts out accepting bus messages. Start a worker inactive
+  in multi-worker setups where workers take turns, so it does nothing until
+  another worker or the application activates it.
+</ParamField>
+
+<ParamField path="bridged" type="tuple[str, ...] | None" default="None">
+  Bridge configuration. `None` means the pipeline is not bridged. An empty tuple
+  `()` accepts frames from all bridges, and a tuple of names like `("voice",)`
+  accepts frames only from those bridges. The bus comes from the runner.
+</ParamField>
+
+<ParamField
+  path="exclude_frames"
+  type="tuple[type[Frame], ...] | None"
+  default="None"
+>
+  When `bridged` is set, extra frame types that should not cross the bus.
+  Lifecycle frames are always excluded.
 </ParamField>
 
 <ParamField path="handle_flush_frame" type="bool | None" default="None">
@@ -103,8 +131,21 @@ await runner.run(worker)
   details.
 </ParamField>
 
+<ParamField path="cancel_runner_on_idle_timeout" type="bool" default="True">
+  When `cancel_on_idle_timeout` is also `True`, whether reaching the idle
+  timeout also cancels every other worker in the `WorkerRunner`. Set to `False`
+  for a sidecar worker that should cancel itself on idle without bringing down
+  its peers.
+</ParamField>
+
+<ParamField path="cancel_timeout_secs" type="float" default="20.0">
+  How long to wait, in seconds, for cancellation to finish cleanly.
+</ParamField>
+
 <ParamField path="enable_tracing" type="bool" default="False">
-  Whether to enable OpenTelemetry tracing. See [The OpenTelemetry
+  Whether to enable OpenTelemetry tracing. Has no effect when OpenTelemetry
+  isn't installed, and turn and conversation spans also require
+  `enable_turn_tracking=True`. See [The OpenTelemetry
   guide](/api-reference/server/utilities/opentelemetry) for details.
 </ParamField>
 
@@ -118,6 +159,23 @@ await runner.run(worker)
   unless the pipeline is bridged: a bridged worker has no client of its own, and
   its RTVI would report every frame a second time as it crosses the bridge. Pass
   `True` to enable RTVI on a bridged worker, or `False` to disable it entirely.
+  If the pipeline already contains an `RTVIProcessor` and `observers` contains
+  an `RTVIObserver`, the worker uses that pair and ignores `enable_rtvi`,
+  `rtvi_processor` and `rtvi_observer_params`. If only one of the two is
+  present, the worker logs an error and sets up no RTVI.
+</ParamField>
+
+<ParamField path="rtvi_processor" type="RTVIProcessor | None" default="None">
+  The RTVI processor to add when RTVI is enabled. If `None`, a default
+  `RTVIProcessor` is created.
+</ParamField>
+
+<ParamField
+  path="rtvi_observer_params"
+  type="RTVIObserverParams | None"
+  default="None"
+>
+  Parameters for the RTVI observer added when RTVI is enabled.
 </ParamField>
 
 <ParamField path="conversation_id" type="str | None" default="None">
@@ -139,8 +197,9 @@ await runner.run(worker)
 </ParamField>
 
 <ParamField path="start_timeout_secs" type="float" default="20.0">
-  How long to wait for the `StartFrame` to reach the end of the pipeline. When
-  the wait runs out the pipeline reports `on_pipeline_timeout`.
+  How long to wait for the `StartFrame` to reach the end of the pipeline,
+  counted from when every processor has finished setting up. When the wait runs
+  out the pipeline reports `on_pipeline_timeout`.
 </ParamField>
 
 <ParamField
@@ -165,8 +224,8 @@ await runner.run(worker)
   after the worker finishes.
 </ParamField>
 
-<ParamField path="tool_resources" type="Any" default="None">
-  Deprecated alias for `app_resources`. Use `app_resources` in new code.
+<ParamField path="tool_resources" type="Any" default="None" deprecated>
+  _Deprecated since 1.2.0, removed in 2.0.0._ Use `app_resources` instead.
 </ParamField>
 
 <ParamField path="capabilities" type="BotCapabilities | None" default="None">
@@ -182,7 +241,7 @@ await runner.run(worker)
 <ResponseField name="capabilities" type="BotCapabilities">
 Property returning what the bot does in the session. It is derived from the media the pipeline's transports send and receive and from `PipelineParams.enable_metrics`, then the `capabilities` constructor argument is applied on top. RTVI sends it to the client in the `bot-ready` message.
 
-`BotCapabilities` (from `pipecat.pipeline.capabilities`) has these optional fields: `audio_in`, `audio_out`, `video_in`, `video_out` and `metrics`. `None` means unknown, so the client keeps its default; `False` means the bot doesn't do it.
+`BotCapabilities` (from `pipecat.pipeline.capabilities`) has these optional fields: `audio_in`, `audio_out`, `video_in`, `screen_in`, `video_out` and `metrics`. `None` means unknown, so the client keeps its default; `False` means the bot doesn't do it.
 
 ```python
 from pipecat.pipeline.capabilities import BotCapabilities
@@ -196,18 +255,20 @@ print(worker.capabilities.video_out)
 ### Worker Lifecycle Management
 
 <Note>
-  `end()` and `activate_worker()` wait for in-flight frames to be processed
-  before they take effect, so a closing line is heard rather than cut off and a
-  worker handing over stops talking before the one taking over starts. A
-  pipeline that never started, or one that has already finished, is left alone.
+  `end()`, and `activate_worker()` with `deactivate_self=True`, wait for
+  in-flight frames to be processed before they take effect, so a closing line is
+  heard rather than cut off and a worker handing over stops talking before the
+  one taking over starts. A pipeline that never started, or one that has already
+  finished, is left alone.
 </Note>
 
-<ResponseField name="run()" type="async">
-Starts and manages the pipeline execution until completion or cancellation. Typically called via `WorkerRunner` rather than directly:
+<ResponseField name="run(params)" type="async">
+Starts and manages the pipeline execution until completion or cancellation. `params` is a `WorkerParams` (from `pipecat.workers.base_worker`) carrying the task manager. Typically called via `WorkerRunner`, which supplies it, rather than directly:
 
 ```python
 runner = WorkerRunner()
-await runner.run(worker)
+await runner.add_workers(worker)
+await runner.run()
 ```
 
 </ResponseField>
@@ -231,8 +292,8 @@ Requests a graceful end of the session, draining the pipeline first. Whatever th
 
 </ResponseField>
 
-<ResponseField name="cancel()" type="async">
-Stops the running pipeline immediately by sending a CancelFrame.
+<ResponseField name="cancel(*, reason=None)" type="async">
+Stops the running pipeline immediately by sending a CancelFrame. `reason` is an optional string saying why. If the pipeline hasn't started yet, no `CancelFrame` is sent; the processors still setting up never start and the pipeline is cleaned up instead.
 
 ```python
   await worker.cancel()
@@ -252,13 +313,13 @@ if worker.has_finished(): print("Worker is complete")
 ### Frame Management
 
 <ResponseField name="flush_pipeline(timeout=5.0)" type="async">
-Wait for in-flight frames to be processed. Pushes a flush probe downstream; the sink bounces it back upstream and the source sets its event once it completes the round-trip, signalling that every frame queued ahead of it has been processed. The probe goes on the worker's push queue, behind whatever is already waiting there.
+Wait for in-flight frames to be processed. Pushes a flush probe downstream; the sink bounces it back upstream, the source sends it down again, and its event is set when it reaches the sink a second time, signalling that every frame queued ahead of it has been processed, along with any work a processor started by pushing a frame upstream. The probe goes on the worker's push queue, behind whatever is already waiting there.
 
 **Parameters:**
 
-| Parameter | Type    | Default | Description                                                                                                                                               |
-| --------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timeout` | `float` | `5.0`   | Seconds of no frames reaching the sink before giving up. A pipeline still working keeps the wait alive; one that is stuck gives up after this much quiet. |
+| Parameter | Type    | Default | Description                                                                                                                                                                                                                            |
+| --------- | ------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout` | `float` | `5.0`   | Seconds of no progress (a frame reaching the sink, or a progress report from another worker the probe crossed into) before giving up. A pipeline still working keeps the wait alive; one that is stuck gives up after this much quiet. |
 
 ```python
 drained = await worker.flush_pipeline(timeout=10.0)
@@ -287,6 +348,7 @@ Downstream frames are pushed from the beginning of the pipeline. Upstream frames
 await worker.queue_frame(TTSSpeakFrame("Hello!"))
 
 # Push a frame upstream from the end of the pipeline
+from pipecat.frames.frames import UserStoppedSpeakingFrame
 from pipecat.processors.frame_processor import FrameDirection
 await worker.queue_frame(UserStoppedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
 ```
@@ -312,8 +374,13 @@ frames = [TTSSpeakFrame("Hello!"), TTSSpeakFrame("How are you?")]
 await worker.queue_frames(frames)
 
 # Push frames upstream from the end of the pipeline
+from pipecat.frames.frames import TranscriptionFrame, UserStoppedSpeakingFrame
 from pipecat.processors.frame_processor import FrameDirection
-frames = [TranscriptionFrame("user input"), UserStoppedSpeakingFrame()]
+from pipecat.utils.time import time_now_iso8601
+frames = [
+    TranscriptionFrame("user input", user_id="user", timestamp=time_now_iso8601()),
+    UserStoppedSpeakingFrame(),
+]
 await worker.queue_frames(frames, direction=FrameDirection.UPSTREAM)
 ```
 
@@ -345,6 +412,8 @@ async def on_pipeline_started(worker, frame):
     print("Pipeline is running!")
 ```
 
+The input transport's `on_client_connected` can fire before later services have connected. Use `on_pipeline_started` for anything that needs every service ready.
+
 **Parameters:**
 
 | Parameter | Type             | Description                        |
@@ -354,9 +423,11 @@ async def on_pipeline_started(worker, frame):
 
 ### on_pipeline_finished
 
-Fired after the pipeline reaches any terminal state. This includes normal completion (`EndFrame`), explicit stop (`StopFrame`), or cancellation (`CancelFrame`). Use this event for cleanup, logging, or post-processing.
+Fired after the pipeline reaches any terminal state. This includes normal completion (`EndFrame`), explicit stop (`StopFrame`), or cancellation (`CancelFrame`). It doesn't fire when setup or the `StartFrame` times out (`on_setup_timeout`, or `on_pipeline_timeout` with a `StartFrame`). Use this event for cleanup, logging, or post-processing.
 
 ```python
+from pipecat.frames.frames import CancelFrame, EndFrame, StopFrame
+
 @worker.event_handler("on_pipeline_finished")
 async def on_pipeline_finished(worker, frame):
     if isinstance(frame, EndFrame):
@@ -497,7 +568,7 @@ async def on_heartbeat_timeout(worker):
 <Note>
   Heartbeat monitoring must be enabled by setting `enable_heartbeats=True` in
   `PipelineParams`. The timeout period is controlled by
-  `heartbeats_monitor_secs` (default: 5 seconds). See
+  `heartbeats_monitor_secs` (default: 10 seconds). See
   [PipelineParams](/api-reference/server/pipeline/pipeline-params) for
   configuration details.
 </Note>
@@ -507,6 +578,9 @@ async def on_heartbeat_timeout(worker):
 Fired when no activity frames (as specified by `idle_timeout_frames`) have been received within the idle timeout period. See [Pipeline Idle Detection](/api-reference/server/pipeline/pipeline-idle-detection) for configuration details.
 
 ```python
+# Keep the worker running after the timeout so the prompt is heard
+worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
+
 @worker.event_handler("on_idle_timeout")
 async def on_idle_timeout(worker):
     print("Pipeline has been idle too long")
@@ -520,7 +594,8 @@ async def on_idle_timeout(worker):
 | `worker`  | `PipelineWorker` | The pipeline worker instance |
 
 <Note>
-  If `cancel_on_idle_timeout` is `True` (the default), the pipeline will be
-  automatically cancelled after this handler runs. Set it to `False` if you want
-  to handle idle timeouts yourself.
+  If `cancel_on_idle_timeout` is `True` (the default), the worker is cancelled
+  as soon as this event fires, without waiting for the handler to finish, so
+  anything the handler queues isn't heard. Set it to `False` if you want to
+  handle idle timeouts yourself.
 </Note>
