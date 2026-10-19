@@ -218,7 +218,10 @@ A page documenting several classes may use a `##` per class, with Settings,
 Usage, Frames, Methods, Notes, and Event Handlers as `###` under each.
 
 Notes are not a second description of the parameters. If a bullet only
-restates a `<ParamField>`, delete it.
+restates a `<ParamField>` or a settings table, delete it. Keep one note per
+topic: when the behavior changes, rewrite the note that covers it rather than
+adding one beside it. Leave out how the service works inside (handshake
+messages, timeouts, watchdogs) unless the reader acts on it.
 
 ## Changing Existing Pages
 
