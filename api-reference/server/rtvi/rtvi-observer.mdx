@@ -11,11 +11,12 @@ The `RTVIObserver` primarily serves to convert internal pipeline frames into to 
 
 ## Automatic Setup
 
-`RTVIObserver` is automatically created and attached when you create a `PipelineWorker`. No manual setup is required for standard usage.
+`RTVIObserver` is automatically created and attached when you create a `PipelineWorker`, unless the worker has `enable_rtvi=False` or is bridged (where `enable_rtvi` defaults to off). No manual setup is required for standard usage. If you add your own `RTVIProcessor` to the pipeline, also pass an `RTVIObserver` in `observers`: the worker uses the pair instead of its defaults, and sets up no RTVI at all when only one of them is present.
 
 To customize the observer's behavior, pass `RTVIObserverParams` to the worker:
 
 ```python
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 
 worker = PipelineWorker(
@@ -125,6 +126,14 @@ worker = PipelineWorker(
   types as bot output messages. Only sent to clients of protocol 2.2.0 or later.
 </ParamField>
 
+<ParamField path="ignored_sources" type="list[FrameProcessor]" default="[]">
+  Processors whose frames the observer ignores, so no RTVI messages are sent for
+  their activity (for example, a silent evaluation LLM in a parallel branch).
+  Add and remove sources at runtime with
+  `observer.add_ignored_source(processor)` and
+  `observer.remove_ignored_source(processor)`.
+</ParamField>
+
 <ParamField path="skip_text_types" default="None">
   List of text types to skip sending as tts/output messages. This also hides the
   words of skipped text that the TTS service reports with timestamps. Text of
@@ -161,33 +170,50 @@ The legacy 2-parameter signature `(text, text_type) -> str` is deprecated but st
 **Example:**
 
 ```python
-from pipecat.processors.frameworks.rtvi import BotOutputTransformResult
+from pipecat.processors.frameworks.rtvi import (
+    BotOutputTransformResult,
+    RTVIObserverParams,
+)
 
 async def redact_sensitive(
-        text: str,
-        text_type: str,
-        accumulated_text: str | None = None,
-        remaining_text: str | None = None,
-    ) -> BotOutputTransformResult:
-        transformed = "XXXX-XXXX-XXXX-" + text[-4:]
-        if accumulated_text is not None and remaining_text is not None:
-            ratio = len(accumulated_text) / max(len(text), 1)
-            split = int(ratio * len(transformed))
-            return BotOutputTransformResult(
-                text=transformed,
-                accumulated_text=transformed[:split],
-                remaining_text=transformed[split:],
-            )
-        return BotOutputTransformResult(text=transformed)
+    text: str,
+    text_type: str,
+    accumulated_text: str | None = None,
+    remaining_text: str | None = None,
+) -> BotOutputTransformResult:
+    transformed = "XXXX-XXXX-XXXX-" + text[-4:]
+    if accumulated_text is not None and remaining_text is not None:
+        ratio = len(accumulated_text) / max(len(text), 1)
+        split = int(ratio * len(transformed))
+        return BotOutputTransformResult(
+            text=transformed,
+            accumulated_text=transformed[:split],
+            remaining_text=transformed[split:],
+        )
+    return BotOutputTransformResult(text=transformed)
+
+async def uppercase(
+    text: str,
+    text_type: str,
+    accumulated_text: str | None = None,
+    remaining_text: str | None = None,
+) -> BotOutputTransformResult:
+    if accumulated_text is not None and remaining_text is not None:
+        return BotOutputTransformResult(
+            text=text.upper(),
+            accumulated_text=accumulated_text.upper(),
+            remaining_text=remaining_text.upper(),
+        )
+    return BotOutputTransformResult(text=text.upper())
 
 bot_output_transforms = [
     ("credit_card", redact_sensitive),  # Only for 'credit_card' type
-    ("*", lambda text, agg_type: text.upper()),  # For all types, make uppercase
+    ("*", uppercase),  # For all types, make uppercase
 ]
 
-observer = RTVIObserver(
-    rtvi,
-    params=RTVIObserverParams(bot_output_transforms=bot_output_transforms),
+worker = PipelineWorker(
+    pipeline,
+    rtvi_observer_params=RTVIObserverParams(bot_output_transforms=bot_output_transforms),
 )
 ```
 
@@ -206,7 +232,7 @@ observer = RTVIObserver(
 **Levels:**
 
 - `DISABLED`: No events emitted for this function
-- `NONE`: Events with `tool_call_id` only (most secure when events are needed)
+- `NONE`: Events with `tool_call_id` only (most secure when events are needed). `llm-function-call-started` carries no `tool_call_id`, so its data is empty at this level
 - `NAME`: Adds function name to events
 - `ARGUMENTS`: Adds function name and arguments, no results
 - `FULL`: Adds function name, arguments, and results
@@ -234,50 +260,62 @@ worker = PipelineWorker(
 
 The observer maps Pipecat's internal frames to RTVI protocol messages:
 
-| Pipeline Frame                | RTVI Message                                               |
-| ----------------------------- | ---------------------------------------------------------- |
+| Pipeline Frame                | RTVI Message                                                             |
+| ----------------------------- | ------------------------------------------------------------------------ |
 | **Speech Events**             |
-| `UserStartedSpeakingFrame`    | `RTVIUserStartedSpeakingMessage`                           |
-| `UserStoppedSpeakingFrame`    | `RTVIUserStoppedSpeakingMessage`                           |
-| `VADUserStartedSpeakingFrame` | `VADUserStartedSpeakingMessage`                            |
-| `VADUserStoppedSpeakingFrame` | `VADUserStoppedSpeakingMessage`                            |
-| `BotStartedSpeakingFrame`     | `RTVIBotStartedSpeakingMessage`                            |
-| `BotStoppedSpeakingFrame`     | `RTVIBotStoppedSpeakingMessage`                            |
+| `UserStartedSpeakingFrame`    | `UserStartedSpeakingMessage`                                             |
+| `UserStoppedSpeakingFrame`    | `UserStoppedSpeakingMessage`                                             |
+| `VADUserStartedSpeakingFrame` | `VADUserStartedSpeakingMessage`                                          |
+| `VADUserStoppedSpeakingFrame` | `VADUserStoppedSpeakingMessage`                                          |
+| `BotStartedSpeakingFrame`     | `BotStartedSpeakingMessage`                                              |
+| `BotStoppedSpeakingFrame`     | `BotStoppedSpeakingMessage`                                              |
+| `InterruptionFrame`           | `BotInterruptedMessage` (`bot-interrupted`, when `bot_speaking_enabled`) |
 | **User Mute**                 |
-| `UserMuteStartedFrame`        | `RTVIUserMuteStartedMessage`                               |
-| `UserMuteStoppedFrame`        | `RTVIUserMuteStoppedMessage`                               |
+| `UserMuteStartedFrame`        | `UserMuteStartedMessage`                                                 |
+| `UserMuteStoppedFrame`        | `UserMuteStoppedMessage`                                                 |
 | **Transcription**             |
-| `TranscriptionFrame`          | `RTVIUserTranscriptionMessage(final=true)` (deprecated)    |
-| `InterimTranscriptionFrame`   | `RTVIUserTranscriptionMessage(final=false)` (deprecated)   |
-| `TranscriptionFrame`          | `stt-raw-text` (`final=true`, when enabled)                |
-| `InterimTranscriptionFrame`   | `stt-raw-text` (`final=false`, when enabled)               |
-| `TranscriptionFrame`          | `user-input` (`input_type="transcription"`, `final=true`)  |
-| `InterimTranscriptionFrame`   | `user-input` (`input_type="transcription"`, `final=false`) |
-| `UserBackchannelFrame`        | `user-input` (`input_type="backchannel"`)                  |
-| `RTVISendTextFrame`           | `user-input` (`input_type="chat"`)                         |
+| `TranscriptionFrame`          | `UserTranscriptionMessage(final=true)` (deprecated)                      |
+| `InterimTranscriptionFrame`   | `UserTranscriptionMessage(final=false)` (deprecated)                     |
+| `TranscriptionFrame`          | `stt-raw-text` (`final=true`, when enabled)                              |
+| `InterimTranscriptionFrame`   | `stt-raw-text` (`final=false`, when enabled)                             |
+| `TranscriptionFrame`          | `user-input` (`input_type="transcription"`, `final=true`)                |
+| `InterimTranscriptionFrame`   | `user-input` (`input_type="transcription"`, `final=false`)               |
+| `UserBackchannelFrame`        | `user-input` (`input_type="backchannel"`)                                |
+| `RTVISendTextFrame`           | `user-input` (`input_type="chat"`)                                       |
 | **Bot Output**                |
-| `AggregatedTextFrame`         | `RTVIBotOutputMessage`                                     |
+| `AggregatedTextFrame`         | `BotOutputMessage`                                                       |
 | **LLM Processing**            |
-| `LLMFullResponseStartFrame`   | `RTVIBotLLMStartedMessage`                                 |
-| `LLMFullResponseEndFrame`     | `RTVIBotLLMStoppedMessage`                                 |
-| `LLMTextFrame`                | `RTVIBotLLMTextMessage` (deprecated)                       |
-| `LLMTextFrame`                | `llm-raw-text` (when enabled)                              |
-| `LLMMarkerResponseFrame`      | `bot-llm-marker` (when enabled)                            |
+| `LLMFullResponseStartFrame`   | `BotLLMStartedMessage`                                                   |
+| `LLMFullResponseEndFrame`     | `BotLLMStoppedMessage`                                                   |
+| `LLMTextFrame`                | `BotLLMTextMessage` (deprecated)                                         |
+| `LLMTextFrame`                | `llm-raw-text` (when enabled)                                            |
+| `LLMMarkerResponseFrame`      | `bot-llm-marker` (when enabled)                                          |
 | **TTS Events**                |
-| `TTSStartedFrame`             | `RTVIBotTTSStartedMessage`                                 |
-| `TTSStoppedFrame`             | `RTVIBotTTSStoppedMessage`                                 |
-| `TTSTextFrame`                | `RTVIBotTTSTextMessage` (deprecated)                       |
-| `AggregatedTextFrame`         | `tts-raw-text` (when enabled)                              |
+| `TTSStartedFrame`             | `BotTTSStartedMessage`                                                   |
+| `TTSStoppedFrame`             | `BotTTSStoppedMessage`                                                   |
+| `TTSTextFrame`                | `BotTTSTextMessage` (deprecated)                                         |
+| `TTSTextFrame`                | `tts-raw-text` (when enabled)                                            |
 | **Function Calls**            |
-| `FunctionCallsStartedFrame`   | `llm-function-call-started`                                |
-| `FunctionCallInProgressFrame` | `llm-function-call-in-progress`                            |
-| `FunctionCallResultFrame`     | `llm-function-call-stopped`                                |
+| `FunctionCallsStartedFrame`   | `llm-function-call-started`                                              |
+| `FunctionCallInProgressFrame` | `llm-function-call-in-progress`                                          |
+| `FunctionCallResultFrame`     | `llm-function-call-stopped` (final results only)                         |
+| `FunctionCallCancelFrame`     | `llm-function-call-stopped` (`cancelled=true`)                           |
+| `ExternalFunctionCall*Frame`  | Same messages as the matching `FunctionCall*Frame`                       |
 | **Context/Metrics**           |
-| `LLMContextFrame`             | `RTVIUserLLMTextMessage`                                   |
-| `MetricsFrame`                | `RTVIMetricsMessage`                                       |
-| `RTVIServerMessageFrame`      | `RTVIServerMessage`                                        |
+| `LLMContextFrame`             | `UserLLMTextMessage`                                                     |
+| `MetricsFrame`                | `MetricsMessage`                                                         |
+| `RTVIServerMessageFrame`      | `ServerMessage`                                                          |
+| `RTVIServerResponseFrame`     | `server-response`, or `error-response` when `error` is set               |
 | **User Interface**            |
-| `RTVIUICommandFrame`          | `UICommandMessage` (`ui-command`)                          |
-| `RTVIUIJobGroupFrame`         | `UIJobGroupMessage` (`ui-job-group`)                       |
+| `RTVIUICommandFrame`          | `UICommandMessage` (`ui-command`)                                        |
+| `RTVIUIJobGroupFrame`         | `UIJobGroupMessage` (`ui-job-group`)                                     |
 
 The [User Interface](/client/rtvi-standard#user-interface) frames are emitted by `PipelineWorker` when a [`UIWorker`](/api-reference/server/workers/ui-worker) sends a command or runs a job group; the observer translates them into the outbound `ui-command` / `ui-job-group` messages the client renders.
+
+## Frames
+
+**Sent to the observer:**
+
+| Frame                        | Fields                                                                              | Effect                                                                                               |
+| ---------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `RTVIConfigureObserverFrame` | `function_call_report_level`, `vad_user_speaking_enabled`, `bot_llm_marker_enabled` | Changes the matching `RTVIObserverParams` fields at runtime. Fields left as `None` keep their value. |

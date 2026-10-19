@@ -3,13 +3,16 @@ title: "RTVIProcessor"
 description: "RTVIProcessor coordinates RTVI protocol communication between Pipecat pipelines and connected clients."
 ---
 
-The `RTVIProcessor` manages bidirectional communication between clients and your Pipecat application. It processes client messages, handles service configuration, executes actions, and coordinates function calls.
+The `RTVIProcessor` manages bidirectional communication between clients and your Pipecat application. It processes client messages and handles the client-ready handshake.
 
 ## Initialization
 
 `RTVIProcessor` is automatically added to your pipeline when you create a `PipelineWorker`. Access it via `worker.rtvi`:
 
 ```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
+
 pipeline = Pipeline([
     transport.input(),
     stt,
@@ -55,8 +58,7 @@ Clients indicate readiness by sending a `client-ready` message, triggering the `
 ```python
 @rtvi.event_handler("on_client_ready")
 async def on_client_ready(rtvi):
-    # Handle client ready state
-    await rtvi.set_bot_ready()
+    # PipelineWorker calls set_bot_ready() for you
     # Initialize conversation
     await worker.queue_frames([...])
 ```
@@ -72,162 +74,46 @@ async def on_client_ready(rtvi):
 
 ### Bot Ready State
 
-The server must mark the bot as ready before it can process client messages:
-
-```python
-await rtvi.set_bot_ready()
-```
-
-When marked ready, the bot sends a response containing:
+`PipelineWorker` calls `set_bot_ready()` when the client sends `client-ready`. It sends the client a `bot-ready` message containing:
 
 - RTVI protocol version
-- Current service configuration
-- Available actions
-
-## Services
-
-Services represent configurable components of your application that clients can interact with.
-
-### Registering Services
-
-```python
-# 1. Define option handler
-async def handle_voice_option(processor, service, option):
-    voice_id = option.value
-    # Apply configuration change
-    logger.info(f"Voice ID updated to: {voice_id}")
-
-# 2. Create RTVIService
-voice_service = RTVIService(
-    name="voice",
-    options=[
-        RTVIServiceOption(
-            name="voice_id",
-            type="string",
-            handler=handle_voice_option
-        )
-    ]
-)
-
-# 3. Register with processor
-rtvi.register_service(voice_service)
-```
-
-### Option Types
-
-Services support multiple data types for configuration:
-
-```python
-RTVIServiceOption(
-    name="temperature",
-    type="number",  # number, string, bool, array, object
-    handler=handle_temperature
-)
-```
-
-Option handlers receive:
-
-- The processor instance
-- The service name
-- The option configuration with new value
-
-## Actions
-
-Actions are server-side functions that clients can trigger with arguments.
-
-### Registering Actions
-
-```python
-# 1. Define handler function
-async def handle_print_message(processor, service, arguments):
-    message = arguments.get("message", "Default message")
-    logger.info(f"Print action triggered with message: {message}")
-    return True
-
-# 2. Create and register RTVIAction
-print_action = RTVIAction(
-    service="conversation",
-    action="print_message",
-    arguments=[
-        RTVIActionArgument(name="message", type="string")
-    ],
-    result="bool",
-    handler=handle_print_message
-)
-rtvi.register_action(print_action)
-```
-
-### Action Arguments
-
-Actions can accept typed arguments from clients:
-
-```python
-search_action = RTVIAction(
-    service="knowledge",
-    action="search",
-    arguments=[
-        RTVIActionArgument(name="query", type="string"),
-        RTVIActionArgument(name="limit", type="number")
-    ],
-    result="array",
-    handler=handle_search
-)
-```
+- `about` information (the Pipecat library and version by default)
+- The bot's `capabilities`
 
 ## Function Calls
 
-Handle LLM function calls with client interaction:
+`RTVIObserver` reports the LLM's function calls to the client as `llm-function-call-started`, `llm-function-call-in-progress`, and `llm-function-call-stopped` messages; see [RTVIObserver](/api-reference/server/rtvi/rtvi-observer#frame-translation). When the client sends an `llm-function-call-result` message, the processor pushes it downstream as a `FunctionCallResultFrame`.
+
+## Frames
+
+**Sent to RTVI:**
+
+| Frame                                                                                           | Fields                        | Effect                                                                                                                                                                                                                                           |
+| ----------------------------------------------------------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`ErrorFrame`](/api-reference/server/frames/system-frames#errorframe)                           | `error`                       | Sent to the client as an `error` message. A processor reports one with `await self.push_error("...")`, which pushes it upstream to the `RTVIProcessor` at the start of the pipeline.                                                             |
+| [`RTVIServerResponseFrame`](/api-reference/server/frames/system-frames#rtviserverresponseframe) | `client_msg`, `data`, `error` | Answers a client request. When the client sends a `client-message`, the processor pushes an `RTVIClientMessageFrame` downstream; push a response carrying that frame as `client_msg`. With `error` set, the client receives an `error-response`. |
+
+Interrupt the bot with an [`InterruptionWorkerFrame`](/api-reference/server/frames/system-frames#interruptionworkerframe).
+
+## Methods
+
+An `on_client_message` handler receives the request as an `RTVI.ClientMessage`, not the `RTVIClientMessageFrame` that `RTVIServerResponseFrame` takes, so it answers with these methods (see [Requesting Data from the Server](/client/guides/custom-messaging#requesting-data-from-the-server)).
+
+### send_server_response()
 
 ```python
-
-await processor.handle_function_call(
-    function_name=function_name,
-    tool_call_id=tool_call_id,
-    arguments=arguments,
-)
-
-await processor.handle_function_call(params)
+async def send_server_response(client_msg: RTVI.ClientMessage, data: Any)
 ```
 
-The function call process:
+Sends the client a `server-response` to the request `client_msg`, carrying `data`.
 
-1. LLM requests a function call
-2. Processor notifies client with `llm-function-call` message
-3. Client executes function and returns result
-4. Result is passed back to LLM via `FunctionCallResultFrame`
-5. Conversation continues
-
-## Error Handling
-
-Send error messages to clients:
+### send_error_response()
 
 ```python
-# General error
-await processor.send_error("Invalid configuration")
-
-# Request-specific error
-await processor._send_error_response(request_id, "Invalid action arguments")
+async def send_error_response(client_msg: RTVI.ClientMessage, error: str)
 ```
 
-Error categories:
-
-- Configuration errors
-- Action execution errors
-- Function call errors
-- Protocol errors
-- Fatal and non-fatal errors
-
-## Bot Control
-
-Manage bot state and handle interruptions:
-
-```python
-# Set bot as ready
-await processor.set_bot_ready()
-
-# Handle interruptions
-await processor.interrupt_bot()
-```
+Sends the client an `error-response` to the request `client_msg`, carrying `error`.
 
 ## Custom Messaging
 
@@ -315,15 +201,15 @@ The processor handles `send-file` client messages (protocol 2.2.0) that send a f
 }
 ```
 
-| Field                     | Description                                                                                                                        |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `content`                 | Text to accompany the file.                                                                                                        |
-| `file.format`             | MIME type of the file, e.g. `application/pdf`.                                                                                     |
-| `file.name`               | Optional file name.                                                                                                                |
-| `file.source`             | Either `{"type": "bytes", "bytes": "<base64>"}` (images may also include `width` and `height`) or `{"type": "url", "url": "..."}`. |
-| `options.run_immediately` | Interrupt the bot and run the LLM right away. Defaults to `true`.                                                                  |
-| `options.audio_response`  | Speak the response. When `false`, TTS is skipped for this response. Defaults to `true`.                                            |
-| `options.custom_options`  | Provider-specific options, e.g. `detail` for OpenAI or `citations` for Bedrock.                                                    |
+| Field                     | Description                                                                                                                               |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `content`                 | Text to accompany the file.                                                                                                               |
+| `file.format`             | MIME type of the file, e.g. `application/pdf`.                                                                                            |
+| `file.name`               | Optional file name.                                                                                                                       |
+| `file.source`             | Either `{"type": "bytes", "bytes": "<base64>"}` (images may also include `width` and `height`) or `{"type": "url", "url": "..."}`.        |
+| `options.run_immediately` | Interrupt the bot and run the LLM right away. Defaults to `true`.                                                                         |
+| `options.audio_response`  | Speak the response. When `false`, TTS is skipped for this response. Defaults to `true`.                                                   |
+| `options.custom_options`  | Provider-specific options, such as `detail` for OpenAI or `citations` for Bedrock. Not passed to the LLM service, so they have no effect. |
 
 Image files sent as bytes are pushed downstream as a `UserImageRawFrame`; all other files are pushed as a [`UserFileRawFrame`](/api-reference/server/frames/system-frames#userfilerawframe), both appended to the context.
 

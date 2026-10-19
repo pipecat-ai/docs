@@ -104,7 +104,7 @@ Before using LiveKitTransport, you need:
 
 ### LiveKitParams
 
-Video output publishes a single `"pipecat-video"` camera track when `video_out_enabled` is set (mirroring how audio output always publishes one `"pipecat-audio"` microphone track). The track is sized using `video_out_width`/`video_out_height` and encodes frames according to `video_out_color_format` (default `"RGB"`); `video_out_framerate` governs how often frames are drawn. Per-destination video routing (multiple named output tracks, as supported by Daily's `camera_out_enabled`/`register_video_destination`) is not yet implemented for LiveKit.
+Video output publishes a single `"pipecat-video"` camera track when `video_out_enabled` is set (mirroring how audio output always publishes one `"pipecat-audio"` microphone track). The track is sized using `video_out_width`/`video_out_height` and publishes each frame in its own `format`, which must be `"RGB"`, `"RGBA"`, `"BGRA"` or `"ARGB"`; frames in other formats are dropped and an error is logged. `video_out_framerate` governs how often frames are drawn. Per-destination video routing (multiple named output tracks, as supported by Daily's `camera_out_enabled`/`register_video_destination`) is not yet implemented for LiveKit.
 
 `video_out_codec` selects the published video codec (`"VP8"`, `"H264"`, `"VP9"`, `"AV1"` or `"H265"`); LiveKit picks one when unset.
 
@@ -122,18 +122,18 @@ Video output publishes a single `"pipecat-video"` camera track when `video_out_e
 </ParamField>
 
 <ParamField path="video_out_max_bitrate" type="int | None" default="None">
-  Maximum bitrate of the published video track, in bits per second, capped at
-  `video_out_framerate`. LiveKit chooses the encoding from the track resolution
-  when unset.
+  Maximum bitrate of the published video track, in bits per second. When set,
+  `video_out_framerate` is also sent as the track's maximum framerate. LiveKit
+  chooses the encoding from the track resolution when unset.
 </ParamField>
 
 ### Video input
 
 With `video_in_enabled`, a participant's camera (`"camera"`) and screen share (`"screenVideo"`) are received separately, and each `UserImageRawFrame` carries its source in `transport_source`. Without `video_in_sources`, every frame of every video track is passed on. With it, only the listed sources are, each at its own framerate (see [TransportParams](/api-reference/server/services/transport/transport-params)).
 
-A `UserImageRequestFrame` is answered with the next frame of the requested source, so image-request tools such as `fetch_user_image` work with LiveKit. A request for a source the participant isn't sending, or one still waiting when the participant stops sending it or leaves, completes with an error result.
+A `UserImageRequestFrame` is answered with the next frame of the requested source, so image-request tools such as `fetch_user_image` work with LiveKit. A request for a source the participant isn't sending, for a source not listed in `video_in_sources` (when it is set) and not captured with `capture_participant_video()`, or one still waiting when the participant stops sending it or leaves, completes with an error result. Without `video_in_enabled=True`, no frames are received, so a request waits until the participant stops sending the source or leaves.
 
-`capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` captures a source at a framerate and takes precedence over `video_in_sources`. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on frames only to answer image requests. Get the `participant_id` with `transport.get_client_id(client)`. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
+`capture_participant_video(participant_id, framerate=30, video_source="camera", *, on_request_only=False)` is a coroutine that captures a source at a framerate and takes precedence over `video_in_sources`. A `framerate` of `None` passes on every frame, and `on_request_only=True` passes on frames only to answer image requests. Get the `participant_id` with `transport.get_client_id(client)`. Passing `framerate=0` is deprecated since 1.13.0; use `on_request_only=True`.
 
 ## Usage
 
@@ -146,6 +146,76 @@ See the [complete example](https://github.com/pipecat-ai/pipecat/blob/main/examp
 - Pipeline integration with audio processing
 - Event handling for room lifecycle management
 
+## Frames
+
+**Sent to the transport:**
+
+| Frame                                      | Fields                                 | Effect                                                                                                                                         |
+| ------------------------------------------ | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LiveKitOutputTransportMessageFrame`       | `message`, `participant_id` (optional) | Sends `message` on the data channel after the audio queued before it, to the participant with that identity or, without one, to the whole room |
+| `LiveKitOutputTransportMessageUrgentFrame` | `message`, `participant_id` (optional) | Sends `message` the same way, at once                                                                                                          |
+| `OutputDTMFFrame`                          | `button` or `buttons`                  | Sends a SIP DTMF tone. Only the first of `buttons` is sent                                                                                     |
+
+A `dict` message is sent as JSON. A plain [`OutputTransportMessageFrame`](/api-reference/server/frames/data-frames#outputtransportmessageframe) goes to the whole room.
+
+**Pushed by the transport:**
+
+| Frame                               | Fields                      | Meaning                                                                                                                |
+| ----------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `LiveKitInputTransportMessageFrame` | `message`, `participant_id` | A data channel message that parsed as a JSON object, the one `on_app_message` receives. Pushed upstream and downstream |
+
+```python
+from pipecat.transports.livekit.transport import LiveKitOutputTransportMessageFrame
+
+await worker.queue_frame(
+    LiveKitOutputTransportMessageFrame(message={"type": "status"}, participant_id="user-1")
+)
+```
+
+## Methods
+
+The room exists once the pipeline starts. Before that, these methods raise `Exception`.
+
+### get_participants()
+
+```python
+def get_participants() -> list[str]
+```
+
+Returns the LiveKit identities of the remote participants in the room.
+
+### get_participant_metadata()
+
+```python
+async def get_participant_metadata(participant_id: str) -> dict
+```
+
+Returns a participant's `id` (identity), `name`, and `metadata` as a `dict`, or an empty `dict` when no participant in the room has that identity.
+
+### set_metadata()
+
+```python
+async def set_metadata(metadata: str)
+```
+
+Sets the bot's own participant metadata in the room.
+
+### mute_participant()
+
+```python
+async def mute_participant(participant_id: str)
+```
+
+Stops the bot receiving a participant's audio. The participant isn't muted for anyone else in the room.
+
+### unmute_participant()
+
+```python
+async def unmute_participant(participant_id: str)
+```
+
+Resumes the bot receiving a participant's audio after `mute_participant()`.
+
 ## Event Handlers
 
 LiveKitTransport provides event handlers for room lifecycle, participant management, and media track events. Register handlers using the `@event_handler` decorator on the transport instance.
@@ -157,15 +227,17 @@ LiveKitTransport provides event handlers for room lifecycle, participant managem
 | `on_connected`                | Connected to the room               |
 | `on_disconnected`             | Disconnected from the room          |
 | `on_before_disconnect`        | About to disconnect (sync)          |
-| `on_call_state_updated`       | Call state changed                  |
 | `on_first_participant_joined` | First participant joined            |
 | `on_participant_connected`    | A participant connected             |
 | `on_participant_disconnected` | A participant disconnected          |
 | `on_participant_left`         | A participant left                  |
+| `on_client_connected`         | A participant connected (alias)     |
+| `on_client_disconnected`      | A participant disconnected (alias)  |
 | `on_audio_track_subscribed`   | Audio track subscribed              |
 | `on_audio_track_unsubscribed` | Audio track unsubscribed            |
 | `on_video_track_subscribed`   | Video track subscribed              |
 | `on_video_track_unsubscribed` | Video track unsubscribed            |
+| `on_app_message`              | JSON app message received           |
 | `on_data_received`            | Data message received               |
 | `on_active_speaker_changed`   | Loudest speaker in the room changed |
 | `on_dtmf_event`               | SIP DTMF tone received (telephony)  |
@@ -225,23 +297,6 @@ async def on_before_disconnect(transport):
   handlers complete. Keep handlers fast.
 </Note>
 
-#### on_call_state_updated
-
-Fired when the call state changes.
-
-```python
-@transport.event_handler("on_call_state_updated")
-async def on_call_state_updated(transport, state):
-    print(f"Call state: {state}")
-```
-
-**Parameters:**
-
-| Parameter   | Type               | Description            |
-| ----------- | ------------------ | ---------------------- |
-| `transport` | `LiveKitTransport` | The transport instance |
-| `state`     | `str`              | The new call state     |
-
 ### Participants
 
 <Note>
@@ -254,7 +309,7 @@ async def on_call_state_updated(transport, state):
 
 #### on_first_participant_joined
 
-Fired when the first participant (other than the bot) joins the room. This is commonly used to start the conversation.
+Fired when the first participant (other than the bot) joins the room, or is already in it when the bot connects. It fires again for the next participant after the room empties. This is commonly used to start the conversation.
 
 ```python
 @transport.event_handler("on_first_participant_joined")
@@ -271,7 +326,7 @@ async def on_first_participant_joined(transport, participant_id):
 
 #### on_participant_connected
 
-Fired when a participant connects to the room.
+Fired when a participant connects to the room, and for each participant already in the room when the bot connects.
 
 ```python
 @transport.event_handler("on_participant_connected")
@@ -327,6 +382,16 @@ async def on_participant_left(transport, participant_id, reason):
 | `participant_id` | `str`              | The participant's LiveKit identity          |
 | `reason`         | `str`              | Reason for leaving (e.g., `"disconnected"`) |
 
+#### on_client_connected / on_client_disconnected
+
+Transport-agnostic aliases that fire alongside `on_participant_connected` and `on_participant_disconnected` respectively, for compatibility with other transports. The handler receives the participant as a dict, with the LiveKit identity under `"id"`.
+
+```python
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, client):
+    print(f"Client connected: {client['id']}")
+```
+
 ### Media Tracks
 
 Track subscription events fire when audio or video tracks from participants are subscribed or unsubscribed. All receive `(transport, participant_id)`, where `participant_id` is the participant's LiveKit identity.
@@ -345,6 +410,24 @@ async def on_audio_track_subscribed(transport, participant_id):
 ```
 
 ### Messaging
+
+#### on_app_message
+
+Fired when a data channel message parses as a JSON object. `on_data_received` fires for the same packet with the raw bytes.
+
+```python
+@transport.event_handler("on_app_message")
+async def on_app_message(transport, message, participant_id):
+    print(f"Message from {participant_id}: {message}")
+```
+
+**Parameters:**
+
+| Parameter        | Type                | Description                                                          |
+| ---------------- | ------------------- | -------------------------------------------------------------------- |
+| `transport`      | `LiveKitTransport`  | The transport instance                                               |
+| `message`        | `dict`              | The parsed JSON message                                              |
+| `participant_id` | `str` &#124; `None` | The sender's LiveKit identity, or `None` for server SDK-sent packets |
 
 #### on_data_received
 
@@ -401,10 +484,10 @@ async def on_dtmf_event(transport, data):
 
 **Parameters:**
 
-| Parameter   | Type               | Description                                                                                              |
-| ----------- | ------------------ | -------------------------------------------------------------------------------------------------------- |
-| `transport` | `LiveKitTransport` | The transport instance                                                                                   |
-| `data`      | `dict`             | DTMF data with keys `tone`/`digit` (str), `code` (int), and `participant_id` (str, the LiveKit identity) |
+| Parameter   | Type               | Description                                                                                                                                                |
+| ----------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `transport` | `LiveKitTransport` | The transport instance                                                                                                                                     |
+| `data`      | `dict`             | DTMF data with keys `tone`/`digit` (str), `code` (int), and `participant_id` (str, the LiveKit identity, or `None` when the packet carries no participant) |
 
 <Note>
   The transport pushes `InputDTMFFrame` automatically, so you only need this

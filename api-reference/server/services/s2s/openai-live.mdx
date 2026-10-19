@@ -118,19 +118,19 @@ Before using GPT-Live, you need:
 
 Settings passed via the `settings` constructor argument using `OpenAILiveLLMService.Settings(...)`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter            | Type   | Default     | Description                                                                                                                                                                                                                                        |
-| -------------------- | ------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`              | `str`  | `NOT_GIVEN` | GPT-Live model identifier. _(Inherited from base settings.)_                                                                                                                                                                                       |
-| `system_instruction` | `str`  | `NOT_GIVEN` | Instructions for the GPT-Live model. _(Inherited from base settings.)_                                                                                                                                                                             |
-| `voice`              | `str`  | `NOT_GIVEN` | Output voice name (for example `"marin"` or `"cedar"`). `None` leaves the choice to the API.                                                                                                                                                       |
-| `store`              | `bool` | `NOT_GIVEN` | Whether the API keeps the session for 30 days as a stereo recording (`GET /v1/live/sessions/{id}/content`) and as a source a later session can fork from. `False` at the API by default; requires a project whose data policy permits persistence. |
+| Parameter            | Type   | Default        | Description                                                                                                                                                                                                                                        |
+| -------------------- | ------ | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`              | `str`  | `"gpt-live-1"` | GPT-Live model identifier. _(Inherited from base settings.)_                                                                                                                                                                                       |
+| `system_instruction` | `str`  | `None`         | Instructions for the GPT-Live model. _(Inherited from base settings.)_                                                                                                                                                                             |
+| `voice`              | `str`  | `None`         | Output voice name (for example `"marin"` or `"cedar"`). `None` leaves the choice to the API.                                                                                                                                                       |
+| `store`              | `bool` | `None`         | Whether the API keeps the session for 30 days as a stereo recording (`GET /v1/live/sessions/{id}/content`) and as a source a later session can fork from. `False` at the API by default; requires a project whose data policy permits persistence. |
 
 <Note>
-  `NOT_GIVEN` values are omitted, letting the service use its own defaults
-  (`"gpt-live-1"` for model). The API fixes `model`, `voice`, `store` and
-  `system_instruction` when the session starts, so a change sent with
-  `LLMUpdateSettingsFrame` is stored, logged as unsupported for the session in
-  progress, and applied to the next session started by `reset_conversation()`.
+  `None` values are omitted, letting the service use its own defaults. The API
+  fixes `model`, `voice`, `store` and `system_instruction` when the session
+  starts, so a change sent with `LLMUpdateSettingsFrame` is stored, logged as
+  unsupported for the session in progress, and applied to the next session
+  started by `reset_conversation()`.
 </Note>
 
 ### ResponsesDelegation
@@ -144,7 +144,9 @@ OpenAI hosts the backend model. Passed as `delegation=OpenAILiveLLMService.Respo
   instructions, `max_completion_tokens` its `max_output_tokens`, and `reasoning`
   is sent when configured. Fields the GPT-Live API does not accept for a
   delegated model (`temperature`, `top_p`, the penalties, `seed`, `top_k`,
-  `max_tokens`) are dropped with a warning.
+  `max_tokens`, `user_turn_completion_config`, `filter_incomplete_user_turns`)
+  are dropped with a warning. `extra` is merged into the delegation
+  configuration.
 </ParamField>
 
 <ParamField path="service_tier" type="str | None" default="None">
@@ -158,12 +160,12 @@ The backend model's tools and `tool_choice` come from the pipeline's `LLMContext
 
 A Pipecat worker is the backend. Passed as `delegation=OpenAILiveLLMService.ClientDelegation(...)`.
 
-<ParamField path="backend" type="BaseWorker | str" required>
+<ParamField path="backend" type="BackendLLMWorker | str" required>
   The worker that runs delegated tasks, normally a
   [`BackendLLMWorker`](#backendllmworker) wrapping any LLM service. The service
   registers it as a child of the pipeline worker at setup, so the pipeline must
-  run under a `WorkerRunner`. A string names a backend worker running in another
-  process on a shared bus.
+  run under a `WorkerRunner`. A string names a backend worker registered
+  elsewhere, in the app or in another process on a shared bus.
 </ParamField>
 
 <ParamField path="timeout_secs" type="float" default="120.0">
@@ -171,7 +173,7 @@ A Pipecat worker is the backend. Passed as `delegation=OpenAILiveLLMService.Clie
   the delegated work could not be completed.
 </ParamField>
 
-A delegation names no task: the GPT-Live model signals only that it is handing work over. The service sends the backend the transcript of the conversation since the previous delegation, and the backend works out the request from it. Each turn the backend's model writes is sent as soon as it is produced and appended to the live session according to its `prefers_spoken` flag: text the backend wants heard is appended as commentary, which the model relays in its own words, and the rest as silent context the model can draw on.
+A delegation names no task: the GPT-Live model signals only that it is handing work over. The service sends the backend the transcript of the conversation since the previous delegation, and the backend works out the request from it. Delegations run one at a time: one created while another is in progress waits for it to finish. Each turn the backend's model writes is sent as soon as it is produced and appended to the live session according to its `prefers_spoken` flag: text the backend wants heard is appended as commentary, which the model relays in its own words, and the rest as silent context the model can draw on.
 
 ### BackendLLMWorker
 
@@ -384,17 +386,27 @@ async def load_conversation(params: FunctionCallParams, filename: str):
     await params.llm.reset_conversation()
 ```
 
+## Methods
+
+### reset_conversation()
+
+```python
+async def reset_conversation()
+```
+
+Drops the session and starts a new one configured from the context as it is now. See [Restoring a Conversation](#restoring-a-conversation).
+
 ## Notes
 
 - **Turn taking is the model's**: The service proposes user turn boundaries from the API's transcript stream, and `LLMContextAggregatorPair` resolves them with the recommended `ExternalUserTurnStrategies(enable_interruptions=False)`. No `InterruptionFrame` is broadcast: the model handles being talked over itself, and a delegation keeps running when that happens. As a consequence every tool behaves as `cancel_on_interruption=False`; use `cancellable_by_llm=True` for tools the model should be able to cancel on request.
 - **No local VAD**: The model detects the user's turns itself, so the pipeline needs no VAD analyzer and no `realtime_service_mode` on the aggregators. The user aggregator writes each user turn to the context as it ends, before any tool calls it triggers.
-- **Session start**: The session starts on the first `LLMContextFrame`, typically queued as an `LLMRunFrame`. The context's leading system message (or `Settings.system_instruction`) becomes the model's instructions and the remaining text messages seed the session as prior conversation. At most 128 messages are kept, dropping the oldest; tool calls, tool results and non-text content have no representation in the startup history and are skipped.
+- **Session start**: The session starts on the first `LLMContextFrame`, typically queued as an `LLMRunFrame`. The context's leading system message (or `Settings.system_instruction`) becomes the model's instructions and the remaining text messages seed the session as prior conversation. At most 128 messages are kept, dropping the oldest; tool calls, tool results and non-text content have no representation in the startup history and are skipped. Input audio is dropped until the session has started.
 - **Opening the conversation**: A trailing developer message in the context is delivered to the model once the session starts, as the request to speak first. Omit it to have the model wait for the user.
 - **System instruction precedence**: `system_instruction` from service settings takes precedence over an initial system message in the LLM context. A warning is logged when both are set.
 - **Tools belong to the backend**: The GPT-Live model calls no tools of its own. In Responses delegation mode this is invisible to your code: register functions and write their handlers as for any other LLM service, and the backend model calls them through the pipeline. In client delegation mode the `BackendLLMWorker`'s own context carries the tools, and its pipeline runs them.
 - **Audio format**: Input audio is resampled to 24 kHz; output is 24 kHz PCM, pushed as `SpeechOutputAudioRawFrame` so the output transport derives bot speaking state from the audio itself.
-- **Usage metrics**: GPT-Live usage is reported as cumulative session seconds. Token usage comes from the backend model's completed responses in Responses delegation.
-- **Delegation failures**: When a client delegation fails or times out, the model is told the delegated work could not be completed and the detail is pushed as an `ErrorFrame`. A delegation that finishes without producing any text is reported to the model as having no answer, so the conversation moves on.
+- **Usage metrics**: GPT-Live usage, in cumulative session seconds, is logged at debug level and not reported as a metric. Token usage metrics come from the backend model's completed responses in Responses delegation.
+- **Delegation failures**: When a client delegation fails, the model is told the delegated work could not be completed and the detail is pushed as an `ErrorFrame`. A delegation that times out pushes no `ErrorFrame`. A delegation that finishes without producing any output meant to be spoken is reported to the model as having no answer, so the conversation moves on.
 
 ## Event Handlers
 

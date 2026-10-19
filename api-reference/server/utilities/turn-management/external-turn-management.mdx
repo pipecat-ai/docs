@@ -39,30 +39,22 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 ```
 
 <Note>
-  When the STT service is driving turn detection, a VAD in the transport (such
-  as `SileroVADAnalyzer`) is optional. It's not needed for core turn management,
-  but including one enables useful STT metrics. Drop it if you don't care about
-  those metrics.
+  When the STT service is driving turn detection, a VAD on the user aggregator
+  (`vad_analyzer=SileroVADAnalyzer()` in `LLMUserAggregatorParams`) is optional.
+  It's not needed for core turn management, but including one enables useful STT
+  metrics. Drop it if you don't care about those metrics.
 </Note>
 
 ## Realtime (Speech-to-Speech) Services
 
-Realtime (speech-to-speech) LLM services — OpenAI Realtime, Azure Realtime, Grok/xAI Realtime, Inworld, Gemini Live, AWS Nova Sonic, and Ultravox — consume user audio directly and manage their own conversation flow. For these, pass `realtime_service_mode=True` to `LLMContextAggregatorPair`:
+Realtime (speech-to-speech) LLM services (OpenAI Realtime, Azure Realtime, Grok/xAI Realtime, Inworld, Gemini Live, AWS Nova Sonic, and Ultravox) consume user audio directly and manage their own conversation flow. `LLMContextAggregatorPair` switches to realtime mode on its own when one of these services starts, so it needs no configuration. Its `realtime_service_mode` argument overrides that: `False` keeps the cascade behavior, and `True` turns realtime mode on for a third-party realtime service that doesn't announce itself.
 
-```python
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-
-user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-    context,
-    realtime_service_mode=True,
-)
-```
-
-Setting `realtime_service_mode=True` adapts the pair's behavior in three ways:
+Realtime mode adapts the pair's behavior in two ways:
 
 1. **Context writes are decoupled from `UserStoppedSpeakingFrame`.** Instead, the assistant response start triggers the user message write. This keeps the context correct even when the realtime service provides no turn frames and local turn detection (VAD) is disabled.
 2. **`UserStoppedSpeakingFrame` can fire without waiting for transcripts.** When local turn detection drives the conversation, this frame triggers the assistant response — letting it fire earlier reduces latency. The pair flips `wait_for_transcript=False` on the [stop strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#stop-strategies) that support it.
-3. **Default turn strategies are replaced with external strategies when the service detects turns server-side.** Services that propose turn boundaries from server-side VAD (OpenAI Realtime, Azure Realtime, Grok, Inworld) request `ExternalUserTurnStrategies`, which resolve those proposals into `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and drive `on_user_turn_started` / `on_user_turn_stopped`. Services that propose nothing — either because they never do (Gemini Live, Nova Sonic, Ultravox) or because server-side turn detection was disabled at runtime (e.g. OpenAI Realtime with `turn_detection=False`) — keep the defaults so locally-driven turn detection (e.g. local VAD) can fire the events. Passing custom `user_turn_strategies` opts out of this swap.
+
+Separately from realtime mode, services that propose turn boundaries from server-side VAD (OpenAI Realtime, Azure Realtime, Grok, Inworld) replace the default turn strategies with `ExternalUserTurnStrategies`, which resolve those proposals into `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and drive `on_user_turn_started` / `on_user_turn_stopped`. Services that propose nothing, either because they never do (Gemini Live, Nova Sonic, Ultravox) or because server-side turn detection was disabled at runtime (e.g. OpenAI Realtime with `turn_detection=False`), keep the defaults so locally-driven turn detection (e.g. local VAD) can fire the events. Passing custom `user_turn_strategies` opts out of this swap.
 
 <Note>
   In realtime mode, subscribe to
@@ -95,8 +87,8 @@ Setting `realtime_service_mode=True` adapts the pair's behavior in three ways:
 </ParamField>
 
 <ParamField path="user_turn_stop_timeout" type="float" default="5.0">
-  Timeout in seconds to automatically stop a user turn if no stop strategy
-  triggers.
+  Seconds of inactivity after which an active user turn stops. The timer runs
+  while the user isn't speaking and resets on each VAD event and transcript.
 </ParamField>
 
 <ParamField path="user_idle_timeout" type="float" default="0">
@@ -117,6 +109,11 @@ async def on_user_turn_started(processor, strategy):
     # Called when a user turn starts
     pass
 
+@user_turn_processor.event_handler("on_user_turn_inference_triggered")
+async def on_user_turn_inference_triggered(processor, strategy):
+    # Called when there is enough signal to start LLM inference
+    pass
+
 @user_turn_processor.event_handler("on_user_turn_stopped")
 async def on_user_turn_stopped(processor, strategy):
     # Called when a user turn stops
@@ -124,16 +121,17 @@ async def on_user_turn_stopped(processor, strategy):
 
 @user_turn_processor.event_handler("on_user_turn_stop_timeout")
 async def on_user_turn_stop_timeout(processor):
-    # Called if no stop strategy triggers before timeout
+    # Called when a user turn stops after user_turn_stop_timeout of inactivity
     pass
 ```
 
 ### Usage with Parallel Pipelines
 
-When using parallel pipelines with multiple context aggregators, place `UserTurnProcessor` before the parallel pipeline and configure each context aggregator with `ExternalUserTurnStrategies`:
+When using parallel pipelines with multiple context aggregators, place `UserTurnProcessor` before the parallel pipeline and configure each context aggregator with `ExternalUserTurnStrategies`. `UserTurnProcessor` has no VAD of its own, so put a `VADProcessor` ahead of it to supply the speech events its strategies need:
 
 ```python
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.parallel_pipeline import ParallelPipeline
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -141,9 +139,12 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserTurnStrategies
+
+vad_processor = VADProcessor(vad_analyzer=SileroVADAnalyzer())
 
 # Create the external user turn processor with your preferred strategies
 user_turn_processor = UserTurnProcessor(
@@ -179,6 +180,7 @@ pipeline = Pipeline(
     [
         transport.input(),
         stt,
+        vad_processor,
         user_turn_processor,  # Handles turn management for all branches
         ParallelPipeline(
             [
