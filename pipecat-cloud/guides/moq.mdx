@@ -1,0 +1,150 @@
+---
+title: "Pipecat Cloud Media over QUIC"
+sidebarTitle: "Media over QUIC (MoQ)"
+description: "Run Pipecat Cloud agents over Media over QUIC: start a session with transport moq, connect MoqTransport, and use MOQSessionArguments."
+---
+
+Media over QUIC (MoQ) connects a browser to your Pipecat Cloud agent through the MoQ relays in the agent's region. The browser's audio and RTVI messages travel over WebTransport, with a WebSocket fallback, and your agent reaches the region's relays from inside Pipecat Cloud. Pipecat Cloud runs the relays and issues each session's credentials, so there is no relay to deploy and no token to mint.
+
+MoQ is a browser transport. For telephony and server-to-server links, use the [generic WebSocket endpoint](/pipecat-cloud/guides/generic-websocket); for Daily rooms, see [Daily WebRTC](/pipecat-cloud/guides/daily-webrtc).
+
+## Requirements
+
+Your agent image needs:
+
+- `pipecat-ai[moq]` 1.13.0 or newer.
+- The Pipecat Cloud base image `dailyco/pipecat-base` 0.2.7 or newer. Name the version in your Dockerfile's `FROM` rather than relying on `latest`: a cloud build can get the previous base image for up to a day after a release.
+- `pipecatcloud` 1.3.0 or newer, if your image installs its own rather than using the one the base image provides.
+
+Your browser client needs `@pipecat-ai/client-js` 1.14 and `@pipecat-ai/moq-transport` 0.3.0 or newer.
+
+<Note>
+  Pipecat Cloud starts a MoQ session only for an agent whose current deployment
+  can serve one. While a new deployment rolls out or reports what it can serve,
+  `/start` with `transport: "moq"` can return `409 Conflict`: retry. An image
+  that can't serve MoQ gets `400 Bad Request`, with a message that says what to
+  rebuild. See [Errors](#errors).
+</Note>
+
+## Bot code
+
+Add the `moq` extra to your requirements:
+
+```text requirements.txt
+pipecat-ai[moq]>=1.13.0
+```
+
+For a MoQ session, the base image passes your `bot()` a `MOQSessionArguments`, which subclasses `pipecat-ai`'s `MOQRunnerArguments`. `create_transport` takes the `"moq"` entry for it and dials the relay, so one agent can serve MoQ beside its other transports:
+
+```python bot.py
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.transports.moq.transport import MOQParams
+
+transport_params = {
+    "moq": lambda: MOQParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+}
+
+
+async def bot(runner_args: RunnerArguments):
+    transport = await create_transport(runner_args, transport_params)
+    # Build and run your pipeline with `transport`, as with any other transport.
+```
+
+The relay URL the bot dials carries the session's credential. `MOQSessionArguments` keeps it out of its `repr`; keep it out of your own logs too. See [Session arguments](/api-reference/pipecat-cloud/sdk-reference/session-arguments#moqsessionarguments) for the fields.
+
+## Starting a session
+
+Start a session with `transport: "moq"`. As with the other transports, `body` reaches your bot as `runner_args.body`:
+
+```bash
+curl -X POST "https://api.pipecat.daily.co/v1/public/my-agent/start" \
+  -H "Authorization: Bearer pk_your_public_key" \
+  -H "Content-Type: application/json" \
+  -d '{"transport": "moq", "body": {"greeting": "hello"}}'
+```
+
+The response carries everything the browser transport needs under a `moq` key:
+
+```json
+{
+  "sessionId": "639f91d8-d511-4677-a83b-bd7564d5d92f",
+  "moq": {
+    "relayUrl": "https://us-west.moq.pipecat.daily.co/?jwt=eyJhbGciOiJFUzI1NiIs...",
+    "certHash": null,
+    "namespace": "pcc/639f91d8-d511-4677-a83b-bd7564d5d92f",
+    "clientId": "request",
+    "botId": "response",
+    "transcriptTrack": "transcript.json.z"
+  }
+}
+```
+
+- `relayUrl` reaches the MoQ relays in your agent's region, with the browser's credential for this session in its query string. Treat it as a secret. It stays valid for the agent's maximum session duration.
+- `certHash` is `null`: the relays use publicly trusted certificates, so there is nothing to pin.
+- `namespace`, `clientId` and `botId` place the browser and the bot in the session: the browser publishes under `<namespace>/<clientId>` and subscribes to `<namespace>/<botId>`, and the bot the reverse.
+
+A MoQ session has no Daily room and no ICE servers, so `createDailyRoom` and `enableDefaultIceServers` can't be combined with `transport: "moq"`.
+
+## Connecting from the browser
+
+`MoqTransport` reads the `/start` response's `moq` block itself, so `startBotAndConnect()` can call `/start` and connect in one step:
+
+```javascript
+import { PipecatClient } from "@pipecat-ai/client-js";
+import { MoqTransport } from "@pipecat-ai/moq-transport";
+
+const client = new PipecatClient({
+  // relayUrl is required by the type; the /start response replaces it
+  transport: new MoqTransport({ relayUrl: "" }),
+});
+
+await client.startBotAndConnect({
+  endpoint: "https://api.pipecat.daily.co/v1/public/my-agent/start",
+  headers: new Headers({ Authorization: "Bearer pk_your_public_key" }),
+  requestData: { transport: "moq", body: { greeting: "hello" } },
+});
+```
+
+See the [MoQ transport reference](/api-reference/client/js/transports/moq) for its options and events.
+
+## Reconnects
+
+If either side's connection to its relay drops, its transport reconnects on its own and the session continues: the browser transport keeps trying for up to 60 seconds by default (`relayRetryTimeoutMs`), and the bot's transport for its `connection_timeout`. RTVI messages are not lost or delivered twice across a reconnect. Audio has a short gap while the connection comes back.
+
+## Errors
+
+A `/start` with `transport: "moq"` can be refused before any session starts. The message says what to change.
+
+`409 Conflict` means retry:
+
+- The agent's latest deployment hasn't finished reporting what it can serve. This can take a few minutes after a deploy; retry with backoff.
+- A new deployment is still rolling out, or the latest one failed while the previous one keeps serving. Retry once a deployment has completed.
+
+`400 Bad Request` means change the agent or the request:
+
+- The agent's current deployment can't serve MoQ: for example, its image is older than `pipecat-base` 0.2.7, its `pipecat-ai` is older than 1.13.0, or the `moq` extra isn't installed. Rebuild on the [requirements](#requirements) above and deploy again.
+- The request also sets `createDailyRoom` or `enableDefaultIceServers`.
+- MoQ isn't offered in the agent's region.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card
+    title="MoQ transport (JavaScript)"
+    icon="js"
+    href="/api-reference/client/js/transports/moq"
+  >
+    `MoqTransport` options, events and connection states.
+  </Card>
+  <Card
+    title="MoQ transport (server)"
+    icon="python"
+    href="/api-reference/server/services/transport/moq"
+  >
+    `MOQTransport` and `MOQParams` in the Pipecat framework.
+  </Card>
+</CardGroup>
