@@ -56080,11 +56080,11 @@ For provider slugs and full routing semantics, see [OpenRouter's provider select
 # Perplexity LLM
 Source: https://docs.pipecat.ai/api-reference/server/services/llm/perplexity.md
 
-PerplexityLLMService accesses Perplexity language models through an OpenAI-compatible interface, inheriting OpenAILLMService.
+PerplexityAgentHttpLLMService accesses Perplexity's Agent API with web search and function calling, over the OpenAI Responses protocol.
 
 ## Overview
 
-`PerplexityLLMService` provides access to Perplexity's language models through an OpenAI-compatible interface. It inherits from `OpenAILLMService` and supports streaming responses and context management.
+`PerplexityAgentHttpLLMService` provides access to Perplexity's Agent API, which answers with web search using models from Perplexity and other providers. It inherits from `OpenAIResponsesHttpLLMService`, so streaming, function calling, and context management work as they do on the [OpenAI Responses](/api-reference/server/services/llm/openai-responses) page.
 
 <CardGroup cols={2}>
   <Card
@@ -56104,7 +56104,7 @@ PerplexityLLMService accesses Perplexity language models through an OpenAI-compa
   <Card
     title="Perplexity Documentation"
     icon="book"
-    href="https://docs.perplexity.ai/api-reference/chat-completions-post"
+    href="https://docs.perplexity.ai/"
   >
     Official Perplexity API documentation and features
   </Card>
@@ -56133,42 +56133,51 @@ Before using Perplexity LLM services, you need:
 
 1. **Perplexity Account**: Sign up at [Perplexity](https://www.perplexity.ai/)
 2. **API Key**: Generate an API key from your account dashboard
-3. **Model Selection**: Choose from available models with built-in search capabilities
+3. **Model or Preset Selection**: Choose a model, a preset, or both
 
 ### Required Environment Variables
 
 - `PERPLEXITY_API_KEY`: Your Perplexity API key for authentication
 
-<Note>
-  Unlike other LLM services, Perplexity does not support function calling.
-  Instead, they offer native internet search built in without requiring special
-  function calls.
-</Note>
-
 ## Configuration
 
-<ParamField path="api_key" type="str" required>
-  Perplexity API key for authentication. Raises `ValueError` when empty.
+```python
+from pipecat.services.perplexity.llm import PerplexityAgentHttpLLMService
+```
+
+<ParamField path="api_key" type="str" default="None">
+  Perplexity API key for authentication.
 </ParamField>
 
-<ParamField path="base_url" type="str" default="https://api.perplexity.ai">
+<ParamField path="base_url" type="str" default="https://api.perplexity.ai/v1">
   Base URL for Perplexity API endpoint.
 </ParamField>
 
-<ParamField path="model" type="str" default="None" deprecated>
-  _Deprecated since 0.0.105, removed in 2.0.0._ Use
-  `settings=PerplexityLLMService.Settings(model=...)` instead.
-</ParamField>
-
-<ParamField path="settings" type="PerplexityLLMService.Settings" default="None">
+<ParamField
+  path="settings"
+  type="PerplexityAgentHttpLLMService.Settings"
+  default="None"
+>
   Runtime-configurable settings. See [Settings](#settings) below.
 </ParamField>
 
+Other constructor arguments, such as `retry_on_timeout`, are those of `OpenAIResponsesHttpLLMService`.
+
 ### Settings
 
-Runtime-configurable settings passed via the `settings` constructor argument using `PerplexityLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+Runtime-configurable settings passed via the `settings` constructor argument using `PerplexityAgentHttpLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-This service uses the same settings class as `OpenAILLMService` (see [OpenAI LLM Settings](/api-reference/server/services/llm/openai#settings)), but applies only `model`, `system_instruction`, `temperature`, `top_p`, `max_tokens`, `frequency_penalty`, and `presence_penalty`. `seed`, `max_completion_tokens`, `top_k`, and `extra` are not sent by this service, so they have no effect; neither does the `service_tier` constructor argument. The default `model` is `"sonar"`.
+This service adds the following to the settings of `OpenAIResponsesHttpLLMService` (see [OpenAI Responses Settings](/api-reference/server/services/llm/openai-responses#settings)). The default `model` is `"openai/gpt-5.6-luna"`.
+
+| Parameter    | Type          | Default | Description                                                                                                                                                                                                                                                                              |
+| ------------ | ------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `preset`     | `str \| None` | `None`  | Perplexity preset that sets the model, its instructions, its search budget, and how much it reasons: `"fast"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`. `model` replaces the preset's model; set `model=None` to use the preset's. At least one of `model` and `preset` must be set. |
+| `web_search` | `bool`        | `True`  | Whether to offer the `web_search` tool on every request, alongside any tools from the context. A preset searches the web whatever this is set to.                                                                                                                                        |
+| `max_steps`  | `int \| None` | `None`  | Maximum number of search and reasoning steps per response. `None` uses Perplexity's default.                                                                                                                                                                                             |
+
+Raises `ValueError` when the constructor settings leave neither `model` nor `preset`. A runtime update that leaves neither pushes an `ErrorFrame`.
+
+With neither `preset` nor `reasoning` set, each request sends the `"fast"` preset, Perplexity's lowest-latency setup, and the first request for each model logs it. With `use_provider_thinking_default` set to `True`, no preset is sent.
 
 ## Usage
 
@@ -56176,36 +56185,41 @@ This service uses the same settings class as `OpenAILLMService` (see [OpenAI LLM
 
 ```python
 import os
-from pipecat.services.perplexity.llm import PerplexityLLMService
+from pipecat.services.perplexity.llm import PerplexityAgentHttpLLMService
 
-llm = PerplexityLLMService(
+llm = PerplexityAgentHttpLLMService(
     api_key=os.getenv("PERPLEXITY_API_KEY"),
-    settings=PerplexityLLMService.Settings(model="sonar"),
+    settings=PerplexityAgentHttpLLMService.Settings(
+        system_instruction="You are a helpful assistant.",
+    ),
 )
 ```
 
-### With Custom Settings
+### With a Preset
 
 ```python
-from pipecat.services.perplexity.llm import PerplexityLLMService
-
-llm = PerplexityLLMService(
+llm = PerplexityAgentHttpLLMService(
     api_key=os.getenv("PERPLEXITY_API_KEY"),
-    settings=PerplexityLLMService.Settings(
-        model="sonar",
-        temperature=0.7,
-        top_p=0.9,
-        max_tokens=1024,
+    settings=PerplexityAgentHttpLLMService.Settings(
+        model=None,
+        preset="medium",
+        max_steps=3,
     ),
 )
 ```
 
 ## Notes
 
-- Perplexity does not support function calling or tools. The service only sends messages to the API, without tool definitions.
-- Token usage is reported once per completion at the end of each request.
-- Perplexity models have built-in internet search capabilities, providing up-to-date information without requiring additional tool configuration.
-- **Message transformation**: Perplexity's API enforces stricter constraints than OpenAI on conversation history structure (strict role alternation, no non-initial system messages, last message must be user/tool). The service automatically transforms messages to satisfy these constraints before sending them to the API, so you don't need to manually structure your conversation history.
+- **Citations**: Answers can include citation markers such as `[1]`.
+- **Anthropic models**: Models from Anthropic need `max_completion_tokens` set in the settings.
+
+## Deprecated: PerplexityLLMService
+
+<Warning>
+  _Deprecated since 1.13.0, removed in 2.0.0._ Use
+  `PerplexityAgentHttpLLMService` instead. Perplexity has ended support for the
+  Sonar chat completions API that `PerplexityLLMService` uses.
+</Warning>
 
 # Qwen LLM
 Source: https://docs.pipecat.ai/api-reference/server/services/llm/qwen.md
