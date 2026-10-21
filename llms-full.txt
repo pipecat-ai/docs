@@ -5172,7 +5172,7 @@ tts = YourTTSService(
   services that never end it.
 - **`transport_destination`**: Destination for the generated audio frames.
 
-Text handling — `text_aggregation_mode`, `text_transforms`, `text_filters`, and
+Text handling — `text_aggregation_mode`, `text_transforms`, and
 `skip_text_types` — is covered in
 [Text Processing and Filtering](#text-processing-and-filtering) below. Runtime
 settings are covered in [Service Settings](/pipecat/fundamentals/service-settings).
@@ -5285,11 +5285,8 @@ Text transforms are registered directly on the TTS service instance via the `add
 A transform sees one aggregation at a time. With the default `TextAggregationMode.SENTENCE`, that is a sentence. With `TextAggregationMode.TOKEN`, it is a single LLM token, so a pattern or pronunciation that spans tokens, such as a multi-word phrase or a word the LLM streams in pieces, never matches.
 
 <Note>
-  The intentions of text transforms are meant to be TTS-specific modifications
-  that do not affect the underlying LLM text or context. That said, since the
-  context aggregator attempts to base its context on what was actually spoken,
-  for services that support word timestamps, like Cartesia, ElevenLabs, and
-  Rime,these transforms will modify the context as they modify what is spoken.
+  Text transforms on a TTS service rewrite only what is spoken. The context
+  keeps the text as the LLM wrote it, on every service.
 </Note>
 
 ```python
@@ -5333,23 +5330,24 @@ tts.add_text_transformer(replace_acronyms, "*")  # Apply to all text
 #   llm -> llm_text_processor -> tts
 ```
 
+A transform that returns only whitespace leaves its text unspoken. To rewrite text for everything downstream, including the context and the client, register the transform on an [`LLMTextProcessor`](/api-reference/server/utilities/frame/llm-text-processor) with its `text_transforms` parameter or `add_text_transformer()` method.
+
 ### Text Filters
 
 <Warning>
-  Text filters are no longer the preferred method for text preprocessing and
-  will be deprecated in future releases. Instead, you should use one of the
-  methods described above.
+  _Deprecated since 1.14.0, removed in 2.0.0._ Use `text_transforms` instead:
+  `strip_markdown` from `pipecat.utils.text.transforms` replaces
+  `MarkdownTextFilter`. In place of `filter_code` and `filter_tables`, give the
+  block its own text type with `PatternPairAggregator` and list it in
+  `skip_text_types`.
 </Warning>
 
-Apply preprocessing to text before synthesis:
+The `text_filters` parameter applies preprocessing to text before synthesis:
 
 ```python
-from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
-
 tts = YourTTSService(
     # ... other options
     text_filters=[
-        MarkdownTextFilter(),     # Remove markdown formatting
         CustomTextFilter(),       # Your custom processing
     ],
 )
@@ -5358,7 +5356,7 @@ tts = YourTTSService(
 **Common filters:**
 
 - **MarkdownTextFilter**: Strips markdown formatting from LLM responses
-- **Custom filters**: Implement your own text preprocessing logic
+- **Custom filters**: Subclasses of `BaseTextFilter`
 
 ## Skipping TTS Output
 
@@ -79711,6 +79709,37 @@ The benefit of pre-aggregating LLM text frames is that it allows for more contro
   based on sentence boundaries.
 </ParamField>
 
+<ParamField
+  path="text_transforms"
+  type="list[tuple[TextType | str, TextTransform]]"
+  default="None"
+>
+  Callables that rewrite each aggregation, as `(text_type | "*", transform)`
+  pairs. A transform takes the text and its type and returns the rewritten text,
+  and `"*"` matches every type. The rewrite reaches the TTS service, the
+  context, and the client. A transform that leaves only whitespace drops the
+  aggregation. A transform registered on the TTS service rewrites only what is
+  spoken. `TextTransform` is in `pipecat.utils.text.transforms`.
+</ParamField>
+
+## Methods
+
+### add_text_transformer
+
+```python
+processor.add_text_transformer(transform_function, text_type="*")
+```
+
+Registers a transform for aggregations of `text_type`, or for every type with `"*"`.
+
+### remove_text_transformer
+
+```python
+processor.remove_text_transformer(transform_function, text_type="*")
+```
+
+Removes the transform registered with the same function and `text_type`.
+
 ## Usage
 
 The `LLMTextProcessor` should be integrated into your pipeline after the LLM service and before any services that consume text, such as TTS. It processes incoming `LLMTextFrame`s, aggregates their text content, and outputs `AggregatedTextFrame`s.
@@ -86000,6 +86029,11 @@ You can create custom aggregators by subclassing the `BaseTextAggregator` class 
 
 ## Filters
 
+<Warning>
+  _Deprecated since 1.14.0, removed in 2.0.0._ Text filters and `BaseTextFilter`
+  are replaced by [transforms](#transforms).
+</Warning>
+
 Filters are components that process text data in a streaming fashion, transforming or modifying it as it passes through. Unlike aggregators, filters typically do not buffer text but instead operate on each chunk of text individually. Currently, the only built-in filter is the [`MarkdownTextFilter`](./markdown-text-filter), which processes markdown syntax in streaming text, converting it into TTS-friendly plain text.
 
 ### Usage Pattern
@@ -86007,8 +86041,7 @@ Filters are components that process text data in a streaming fashion, transformi
 Filters are used by calling their `filter()` method with incoming text chunks. The filter processes the text and returns the transformed text immediately.
 
 ```python
-from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
-filter = MarkdownTextFilter()
+filter = MyTextFilter()  # a BaseTextFilter subclass
 while streaming_text:
     chunk = get_next_text_chunk()
     filtered_text = await filter.filter(chunk)
@@ -86021,7 +86054,7 @@ You can create custom filters by subclassing the `BaseTextFilter` class and impl
 
 ## Transforms
 
-Transforms rewrite text on its way to a TTS service, so that what a bot says matches how the text should be heard rather than how it was written — currency amounts, dates, acronyms, phone numbers. They attach to a TTS service through `text_transforms` and don't touch the conversation context, which keeps the LLM's original text.
+Transforms rewrite text on its way to a TTS service, so that what a bot says matches how the text should be heard rather than how it was written — currency amounts, dates, acronyms, phone numbers. They attach to a TTS service through `text_transforms` and don't touch the conversation context, which keeps the LLM's original text. To rewrite text for everything downstream, including the context and the client, attach them to an [`LLMTextProcessor`](/api-reference/server/utilities/frame/llm-text-processor) instead.
 
 <Card
   title="Voice Formatter"
@@ -86035,6 +86068,14 @@ Transforms rewrite text on its way to a TTS service, so that what a bot says mat
 Source: https://docs.pipecat.ai/api-reference/server/utilities/text/markdown-text-filter.md
 
 Converts Markdown-formatted text to TTS-friendly plain text while preserving structure
+
+<Warning>
+  _Deprecated since 1.14.0, removed in 2.0.0._ Use the `strip_markdown`
+  transform from `pipecat.utils.text.transforms` with `text_transforms` instead.
+  In place of `filter_code` and `filter_tables`, give the block its own text
+  type with `PatternPairAggregator` and list it in the TTS service's
+  `skip_text_types`.
+</Warning>
 
 ## Overview
 
@@ -86092,17 +86133,13 @@ The filter handles these Markdown elements:
 ### Basic Usage with TTS Service
 
 ```python
-from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
+from pipecat.utils.text.transforms import strip_markdown
 from pipecat.services.cartesia.tts import CartesiaTTSService
 
-# Create the filter
-md_filter = MarkdownTextFilter()
-
-# Use with TTS service
 tts = CartesiaTTSService(
     api_key=os.getenv("CARTESIA_API_KEY"),
     settings=CartesiaTTSService.Settings(voice="voice_id_here"),
-    text_filters=[md_filter]
+    text_transforms=[("*", strip_markdown)],
 )
 ```
 
