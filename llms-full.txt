@@ -36464,6 +36464,7 @@ Composite services hold one or more services and stand in a pipeline where a sin
 | Composite Service                                                            | Setup    | Maintainer |
 | ---------------------------------------------------------------------------- | -------- | ---------- |
 | [LLMSwitcher](/api-reference/server/composite-services/llm-switcher)         | Built in | Pipecat    |
+| [LLMWithBackend](/api-reference/server/composite-services/llm-with-backend)  | Built in | Pipecat    |
 | [ServiceSwitcher](/api-reference/server/composite-services/service-switcher) | Built in | Pipecat    |
 
 ## Extensions
@@ -71483,7 +71484,7 @@ OpenAILiveLLMService connects Pipecat to OpenAI's GPT-Live API for full-duplex s
 
 `OpenAILiveLLMService` provides full-duplex speech-to-speech conversation using OpenAI's GPT-Live API and the `gpt-live-1` model. The GPT-Live model listens and speaks at the same time: it decides on its own when to answer, stops when the user talks over it, and delegates work that needs search, reasoning, or tools to a backend text model while the conversation continues. The pipeline streams audio in and plays audio out; there is no client-side turn detection or response triggering.
 
-The backend runs in one of two **delegation modes**. In **Responses delegation**, OpenAI hosts the backend: a Responses API model you configure with `OpenAILiveLLMService.ResponsesDelegation`, using the tools from your pipeline's `LLMContext` as normal. In **client delegation**, the backend is any Pipecat LLM service running in a `BackendLLMWorker` you provide, configured with `OpenAILiveLLMService.ClientDelegation`, with tools of its own.
+The backend runs in one of two **delegation modes**. In **Responses delegation**, OpenAI hosts the backend: a Responses API model you configure with `OpenAILiveLLMService.ResponsesDelegation`, using the tools from your pipeline's `LLMContext` as normal. In **client delegation**, the backend is any Pipecat LLM service running in a [`BackendLLMWorker`](/api-reference/server/workers/backend-llm-worker) you provide, configured with `OpenAILiveLLMService.ClientDelegation`, with tools of its own.
 
 <CardGroup cols={2}>
   <Card
@@ -79332,6 +79333,263 @@ pipeline = Pipeline([
 # Switch to cheaper model for simple tasks
 await worker.queue_frame(ManuallySwitchServiceFrame(service=gemini))
 ```
+
+# LLMWithBackend
+Source: https://docs.pipecat.ai/api-reference/server/composite-services/llm-with-backend.md
+
+LLMWithBackend pairs a conversational frontend LLM with a backend LLM for tool work, set up with BackendConnector and PredictiveDelegation.
+
+<Warning>
+  `LLMWithBackend` is in alpha: its API is likely to change between releases.
+</Warning>
+
+## Overview
+
+`LLMWithBackend` pairs a conversational **frontend** LLM, which keeps the conversation fluent, with a **backend** LLM that handles work needing tools or careful reasoning. It goes where the LLM goes in your pipeline and runs the backend as an agent of its own. The frontend hands work to the backend with a `delegate` tool and keeps talking with the user, and what the backend has to say comes back into the frontend's conversation for it to relay to the user.
+
+Composite services hold one or more services and stand in a pipeline where a single service would. `LLMWithBackend` holds the frontend service; the backend is a [`BackendLLMWorker`](/api-reference/server/workers/backend-llm-worker).
+
+For a walkthrough, see [LLM with a Backend](/pipecat/learn/llm-with-backend).
+
+<CardGroup cols={2}>
+  <Card
+    title="Example"
+    icon="code"
+    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/multi-worker/llm-with-backend"
+  >
+    An engineering assistant with text and speech-to-speech frontends
+  </Card>
+  <Card
+    title="BackendLLMWorker"
+    icon="server"
+    href="/api-reference/server/workers/backend-llm-worker"
+  >
+    The worker that runs the backend LLM
+  </Card>
+</CardGroup>
+
+```python
+from pipecat.pipeline.llm_with_backend import (
+    BackendConnector,
+    ExplicitBackendRequestStrategy,
+    LLMWithBackend,
+    PredictiveDelegation,
+    TranscriptBackendRequestStrategy,
+)
+```
+
+## LLMWithBackend
+
+`LLMWithBackend` is a `Pipeline`, not an `LLMService`: functions, settings updates, event handlers and a `FlowManager` go on its [`frontend`](#properties). The backend's tools go in the backend's own context.
+
+### Configuration
+
+<ParamField path="frontend" type="LLMService" required>
+  The conversational LLM service, text or speech-to-speech.
+</ParamField>
+
+<ParamField path="backend" type="BackendLLMWorker | str" required>
+  The backend worker, or the name of one registered elsewhere: in the app, or in
+  another process on a shared bus. A worker given here is added to the pipeline
+  worker when the pipeline starts.
+</ParamField>
+
+<ParamField path="connector" type="BackendConnector | None" default="None">
+  How delegation works. A default [`BackendConnector`](#backendconnector) when
+  `None`.
+</ParamField>
+
+<ParamField
+  path="predictive_delegation"
+  type="PredictiveDelegation | None"
+  default="None"
+>
+  A [`PredictiveDelegation`](#predictivedelegation), to start the backend sooner
+  on turns that need it. Text frontends only.
+</ParamField>
+
+Raises `ValueError` when the frontend service refuses the role, when the connector's request strategy reads the frontend's context and the frontend is speech-to-speech, or when `predictive_delegation` is given with a speech-to-speech frontend or with a request strategy whose `delegate` call needs arguments.
+
+### Properties
+
+| Property                | Type                           | Description                                         |
+| ----------------------- | ------------------------------ | --------------------------------------------------- |
+| `frontend`              | `LLMService`                   | The frontend LLM service.                           |
+| `backend`               | `BackendLLMWorker \| str`      | The backend worker, or its name.                    |
+| `connector`             | `BackendConnector`             | The connector joining the two.                      |
+| `predictive_delegation` | `PredictiveDelegation \| None` | The predictive delegation in front of the frontend. |
+| `tool`                  | `FunctionSchema`               | The `delegate` tool installed on the frontend.      |
+
+## BackendConnector
+
+`BackendConnector` defines the `delegate` tool, holds the session with the backend for the pipeline's life, and turns what the backend produces into messages in the frontend's conversation.
+
+<ParamField
+  path="request_strategy"
+  type="BackendRequestStrategy | None"
+  default="None"
+>
+  How a `delegate` call becomes the backend's request. When `None`,
+  [`TranscriptBackendRequestStrategy`](#transcriptbackendrequeststrategy) for a
+  text frontend and
+  [`ExplicitBackendRequestStrategy`](#explicitbackendrequeststrategy) for a
+  speech-to-speech one.
+</ParamField>
+
+<ParamField
+  path="frontend_pairing_instruction"
+  type="str"
+  default="FRONTEND_PAIRING_INSTRUCTION"
+>
+  How the frontend's model works with a backend, appended to its system
+  instruction. A replacement has to cover everything the default does: when and
+  how to delegate, that to the user there is one assistant, what to do after
+  delegating, and what to do with the backend's messages. The request strategy's
+  guidance goes where `STRATEGY_PLACEHOLDER` stands, or after the text when it
+  has none.
+</ParamField>
+
+<ParamField path="respond_on_delegate" type="bool" default="True">
+  Whether the frontend replies as soon as a delegation is sent, which is where
+  its acknowledgement comes from. Set `False` to delegate without a reply.
+</ParamField>
+
+<ParamField path="timeout_secs" type="float | None" default="30">
+  How long the backend may take to acknowledge a request, including the wait for
+  it to become ready.
+</ParamField>
+
+<ParamField path="client_trace" type="bool" default="False">
+  Whether to send every exchange with the backend to the client as an RTVI
+  server message, for debugging. See [Frames](#frames).
+</ParamField>
+
+```python
+connector = BackendConnector(respond_on_delegate=False)
+```
+
+## Request Strategies
+
+A request strategy defines the `delegate` tool's parameters and description, and builds the request the backend receives from a `delegate` call. Both strategies place an instruction after the request: tell the user the result as soon as it is in hand, and nothing when the request only stops or changes work already under way.
+
+### TranscriptBackendRequestStrategy
+
+The frontend's model calls `delegate` with no arguments, and the request is the transcript of the user and assistant turns since the previous delegation (the whole conversation the first time). The default for a text frontend. Its `delegate` call needs no arguments, so it works with predictive delegation. It reads the frontend's context, so a speech-to-speech frontend refuses it.
+
+<ParamField
+  path="frontend_instruction"
+  type="str | None"
+  default="TRANSCRIPT_FRONTEND_INSTRUCTION"
+>
+  The strategy's guidance to the frontend's model, placed in the pairing
+  instruction.
+</ParamField>
+
+<ParamField
+  path="tool_description"
+  type="str"
+  default="TRANSCRIPT_TOOL_DESCRIPTION"
+>
+  How the `delegate` tool is described.
+</ParamField>
+
+<ParamField
+  path="request_instruction"
+  type="str"
+  default="TRANSCRIPT_REQUEST_INSTRUCTION"
+>
+  What the backend should do with the transcript, placed after it.
+</ParamField>
+
+### ExplicitBackendRequestStrategy
+
+The frontend's model words the request itself, in the `delegate` tool's `request` argument. The default for a speech-to-speech frontend, which replies to the user's audio before that audio's transcript reaches its context.
+
+<ParamField
+  path="frontend_instruction"
+  type="str | None"
+  default="EXPLICIT_FRONTEND_INSTRUCTION"
+>
+  The strategy's guidance to the frontend's model, placed in the pairing
+  instruction.
+</ParamField>
+
+<ParamField
+  path="tool_description"
+  type="str"
+  default="EXPLICIT_TOOL_DESCRIPTION"
+>
+  How the `delegate` tool is described.
+</ParamField>
+
+<ParamField
+  path="request_instruction"
+  type="str"
+  default="EXPLICIT_REQUEST_INSTRUCTION"
+>
+  What the backend should do with the request, placed after it.
+</ParamField>
+
+## PredictiveDelegation
+
+<Warning>
+  `PredictiveDelegation` is in alpha: its API is likely to change between
+  releases.
+</Warning>
+
+`PredictiveDelegation` starts the backend sooner on turns that need it. On each user turn, a yes/no classifier races the frontend's inference, asking whether the turn needs the backend. A "yes" that arrives before the frontend's first output delegates the turn at once and cancels the inference. A "no", a late answer or a classifier error leaves the turn to the frontend, which never waits for the classifier.
+
+The classifier reads what the frontend's model reads: its system instruction, pairing instruction included, the `delegate` tool's description, and the latest messages of the conversation.
+
+<ParamField path="classifier" type="BaseClassifier" required>
+  The yes/no [classifier](/api-reference/server/classifiers/overview) to ask,
+  such as [`JevClassifier`](/api-reference/server/classifiers/jev).
+</ParamField>
+
+```python
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    predictive_delegation=PredictiveDelegation(
+        JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+    ),
+)
+```
+
+It needs a text frontend and a request strategy whose `delegate` call takes no arguments, such as the default `TranscriptBackendRequestStrategy`. It leaves speculative turns (eager end of turn) to the frontend, and every turn while the frontend filters incomplete user turns. The classifier's metrics are pushed as `MetricsFrame`s.
+
+## Constants
+
+The default texts are module constants of `pipecat.pipeline.llm_with_backend`, except the request instructions, which are in `pipecat.workers.llm.backend_llm_worker`. Read the [source](https://github.com/pipecat-ai/pipecat/blob/main/src/pipecat/pipeline/llm_with_backend.py) for their wording.
+
+| Constant                          | What it is                                                                         |
+| --------------------------------- | ---------------------------------------------------------------------------------- |
+| `FRONTEND_PAIRING_INSTRUCTION`    | The default `frontend_pairing_instruction`.                                        |
+| `STRATEGY_PLACEHOLDER`            | `"{strategy}"`: where a pairing instruction takes the request strategy's guidance. |
+| `TRANSCRIPT_FRONTEND_INSTRUCTION` | `TranscriptBackendRequestStrategy`'s default `frontend_instruction`.               |
+| `TRANSCRIPT_TOOL_DESCRIPTION`     | `TranscriptBackendRequestStrategy`'s default `tool_description`.                   |
+| `TRANSCRIPT_REQUEST_INSTRUCTION`  | `TranscriptBackendRequestStrategy`'s default `request_instruction`.                |
+| `EXPLICIT_FRONTEND_INSTRUCTION`   | `ExplicitBackendRequestStrategy`'s default `frontend_instruction`.                 |
+| `EXPLICIT_TOOL_DESCRIPTION`       | `ExplicitBackendRequestStrategy`'s default `tool_description`.                     |
+| `EXPLICIT_REQUEST_INSTRUCTION`    | `ExplicitBackendRequestStrategy`'s default `request_instruction`.                  |
+| `DELEGATE_TOOL_NAME`              | `"delegate"`.                                                                      |
+
+## Frames
+
+### Pushed by
+
+| Frame                                                                                                        | Fields                                    | Effect                                                                                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`ExternalFunctionCall*Frame`](/api-reference/server/frames/system-frames#externalfunctioncallsstartedframe) | function name, call ID, arguments, result | One per phase of each function call the backend makes. [`RTVIObserver`](/api-reference/server/rtvi/rtvi-observer) reports them to the client as function-call events.                      |
+| `RTVIServerMessageFrame`                                                                                     | `data`                                    | With `client_trace=True`, one per exchange with the backend. `data["type"]` is `"llm-with-backend"`, and `data["event"]` is `"request"`, `"output"`, `"tool_call"`, `"error"` or `"idle"`. |
+
+## Notes
+
+- **Backend messages in the frontend's context**: What the backend produces is appended to the frontend's context as `developer` messages. A message for the user starts with `Backend: `, and the rest are silent: `Backend (note): ` for text not meant for the user, `Backend (working): ` for a function call the backend is making, and `Backend (thinking): ` for a reasoning summary.
+- **The `delegate` tool**: The frontend gets `delegate` as a built-in tool: it is sent with every inference beside the frontend's own tools and never enters the context's tool list.
+- **Frontends that refuse the role**: `InworldRealtimeLLMService`, `UltravoxRealtimeLLMService` and `OpenAILiveLLMService` can't be a frontend; `OpenAILiveLLMService` can't be a backend either.
 
 # BaseClassifier
 Source: https://docs.pipecat.ai/api-reference/server/classifiers/overview.md
@@ -94799,6 +95057,149 @@ Inherits `name`, `llm`, `active`, `bridged`, and `defer_tool_frames` from [`LLMW
 | `context`              | `LLMContext`             | The `LLMContext` owned by this agent  |
 | `user_aggregator`      | `LLMUserAggregator`      | The user-side context aggregator      |
 | `assistant_aggregator` | `LLMAssistantAggregator` | The assistant-side context aggregator |
+
+# BackendLLMWorker
+Source: https://docs.pipecat.ai/api-reference/server/workers/backend-llm-worker.md
+
+BackendLLMWorker runs an LLM service as the backend a frontend delegates to, for LLMWithBackend and OpenAILiveLLMService.
+
+<Warning>
+  `BackendLLMWorker` is in alpha: its API is likely to change between releases.
+</Warning>
+
+## Overview
+
+`BackendLLMWorker` runs any Pipecat LLM service as the backend of a conversational frontend: the agent that handles work needing tools or careful reasoning while the frontend keeps talking with the user. It extends [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker), so the backend keeps a conversation of its own and calls its tools over as many steps as the work takes.
+
+Two frontends drive it: [`LLMWithBackend`](/api-reference/server/composite-services/llm-with-backend), with any LLM service as the frontend, and [`OpenAILiveLLMService`](/api-reference/server/services/s2s/openai-live) in client delegation. For a walkthrough, see [LLM with a Backend](/pipecat/learn/llm-with-backend).
+
+```python
+from pipecat.workers.llm import BackendLLMWorker, BackendOutput
+```
+
+```python
+backend = BackendLLMWorker(
+    llm=AnthropicLLMService(
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        settings=AnthropicLLMService.Settings(system_instruction=BACKEND_INSTRUCTIONS),
+    ),
+    context=LLMContext(tools=[search_codebase, read_file, apply_patch, run_tests]),
+)
+```
+
+## Configuration
+
+<ParamField path="llm" type="LLMService" required>
+  The backend LLM service. It runs at its provider's default thinking for the
+  model unless its settings configure thinking.
+</ParamField>
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  The backend's context, carrying its tools. A fresh empty context when `None`.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Unique name for this worker on the bus. Auto-generated when `None`; give one
+  when the backend runs in another process, where the frontend addresses it by
+  name.
+</ParamField>
+
+<ParamField
+  path="transform_output"
+  type="BackendOutputTransform | None"
+  default="None"
+>
+  Called with each [`BackendOutput`](#backendoutput) the model produces before
+  it is sent: return the output to send in its place, or `None` to send nothing.
+  Outputs sent with [`send_output()`](#send_output) skip it unless that call
+  asks for it.
+</ParamField>
+
+<ParamField
+  path="pairing_instruction"
+  type="str"
+  default="BACKEND_PAIRING_INSTRUCTION"
+>
+  How the model works with the frontend, appended to the LLM's system
+  instruction. A replacement has to cover everything the default does: that the
+  frontend sends it requests, that the user hears what it marks with
+  `SPOKEN_MARK` and nothing else, and how to take requests that arrive while it
+  works.
+</ParamField>
+
+<ParamField
+  path="user_params"
+  type="LLMUserAggregatorParams | None"
+  default="None"
+>
+  Parameters for the user aggregator. When `None`, external turn strategies: the
+  backend has no audio to detect turns in.
+</ParamField>
+
+<ParamField
+  path="assistant_params"
+  type="LLMAssistantAggregatorParams | None"
+  default="None"
+>
+  Parameters for the assistant aggregator.
+</ParamField>
+
+Raises `ValueError` when the LLM service refuses the role. `OpenAILiveLLMService` does.
+
+## BackendOutput
+
+One piece of output from the backend on its way to the frontend: what `transform_output` receives and returns, and what `send_output()` sends.
+
+| Field            | Type   | Default | Description                                                                              |
+| ---------------- | ------ | ------- | ---------------------------------------------------------------------------------------- |
+| `text`           | `str`  |         | The text.                                                                                |
+| `is_thought`     | `bool` | `False` | Whether this is a reasoning summary.                                                     |
+| `prefers_spoken` | `bool` | `True`  | Whether the backend would like the user to hear this. The frontend decides what it says. |
+
+`BackendOutputTransform` is the type of `transform_output`:
+
+```python
+async def transform_output(output: BackendOutput) -> BackendOutput | None
+```
+
+## Properties
+
+Inherits the properties of [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker).
+
+### working
+
+```python
+backend.working -> bool
+```
+
+`True` while the backend has work in hand: a request or model run outstanding, or a function call in flight.
+
+## Methods
+
+### send_output
+
+```python
+async def send_output(
+    self, output: BackendOutput, *, apply_transform_output: bool = False
+) -> None
+```
+
+Sends an output of the app's own to the frontend, as the model's outputs are sent. A tool can use it to tell the user something itself, such as a booking confirmation worded by the booking system. It skips `transform_output` unless `apply_transform_output` is `True`. With no frontend attached, the output is dropped with a warning.
+
+## Constants
+
+Module constants of `pipecat.workers.llm.backend_llm_worker`:
+
+| Constant                      | What it is                                                                 |
+| ----------------------------- | -------------------------------------------------------------------------- |
+| `BACKEND_PAIRING_INSTRUCTION` | The default `pairing_instruction`.                                         |
+| `SPOKEN_MARK`                 | `">>"`: the mark the model starts a message with to have the user told it. |
+
+## Notes
+
+- **What the user hears**: A message the model starts with `SPOKEN_MARK` is sent with `prefers_spoken=True`, mark removed, whether or not the same turn calls tools. Anything else it writes, reasoning summaries included, is sent with `prefers_spoken=False`: the frontend keeps it as a note and doesn't say it. When the mark starts a later line, the text before that line is a note and the rest is spoken.
+- **Requests while working**: A request that arrives while the backend is working joins that work. The model reads it against what it has under way, and stops a long-running tool through the `cancel_<tool>` tool that `cancellable_by_llm=True` gives it.
+- **One frontend at a time**: The worker serves one frontend. When that frontend lets go, such as when its pipeline ends, the backend's work in progress is cancelled.
 
 # UIWorker
 Source: https://docs.pipecat.ai/api-reference/server/workers/ui-worker.md
