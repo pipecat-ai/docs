@@ -2069,6 +2069,7 @@ In the following sections, we'll build a complete agent and explore each compone
 - Handling the complete pipeline lifecycle
 - Making small decisions with classifiers
 - Coordinating multiple agents that share a message bus
+- Pairing a conversational LLM with a backend LLM that handles the heavy lifting
 
 Each section includes practical examples and configuration options to help you build production-ready voice AI applications.
 
@@ -7713,7 +7714,234 @@ python main.py --remote-url ws://localhost:8765/ws
 
 ## What's next
 
-You've built a multi-agent system and scaled it across processes, machines, and networks. Here's where to go from here.
+You've built a multi-agent system and scaled it across processes, machines, and networks. Next, a multi-agent setup that comes ready-made: a conversational LLM with a backend that handles the heavy lifting.
+
+<Card
+  title="LLM with a Backend"
+  icon="arrow-right"
+  href="/pipecat/learn/llm-with-backend"
+>
+  Pair a conversational frontend LLM with a backend LLM that handles the heavy
+  lifting
+</Card>
+
+# LLM with a Backend
+Source: https://docs.pipecat.ai/pipecat/learn/llm-with-backend.md
+
+Pair a conversational frontend LLM with a backend LLM that handles tools and reasoning, using LLMWithBackend and BackendLLMWorker.
+
+<Warning>
+  `LLMWithBackend` is in alpha: its API is likely to change between releases.
+</Warning>
+
+`LLMWithBackend` pairs a conversational **frontend** LLM, which keeps the conversation fluent, with a **backend** LLM that handles work needing tools or careful reasoning. It goes where the LLM goes in your pipeline and runs the backend as an agent of its own. The frontend hands work to the backend with a `delegate` tool and keeps talking with the user, and what the backend has to say comes back into the frontend's conversation for it to relay to the user.
+
+It fits a voice bot whose work takes several tool calls or real reasoning: fixing a failing test, researching a question across documents, rebooking a trip. A model suited to that work can take seconds or minutes over it, too long for the user to wait in silence. With `LLMWithBackend`, the user talks with a conversational model while the backend works.
+
+## Basic Usage
+
+The backend's tools are ordinary [direct functions](/pipecat/learn/function-calling):
+
+```python
+from pipecat.services.llm_service import FunctionCallParams
+
+
+async def run_tests(params: FunctionCallParams, path: str | None = None):
+    """Run the test suite, or one test file.
+
+    Args:
+        path: A test file to run alone; the whole suite when omitted.
+    """
+    result = await test_runner.run(path)
+    await params.result_callback(result)
+```
+
+Give the frontend a service of its own and the backend a [`BackendLLMWorker`](/api-reference/server/workers/backend-llm-worker) holding the backend's LLM and tools:
+
+```python
+import os
+
+from pipecat.pipeline.llm_with_backend import LLMWithBackend
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
+from pipecat.workers.llm import BackendLLMWorker
+
+llm = LLMWithBackend(
+    # OpenAIResponsesLLMService runs a reasoning model at its lowest reasoning
+    # effort, so the frontend replies quickly.
+    frontend=OpenAIResponsesLLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAIResponsesLLMService.Settings(system_instruction=FRONTEND_INSTRUCTIONS),
+    ),
+    # The backend runs its model at the provider's default thinking, since it
+    # does the reasoning the frontend hands off.
+    backend=BackendLLMWorker(
+        llm=AnthropicLLMService(
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            settings=AnthropicLLMService.Settings(
+                model="claude-opus-5-5",
+                system_instruction=BACKEND_INSTRUCTIONS,
+            ),
+        ),
+        context=LLMContext(tools=[search_codebase, read_file, apply_patch, run_tests]),
+    ),
+)
+```
+
+Put `llm` where the LLM goes in the pipeline:
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    aggregators.user(),
+    llm,
+    tts,
+    transport.output(),
+    aggregators.assistant(),
+])
+```
+
+The frontend needs no tools of its own: `LLMWithBackend` gives it the `delegate` tool. `LLMWithBackend` is a pipeline, not an LLM service, so functions, settings updates and event handlers go on `llm.frontend`. The backend is added to your pipeline worker when the pipeline starts, so there is nothing else to register.
+
+## Writing the Prompts
+
+Each model gets a system instruction from you. The frontend's says who the assistant is and, in plain words, what work it can take on:
+
+```python
+FRONTEND_INSTRUCTIONS = """You are Pip, the voice assistant of the Acme engineering team.
+Your responses are spoken aloud, so keep them to one or two natural sentences. You can
+make code changes and run the tests, research the team's internal docs, and check CI
+and the open pull requests; that work takes a moment."""
+```
+
+The backend's says what it does with its tools and what the user should be told:
+
+```python
+BACKEND_INSTRUCTIONS = """You do the engineering work for the Acme team's assistant.
+When asked for a code change, keep going until the tests pass, then tell the user what
+you changed and the test result. Keep what you tell them short and concrete."""
+```
+
+Pipecat appends a **pairing instruction** to each, the text that tells a model how it works with the other: the frontend's says when and how to delegate and what to do with the backend's messages, and the backend's says how to take requests and how to mark what the user should hear. So neither of your prompts mentions the `delegate` tool, the other model, or how the backend's messages reach the user.
+
+## What the Conversation Is Like
+
+When the user asks for something that needs the backend, the frontend calls `delegate`, which returns at once, and the frontend acknowledges: "Sure, I'll get on that now." The backend starts working.
+
+The user can keep talking. Small talk and questions the frontend can answer itself stay with the frontend. A new request joins the backend's work, a correction changes it, and a "never mind" stops it: the frontend hands each of these to the backend, which works out what it means for the work under way and cancels the tool calls whose results are no longer wanted.
+
+When the backend has something for the user, such as a result or a question it can't go on without, the frontend relays it in its own words on whatever turn is under way. Everything else the backend writes, the function calls it makes, and its reasoning reach the frontend silently, so when the user asks how it's going, the frontend answers from them without delegating again.
+
+To the user there is one assistant: the frontend never mentions the backend, and talks about the work as its own.
+
+## Speech-to-Speech Frontends
+
+The frontend can be a speech-to-speech service, such as [`OpenAIRealtimeLLMService`](/api-reference/server/services/s2s/openai) or [`GeminiLiveLLMService`](/api-reference/server/services/s2s/gemini-live), in place of the STT, LLM and TTS services. Its model then words each request to the backend itself. `InworldRealtimeLLMService` and `UltravoxRealtimeLLMService` can't be a frontend.
+
+[`OpenAILiveLLMService`](/api-reference/server/services/s2s/openai-live) has the same shape built in: OpenAI's GPT-Live model is the frontend, and in client delegation its backend is a `BackendLLMWorker`.
+
+## Predictive Delegation
+
+<Warning>
+  `PredictiveDelegation` is in alpha: its API is likely to change between
+  releases.
+</Warning>
+
+A text frontend spends a whole inference deciding to call `delegate` before the backend can start. **Predictive delegation** starts the backend sooner: on each user turn, a fast yes/no [classifier](/pipecat/learn/classifiers) races the frontend, asking whether the turn needs the backend. A "yes" that arrives before the frontend has said anything delegates the turn at once, in place of the frontend's inference. Otherwise the frontend handles the turn as usual, having waited for nothing.
+
+```python
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+from pipecat.pipeline.llm_with_backend import PredictiveDelegation
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    predictive_delegation=PredictiveDelegation(
+        JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+    ),
+)
+```
+
+It costs a classification on every user turn, and the frontend request it cancels when it delegates early. It needs a text frontend and the default request strategy, under which the frontend calls `delegate` without wording a request.
+
+## Showing Backend Work in a Client
+
+The function calls the backend makes reach clients as RTVI function-call events, the same as calls the frontend makes, so a UI can show what the backend is doing. To show the backend's calls with their arguments and results, and hide the `delegate` call itself, set [`function_call_report_level`](/api-reference/server/rtvi/rtvi-observer#configuration) on your pipeline worker:
+
+```python
+from pipecat.processors.frameworks.rtvi import RTVIFunctionCallReportLevel, RTVIObserverParams
+
+worker = PipelineWorker(
+    pipeline,
+    rtvi_observer_params=RTVIObserverParams(
+        function_call_report_level={
+            "*": RTVIFunctionCallReportLevel.FULL,
+            "delegate": RTVIFunctionCallReportLevel.DISABLED,
+        },
+    ),
+)
+```
+
+While developing, `BackendConnector(client_trace=True)` sends every exchange with the backend to the client as an RTVI server message, which a client's event log shows.
+
+## Running the Backend in Another Process
+
+The frontend reaches the backend by name over the bus, so the backend can run in another process. Name the backend worker and run it under its own `WorkerRunner` on a network bus, set up as in [Distributed Agents](/pipecat/learn/distributed-agents):
+
+```python
+backend = BackendLLMWorker(name="engineering-backend", llm=backend_llm, context=backend_context)
+
+runner = WorkerRunner(bus=bus)
+await runner.add_workers(backend)
+await runner.run()
+```
+
+In the frontend's process, on the same bus, pass the name in place of the worker:
+
+```python
+llm = LLMWithBackend(frontend=frontend_llm, backend="engineering-backend")
+```
+
+The frontend waits for the backend to be ready, so a backend that starts a little after the frontend is fine.
+
+## Adjusting the Defaults
+
+`BackendConnector(respond_on_delegate=False)` makes the frontend delegate without replying, for an app where a quick reply on delegating isn't wanted:
+
+```python
+from pipecat.pipeline.llm_with_backend import BackendConnector
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    connector=BackendConnector(respond_on_delegate=False),
+)
+```
+
+The pairing instructions and the way requests are worded are tuned to work across providers. The [reference](/api-reference/server/composite-services/llm-with-backend) lists the parameters that replace them, and a replacement has to cover everything the default covers. Say what is specific to your bot in your own prompts instead.
+
+## Other Multi-Agent Setups
+
+`LLMWithBackend` sets up one multi-agent shape: a frontend, a backend, and the messages between them handled for you. When your bot needs a different shape, build it from the multi-agent pieces directly:
+
+- [Multiple LLM Agents](/pipecat/learn/multiple-llm-agents): agents that each own an LLM, tools and context
+- [Agent Handoff](/pipecat/learn/agent-handoff): moving the conversation from one agent to another
+- [Job Coordination](/pipecat/learn/job-coordination): dispatching work to agents and collecting results
+- [Distributed Agents](/pipecat/learn/distributed-agents): agents across processes and machines
+
+## What's Next
+
+For every parameter of `LLMWithBackend`, its connector and predictive delegation, see the reference:
+
+<Card
+  title="LLMWithBackend Reference"
+  icon="book"
+  href="/api-reference/server/composite-services/llm-with-backend"
+>
+  Configuration, request strategies, predictive delegation, and frames
+</Card>
 
 <Card title="What's Next" icon="arrow-right" href="/pipecat/learn/whats-next">
   Explore Fundamentals and advanced patterns
