@@ -1,19 +1,19 @@
 ---
 title: "LLM with a Backend"
-description: "Pair a conversational frontend LLM with a backend LLM that handles tools and reasoning, using LLMWithBackend and BackendLLMWorker."
+description: "Pair a conversational frontend LLM with a backend LLM that handles work needing tools or careful reasoning, using LLMWithBackend."
 ---
 
 <Warning>
   `LLMWithBackend` is in alpha: its API is likely to change between releases.
 </Warning>
 
-`LLMWithBackend` pairs a conversational **frontend** LLM, which keeps the conversation fluent, with a **backend** LLM that handles work needing tools or careful reasoning. It goes where the LLM goes in your pipeline and runs the backend as an agent of its own. The frontend hands work to the backend with a `delegate` tool and keeps talking with the user, and what the backend has to say comes back into the frontend's conversation for it to relay to the user.
+`LLMWithBackend` pairs a **frontend** LLM, which keeps the conversation with the user fluent, with a **backend** LLM that handles work needing tools or careful reasoning. It goes where the LLM goes in your pipeline and runs the backend as an agent of its own. The frontend hands work to the backend with a `delegate` tool and keeps talking with the user, and what the backend has to say comes back into the frontend's conversation for it to relay to the user.
 
-It fits a voice bot whose work takes several tool calls or real reasoning: fixing a failing test, researching a question across documents, rebooking a trip. A model suited to that work can take seconds or minutes over it, too long for the user to wait in silence. With `LLMWithBackend`, the user talks with a conversational model while the backend works.
+It's a good fit for a voice bot whose work may involve nontrivial tool calls, several tool calls, or real reasoning: the user keeps talking with the frontend while the backend works.
 
 ## Basic Usage
 
-The backend's tools are ordinary [direct functions](/pipecat/learn/function-calling):
+Define the backend's [tools](/pipecat/learn/function-calling) as you would for any LLM:
 
 ```python
 from pipecat.services.llm_service import FunctionCallParams
@@ -41,14 +41,15 @@ from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
 from pipecat.workers.llm import BackendLLMWorker
 
 llm = LLMWithBackend(
-    # OpenAIResponsesLLMService runs a reasoning model at its lowest reasoning
-    # effort, so the frontend replies quickly.
+    # By default, a frontend runs like any LLM in a pipeline: services that set a
+    # reasoning default, as this one does, run a reasoning model at its lowest
+    # reasoning effort, for fast replies.
     frontend=OpenAIResponsesLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAIResponsesLLMService.Settings(system_instruction=FRONTEND_INSTRUCTIONS),
     ),
-    # The backend runs its model at the provider's default thinking, since it
-    # does the reasoning the frontend hands off.
+    # By default, a backend runs its model at the provider's default reasoning
+    # effort, since it does the reasoning the frontend hands off.
     backend=BackendLLMWorker(
         llm=AnthropicLLMService(
             api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -99,19 +100,19 @@ you changed and the test result. Keep what you tell them short and concrete."""
 
 Pipecat appends a **pairing instruction** to each, the text that tells a model how it works with the other: the frontend's says when and how to delegate and what to do with the backend's messages, and the backend's says how to take requests and how to mark what the user should hear. So neither of your prompts mentions the `delegate` tool, the other model, or how the backend's messages reach the user.
 
-## What the Conversation Is Like
+## How a Conversation Works
 
 When the user asks for something that needs the backend, the frontend calls `delegate`, which returns at once, and the frontend acknowledges: "Sure, I'll get on that now." The backend starts working.
 
-The user can keep talking. Small talk and questions the frontend can answer itself stay with the frontend. A new request joins the backend's work, a correction changes it, and a "never mind" stops it: the frontend hands each of these to the backend, which works out what it means for the work under way and cancels the tool calls whose results are no longer wanted.
+The user can keep talking. The frontend handles small talk and questions it can answer itself. When the user asks for more work, corrects the work in progress, or says "never mind", the frontend delegates that too, and the backend works out what it means for its work and cancels any tool calls whose results are no longer wanted.
 
-When the backend has something for the user, such as a result or a question it can't go on without, the frontend relays it in its own words on whatever turn is under way. Everything else the backend writes, the function calls it makes, and its reasoning reach the frontend silently, so when the user asks how it's going, the frontend answers from them without delegating again.
+When the backend has something the user really needs to hear, such as a result or a question it can't go on without, the frontend relays it in its own words. Everything else the backend outputs (progress notes, function calls, reasoning) reaches the frontend silently, so when the user asks how it's going, the frontend can answer without delegating again.
 
 To the user there is one assistant: the frontend never mentions the backend, and talks about the work as its own.
 
 ## Speech-to-Speech Frontends
 
-The frontend can be a speech-to-speech service, such as [`OpenAIRealtimeLLMService`](/api-reference/server/services/s2s/openai) or [`GeminiLiveLLMService`](/api-reference/server/services/s2s/gemini-live), in place of the STT, LLM and TTS services. Its model then words each request to the backend itself. `InworldRealtimeLLMService` and `UltravoxRealtimeLLMService` can't be a frontend.
+The frontend can be a speech-to-speech service, such as [`OpenAIRealtimeLLMService`](/api-reference/server/services/s2s/openai) or [`GeminiLiveLLMService`](/api-reference/server/services/s2s/gemini-live), in place of the STT, LLM and TTS services. Its model then words each request to the backend itself. Two can't be a frontend: `InworldRealtimeLLMService`, because its model calls `delegate` again in place of taking in the backend's messages, and `UltravoxRealtimeLLMService`, because built-in tools such as `delegate` don't reach its session.
 
 [`OpenAILiveLLMService`](/api-reference/server/services/s2s/openai-live) has the same shape built in: OpenAI's GPT-Live model is the frontend, and in client delegation its backend is a `BackendLLMWorker`.
 
@@ -122,7 +123,9 @@ The frontend can be a speech-to-speech service, such as [`OpenAIRealtimeLLMServi
   releases.
 </Warning>
 
-A text frontend spends a whole inference deciding to call `delegate` before the backend can start. **Predictive delegation** starts the backend sooner: on each user turn, a fast yes/no [classifier](/pipecat/learn/classifiers) races the frontend, asking whether the turn needs the backend. A "yes" that arrives before the frontend has said anything delegates the turn at once, in place of the frontend's inference. Otherwise the frontend handles the turn as usual, having waited for nothing.
+A text frontend spends a whole inference deciding to call `delegate` before the backend can start. **Predictive delegation** starts the backend sooner on turns that need it.
+
+How it works: on each user turn, a fast yes/no [classifier](/pipecat/learn/classifiers) races the frontend's inference, asking whether the turn needs the backend. A "yes" that arrives before the frontend's first output delegates the turn at once and cancels the inference. A "no", a late answer, or a classifier error leaves the turn to the frontend as usual. The frontend is never slowed down waiting for the classifier.
 
 ```python
 from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
@@ -137,7 +140,9 @@ llm = LLMWithBackend(
 )
 ```
 
-It costs a classification on every user turn, and the frontend request it cancels when it delegates early. It needs a text frontend and the default request strategy, under which the frontend calls `delegate` without wording a request.
+The cost: a classification on every user turn, and a cancelled frontend request each time it delegates early.
+
+Predictive delegation needs a text frontend and a request strategy whose `delegate` call takes no arguments, such as the default `TranscriptBackendRequestStrategy`.
 
 ## Showing Backend Work in a Client
 
@@ -149,15 +154,30 @@ from pipecat.processors.frameworks.rtvi import RTVIFunctionCallReportLevel, RTVI
 worker = PipelineWorker(
     pipeline,
     rtvi_observer_params=RTVIObserverParams(
+        # How much of each function call to report to the client, by function name
         function_call_report_level={
+            # Report every function call with its arguments and result...
             "*": RTVIFunctionCallReportLevel.FULL,
+            # ...except the frontend's delegate calls, which aren't reported
             "delegate": RTVIFunctionCallReportLevel.DISABLED,
         },
     ),
 )
 ```
 
-While developing, `BackendConnector(client_trace=True)` sends every exchange with the backend to the client as an RTVI server message, which a client's event log shows.
+While developing, turn on `client_trace` to send every exchange with the backend to the client:
+
+```python
+from pipecat.pipeline.llm_with_backend import BackendConnector
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    connector=BackendConnector(client_trace=True),
+)
+```
+
+Each exchange arrives as an RTVI `server-message` whose `data.type` is `"llm-with-backend"`, which a client's event log shows.
 
 ## Running the Backend in Another Process
 
@@ -193,7 +213,7 @@ llm = LLMWithBackend(
 )
 ```
 
-The pairing instructions and the way requests are worded are tuned to work across providers. The [reference](/api-reference/server/composite-services/llm-with-backend) lists the parameters that replace them, and a replacement has to cover everything the default covers. Say what is specific to your bot in your own prompts instead.
+The pairing instructions and the way requests are worded are tuned to work across providers. The [reference](/api-reference/server/composite-services/llm-with-backend) lists the parameters for custom overrides, and a custom override has to cover everything the default does. Say what is specific to your bot in your own prompts instead.
 
 ## Other Multi-Agent Setups
 
