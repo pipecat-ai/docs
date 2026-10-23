@@ -36638,6 +36638,7 @@ Text-to-Speech services receive text input and output audio streams or chunks.
 | [Hakim](/api-reference/server/services/tts/hakim)                 | `uv pip install git+https://github.com/tryHakimAI/hakim-pipecat.git`                  | Community  |
 | [Hume](/api-reference/server/services/tts/hume)                   | `uv add "pipecat-ai[hume]"`                                                           | Pipecat    |
 | [Inworld](/api-reference/server/services/tts/inworld)             | `uv add "pipecat-ai[inworld]"`                                                        | Pipecat    |
+| [Kalpa](/api-reference/server/services/tts/kalpa)                 | `uv add "pipecat-kalpa @ git+https://github.com/kalpalabs/pipecat-kalpa.git@v0.1.0"`  | Community  |
 | [Kokoro](/api-reference/server/services/tts/kokoro)               | `uv add "pipecat-ai[kokoro]"`                                                         | Pipecat    |
 | [Lokutor](/api-reference/server/services/tts/lokutor)             | `uv add pipecat-lokutor`                                                              | Community  |
 | [Maya](/api-reference/server/services/tts/maya)                   | `uv add "pipecat-maya @ git+https://github.com/MayaResearch/pipecat-maya.git@v0.1.0"` | Community  |
@@ -61931,6 +61932,203 @@ async with aiohttp.ClientSession() as session:
 async def on_connected(service):
     print("Connected to Inworld")
 ```
+
+# Kalpa Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/kalpa.md
+
+KalpaTTSService streams TTS over WebSocket, and KalpaHttpTTSService streams audio over HTTP, using the pipecat-kalpa community package.
+
+## Overview
+
+[KalpaTTSService](#kalpattsservice) converts text to speech through Kalpa's
+streaming WebSocket API. [KalpaHttpTTSService](#kalpahttpttsservice) uses the
+HTTP streaming API. Kalpa Labs maintains both services in `pipecat-kalpa`.
+For a walkthrough of TTS in a pipeline, see
+[Text-to-Speech](/pipecat/learn/text-to-speech).
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/kalpalabs/pipecat-kalpa"
+  >
+    Source code, runnable examples, changelog, and issues
+  </Card>
+  <Card
+    title="Kalpa API Documentation"
+    icon="book"
+    href="https://docs.kalpalabs.ai/text-to-speech"
+  >
+    Current models, voices, and HTTP and WebSocket API behavior
+  </Card>
+</CardGroup>
+
+The [package README](https://github.com/kalpalabs/pipecat-kalpa#readme) is the
+source of truth for the integration's examples and release compatibility.
+
+## Installation
+
+Install the community package from its versioned Git release:
+
+```bash
+uv add "pipecat-kalpa @ git+https://github.com/kalpalabs/pipecat-kalpa.git@v0.1.0"
+```
+
+## Prerequisites
+
+Create an API key in the
+[Kalpa dashboard](https://kalpalabs.ai/dashboard/keys/).
+
+### Required Environment Variables
+
+- `KALPA_API_KEY`: Your Kalpa API key.
+
+Import the service classes from the community package:
+
+```python
+from pipecat_kalpa import KalpaHttpTTSService, KalpaTTSService
+```
+
+## Configuration
+
+### KalpaTTSService
+
+<ParamField path="api_key" type="str" required>
+  Kalpa API key. Raises `ValueError` when empty.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="wss://api.kalpalabs.ai">
+  WebSocket base URL for the Kalpa API.
+</ParamField>
+
+<ParamField
+  path="text_aggregation_mode"
+  type="TextAggregationMode"
+  default="TextAggregationMode.TOKEN"
+>
+  How incoming text is aggregated before synthesis. `TOKEN` forwards LLM text as
+  it arrives; `SENTENCE` aggregates sentences first. Import from
+  `pipecat.services.tts_service`.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="KalpaTTSService.Settings | None"
+  default="None"
+>
+  Runtime-configurable settings. See [Settings](#settings).
+</ParamField>
+
+### KalpaHttpTTSService
+
+<ParamField path="api_key" type="str" required>
+  Kalpa API key. Raises `ValueError` when empty.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.kalpalabs.ai">
+  HTTP base URL for the Kalpa API.
+</ParamField>
+
+<ParamField
+  path="aiohttp_session"
+  type="aiohttp.ClientSession | None"
+  default="None"
+>
+  Shared HTTP session. When `None`, the service creates and closes its own
+  session. You are responsible for closing a session you provide.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="KalpaHttpTTSService.Settings | None"
+  default="None"
+>
+  Runtime-configurable settings. See [Settings](#settings).
+</ParamField>
+
+### Settings
+
+Pass settings through `KalpaTTSService.Settings(...)` or
+`KalpaHttpTTSService.Settings(...)`. Both expose the following settings:
+
+| Parameter  | Type                      | Default                                  | Description                                                                                                                                                     |
+| ---------- | ------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`    | `str \| None`             | `"kalpa-tts-1"`                          | Public model ID. See [Kalpa models](https://docs.kalpalabs.ai/models).                                                                                          |
+| `voice`    | `str \| None`             | `"18c26f49-9f9c-400c-bec9-7467f28e1db5"` | Named voice ID, defaulting to Arjun. Select a voice offered for your model from Kalpa's [voice catalog](https://docs.kalpalabs.ai/text-to-speech#named-voices). |
+| `language` | `Language \| str \| None` | `None`                                   | Guides Pipecat's sentence splitting. It is not sent to Kalpa.                                                                                                   |
+
+Use a [`TTSUpdateSettingsFrame`](/pipecat/fundamentals/service-settings) to
+change settings during a conversation. Updating `model` or `voice` reconnects
+the WebSocket service.
+
+## Usage
+
+### Add Kalpa to a Voice Pipeline
+
+Place the service after your LLM and before the transport output. This example
+uses your existing transport, STT, LLM, and context aggregators:
+
+```python
+import os
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_kalpa import KalpaTTSService
+
+tts = KalpaTTSService(api_key=os.getenv("KALPA_API_KEY"))
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+For a complete runnable example, follow the
+[voice agent example](https://github.com/kalpalabs/pipecat-kalpa/blob/v0.1.0/examples/voice.py)
+and its instructions in the package README.
+
+### Use HTTP Synthesis
+
+Use the HTTP service in the same pipeline position:
+
+```python
+import os
+
+from pipecat_kalpa import KalpaHttpTTSService
+
+tts = KalpaHttpTTSService(api_key=os.getenv("KALPA_API_KEY"))
+```
+
+## Notes
+
+- **Audio format**: Both services produce 24 kHz mono PCM audio. The output
+  transport resamples it to the pipeline's output rate.
+- **Interruptions**: Use Pipecat's
+  [interruption handling](/pipecat/fundamentals/interruptions) to stop playback
+  when the user interrupts. `KalpaTTSService` cancels the interrupted response
+  and reuses the connection for subsequent speech.
+
+## Event Handlers
+
+`KalpaTTSService` supports the standard
+[service connection events](/api-reference/server/events/service-events):
+
+| Event                 | Description                          |
+| --------------------- | ------------------------------------ |
+| `on_connected`        | The WebSocket connection is open.    |
+| `on_disconnected`     | The WebSocket connection is closed.  |
+| `on_connection_error` | A WebSocket connection error occurs. |
+
+## Compatibility
+
+Tested with Pipecat 1.13.0 on Python 3.12.
+Requires Python 3.11 or later and Pipecat 1.13.x (`>=1.13.0,<1.14.0`).
 
 # Kokoro Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/kokoro.md
