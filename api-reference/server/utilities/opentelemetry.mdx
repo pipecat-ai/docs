@@ -103,20 +103,20 @@ Conversation (conversation)
     turn...
 ```
 
-For real-time multimodal services like Gemini Live and OpenAI Realtime, the structure adapts to their specific patterns:
+Realtime (speech-to-speech) services like Gemini Live and OpenAI Realtime take audio in and send audio out, so there is no separate STT or TTS stage to trace. Each reply is one span:
 
 ```
 Conversation (conversation)
 ├── turn
-│   ├── llm_setup (session configuration)
-│   ├── stt (user input)
-│   ├── llm_response (complete response with usage)
-│   └── llm_tool_call/llm_tool_result (for function calls)
+│   ├── llm_setup (session configuration, once per session)
+│   ├── llm_response (one per reply: end of user speech → end of reply)
+│   └── llm_tool_call (one per function call)
 └── turn
-    ├── stt (user input)
-    └── llm_response (complete response)
+    └── llm_response
     turn...
 ```
+
+An `llm_response` span starts when the user stopped speaking and ends when the reply ends, or at the user's speech onset when they interrupt it. The user's transcript and the reply text are attributes on it, so there are no `stt` spans for realtime services.
 
 This hierarchical structure makes it easy to:
 
@@ -239,44 +239,49 @@ Pipecat enriches spans with detailed attributes about service operations:
 - `metrics.ttfb`: Time to first byte in seconds
 - `gen_ai.request.*`: Standard parameters (temperature, max_tokens, etc.)
 
-### Multimodal Service Spans (Gemini Live & OpenAI Realtime)
+### Realtime Service Spans (Gemini Live, OpenAI Realtime, and other speech-to-speech services)
 
-#### Setup Spans
+#### Setup Spans (`llm_setup`)
 
-- `gen_ai.provider.name`: "gcp.gemini" or "openai"
+- `gen_ai.provider.name`: "gcp.gemini", "openai", etc.
 - `gen_ai.request.model`: Model identifier
 - `tools.count`: Number of available tools
 - `tools.definitions`: JSON-serialized tool schemas
-- `gen_ai.system_instructions`: System instructions (truncated). The OpenAI Realtime setup span reports this as `instructions`
-- `session.*`: Session configuration parameters
+- `gen_ai.system_instructions`: System prompt (truncated)
+- `session.*`: Session configuration parameters (OpenAI Realtime)
 
-#### Request Spans (OpenAI Realtime)
+#### Response Spans (`llm_response`)
 
-- `input`: JSON-serialized context messages being sent
-- `gen_ai.operation.name`: "llm_request"
+One per reply, from the end of the user's speech to the end of the reply.
 
-#### Response Spans
+- `gen_ai.provider.name`: Provider name, e.g. "gcp.gemini", "gcp.vertex_ai", "openai", "azure.ai.openai"
+- `gen_ai.request.model`: Model identifier
+- `gen_ai.operation.name`: "chat"
+- `gen_ai.output.type`: "speech" when the reply carried audio, else "text"
+- `input`: Transcript of the user speech this reply answers (absent for a greeting or a reply to appended messages)
+- `input_modality`: "AUDIO" when `input` is set
+- `output`: Reply text or transcript
+- `output_modality`: "AUDIO" or "TEXT"
+- `metrics.ttfb` and `gen_ai.response.time_to_first_chunk`: Time to first byte in seconds (needs `enable_metrics=True`)
+- `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`: Token usage
+- `gen_ai.usage.audio.input_tokens`, `gen_ai.usage.audio.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.audio.cache_read.input_tokens`, `gen_ai.usage.reasoning.output_tokens`: Token usage breakdown, when the service reports it
+- `llm.interrupted`: Whether the user interrupted the reply
 
-- `output`: Complete assistant response text
-- `output_modality`: "TEXT" or "AUDIO" (Gemini Live)
-- `gen_ai.usage.input_tokens`: Prompt tokens used
-- `gen_ai.usage.output_tokens`: Completion tokens generated
-- `gen_ai.usage.cache_read.input_tokens`: Cached prompt tokens (when applicable)
-- `gen_ai.usage.audio.input_tokens`: Audio prompt tokens (Gemini Live, OpenAI Realtime)
-- `gen_ai.usage.audio.output_tokens`: Audio completion tokens (Gemini Live, OpenAI Realtime)
-- `gen_ai.usage.audio.cache_read.input_tokens`: Cached audio tokens (Gemini Live, OpenAI Realtime)
-- `function_calls.count`: Number of function calls made
-- `function_calls.first_name`: Name of the first function call
-- `function_calls.all_names`: Comma-separated names, when more than one call is made
-- `metrics.ttfb`: Time to first response in seconds
+Usage and the user transcript can arrive after the reply ends, so the span is exported once they are in, when the next reply starts, at pipeline end, or after a two second grace period, whichever comes first. The span keeps the time the reply actually ended.
 
-#### Tool Call/Result Spans (Gemini Live)
+#### Tool Call Spans (`llm_tool_call`)
 
-- `tool.function_name`: Name of the function being called
-- `tool.call_id`: Unique identifier for the call
-- `tool.arguments`: Function arguments (truncated)
-- `tool.result`: Function execution result (truncated)
-- `tool.result_status`: "completed", "success", or "error"
+One per function call, from the call starting to its final result or cancellation. Parented to the turn, beside the reply.
+
+- `gen_ai.operation.name`: "execute_tool"
+- `gen_ai.tool.name`: Name of the function being called
+- `gen_ai.tool.call.id`: Unique identifier for the call
+- `gen_ai.tool.call.arguments`: Function arguments as JSON (truncated)
+- `gen_ai.tool.call.result`: Function result as JSON (truncated)
+- `error.type`: "tool_error" when the handler raised; the span status is then ERROR
+- `tool.cancelled`: true when the call was cancelled
+
+`OpenAILiveLLMService` is not traced this way: it is full duplex, and its usage and tool calls belong to the backend model it delegates to.
 
 ### Turn Spans
 
