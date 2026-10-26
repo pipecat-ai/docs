@@ -1,0 +1,148 @@
+---
+title: "Alkove Audio Filter"
+sidebarTitle: "Alkove"
+description: "Keeps the user's voice and removes the other voices and the noise before VAD and speech-to-text, on the bot's CPU"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="edbrdi"
+  maintainerUrl="https://github.com/edbrdi"
+  repo="https://github.com/alkove-ai/alkove/tree/main/integrations/pipecat"
+/>
+
+## Overview
+
+`AlkoveFilter` is a `BaseAudioFilter` implementation backed by Focus, the
+voice isolation model of [Alkove](https://alkove.ai), an open-source
+(Apache-2.0) voice SDK. You attach it to a transport's `audio_in_filter`, and it
+keeps the user's voice (the closest one, or the voice of a voiceprint) and
+removes the other people talking and the background noise, so VAD and your STT
+service only hear the user. It runs locally on the CPU with Alkove's own
+inference engine: no API key and no network calls after the model download.
+
+The same package has [`AlkoveVADAnalyzer`](/api-reference/server/services/vad/alkove-vad),
+a VAD that hears only the user when it sits behind this filter.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/alkove-ai/alkove/tree/main/integrations/pipecat"
+  >
+    Code, example and README of the Pipecat plugin
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="box"
+    href="https://pypi.org/project/pipecat-alkove/"
+  >
+    The `pipecat-alkove` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-alkove
+```
+
+## Prerequisites
+
+- **No API key.** The models (Focus 1.1 MB, Cue 1.1 MB) download once into the
+  cache and are checked by their sha256.
+
+## Configuration
+
+<ParamField
+  path="voiceprint"
+  type="alkove.Voiceprint | list[float] | None"
+  default="None"
+>
+  Keep the voice of this print rather than the closest voice. Make it with
+  `alkove.Timbre` from 1.5 s or more of the user's voice.
+</ParamField>
+
+<ParamField path="strength" type="float" default="1.0">
+  Mix between the raw microphone (0) and Focus's output (1).
+</ParamField>
+
+<ParamField path="normalize" type="bool" default="False">
+  Bring the kept voice to a steady level.
+</ParamField>
+
+<ParamField path="models" type="alkove.Models | None" default="None">
+  Models to use. `None` loads Focus and Cue once per process, shared by every
+  session. Pass `alkove.Models.load(["focus", "cue"], dir=...)` to read them
+  from your own folder.
+</ParamField>
+
+## Usage
+
+Create one filter per call and pass it to your transport as `audio_in_filter`:
+
+```python
+from pipecat.transports.base_transport import TransportParams
+from pipecat_alkove import AlkoveFilter
+
+transport_params = TransportParams(
+    audio_in_enabled=True,
+    audio_in_filter=AlkoveFilter(),
+)
+```
+
+The transport drives the filter lifecycle, so no additional wiring is needed.
+[example.py](https://github.com/alkove-ai/alkove/blob/main/integrations/pipecat/example.py)
+runs the filter and the VAD on your microphone.
+
+### With a voiceprint
+
+```python
+from alkove import Models, Timbre
+from pipecat_alkove import AlkoveFilter
+
+models = Models.load(["focus", "cue", "timbre"])
+me = Timbre(models).embed(pcm)  # 16 kHz mono, 1.5 s or more
+audio_filter = AlkoveFilter(models=models, voiceprint=me)
+```
+
+## Input Frames
+
+<ParamField path="FilterEnableFrame" type="Frame">
+  Toggles the filter at runtime. Disabled, it gives the raw microphone back at
+  the same delay.
+
+```python
+from pipecat.frames.frames import FilterEnableFrame
+
+await worker.queue_frame(FilterEnableFrame(enable=False))
+```
+
+</ParamField>
+
+<ParamField path="FilterUpdateSettingsFrame" type="Frame">
+  Changes `strength` (0 to 1) or `voiceprint` (a print, or `None`) while it runs.
+
+```python
+from pipecat.frames.frames import FilterUpdateSettingsFrame
+
+await worker.queue_frame(FilterUpdateSettingsFrame(settings={"strength": 0.5}))
+```
+
+</ParamField>
+
+## Audio Requirements
+
+- Input is 16-bit mono PCM at the transport's sample rate; the filter works at
+  that rate.
+- Focus adds 16 ms of delay: the first calls to `filter()` return a little less
+  audio than they get, then about the same size.
+
+## Compatibility
+
+Tested with Pipecat 1.14.0. See the
+[changelog](https://github.com/alkove-ai/alkove/blob/main/CHANGELOG.md) for the
+latest version.
