@@ -4,15 +4,54 @@ sidebarTitle: "AIC Tyto"
 description: "AICTytoObserver scores the quality of the user's audio with the ai-coustics Tyto model and summarizes the scores at the end of a call."
 ---
 
+## Overview
+
 `AICTytoObserver` scores the quality of the user's audio with the ai-coustics Tyto model. It analyzes the latest 5-second window in a background thread after every 5 seconds of received audio, and emits each result through `on_analysis_result`. When the call ends, it emits a summary through `on_call_summary`.
 
-To use Tyto, you need an ai-coustics license key. Get started at [ai-coustics.com](https://docs.ai-coustics.com/tutorials/pipecat-quickstart).
+<CardGroup cols={2}>
+  <Card
+    title="AIC Tyto Observer API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.observers.aic_tyto_observer.html"
+  >
+    Pipecat's API methods for the Tyto observer
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-aicoustics-tyto.py"
+  >
+    Complete example with AICFilter and AICTytoObserver
+  </Card>
+  <Card
+    title="ai-coustics Documentation"
+    icon="book"
+    href="https://docs.ai-coustics.com/tutorials/pipecat-quickstart"
+  >
+    ai-coustics Pipecat quickstart and model guides
+  </Card>
+  <Card
+    title="ai-coustics Models"
+    icon="cube"
+    href="https://artifacts.ai-coustics.io/"
+  >
+    Browse available Tyto and Quail models
+  </Card>
+</CardGroup>
 
 ## Installation
 
 ```bash
 uv add "pipecat-ai[aic]"
 ```
+
+## Prerequisites
+
+You need an ai-coustics license key. Get one at [developers.ai-coustics.io](https://developers.ai-coustics.io).
+
+### Required Environment Variables
+
+- `AIC_SDK_LICENSE`: Your ai-coustics SDK license key
 
 ## Configuration
 
@@ -56,17 +95,40 @@ Raises `ValueError` when neither `model_id` nor `model_path` is set, or when `de
 
 ## Usage
 
+### Scoring Audio Before Enhancement
+
 Tyto must score the audio before enhancement. When `AICFilter` is the transport's `audio_in_filter`, pass the same filter as `audio_filter`:
 
 ```python
 import os
 
+from loguru import logger
+
 from pipecat.audio.filters.aic_filter import AICFilter
 from pipecat.observers.aic_tyto_observer import AICTytoObserver
 from pipecat.pipeline.worker import PipelineWorker
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
-aic_filter = AICFilter(license_key=os.getenv("AIC_SDK_LICENSE"), model_id="quail-vf-2.2-l-16khz")
-tyto = AICTytoObserver(license_key=os.getenv("AIC_SDK_LICENSE"), audio_filter=aic_filter)
+aic_filter = AICFilter(
+    license_key=os.environ["AIC_SDK_LICENSE"],
+    model_id="quail-vf-2.2-l-16khz",
+)
+
+transport = DailyTransport(
+    room_url,
+    token,
+    "Bot",
+    DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        audio_in_filter=aic_filter,
+    ),
+)
+
+tyto = AICTytoObserver(
+    license_key=os.environ["AIC_SDK_LICENSE"],
+    audio_filter=aic_filter,
+)
 
 @tyto.event_handler("on_analysis_result")
 async def on_analysis_result(observer, scores, audio_secs):
@@ -79,6 +141,16 @@ async def on_call_summary(observer, summary):
 worker = PipelineWorker(pipeline, observers=[tyto])
 ```
 
+Without an `AICFilter` on the transport, leave out `audio_filter` and the observer analyzes the input audio frames directly.
+
+## Notes
+
+- **One filter per session**: The observer attaches itself to `audio_filter` and the filter holds one attachment at a time, so create a new `AICFilter` and observer for each session rather than sharing a filter between sessions.
+- **First result**: The first analysis waits for a full 5-second window, so calls with less than 5 seconds of user audio emit no results.
+- **Model load failure**: If the model fails to load, the observer logs an error and the call continues without analysis.
+- **Analysis failure**: If an analysis fails, the observer logs an error and stops analyzing for the rest of the call.
+- **Filter initialization**: When `audio_filter` is set and the filter fails to initialize, it passes audio through unenhanced and the observer analyzes nothing.
+
 ## Event Handlers
 
 | Event                | Description                                                                                                                               |
@@ -86,7 +158,7 @@ worker = PipelineWorker(pipeline, observers=[tyto])
 | `on_analysis_result` | A window was analyzed. Receives `scores` (`AICAudioQualityScores`) and `audio_secs` (`float`), the seconds of user audio received so far. |
 | `on_call_summary`    | The call ended. Receives `summary` (`AICAudioQualitySummary`). Not emitted when no window was analyzed.                                   |
 
-## AICAudioQualityScores
+### AICAudioQualityScores
 
 All scores are in the range `0.0` to `1.0`. A higher value means more problematic audio.
 
@@ -100,7 +172,7 @@ All scores are in the range `0.0` to `1.0`. A higher value means more problemati
 | `packet_loss`        | `float` | Dropouts or discontinuities in the stream.                                                      |
 | `codec_degradation`  | `float` | Artifacts from lossy speech codecs.                                                             |
 
-## AICAudioQualitySummary
+### AICAudioQualitySummary
 
 | Field                | Type                    | Description                                                                                                                                                |
 | -------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -111,10 +183,3 @@ All scores are in the range `0.0` to `1.0`. A higher value means more problemati
 | `degraded_threshold` | `float`                 | `risk_score` value at or above which a window counts as degraded.                                                                                          |
 | `degraded_fraction`  | `float`                 | Fraction of windows that are degraded.                                                                                                                     |
 | `dominant_dimension` | `str`                   | Name of the score with the highest mean, excluding `risk_score` and `speaker_loudness`. It shows the largest degradation, not the cause of the risk score. |
-
-## Notes
-
-- **First result**: The first analysis waits for a full 5-second window, so calls with less than 5 seconds of user audio emit no results.
-- **Model load failure**: If the model fails to load, the observer logs an error and the call continues without analysis.
-- **Analysis failure**: If an analysis fails, the observer logs an error and stops analyzing for the rest of the call.
-- **Filter initialization**: When `audio_filter` is set and the filter fails to initialize, it passes audio through unenhanced and the observer analyzes nothing.
