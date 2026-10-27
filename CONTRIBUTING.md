@@ -119,7 +119,7 @@ images/ logo/ videos/   # Static assets
 
 ### Mintlify Components
 
-Use Mintlify's [built-in components](https://mintlify.com/docs/content/components/) for structured content:
+Use Mintlify's [built-in components](https://www.mintlify.com/docs/components) for structured content:
 
 | Component                                | Purpose                            |
 | ---------------------------------------- | ---------------------------------- |
