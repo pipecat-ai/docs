@@ -1,0 +1,194 @@
+---
+title: "FreeSWITCH Frame Serializer"
+sidebarTitle: "FreeSWITCH"
+description: "FreeSWITCHFrameSerializer connects Pipecat to FreeSWITCH calls through the open source mod_audio_stream WebSocket module, with playback, barge-in and hang-up over the event socket."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="marujofln"
+  maintainerUrl="https://github.com/marujofln"
+  repo="https://github.com/marujofln/pipecat-freeswitch"
+/>
+
+## Overview
+
+`FreeSWITCHFrameSerializer` connects a Pipecat pipeline to a
+[FreeSWITCH](https://signalwire.com/freeswitch) call through the open source
+[`mod_audio_stream`](https://github.com/amigniter/mod_audio_stream) module
+(community edition). Caller audio arrives over the module's WebSocket and
+becomes `InputAudioRawFrame`; bot audio is sent back as `streamAudio` blocks.
+
+The community edition of `mod_audio_stream` only writes each bot audio block to
+a file, it does not play it. The serializer therefore keeps one FreeSWITCH
+event socket (ESL) connection per call: it queues each file for playback,
+stops playback on interruption (`uuid_break`) and hangs up the call
+(`uuid_kill`) after the queued audio has played. It is designed to be used with
+Pipecat's `FastAPIWebsocketTransport`.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/marujofln/pipecat-freeswitch"
+  >
+    Source code, the example bot, a Docker test bench and issues
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-freeswitch/"
+  >
+    The `pipecat-freeswitch` package on PyPI
+  </Card>
+  <Card title="FreeSWITCH" icon="phone" href="https://signalwire.com/freeswitch">
+    The open source telephony platform
+  </Card>
+  <Card
+    title="mod_audio_stream"
+    icon="book"
+    href="https://github.com/amigniter/mod_audio_stream"
+  >
+    The FreeSWITCH module that streams call audio over a WebSocket
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-freeswitch
+```
+
+Or use `pip install pipecat-freeswitch` if you manage dependencies with `pip`.
+
+## Prerequisites
+
+FreeSWITCH is self-hosted, so there is no provider account to configure. You
+need:
+
+1. **FreeSWITCH with `mod_audio_stream`** (community edition) loaded. The
+   dialplan answers the call and starts the stream with the channel UUID as
+   metadata:
+   `uuid_audio_stream ${uuid} start ws://BOT_HOST:8765/ws mono 8k ${uuid}`.
+2. **The event socket (`mod_event_socket`) reachable from the bot**, restricted
+   with an ACL and a dedicated password: it grants full control of FreeSWITCH.
+3. **A token on the WebSocket handshake** (recommended): FreeSWITCH can send
+   `Authorization: Bearer <token>` through the `STREAM_EXTRA_HEADERS` channel
+   variable, and your endpoint checks it before accepting the connection. Use
+   `wss://` or a private network.
+
+The repository includes a Docker test bench (FreeSWITCH 1.11.3 with
+`mod_audio_stream`) and a complete example bot. See the
+[source repository](https://github.com/marujofln/pipecat-freeswitch) for the
+dialplan, the security setup and the example.
+
+## Configuration
+
+<ParamField path="call_uuid" type="str" default="None">
+  UUID of the FreeSWITCH channel. When omitted, it is taken from the first text
+  message `mod_audio_stream` sends. Only canonical UUIDs are accepted.
+</ParamField>
+
+<ParamField path="esl_host" type="str" default="127.0.0.1">
+  FreeSWITCH event socket host.
+</ParamField>
+
+<ParamField path="esl_port" type="int" default="8021">
+  FreeSWITCH event socket port.
+</ParamField>
+
+<ParamField path="esl_password" type="str" default="ClueCon">
+  Event socket password. A warning is logged when FreeSWITCH's default is used.
+</ParamField>
+
+<ParamField path="params" type="FreeSWITCHFrameSerializer.InputParams" default="None">
+  Optional settings, including `freeswitch_in_sample_rate` (the rate given to
+  `uuid_audio_stream`), `freeswitch_out_sample_rate` (the channel's codec rate:
+  8000, 16000, 24000, 32000 or 48000), `output_gain_db`, `auto_hang_up` and
+  `hang_up_timeout_secs`.
+</ParamField>
+
+<Note>
+  This serializer does not use the Pipecat Settings dataclass pattern. See the
+  [source repository](https://github.com/marujofln/pipecat-freeswitch) for the
+  authoritative, up-to-date parameters.
+</Note>
+
+## Usage
+
+Read the channel UUID from the first message, pass the serializer to a
+`FastAPIWebsocketTransport`, and call `serializer.cleanup()` when the
+WebSocket closes:
+
+```python
+from fastapi import WebSocket
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
+from pipecat_freeswitch import FreeSWITCHFrameSerializer
+
+
+async def run_bot(websocket: WebSocket):
+    await websocket.accept()
+    call_uuid = (await websocket.receive_text()).strip()
+
+    serializer = FreeSWITCHFrameSerializer(
+        call_uuid=call_uuid,
+        esl_host="10.0.0.5",
+        esl_password="your-event-socket-password",
+        params=FreeSWITCHFrameSerializer.InputParams(
+            freeswitch_sample_rate=8000, output_gain_db=-12
+        ),
+    )
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            serializer=serializer,
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_out_10ms_chunks=20,  # 200 ms blocks keep barge-in working
+            audio_out_end_silence_secs=0,
+        ),
+    )
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            # ... VAD, STT, LLM, TTS, etc.
+            transport.output(),
+        ]
+    )
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(audio_in_sample_rate=8000, audio_out_sample_rate=8000),
+    )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await worker.cancel()
+        await serializer.cleanup()  # hang up and close the event socket
+
+    # ... run the worker
+```
+
+<Tip>
+  Use output blocks of 200 ms or more (`audio_out_10ms_chunks=20`): every
+  playback that FreeSWITCH starts flushes about 30-40 ms of the caller's
+  incoming audio, so smaller blocks keep the bot from hearing barge-ins. Send
+  bot audio at the channel's codec rate to avoid resampling artifacts. See the
+  repository's README for the measurements.
+</Tip>
+
+## Compatibility
+
+Tested with Pipecat v1.14.0, FreeSWITCH 1.11.3, `mod_audio_stream` commit
+`da8b068` (community edition) and Python 3.12 and 3.13, with PCMU and Opus
+calls. DTMF is not supported yet. Check the
+[source repository](https://github.com/marujofln/pipecat-freeswitch) for the
+latest tested versions and the changelog.
