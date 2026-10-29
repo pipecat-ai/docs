@@ -5,19 +5,37 @@ description: "The open standard for context passed between real-time models."
 
 The Real-time Context Standard (RCS) defines how the models in a voice agent pass context to each other beyond plain text. A voice agent is a chain of models: speech-to-text transcribes the user, an LLM writes a reply, and text-to-speech speaks it. Between them they pass text, so what isn't words is lost along the way, such as how the user sounded, who said what, whether they meant to take a turn or were only saying "mm-hmm", and how the reply should be said. RCS carries that context in the same text stream, in formats any model in the chain can produce and read.
 
-RCS Alpha carries how the user sounded and how the agent should speak. Who is speaking and when someone means to speak are on the [roadmap](#roadmap).
+RCS 0.1 carries how the user sounded and how the agent should speak. Who is speaking and when someone means to speak are on the [roadmap](#roadmap).
 
 <Warning>
-  This page documents RCS Alpha. Its formats, vocabularies and context types may
-  change.
+  This page documents RCS 0.1, an alpha. Until 1.0, any version may change its
+  formats, vocabularies and context types in ways that aren't backward
+  compatible. See [Versions](#versions).
 </Warning>
+
+## Design Principles
+
+RCS context is written by an LLM as it streams a reply, and read by models that act on it a sentence at a time. Every token of markup is a token the LLM generates before the user hears it, so the formats trade a little expressiveness for as few tokens as they can:
+
+- **Few tokens.** A tag is a short name in brackets, such as `<<warm>>` or `[[laugh]]`. It costs a few tokens where SSML or other XML markup costs several times as many.
+- **No closing tags across sentences.** A delivery tag lasts until the next one, and a span closes within its sentence. Each sentence can be spoken as soon as it's written, without waiting for the markup to close.
+- **Safe to cut off.** A reply can stop anywhere, at its end or when the user interrupts. What's left of an unfinished tag is removed, so nothing malformed is spoken.
+- **Readable inline.** Context travels in the text the models already pass each other. The markup stays legible to an LLM that reads it back in later turns.
+
+## Conformance
+
+MUST, SHOULD and MAY are used as defined in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+
+A model, with any processor beside it, conforms to RCS as a producer or a consumer of a context type when it meets that type's requirements. It doesn't need to support every context type, or both roles.
+
+The grammars are [ABNF](https://www.rfc-editor.org/rfc/rfc5234), with prose in `< >`.
 
 ## Terms
 
 - **Context model**: a model in a voice agent that produces or consumes context, such as a speech-to-text (STT) model, an LLM, a text-to-speech (TTS) model, or a classifier.
 - **Context type**: a kind of context RCS carries. Each context type defines its direction, its format, its vocabulary, and how a model declares support for it.
 - **Producer**: the model, or a processor beside it, that writes context of a type.
-- **Consumer**: the model that reads it, or acts on it.
+- **Consumer**: the model, or a processor before it, that reads context of a type, or acts on it.
 - **Capabilities**: what a producer reports or a consumer performs, declared before the conversation starts, so the models upstream only write what will be used.
 
 ## How Context Flows
@@ -28,11 +46,11 @@ flowchart LR
     STT -- "words + perception" --> LLM[LLM]
     LLM -- "words + expression tags" --> TTS[TTS]
     TTS --> A([Agent audio])
-    STT -. "user-input" .-> C([Client app])
-    TTS -. "bot-output" .-> C
 ```
 
-A context type travels inline, with the words it describes. Context reaches client apps through the [RTVI standard](/api-reference/standards/rtvi-standard).
+A context type travels inline, with the words it describes.
+
+Capabilities are declared out of band. RCS defines the fields of each declaration, listed under each context type; how a declaration reaches the models that read it, and in what encoding, is up to the implementation.
 
 ## Perception
 
@@ -50,10 +68,35 @@ The reading comes first in the user's message, followed by a space and the words
 ([tone frustrated=0.86, neutral=0.10],[speech_rate value=4.1]) Can you tell me where my order is?
 ```
 
-- The reading is `(`, one or more signals separated by `,`, then `)`.
-- A signal read as labels is `[name label=confidence, …]`: its likeliest labels, likeliest first, each with a confidence from 0 to 1 written to two decimals.
-- A signal read as a value is `[name value=N]`, such as a rate or a level.
-- Only a final reading of the turn is written. A turn with no reading has no prefix.
+```text
+reading     = "(" signal *( "," signal ) ")"
+signal      = "[" name SP ( labels / value ) "]"
+labels      = label "=" confidence *( ", " label "=" confidence )
+value       = "value=" number
+name        = 1*name-char
+label       = 1*name-char
+name-char   = <any character except whitespace, "=", ",", "[", "]", "(" and ")">
+confidence  = DIGIT "." 2DIGIT                      ; 0.00 to 1.00
+number      = [ "-" ] 1*DIGIT [ "." 1*DIGIT ] [ "e" ( "-" / "+" ) 1*DIGIT ]
+```
+
+- A signal read as labels gives its likeliest labels, likeliest first, each with a confidence from 0 to 1. A confidence below 0.5 is a guess.
+- A signal read as a value gives a measure, such as a rate or a level.
+- `value`, and the `e` of an exponent, are lowercase. `value` is reserved: it isn't a label.
+
+### Producer Requirements
+
+- A producer MUST write a reading only at the head of the user's message, followed by one space.
+- A producer MUST write only the final reading of a turn. A turn with no reading MUST have no prefix.
+- A producer MUST list a signal's labels likeliest first.
+- A producer MUST declare each signal it reports before the conversation starts, and MUST NOT report a signal it didn't declare.
+
+### Consumer Requirements
+
+- A consumer MUST read the reading as context about the user's words, not as words the user said.
+- A consumer MUST NOT write a reading in its own output.
+- A consumer SHOULD NOT act on a label with a confidence below 0.5.
+- A consumer MAY ignore a signal it doesn't recognize.
 
 ### Declaring Perception
 
@@ -65,7 +108,7 @@ A producer declares each signal it reports before the conversation starts, so th
 | `description` | A short line on how to read it, such as its unit or range, or empty     |
 | `labels`      | The labels it can report, for a signal read as labels; empty for values |
 
-RCS Alpha has no shared vocabulary of signals: a producer names its own.
+RCS 0.1 has no shared vocabulary of signals: a producer names its own.
 
 ## Expression
 
@@ -90,12 +133,44 @@ How the agent should say its reply: the delivery of its words, and the sounds an
 <<sympathetic>> I'm so sorry about the wait. <<warm>> Good news, though: it ^^did^^ ship yesterday. [[breath]] Your tracking number is <<slow: 4 7 2 9>>.
 ```
 
-A consumer handles tags this way:
+### Syntax
 
-- **Tags are never spoken.** A consumer that can't perform a tag leaves it out of the speech.
-- **Brackets decide the kind,** except that a universal name keeps its kind in the other brackets: `[[warm]]` still sets a delivery, and `<<laugh>>` is still a sound.
-- **An unfinished tag** at the end of a response, or cut off by an interruption, is removed.
-- **The reply keeps its tags as written** in the conversation's context.
+```text
+delivery-tag = "<<" name ">>"
+span         = "<<" span-name ":" *WSP span-words ">>"
+emphasis     = "^^" stressed "^^"
+sound-tag    = "[[" name "]]"
+pause-tag    = "[[pause" SP 1*DIGIT "]]"
+name         = *( span-char / ":" )
+span-name    = 1*span-char
+span-char    = letter / DIGIT / "_" / " " / "'" / "-" / "/"
+letter       = <any Unicode letter>
+span-words   = 1*<any character except an angle bracket or a line break>
+stressed     = 1*<any character except a line break>
+```
+
+- A tag doesn't cross a line break.
+- Where text matches more than one rule, a span takes precedence over a delivery tag and a pause over a sound tag. Stressed words end at the first `^^` after them.
+- Names are case-sensitive, and universal names and `pause` are lowercase. Spaces at either end of a name are ignored.
+- An empty `<<>>` returns to the baseline, as `<<neutral>>` does. An empty `[[]]` is left out.
+- A span can hold stressed words, but not another span or tag. Stressed words can't hold a tag.
+- RCS 0.1 has no escape. Text that matches a tag is read as one. An unpaired `^^`, or a `<<` or `[[` left open at the end of a response, is removed. Any other `<<` or `[[` that doesn't start a tag is text.
+
+### Producer Requirements
+
+- A producer SHOULD write only the deliveries and sounds the consumer declared, by their universal names where one exists.
+- A producer SHOULD write a pause only within the consumer's declared range, and stress only when the consumer declared emphasis.
+- A producer MUST NOT write a tag inside a span or inside stressed words.
+- A producer MUST write stress as `^^words^^`, not as a delivery.
+
+### Consumer Requirements
+
+- A consumer MUST NOT speak a tag. It MUST leave a tag it can't perform out of the speech.
+- A consumer MUST read a tag's kind from its brackets, except that a universal name, or a name the consumer declared, keeps its kind in the other brackets: `[[warm]]` still sets a delivery, and `<<laugh>>` is still a sound.
+- A consumer MUST remove an unfinished tag at the end of a response, or one cut off by an interruption, without speaking it.
+- A consumer MUST perform each delivery and sound it declared when it's written by its universal name, as well as by the consumer's own name.
+
+The agent SHOULD keep a reply the LLM wrote with tags in the conversation's context as written, so later turns see how it was said.
 
 ### Universal Names
 
@@ -105,6 +180,8 @@ Deliveries and sounds are named by their universal names, the same whatever the 
 - **Different words stay distinct**, so `content` and `happy` are both names.
 - **Only sounds a voice makes** have names. Sound effects, such as applause, have none.
 - **Any other name** passes through as written, for a consumer that takes free text, such as an accent.
+
+Two names are reserved: `neutral`, the voice's baseline, and `emphasis`, the delivery reported for stressed words.
 
 <AccordionGroup>
   <Accordion title="Deliveries (118)">
@@ -140,6 +217,10 @@ Deliveries and sounds are named by their universal names, the same whatever the 
   </Accordion>
 </AccordionGroup>
 
+### Reporting Delivery
+
+A consumer that reports what it performed, such as to a client app, reports the delivery of each word as a list of universal names: the delivery in effect, a span's delivery added to it, and `emphasis` for a stressed word. `<<warm>> it ^^did^^ ship` reports `did` as `["warm", "emphasis"]`. An empty list is the voice's baseline. Each sound and pause is reported on its own, where it is performed.
+
 ### Declaring Expression
 
 A TTS model declares what it performs before the conversation starts, so the producer is offered only those tags:
@@ -154,27 +235,18 @@ A TTS model declares what it performs before the conversation starts, so the pro
 | Emphasis               | Whether it stresses words                                                                                                                               |
 | Where delivery changes | Anywhere in a response, or only between sentences. A model that changes it only between sentences speaks a span's whole sentence in the span's delivery |
 
-## Reaching Clients
+## Versions
 
-A client app sees context through [RTVI](/api-reference/standards/rtvi-standard) 2.3.0 and later:
+| Version | Changes                                   |
+| ------- | ----------------------------------------- |
+| 0.1     | First version: perception and expression. |
 
-- **`bot-output`** carries the delivery of the text just spoken, by its universal names, such as `["warm", "emphasis"]`, empty for the voice's baseline. Each sound and pause is a segment of its own, of type `expression_sound` or `expression_pause`.
-- **`user-input`** carries a transcription's perception reading.
-
-Transcripts and `bot-output` text never contain tags or readings.
+In 0.1, declarations don't carry a version.
 
 ## Implementations
 
-### Pipecat
-
-Pipecat 1.15.0 and later implement RCS Alpha with [expressive conversation](/pipecat/features/expressive-conversation), turned on with `PipelineParams(enable_expressive_conversation=True)`. See the [reference](/api-reference/server/expressive/overview) and the [examples](https://github.com/pipecat-ai/pipecat/tree/main/examples/expressive-conversation).
-
-| Context type | Producers                                                                                  | Consumers                                                                                                                       |
-| ------------ | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| Perception   | Pipecat Tone's reader (`PipecatToneReader`)                                                | Every LLM service                                                                                                               |
-| Expression   | Every LLM service; Pipecat Tone's tagger (`PipecatToneTagger`) for an LLM that writes none | TTS: Azure, Cartesia, ElevenLabs, Fish Audio, Gemini, Inworld, MiniMax, Mistral and Soniox, on supported models. Avatars: Tavus |
-
-By default, Pipecat offers the LLM its [core names](/api-reference/server/expressive/overview#core-names) that the TTS service performs.
+- **Pipecat** 1.15.0 and later implement RCS 0.1 in [expressive conversation](/pipecat/features/expressive-conversation).
+- **Pipecat clients** receive reported delivery, sounds, pauses and perception readings over [RTVI](/api-reference/standards/rtvi-standard) 2.3.0 and later. RCS doesn't define how context reaches client apps.
 
 ## Roadmap
 
