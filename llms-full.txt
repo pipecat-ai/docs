@@ -2069,6 +2069,7 @@ In the following sections, we'll build a complete agent and explore each compone
 - Handling the complete pipeline lifecycle
 - Making small decisions with classifiers
 - Coordinating multiple agents that share a message bus
+- Pairing a conversational LLM with a backend LLM that handles the heavy lifting
 
 Each section includes practical examples and configuration options to help you build production-ready voice AI applications.
 
@@ -3489,7 +3490,7 @@ stt = YourSTTService(
   `5.0`): Send silence after `keepalive_timeout` seconds without audio to hold
   the connection open, checking every `keepalive_interval` seconds. `None`
   disables it. Useful for services that close idle connections — an inactive
-  service behind a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher),
+  service behind a [`ServiceSwitcher`](/api-reference/server/composite-services/service-switcher),
   for example.
 - **`ttfs_p99_latency`**: P99 latency in seconds from end of speech to final
   transcript, broadcast at pipeline start so downstream processors such as turn
@@ -4323,6 +4324,19 @@ Function calls and their results are automatically stored in the conversation co
   Learn how to enable LLMs to interact with external services and APIs
 </Card>
 
+## Delegating to a Backend LLM
+
+One LLM can talk with the user while another handles the heavy lifting in the background. [`LLMWithBackend`](/pipecat/learn/llm-with-backend) pairs a conversational frontend LLM with a backend LLM that handles work needing tools or careful reasoning: it goes where the LLM goes in your pipeline, runs the backend as an agent of its own, and passes the messages between the two, so there is no bus or job code to write.
+
+<Card
+  title="LLM with a Backend"
+  icon="code"
+  href="/pipecat/learn/llm-with-backend"
+>
+  Pair a conversational frontend LLM with a backend LLM that handles the heavy
+  lifting
+</Card>
+
 ## Key Takeaways
 
 - **Pipeline placement matters** - LLM goes after user context, before TTS
@@ -4579,7 +4593,7 @@ await worker.queue_frame(LLMSetToolsFrame(tools=NOT_GIVEN))
 
 ## Tools Across Service Switches
 
-When you use an [`LLMSwitcher`](/api-reference/server/utilities/service-switchers/llm-switcher) to swap LLM providers mid-session, the tools you list in `LLMContext(tools=[...])` are available on whichever provider is active. You define them once for the whole switcher.
+When you use an [`LLMSwitcher`](/api-reference/server/composite-services/llm-switcher) to swap LLM providers mid-session, the tools you list in `LLMContext(tools=[...])` are available on whichever provider is active. You define them once for the whole switcher.
 
 ```python
 from pipecat.pipeline.llm_switcher import LLMSwitcher
@@ -6133,6 +6147,8 @@ So far you've built a single agent: one LLM, one context, one set of tools. But 
 
 Giving each agent its own LLM keeps every context small and focused. Instead of one model juggling every instruction and tool, each agent reasons over just its own job. That's cheaper, faster, and less prone to the model getting lost.
 
+One pairing comes ready-made: an agent talking with the user while another handles the heavy lifting in the background. [`LLMWithBackend`](/pipecat/learn/llm-with-backend) pairs a conversational frontend LLM with a backend LLM that handles work needing tools or careful reasoning: it goes where the LLM goes in your pipeline, runs the backend as an agent of its own, and passes the messages between the two, so there is no bus or job code to write. The rest of this page shows how to build agents of your own.
+
 ## LLMWorker overview
 
 Multi-agent systems often run several LLM-backed agents -- a greeter, a support agent, a researcher -- each with its own instructions, tools, and (optionally) its own conversation context. `LLMWorker` is the building block for each one. It extends `PipelineWorker` with everything you need to run an LLM-powered agent:
@@ -6933,6 +6949,8 @@ Use cases for jobs:
 - Running a code analysis while talking to the user
 - Fetching data from multiple sources simultaneously
 
+When your bot is one agent talking with the user and one other agent handling the heavy lifting in the background, you may not need jobs at all. [`LLMWithBackend`](/pipecat/learn/llm-with-backend) pairs a conversational frontend LLM with a backend LLM that handles work needing tools or careful reasoning: it goes where the LLM goes in your pipeline, runs the backend as an agent of its own, and passes the messages between the two, so there is no bus or job code to write.
+
 ## Single job
 
 The simplest form is `self.job()`, which sends a job to one agent and waits for the response. What the job carries — its payload, its timeout, the name of the handler it routes to — goes in a [`JobParams`](/api-reference/server/workers/types#jobparams):
@@ -7713,7 +7731,252 @@ python main.py --remote-url ws://localhost:8765/ws
 
 ## What's next
 
-You've built a multi-agent system and scaled it across processes, machines, and networks. Here's where to go from here.
+You've built a multi-agent system and scaled it across processes, machines, and networks. Next, a multi-agent setup that comes ready-made: a conversational LLM with a backend that handles the heavy lifting.
+
+<Card
+  title="LLM with a Backend"
+  icon="arrow-right"
+  href="/pipecat/learn/llm-with-backend"
+>
+  Pair a conversational frontend LLM with a backend LLM that handles the heavy
+  lifting
+</Card>
+
+# LLM with a Backend
+Source: https://docs.pipecat.ai/pipecat/learn/llm-with-backend.md
+
+Pair a conversational frontend LLM with a backend LLM that handles work needing tools or careful reasoning, using LLMWithBackend.
+
+<Warning>
+  `LLMWithBackend` is in alpha: its API is likely to change between releases.
+</Warning>
+
+`LLMWithBackend` pairs a **frontend** LLM, which keeps the conversation with the user fluent, with a **backend** LLM that handles work needing tools or careful reasoning. It goes where the LLM goes in your pipeline and runs the backend as an agent of its own. The frontend hands work to the backend with a `delegate` tool and keeps talking with the user, and what the backend has to say comes back into the frontend's conversation for it to relay to the user.
+
+It's a good fit for a voice bot whose work may involve nontrivial tool calls, several tool calls, or real reasoning: the user keeps talking with the frontend while the backend works.
+
+## Basic Usage
+
+Define the backend's [tools](/pipecat/learn/function-calling) as you would for any LLM:
+
+```python
+from pipecat.services.llm_service import FunctionCallParams
+
+
+async def run_tests(params: FunctionCallParams, path: str | None = None):
+    """Run the test suite, or one test file.
+
+    Args:
+        path: A test file to run alone; the whole suite when omitted.
+    """
+    result = await test_runner.run(path)
+    await params.result_callback(result)
+```
+
+Give the frontend a service of its own and the backend a [`BackendLLMWorker`](/api-reference/server/workers/backend-llm-worker) holding the backend's LLM and tools:
+
+```python
+import os
+
+from pipecat.pipeline.llm_with_backend import LLMWithBackend
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
+from pipecat.workers.llm import BackendLLMWorker
+
+llm = LLMWithBackend(
+    # By default, a frontend runs like any LLM in a pipeline: services that set a
+    # reasoning default, as this one does, run a reasoning model at its lowest
+    # reasoning effort, for fast replies.
+    frontend=OpenAIResponsesLLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAIResponsesLLMService.Settings(system_instruction=FRONTEND_INSTRUCTIONS),
+    ),
+    # By default, a backend runs its model at the provider's default reasoning
+    # effort, since it does the reasoning the frontend hands off.
+    backend=BackendLLMWorker(
+        llm=AnthropicLLMService(
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            settings=AnthropicLLMService.Settings(
+                model="claude-opus-5-5",
+                system_instruction=BACKEND_INSTRUCTIONS,
+            ),
+        ),
+        context=LLMContext(tools=[search_codebase, read_file, apply_patch, run_tests]),
+    ),
+)
+```
+
+Put `llm` where the LLM goes in the pipeline:
+
+```python
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    aggregators.user(),
+    llm,
+    tts,
+    transport.output(),
+    aggregators.assistant(),
+])
+```
+
+The frontend needs no tools of its own: `LLMWithBackend` gives it the `delegate` tool. `LLMWithBackend` is a pipeline, not an LLM service, so functions, settings updates and event handlers go on `llm.frontend`. The backend is added to your pipeline worker when the pipeline starts, so there is nothing else to register.
+
+## Writing the Prompts
+
+Each model gets a system instruction from you. The frontend's says who the assistant is and, in plain words, what work it can take on:
+
+```python
+FRONTEND_INSTRUCTIONS = """You are Pip, the voice assistant of the Acme engineering team.
+Your responses are spoken aloud, so keep them to one or two natural sentences. You can
+make code changes and run the tests, research the team's internal docs, and check CI
+and the open pull requests; that work takes a moment."""
+```
+
+The backend's says what it does with its tools and what the user should be told:
+
+```python
+BACKEND_INSTRUCTIONS = """You do the engineering work for the Acme team's assistant.
+When asked for a code change, keep going until the tests pass, then tell the user what
+you changed and the test result. Keep what you tell them short and concrete."""
+```
+
+Pipecat appends a **pairing instruction** to each, the text that tells a model how it works with the other: the frontend's says when and how to delegate and what to do with the backend's messages, and the backend's says how to take requests and how to mark what the user should hear. So neither of your prompts mentions the `delegate` tool, the other model, or how the backend's messages reach the user.
+
+## How a Conversation Works
+
+When the user asks for something that needs the backend, the frontend calls `delegate`, which returns at once, and the frontend acknowledges: "Sure, I'll get on that now." The backend starts working.
+
+The user can keep talking. The frontend handles small talk and questions it can answer itself. When the user asks for more work, corrects the work in progress, or says "never mind", the frontend delegates that too, and the backend works out what it means for its work and cancels any tool calls whose results are no longer wanted.
+
+When the backend has something the user really needs to hear, such as a result or a question it can't go on without, the frontend relays it in its own words. Everything else the backend outputs (progress notes, function calls, reasoning) reaches the frontend silently, so when the user asks how it's going, the frontend can answer without delegating again.
+
+To the user there is one assistant: the frontend never mentions the backend, and talks about the work as its own.
+
+## Speech-to-Speech Frontends
+
+The frontend can be a speech-to-speech service, such as [`OpenAIRealtimeLLMService`](/api-reference/server/services/s2s/openai) or [`GeminiLiveLLMService`](/api-reference/server/services/s2s/gemini-live), in place of the STT, LLM and TTS services. Its model then words each request to the backend itself. Two can't be a frontend: `InworldRealtimeLLMService`, because its model calls `delegate` again in place of taking in the backend's messages, and `UltravoxRealtimeLLMService`, because built-in tools such as `delegate` don't reach its session.
+
+[`OpenAILiveLLMService`](/api-reference/server/services/s2s/openai-live) has the same shape built in: OpenAI's GPT-Live model is the frontend, and in client delegation its backend is a `BackendLLMWorker`.
+
+## Predictive Delegation
+
+<Warning>
+  `PredictiveDelegation` is in alpha: its API is likely to change between
+  releases.
+</Warning>
+
+A text frontend spends a whole inference deciding to call `delegate` before the backend can start. **Predictive delegation** starts the backend sooner on turns that need it.
+
+How it works: on each user turn, a fast yes/no [classifier](/pipecat/learn/classifiers) races the frontend's inference, asking whether the turn needs the backend. A "yes" that arrives before the frontend's first output delegates the turn at once and cancels the inference. A "no", a late answer, or a classifier error leaves the turn to the frontend as usual. The frontend is never slowed down waiting for the classifier.
+
+```python
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+from pipecat.pipeline.llm_with_backend import PredictiveDelegation
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    predictive_delegation=PredictiveDelegation(
+        JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+    ),
+)
+```
+
+The cost: a classification on every user turn, and a cancelled frontend request each time it delegates early.
+
+Predictive delegation needs a text frontend and a request strategy whose `delegate` call takes no arguments, such as the default `TranscriptBackendRequestStrategy`.
+
+## Showing Backend Work in a Client
+
+The function calls the backend makes reach clients as RTVI function-call events, the same as calls the frontend makes, so a UI can show what the backend is doing. They are reported at the level [`function_call_report_level`](/api-reference/server/rtvi/rtvi-observer#configuration) sets for them, as any function call is; raise it to show their names, arguments or results. To keep the frontend's `delegate` calls from reaching the client, mark them `DISABLED` on your pipeline worker:
+
+```python
+from pipecat.processors.frameworks.rtvi import RTVIFunctionCallReportLevel, RTVIObserverParams
+
+worker = PipelineWorker(
+    pipeline,
+    rtvi_observer_params=RTVIObserverParams(
+        function_call_report_level={
+            # The frontend's delegate calls aren't reported; every other call is
+            # reported at the usual level
+            "delegate": RTVIFunctionCallReportLevel.DISABLED,
+        },
+    ),
+)
+```
+
+While developing, turn on `client_trace` to send every exchange with the backend to the client:
+
+```python
+from pipecat.pipeline.llm_with_backend import BackendConnector
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    connector=BackendConnector(client_trace=True),
+)
+```
+
+Each exchange arrives as an RTVI `server-message` whose `data.type` is `"llm-with-backend"`, which a client's event log shows.
+
+## Running the Backend in Another Process
+
+The frontend reaches the backend by name over the bus, so the backend can run in another process. Name the backend worker and run it under its own `WorkerRunner` on a network bus, set up as in [Distributed Agents](/pipecat/learn/distributed-agents):
+
+```python
+backend = BackendLLMWorker(name="engineering-backend", llm=backend_llm, context=backend_context)
+
+runner = WorkerRunner(bus=bus)
+await runner.add_workers(backend)
+await runner.run()
+```
+
+In the frontend's process, on the same bus, pass the name in place of the worker:
+
+```python
+llm = LLMWithBackend(frontend=frontend_llm, backend="engineering-backend")
+```
+
+The frontend waits for the backend to be ready, so a backend that starts a little after the frontend is fine.
+
+## Adjusting the Defaults
+
+`BackendConnector(respond_on_delegate=False)` makes the frontend delegate without replying, for an app where a quick reply on delegating isn't wanted:
+
+```python
+from pipecat.pipeline.llm_with_backend import BackendConnector
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    connector=BackendConnector(respond_on_delegate=False),
+)
+```
+
+The pairing instructions and the way requests are worded are tuned to work across providers. The [reference](/api-reference/server/composite-services/llm-with-backend) lists the parameters for custom overrides, and a custom override has to cover everything the default does. Say what is specific to your bot in your own prompts instead.
+
+## Other Multi-Agent Setups
+
+`LLMWithBackend` sets up one multi-agent shape: a frontend, a backend, and the messages between them handled for you. When your bot needs a different shape, build it from the multi-agent pieces directly:
+
+- [Multiple LLM Agents](/pipecat/learn/multiple-llm-agents): agents that each own an LLM, tools and context
+- [Agent Handoff](/pipecat/learn/agent-handoff): moving the conversation from one agent to another
+- [Job Coordination](/pipecat/learn/job-coordination): dispatching work to agents and collecting results
+- [Distributed Agents](/pipecat/learn/distributed-agents): agents across processes and machines
+
+## What's Next
+
+For every parameter of `LLMWithBackend`, its connector and predictive delegation, see the reference:
+
+<Card
+  title="LLMWithBackend Reference"
+  icon="book"
+  href="/api-reference/server/composite-services/llm-with-backend"
+>
+  Configuration, request strategies, predictive delegation, and frames
+</Card>
 
 <Card title="What's Next" icon="arrow-right" href="/pipecat/learn/whats-next">
   Explore Fundamentals and advanced patterns
@@ -10200,7 +10463,7 @@ Being unusable changes what the framework does with it:
 
 - STT and TTS services stop accepting work, instead of failing once per chunk of audio or piece of text
 - WebSocket services stop reconnecting, instead of retrying credentials the provider has already rejected
-- A [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) fails over to another provider
+- A [`ServiceSwitcher`](/api-reference/server/composite-services/service-switcher) fails over to another provider
 
 The flag is set as the error is reported, so a handler reading `frame.processor.is_usable` sees the verdict that came with the error it's handling.
 
@@ -10341,7 +10604,7 @@ if frame.processor and not frame.processor.is_usable:
   <Card
     title="Service Switching"
     icon="shuffle"
-    href="/api-reference/server/utilities/service-switchers/service-switcher"
+    href="/api-reference/server/composite-services/service-switcher"
   >
     Fail over to another provider automatically
   </Card>
@@ -15643,7 +15906,7 @@ response = requests.post(url, json=payload, headers=headers)
 
 ## Traces
 
-Bluejay supports [tracing](https://docs.getbluejay.ai/core-concepts/traces) to monitor and observe your agent's execution flow, latency, and performance in real-time. Traces conform to the [OpenTelemetry](https://opentelemetry.io/docs/what-is-opentelemetry/) standard, so you can use any compatible instrumentation library, including OpenInference, Langfuse, and OpenLLMetry.
+Bluejay supports [tracing](https://docs.getbluejay.ai/monitor/traces) to monitor and observe your agent's execution flow, latency, and performance in real-time. Traces conform to the [OpenTelemetry](https://opentelemetry.io/docs/what-is-opentelemetry/) standard, so you can use any compatible instrumentation library, including OpenInference, Langfuse, and OpenLLMetry.
 
 To send traces to Bluejay:
 
@@ -21460,7 +21723,7 @@ Learn how to deploy the SmallWebRTCTransport in a Docker container.
 
 Learn how to use Pipecat Flows to create a structured navigation flow. This example shows a simple restaurant reservation flow.
 
-[View Example →](https://github.com/pipecat-ai/pipecat/blob/main/examples/flows/restaurant_reservation.py)
+[View Example →](https://github.com/pipecat-ai/pipecat/tree/main/examples/flows/yaml/restaurant_reservation)
 
 </Update>
 
@@ -33898,7 +34161,7 @@ rest of this guide calls your organization name.
 
 ### 2. Create a TeXML Application
 
-[Purchase a phone number from Telnyx](https://telnyx.com/resources/purchase-a-phone-number-with-telnyx) if you haven't already, then create a [TeXML Application](https://developers.telnyx.com/docs/voice/programmable-voice/texml-setup) with the following configuration:
+[Purchase a phone number from Telnyx](https://support.telnyx.com/en/articles/4380325-search-and-buy-numbers) if you haven't already, then create a [TeXML Application](https://developers.telnyx.com/docs/voice/programmable-voice/texml-setup) with the following configuration:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -36420,16 +36683,17 @@ Services that drive an external agent from a pipeline.
 
 Analytics services help you better understand how your service operates.
 
-| Service                                                                 | Setup                                          | Maintainer |
-| ----------------------------------------------------------------------- | ---------------------------------------------- | ---------- |
-| [Finchvox](/api-reference/server/services/analytics/finchvox)           | `uv add finchvox`                              | Community  |
-| [floe-guard](/api-reference/server/services/analytics/floe)             | `uv add "floe-guard[pipecat]"`                 | Community  |
-| [Future AGI](/api-reference/server/services/analytics/future-agi)       | `uv add traceAI-pipecat`                       | Community  |
-| [MLflow](/api-reference/server/services/analytics/mlflow)               | `uv add "pipecat-ai[tracing]" mlflow`          | Community  |
-| [Noveum Trace](/api-reference/server/services/analytics/noveum-trace)   | `uv add "noveum-trace[pipecat]"`               | Community  |
-| [OpenInference](/api-reference/server/services/analytics/openinference) | `uv add openinference-instrumentation-pipecat` | Community  |
-| [Roark](/api-reference/server/services/analytics/roark)                 | `uv add pipecat-roark`                         | Community  |
-| [Sentry](/api-reference/server/services/analytics/sentry)               | `uv add "pipecat-ai[sentry]"`                  | Pipecat    |
+| Service                                                                         | Setup                                          | Maintainer |
+| ------------------------------------------------------------------------------- | ---------------------------------------------- | ---------- |
+| [ai-coustics Tyto](/api-reference/server/utilities/observers/aic-tyto-observer) | `uv add "pipecat-ai[aic]"`                     | Pipecat    |
+| [Finchvox](/api-reference/server/services/analytics/finchvox)                   | `uv add finchvox`                              | Community  |
+| [floe-guard](/api-reference/server/services/analytics/floe)                     | `uv add "floe-guard[pipecat]"`                 | Community  |
+| [Future AGI](/api-reference/server/services/analytics/future-agi)               | `uv add traceAI-pipecat`                       | Community  |
+| [MLflow](/api-reference/server/services/analytics/mlflow)                       | `uv add "pipecat-ai[tracing]" mlflow`          | Community  |
+| [Noveum Trace](/api-reference/server/services/analytics/noveum-trace)           | `uv add "noveum-trace[pipecat]"`               | Community  |
+| [OpenInference](/api-reference/server/services/analytics/openinference)         | `uv add openinference-instrumentation-pipecat` | Community  |
+| [Roark](/api-reference/server/services/analytics/roark)                         | `uv add pipecat-roark`                         | Community  |
+| [Sentry](/api-reference/server/services/analytics/sentry)                       | `uv add "pipecat-ai[sentry]"`                  | Pipecat    |
 
 ## Audio Filters
 
@@ -36455,6 +36719,16 @@ Classifiers answer typed questions about some state, such as whether a call reac
 | [Clef](/api-reference/server/classifiers/clef) | `uv add "pipecat-ai[cloudflare]"` | Pipecat    |
 | [Jev](/api-reference/server/classifiers/jev)   | `uv add "pipecat-ai[typesafe]"`   | Pipecat    |
 | [LLM](/api-reference/server/classifiers/llm)   | Built in                          | Pipecat    |
+
+## Composite Services
+
+Composite services hold one or more services and stand in a pipeline where a single service would.
+
+| Composite Service                                                            | Setup    | Maintainer |
+| ---------------------------------------------------------------------------- | -------- | ---------- |
+| [LLMSwitcher](/api-reference/server/composite-services/llm-switcher)         | Built in | Pipecat    |
+| [LLMWithBackend](/api-reference/server/composite-services/llm-with-backend)  | Built in | Pipecat    |
+| [ServiceSwitcher](/api-reference/server/composite-services/service-switcher) | Built in | Pipecat    |
 
 ## Extensions
 
@@ -36626,6 +36900,7 @@ Text-to-Speech services receive text input and output audio streams or chunks.
 
 | Service                                                           | Setup                                                                                 | Maintainer |
 | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ---------- |
+| [AssemblyAI](/api-reference/server/services/tts/assemblyai)       | `uv add "pipecat-ai[assemblyai]"`                                                     | Pipecat    |
 | [Async](/api-reference/server/services/tts/asyncai)               | `uv add "pipecat-ai[asyncai]"`                                                        | Pipecat    |
 | [AWS Polly](/api-reference/server/services/tts/aws)               | `uv add "pipecat-ai[aws]"`                                                            | Pipecat    |
 | [Azure](/api-reference/server/services/tts/azure)                 | `uv add "pipecat-ai[azure]"`                                                          | Pipecat    |
@@ -39245,7 +39520,7 @@ One handle is one session: one pipeline, one context, one history. The transport
   <Card
     title="Streamable HTTP"
     icon="book"
-    href="https://modelcontextprotocol.io/specification/basic/transports"
+    href="https://modelcontextprotocol.io/specification/latest/basic/transports"
   >
     The MCP transport this server speaks
   </Card>
@@ -44727,7 +45002,7 @@ Transcripts are cumulative per turn. There is no `is_final` flag and no `finaliz
 ### Notes
 
 - **English-only**: The ink-2 model family supports English transcription only at launch.
-- **Connection handling**: The service gives up on a connection if Cartesia's `connected` message doesn't arrive within 10 seconds. It reconnects in the background when the connection drops or the first connection fails, so audio and other frames keep moving through the pipeline. Audio that arrives while the connection is down isn't transcribed. After three attempts in a row fail to produce a confirmed connection, it reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) using `ServiceSwitcherStrategyFailover` moves to its next service.
+- **Connection handling**: The service gives up on a connection if Cartesia's `connected` message doesn't arrive within 10 seconds. It reconnects in the background when the connection drops or the first connection fails, so audio and other frames keep moving through the pipeline. Audio that arrives while the connection is down isn't transcribed. After three attempts in a row fail to produce a confirmed connection, it reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/composite-services/service-switcher) using `ServiceSwitcherStrategyFailover` moves to its next service.
 - **Rejected settings**: If Cartesia rejects the connection's settings, such as an unknown model or an out-of-range turn threshold, the service reports a permanent invalid-request error carrying Cartesia's message instead of retrying.
 - **Connection lost mid-turn**: If the connection ends partway through the user's turn, the turn ends with the transcript received so far, as an unfinalized `TranscriptionFrame` followed by a proposed turn stop. If the service reconnects and the user keeps talking, the rest is transcribed as a new turn.
 - **No runtime model switching**: Unlike the v1 API, the ink-2 model does not support runtime model or language switching. However, `keyterm` and the turn detection thresholds (`turn_start_threshold`, `turn_eager_end_threshold`, `turn_end_threshold`, `turn_end_timeout_ms`) can be updated at runtime via `STTUpdateSettingsFrame`, which triggers a reconnect.
@@ -44996,7 +45271,7 @@ stt = DeepgramSTTService(
 
 - **Finalize on VAD stop**: When the pipeline's VAD detects the user has stopped speaking, the service sends a [finalize](https://developers.deepgram.com/docs/finalize) request to Deepgram for faster final transcript delivery.
 - **Multilingual support**: Deepgram Nova models support many languages. The default is `Language.EN` (English). Set `language="multi"` in settings to enable multilingual transcription, which will detect and transcribe multiple languages within the same audio stream.
-- **Reconnection limit**: After three consecutive attempts fail to produce a connection that stays up, the service stops reconnecting and reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) moves off it. See [Error Handling](/pipecat/fundamentals/error-handling).
+- **Reconnection limit**: After three consecutive attempts fail to produce a connection that stays up, the service stops reconnecting and reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/composite-services/service-switcher) moves off it. See [Error Handling](/pipecat/fundamentals/error-handling).
 - **Runtime settings updates**: Changing settings via `STTUpdateSettingsFrame` triggers a reconnection with the new parameters. To avoid audio loss, reconnection is deferred until the current user turn ends (i.e., until `UserStoppedSpeakingFrame` is received). Audio frames arriving during the reconnect are buffered and replayed once the new connection is ready.
 
 ### Event Handlers
@@ -45195,7 +45470,7 @@ This sends a `Configure` message to Deepgram over the existing WebSocket connect
 
 - **Turn management**: Flux provides its own turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on) to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
 - **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`, set with `LLMUserAggregatorParams(vad_analyzer=...)`) is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
-- **Reconnection**: When the connection drops, or the first connection fails, the service reconnects in the background; audio that arrives meanwhile isn't transcribed. A user turn in progress when the connection drops ends with the transcript received so far, and speech after the reconnect starts a new turn. After three consecutive attempts fail to produce a connection that stays up, the service reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) using `ServiceSwitcherStrategyFailover` moves to its next service.
+- **Reconnection**: When the connection drops, or the first connection fails, the service reconnects in the background; audio that arrives meanwhile isn't transcribed. A user turn in progress when the connection drops ends with the transcript received so far, and speech after the reconnect starts a new turn. After three consecutive attempts fail to produce a connection that stays up, the service reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/composite-services/service-switcher) using `ServiceSwitcherStrategyFailover` moves to its next service.
 - **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers Flux's predicted end of turn (`EagerEndOfTurn` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`TurnResumed` event) or the committed transcript differs from the eager one. Each Flux `Update` event pushes an `InterimTranscriptionFrame` holding the transcript of the turn so far, and also fires the `on_update` event.
 - **Multilingual support**: Use the `flux-general-multi` model with `language_hints` to bias transcription toward specific languages (EN, ES, FR, DE, HI, RU, PT, JA, IT, NL). `TranscriptionFrame.language` reflects the detected language for each turn. Omit hints for auto-detection or pass a subset to bias toward expected languages.
 
@@ -52909,6 +53184,7 @@ await worker.queue_frame(
 
 - **No-op tool handling**: AWS Bedrock requires at least one tool to be defined when tool content exists in the conversation. The service automatically adds a placeholder tool when needed to prevent API errors.
 - **Model-specific parameters**: Some models (e.g., Claude Sonnet 4.5) don't allow certain parameter combinations. The service only includes explicitly set parameters in the inference config to avoid conflicts.
+- **Reasoning content**: Reasoning that a model returns, such as Claude with extended thinking or Nova 2 with reasoning enabled, is emitted as `LLMThoughtStartFrame`, `LLMThoughtTextFrame`, and `LLMThoughtEndFrame`. Signed reasoning from Claude is kept in the context and sent back on later turns, so Claude keeps its reasoning across tool calls. Amazon Nova (v1) models write `<thinking>...</thinking>` into the answer text; a block at the start of the response, or of any text the model writes between tool calls, is emitted as thought frames and isn't sent to TTS.
 - **Retry behavior**: When `retry_on_timeout=True`, the first attempt uses the `retry_timeout_secs` timeout. If it times out, a second attempt is made with no timeout limit.
 - **System instruction precedence**: If both the `system_instruction` setting and an initial system message in the context are set, `system_instruction` takes precedence, the context system message isn't sent, and a warning is logged.
 
@@ -54803,11 +55079,11 @@ llm = GroqLLMService(
 # Inception LLM
 Source: https://docs.pipecat.ai/api-reference/server/services/llm/inception.md
 
-InceptionLLMService serves Inception's Mercury-2 diffusion-based reasoning model via an OpenAI-compatible interface.
+InceptionLLMService serves Inception's Mercury-3 diffusion-based reasoning model via an OpenAI-compatible interface.
 
 ## Overview
 
-`InceptionLLMService` provides access to Inception's Mercury-2 diffusion-based reasoning model through an OpenAI-compatible interface. It inherits from `OpenAILLMService` and supports streaming responses, function calling, and context management with advanced reasoning capabilities.
+`InceptionLLMService` provides access to Inception's Mercury-3 diffusion-based reasoning model through an OpenAI-compatible interface. It inherits from `OpenAILLMService` and supports streaming responses, function calling, and context management with advanced reasoning capabilities.
 
 <CardGroup cols={2}>
   <Card
@@ -54849,7 +55125,7 @@ Before using Inception LLM services, you need:
 
 1. **Inception Account**: Sign up at [Inception Labs](https://inceptionlabs.ai/)
 2. **API Key**: Generate an API key from your account dashboard
-3. **Model Selection**: Access to Mercury-2, Inception's diffusion-based reasoning model
+3. **Model Selection**: Access to Mercury-3, Inception's diffusion-based reasoning model
 
 ### Required Environment Variables
 
@@ -54879,8 +55155,8 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 This service extends `OpenAILLMService.Settings` with Inception-specific parameters:
 
-<ParamField path="model" type="str" default="mercury-2">
-  Model identifier to use. Defaults to "mercury-2", Inception's diffusion-based
+<ParamField path="model" type="str" default="mercury-3">
+  Model identifier to use. Defaults to "mercury-3", Inception's diffusion-based
   reasoning model.
 </ParamField>
 
@@ -54922,7 +55198,7 @@ from pipecat.services.inception.llm import InceptionLLMService
 llm = InceptionLLMService(
     api_key=os.getenv("INCEPTION_API_KEY"),
     settings=InceptionLLMService.Settings(
-        model="mercury-2",
+        model="mercury-3",
         reasoning_effort="instant",
         realtime=True,
         temperature=0.7,
@@ -54960,7 +55236,7 @@ context = LLMContext(tools=[get_weather])
 ## Notes
 
 - Inception does not support the `"developer"` message role, so the service sends `"developer"` messages as `"user"` messages.
-- The Mercury-2 model uses a diffusion-based reasoning approach, which can be controlled via the `reasoning_effort` parameter.
+- The Mercury-3 model uses a diffusion-based reasoning approach, which can be controlled via the `reasoning_effort` parameter.
 - Setting `realtime=True` optimizes for lower time-to-first-token at the potential cost of reasoning depth.
 
 # Mistral LLM
@@ -57678,6 +57954,15 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
   Together's reasoning toggle, for the models that support one, e.g. `{"enabled": False}`. A reasoning model such as GLM runs a reasoning pass before every answer, which delays the first spoken token. `None` leaves the choice to the model's own default.
 </ParamField>
 
+<ParamField path="reasoning_effort" type="str | None" default="None">
+  How much the model reasons before answering. Values vary by model: `"low"`,
+  `"medium"` and `"high"` are common, `zai-org/GLM-5.3` also takes `"max"`, and
+  some models map an unsupported value onto one they support. Other strings are
+  passed through as-is. `zai-org/GLM-5.3` ignores `reasoning`, but `"low"` still
+  shortens its reasoning pass. `None` leaves the choice to Together's per-model
+  default.
+</ParamField>
+
 This service also inherits settings from `OpenAILLMService`. See [OpenAI LLM Settings](/api-reference/server/services/llm/openai#settings) for the full parameter reference. The default `model` is `"zai-org/GLM-5.2"`.
 
 ## Usage
@@ -57730,6 +58015,150 @@ llm = TogetherLLMService(
 
 - Together AI hosts a wide variety of open-source models. Model identifiers use the `organization/model-name` format.
 - Together AI fully supports the OpenAI-compatible parameter set inherited from `OpenAILLMService`.
+
+# AssemblyAI Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/assemblyai.md
+
+TTS with AssemblyAITTSService, streaming speech synthesis over AssemblyAI's WebSocket API with per-word timings for voice agents.
+
+## Overview
+
+`AssemblyAITTSService` streams text to AssemblyAI's Streaming TTS WebSocket API and plays the audio as it arrives. Per-word timings drive word-level text output, and interruptions cancel synthesis in flight without reconnecting.
+
+<CardGroup cols={2}>
+  <Card
+    title="AssemblyAI TTS API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.assemblyai.tts.html"
+  >
+    Pipecat's API methods for AssemblyAI TTS integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-assemblyai.py"
+  >
+    Complete example with AssemblyAI STT and TTS
+  </Card>
+  <Card
+    title="AssemblyAI Documentation"
+    icon="book"
+    href="https://www.assemblyai.com/docs"
+  >
+    Official AssemblyAI documentation
+  </Card>
+  <Card
+    title="AssemblyAI Dashboard"
+    icon="microphone"
+    href="https://www.assemblyai.com/dashboard"
+  >
+    Manage API keys and cloned voices
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[assemblyai]"
+```
+
+## Prerequisites
+
+### AssemblyAI Account Setup
+
+1. **AssemblyAI Account**: Sign up at the [AssemblyAI dashboard](https://www.assemblyai.com/dashboard)
+2. **API Key**: Generate an API key from the dashboard
+
+### Required Environment Variables
+
+- `ASSEMBLYAI_API_KEY`: Your AssemblyAI API key for authentication
+
+## Configuration
+
+### AssemblyAITTSService
+
+<ParamField path="api_key" type="str" required>
+  AssemblyAI API key. A temporary token opens a single session, so it can't
+  carry the service's reconnects and session renewals.
+</ParamField>
+
+<ParamField path="url" type="str" default="wss://tts.us.assemblyai.com/v1/ws">
+  Streaming TTS WebSocket URL. Use `wss://tts.eu.assemblyai.com/v1/ws` to
+  process text and audio in the EU. A cloned voice works only on the host of the
+  zone it was created in.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Output sample rate in Hz. When `None`, uses the pipeline's output sample rate.
+</ParamField>
+
+<ParamField path="settings" type="AssemblyAITTSService.Settings" default="None">
+  Runtime-configurable settings. See [Settings](#settings) below.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `AssemblyAITTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. Changing `voice`, `language`, or `model` reconnects the session. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter  | Type              | Default                                  | Description                                                                                                                                                                                    |
+| ---------- | ----------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `voice`    | `str`             | `"49c443a4-8a1d-5f7e-b70b-98bdbd9823c3"` | Voice to speak with, sent as the API's `voice_id`. Accepts a voice ID, an AssemblyAI library slug such as `aai-jane`, or the slug of a cloned voice shown in the dashboard. Default is Audrey. |
+| `language` | `Language \| str` | `None`                                   | Language the session speaks. When unset, the session speaks the voice's own language.                                                                                                          |
+| `model`    | `str`             | `None`                                   | Model name, such as `assemblyai-tts-1`. When unset, the session runs the language's default model.                                                                                             |
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+
+from pipecat.services.assemblyai.tts import AssemblyAITTSService
+
+tts = AssemblyAITTSService(
+    api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+)
+```
+
+### Choosing a Voice
+
+```python
+tts = AssemblyAITTSService(
+    api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+    settings=AssemblyAITTSService.Settings(voice="aai-jane"),
+)
+```
+
+### Processing Data in the EU
+
+```python
+tts = AssemblyAITTSService(
+    api_key=os.getenv("ASSEMBLYAI_API_KEY"),
+    url="wss://tts.eu.assemblyai.com/v1/ws",
+)
+```
+
+## Notes
+
+- **Sentence and token aggregation**: With sentence aggregation, each sentence is its own request. With `TextAggregationMode.TOKEN`, the turn's text streams as it is generated.
+- **Word timestamps**: Per-word timings produce word-level `TTSTextFrame` output.
+- **Sessions**: The service keeps an idle session open, replaces a session before its one-hour limit, and waits as long as the server asks before reconnecting.
+
+## Event Handlers
+
+`AssemblyAITTSService` supports the standard [service connection events](/api-reference/server/events/service-events):
+
+| Event                 | Description                         |
+| --------------------- | ----------------------------------- |
+| `on_connected`        | Connected to AssemblyAI WebSocket   |
+| `on_disconnected`     | Disconnected from AssemblyAI        |
+| `on_connection_error` | WebSocket connection error occurred |
+
+```python
+@tts.event_handler("on_connected")
+async def on_connected(service):
+    print("Connected to AssemblyAI")
+```
 
 # AsyncAI Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/asyncai.md
@@ -58914,13 +59343,14 @@ The HTTP service accepts the WebSocket service's parameters except `url` and `ma
 
 Runtime-configurable settings passed via the `settings` constructor argument using `CartesiaTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter               | Type               | Default       | Description                                                                                |
-| ----------------------- | ------------------ | ------------- | ------------------------------------------------------------------------------------------ |
-| `model`                 | `str`              | `"sonic-3.6"` | TTS model identifier. _(Inherited from base settings.)_                                    |
-| `voice`                 | `str`              | `None`        | Voice identifier. There is no default voice, so set one. _(Inherited from base settings.)_ |
-| `language`              | `Language \| str`  | `Language.EN` | Language for synthesis. _(Inherited from base settings.)_                                  |
-| `generation_config`     | `GenerationConfig` | `None`        | Generation configuration for Cartesia models. See below.                                   |
-| `pronunciation_dict_id` | `str`              | `None`        | ID of the pronunciation dictionary for custom pronunciations.                              |
+| Parameter               | Type               | Default       | Description                                                                                                                                                         |
+| ----------------------- | ------------------ | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                 | `str`              | `"sonic-3.6"` | TTS model identifier. _(Inherited from base settings.)_                                                                                                             |
+| `voice`                 | `str`              | `None`        | Voice identifier. There is no default voice, so set one. _(Inherited from base settings.)_                                                                          |
+| `language`              | `Language \| str`  | `Language.EN` | Language for synthesis. _(Inherited from base settings.)_                                                                                                           |
+| `accent`                | `str`              | `None`        | Accent a multilingual voice speaks the language with (e.g., `"british"`). Must be one the voice supports; when `None`, Cartesia picks the closest supported accent. |
+| `generation_config`     | `GenerationConfig` | `None`        | Generation configuration for Cartesia models. See below.                                                                                                            |
+| `pronunciation_dict_id` | `str`              | `None`        | ID of the pronunciation dictionary for custom pronunciations.                                                                                                       |
 
 #### GenerationConfig
 
@@ -59840,7 +60270,7 @@ ElevenLabs provides high-quality text-to-speech synthesis with three service imp
   <Card
     title="Text-to-Dialogue Documentation"
     icon="book"
-    href="https://elevenlabs.io/docs/api-reference/text-to-dialogue/v-1-text-to-dialogue-multi-stream-input"
+    href="https://elevenlabs.io/docs/api-reference/text-to-dialogue/ttd-multi-websocket"
   >
     Official ElevenLabs Text-to-Dialogue API documentation
   </Card>
@@ -61357,7 +61787,7 @@ tts = GeminiTTSService(
 - **Gemini TTS backends**: `GeminiTTSService` supports two backends:
   - **GenAI backend** (google-genai): Simpler authentication with API key. Automatically selected when `api_key` is provided. Does not support `multi_speaker`. The `prompt` setting is supported by Gemini 3.8 TTS models (sent as `speech_metadata.style`); older models ignore it with a warning.
   - **Google Cloud backend**: Uses service account credentials. Supports `prompt` for style instructions and `multi_speaker` for multi-voice conversations.
-- **Gemini TTS model names**: Model names differ by backend. Cloud Text-to-Speech accepts `gemini-3.1-flash-tts-preview`, `gemini-2.5-flash-tts`, `gemini-2.5-flash-lite-preview-tts`, and `gemini-2.5-pro-tts`. The Gemini API accepts `gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`, `gemini-3.1-flash-tts-preview`, `gemini-2.5-flash-preview-tts`, and `gemini-2.5-pro-preview-tts`. The default (`gemini-3.1-flash-tts-preview`) works on both.
+- **Gemini TTS model names**: Model names differ by backend. Cloud Text-to-Speech accepts `gemini-3.1-flash-tts-preview`, `gemini-2.5-flash-tts`, `gemini-2.5-flash-lite-preview-tts`, and `gemini-2.5-pro-tts`. The Gemini API accepts `gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`, and `gemini-3.1-flash-tts-preview`. The default (`gemini-3.1-flash-tts-preview`) works on both; the Gemini API shuts that preview model down on November 17, 2026 and names `gemini-3.8-flash-lite-tts` as its replacement.
 - **Gemini 3.8 TTS models**: Gemini 3.8 TTS models (`gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`) treat the input text as a verbatim transcript. Momentary vocal events use angle-bracket tags inline (e.g., `<laugh>`, `<sigh>`, `<short pause>`), while sustained delivery style belongs in the `prompt` setting. Older Gemini models use square-bracket tags (e.g., `[sigh]`, `[whispering]`) in the text instead. Requires google-genai >= 2.25.0.
 - **Backend selection**: Pass `api_key` to use the GenAI backend, or `credentials`/`credentials_path` for Google Cloud. Use `use_genai=True` to force the GenAI backend explicitly.
 - **Gemini multi-speaker**: Use `multi_speaker=True` with `speaker_configs` to generate conversations between multiple voices (Google Cloud backend only). Markup text with speaker aliases to control which voice speaks.
@@ -64006,13 +64436,14 @@ For local deployments, see the [NVIDIA TTS NIM documentation](https://docs.nvidi
 
 Runtime-configurable settings passed via the `settings` constructor argument using `NvidiaTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter        | Type                     | Default                               | Description                                                                                                                                          |
-| ---------------- | ------------------------ | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`          | `str`                    | `"magpie-tts-multilingual"`           | Model identifier. _(Inherited.)_                                                                                                                     |
-| `voice`          | `str`                    | `"Magpie-Multilingual.EN-US.Aria"`    | Voice identifier. _(Inherited.)_                                                                                                                     |
-| `language`       | `Language \| str`        | `Language.EN_US`                      | Language for synthesis. _(Inherited.)_                                                                                                               |
-| `quality`        | `int`                    | `20`                                  | Magpie zero-shot voice cloning quality (NVIDIA expects 1 to 40). Sent only when `zero_shot_audio_prompt_file` is set, so it has no effect otherwise. |
-| `synthesis_mode` | `NvidiaTTSSynthesisMode` | `NvidiaTTSSynthesisMode.PER_SENTENCE` | Whether to synthesize one sentence per request or stitch multiple sentences in one stream.                                                           |
+| Parameter              | Type                     | Default                               | Description                                                                                                                                                                                                                                                                                               |
+| ---------------------- | ------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                | `str`                    | `"magpie-tts-multilingual"`           | Model identifier. _(Inherited.)_                                                                                                                                                                                                                                                                          |
+| `voice`                | `str`                    | `"Magpie-Multilingual.EN-US.Aria"`    | Voice identifier. _(Inherited.)_                                                                                                                                                                                                                                                                          |
+| `language`             | `Language \| str`        | `Language.EN_US`                      | Language for synthesis. _(Inherited.)_                                                                                                                                                                                                                                                                    |
+| `quality`              | `int`                    | `20`                                  | Magpie zero-shot voice cloning quality (NVIDIA expects 1 to 40). Sent only when `zero_shot_audio_prompt_file` is set, so it has no effect otherwise.                                                                                                                                                      |
+| `synthesis_mode`       | `NvidiaTTSSynthesisMode` | `NvidiaTTSSynthesisMode.PER_SENTENCE` | Whether to synthesize one sentence per request or stitch multiple sentences in one stream.                                                                                                                                                                                                                |
+| `custom_configuration` | `dict[str, str]`         | `NOT_GIVEN`                           | Model-specific key/value parameters forwarded to the synthesizer, e.g. Magpie's `flush`, `chunk_len_threshold` and `max_chunk_threshold` streaming controls, or Chatterbox's `exaggeration_factor`. See [NVIDIA TTS NIM customization](https://docs.nvidia.com/nim/speech/latest/tts/customization.html). |
 
 ## Usage
 
@@ -64054,7 +64485,8 @@ tts = NvidiaTTSService(
   - `PER_SENTENCE` (default): Opens a separate `SynthesizeOnline` call for each sentence. Compatible with all NVIDIA TTS NIMs, including Chatterbox, Magpie multilingual, and Magpie zero-shot.
   - `STITCHED`: Reuses one `SynthesizeOnline` stream across multiple sentences within the same LLM response for improved multi-sentence synthesis quality. Only use with models that support cross-sentence stitching, such as Magpie multilingual and Magpie zero-shot v1.7.0 or later.
 - **Zero-shot voice cloning**: Magpie zero-shot models support voice cloning via the `zero_shot_audio_prompt_file` parameter. NVIDIA recommends a 16-bit mono WAV prompt (22.05 kHz or higher, 3-10 seconds duration). Access to hosted zero-shot models requires approval.
-- **Runtime settings updates**: Voice, language, quality, and synthesis mode can be updated mid-conversation with `TTSUpdateSettingsFrame`. New values take effect on the next synthesis turn, not for the current turn's in-flight requests.
+- **Custom configuration**: `custom_configuration` passes model-specific key/value parameters straight through to NVIDIA TTS. Values are sent as strings. Supported keys depend on the model.
+- **Runtime settings updates**: Voice, language, quality, synthesis mode, and custom configuration can be updated mid-conversation with `TTSUpdateSettingsFrame`. New values take effect on the next synthesis turn, not for the current turn's in-flight requests.
 - **Model cannot be changed after initialization**: The model and function ID must be set during construction via `model_function_map`. Changing `model` with `TTSUpdateSettingsFrame` has no effect.
 - **SSL enabled by default**: The service connects to NVIDIA's cloud endpoint with SSL. Set `use_ssl=False` only for local or custom Nemotron Speech deployments.
 - **Metrics generation**: This service supports metric generation via `can_generate_metrics()`. Metrics are automatically stopped when an audio context is interrupted.
@@ -66801,14 +67233,16 @@ export SMALLEST_API_KEY=your_api_key
 
 Runtime-configurable settings passed via the `settings` constructor argument using `SmallestTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter        | Type              | Default              | Description                                                                                                                                                                                                                                                                               |
-| ---------------- | ----------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`          | `str`             | `lightning_v3.1_pro` | Model identifier: `lightning_v3.1` or `lightning_v3.1_pro`.                                                                                                                                                                                                                               |
-| `voice`          | `str`             | `meher`              | Voice identifier. The default depends on the `model` given at construction: `meher` for `lightning_v3.1_pro`, `sophia` for `lightning_v3.1`.                                                                                                                                              |
-| `language`       | `Language \| str` | `Language.EN`        | Language code for synthesis.                                                                                                                                                                                                                                                              |
-| `speed`          | `float`           | `None`               | Speech speed multiplier (0.5–2.0). When `None`, uses API defaults.                                                                                                                                                                                                                        |
-| `math_notation`  | `bool`            | `None`               | Read digit-flanked math operators as words (`2 + 2` as "two plus two") instead of leaving them to the default number reader. When `None`, the API default (off) applies.                                                                                                                  |
-| `content_filter` | `str`             | `None`               | Check text against Smallest's profanity word list before synthesis. `"reject"` fails the request with a `CONTENT_FILTER_BLOCKED` error and synthesizes nothing; `"flag"` synthesizes normally and records the match. Text is never rewritten. When `None`, the API default (off) applies. |
+| Parameter                       | Type              | Default              | Description                                                                                                                                                                                                                                                                               |
+| ------------------------------- | ----------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                         | `str`             | `lightning_v3.1_pro` | Model identifier: `lightning_v3.1` or `lightning_v3.1_pro`.                                                                                                                                                                                                                               |
+| `voice`                         | `str`             | `meher`              | Voice identifier. The default depends on the `model` given at construction: `meher` for `lightning_v3.1_pro`, `sophia` for `lightning_v3.1`.                                                                                                                                              |
+| `language`                      | `Language \| str` | `Language.EN`        | Language code for synthesis.                                                                                                                                                                                                                                                              |
+| `speed`                         | `float`           | `None`               | Speech speed multiplier (0.5–2.0). When `None`, uses API defaults.                                                                                                                                                                                                                        |
+| `math_notation`                 | `bool`            | `None`               | Read digit-flanked math operators as words (`2 + 2` as "two plus two") instead of leaving them to the default number reader. When `None`, the API default (off) applies.                                                                                                                  |
+| `content_filter`                | `str`             | `None`               | Check text against Smallest's profanity word list before synthesis. `"reject"` fails the request with a `CONTENT_FILTER_BLOCKED` error and synthesizes nothing; `"flag"` synthesizes normally and records the match. Text is never rewritten. When `None`, the API default (off) applies. |
+| `date_format`                   | `str`             | `None`               | Order in which dates such as `05/03/2024` are read: `"EU"` is day-first, `"US"` is month-first. When `None`, the API default (`"US"`) applies.                                                                                                                                            |
+| `number_pronunciation_language` | `Language \| str` | `None`               | Language used to read numerals, currency, times, and dates, independent of the synthesis `language`. When `None`, they are read in the synthesis language.                                                                                                                                |
 
 ## Usage
 
@@ -67281,14 +67715,15 @@ Before using `SpeechifyHttpTTSService`, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `SpeechifyHttpTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter                | Type              | Default     | Description                                                                                                                                                                                                                                                                                      |
-| ------------------------ | ----------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `voice`                  | `str`             | `geffen_32` | Voice identifier (e.g., `geffen_32`, `beatrice_32`).                                                                                                                                                                                                                                             |
-| `model`                  | `str`             | `simba-3.5` | Model identifier. `simba-3.5` covers 48 languages, English included.                                                                                                                                                                                                                             |
-| `language`               | `Language \| str` | `None`      | Language for synthesis. Supported: DE, EN, ES, FR, IT, PT. _(Inherited.)_                                                                                                                                                                                                                        |
-| `loudness_normalization` | `bool \| None`    | `None`      | Whether to normalize audio loudness to a standard level. Adds latency.                                                                                                                                                                                                                           |
-| `text_normalization`     | `bool \| None`    | `None`      | Whether to spell out numbers, dates, and similar tokens before synthesis. Adds latency.                                                                                                                                                                                                          |
-| `safety_identifier`      | `str \| None`     | `None`      | Stable, opaque end-user identifier (1 to 64 characters of letters, digits, and `. _ - : \| + / =`) so Speechify can rate-limit or block one user instead of the whole workspace. Use a keyed hash of an internal user id, never personal data such as an email address, which Speechify rejects. |
+| Parameter                | Type                 | Default     | Description                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------ | -------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `voice`                  | `str`                | `geffen_32` | Voice identifier (e.g., `geffen_32`, `beatrice_32`).                                                                                                                                                                                                                                                                                                                                                                                             |
+| `model`                  | `str`                | `simba-3.5` | Model identifier. `simba-3.5` covers 48 languages, English included.                                                                                                                                                                                                                                                                                                                                                                             |
+| `language`               | `Language \| str`    | `None`      | Language for synthesis. Supported: DE, EN, ES, FR, IT, PT. _(Inherited.)_                                                                                                                                                                                                                                                                                                                                                                        |
+| `loudness_normalization` | `bool \| None`       | `None`      | Whether to normalize audio loudness to a standard level. Adds latency.                                                                                                                                                                                                                                                                                                                                                                           |
+| `text_normalization`     | `bool \| None`       | `None`      | Whether to spell out numbers, dates, and similar tokens before synthesis. Adds latency.                                                                                                                                                                                                                                                                                                                                                          |
+| `safety_identifier`      | `str \| None`        | `None`      | Stable, opaque end-user identifier (1 to 64 characters of letters, digits, and `. _ - : \| + / =`) so Speechify can rate-limit or block one user instead of the whole workspace. Use a keyed hash of an internal user id, never personal data such as an email address, which Speechify rejects.                                                                                                                                                 |
+| `pronunciations`         | `list[dict] \| None` | `None`      | How specific words should be spoken, up to 200 entries. Each entry has the `text` to match and exactly one of `ipa` (phones from the model's set, for a single word) or `alias` (replacement text), plus an optional `case_sensitive`. Applied on `simba-3.5` in the languages Speechify lists under `pronunciation_languages` in `GET /v1/audio/models`, which excludes English; other models or languages return `pronunciations_unsupported`. |
 
 ## Usage
 
@@ -68149,7 +68584,7 @@ a Pipecat pipeline.
   <Card
     title="API Keys"
     icon="key"
-    href="https://typecast.ai/developers/api/api-key"
+    href="https://studio.typecast.ai/developers/api/api-key"
   >
     Create and manage your Typecast API keys
   </Card>
@@ -68170,7 +68605,7 @@ uv add pipecat-ai-typecast
 Before using the Typecast TTS service, you need:
 
 1. **Typecast Account**: Sign up at [Typecast](https://typecast.ai/)
-2. **API Key**: Create a key from the [Typecast API key page](https://typecast.ai/developers/api/api-key)
+2. **API Key**: Create a key from the [Typecast API key page](https://studio.typecast.ai/developers/api/api-key)
 
 ### Required Environment Variables
 
@@ -71473,7 +71908,7 @@ OpenAILiveLLMService connects Pipecat to OpenAI's GPT-Live API for full-duplex s
 
 `OpenAILiveLLMService` provides full-duplex speech-to-speech conversation using OpenAI's GPT-Live API and the `gpt-live-1` model. The GPT-Live model listens and speaks at the same time: it decides on its own when to answer, stops when the user talks over it, and delegates work that needs search, reasoning, or tools to a backend text model while the conversation continues. The pipeline streams audio in and plays audio out; there is no client-side turn detection or response triggering.
 
-The backend runs in one of two **delegation modes**. In **Responses delegation**, OpenAI hosts the backend: a Responses API model you configure with `OpenAILiveLLMService.ResponsesDelegation`, using the tools from your pipeline's `LLMContext` as normal. In **client delegation**, the backend is any Pipecat LLM service running in a `BackendLLMWorker` you provide, configured with `OpenAILiveLLMService.ClientDelegation`, with tools of its own.
+The backend runs in one of two **delegation modes**. In **Responses delegation**, OpenAI hosts the backend: a Responses API model you configure with `OpenAILiveLLMService.ResponsesDelegation`, using the tools from your pipeline's `LLMContext` as normal. In **client delegation**, the backend is any Pipecat LLM service running in a [`BackendLLMWorker`](/api-reference/server/workers/backend-llm-worker) you provide, configured with `OpenAILiveLLMService.ClientDelegation`, with tools of its own.
 
 <CardGroup cols={2}>
   <Card
@@ -73277,6 +73712,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `model`      | `str`         | `"gpt-image-2.5-flare"` | Image generation model identifier. _(Inherited from base settings.)_                                                                                                                                                                           |
 | `image_size` | `str \| None` | `None`                  | Target size for generated images.                                                                                                                                                                                                              |
 | `quality`    | `str \| None` | `None`                  | Rendering quality. Accepts the tiers the chosen model supports (`low`, `medium`, `high`, and `xhigh`/`max` on the GPT Image 2.5 models). Lower tiers generate faster at the cost of detail. `None` lets OpenAI pick the quality for the model. |
+| `moderation` | `str \| None` | `None`                  | Content-moderation level OpenAI applies to generated images: `"low"` for less restrictive filtering, or `"auto"`. `None` leaves OpenAI's default in place.                                                                                     |
 
 ## Usage
 
@@ -77072,6 +77508,14 @@ await worker.queue_frame(FilterEnableFrame(True))
 
 </ParamField>
 
+## Methods
+
+```python
+aic_filter.set_pre_process_tap(tap)
+```
+
+Sets a callable that receives the input audio before enhancement, or removes it when `tap` is `None`. The filter calls `tap(block, sample_rate)` with each float32 block, normalized to `-1.0` to `1.0`, and writes each new block into the same buffer, so the tap must copy any data it keeps. The tap gets no audio when the enhancement processor fails to initialize. The filter does not remove the tap when it stops; the caller that sets it must also remove it. [`AICTytoObserver`](/api-reference/server/utilities/observers/aic-tyto-observer) uses this tap when given the filter as `audio_filter`.
+
 ## Usage Examples
 
 ### Basic Usage with Quail VAD 2.0
@@ -77241,7 +77685,7 @@ The AIC filter enhances audio before it reaches the VAD and STT stages, improvin
 
 #### Migration Steps
 
-1. Update Pipecat to the latest version (aic-sdk v3.1.0+ is included automatically).
+1. Update Pipecat to the latest version (aic-sdk v3.3.1+ is included automatically).
 2. **Remove deprecated VAD methods**: The `create_vad_analyzer()` and `get_vad_context()` methods have been removed. Use [`AICQuailVADAnalyzer`](/api-reference/server/services/vad/aic-quail-vad-analyzer) for voice activity detection.
 3. Update model selection if needed: The old default `quail-vad-2.0-xxs-16khz` no longer works with aic-sdk 3.0. See [artifacts.ai-coustics.io](https://artifacts.ai-coustics.io/) for current models.
 
@@ -77283,7 +77727,7 @@ The AIC filter enhances audio before it reaches the VAD and STT stages, improvin
 
 - Requires ai-coustics license key (get one at [developers.ai-coustics.io](https://developers.ai-coustics.io))
 - **Environment variable**: Use `AIC_SDK_LICENSE` (not `AIC_LICENSE_KEY`) for authentication
-- **aic-sdk 3.x required**: Version 3.1.0+ is included in `pipecat-ai[aic]`
+- **aic-sdk 3.x required**: Version 3.3.1+ is included in `pipecat-ai[aic]`
 - Models are automatically downloaded and cached on first use
 - Supports real-time audio processing with low latency
 - Handles PCM_16 audio format (int16 samples)
@@ -78431,7 +78875,7 @@ The analyzer can work with or without the AIC enhancement filter, providing flex
 
 - Requires ai-coustics license key (get one at [developers.ai-coustics.io](https://developers.ai-coustics.io))
 - **Environment variable**: Use `AIC_SDK_LICENSE` for authentication
-- **aic-sdk 3.x required**: Version 3.1.0+ is included in `pipecat-ai[aic]`
+- **aic-sdk 3.x required**: Version 3.3.1+ is included in `pipecat-ai[aic]`
 - Default model is `vad-2.1-xxs-16khz`, optimized for 16kHz audio
 - **Model compatibility**: The old default `quail-vad-2.0-xxs-16khz` does not work with aic-sdk 3.0; use models from [artifacts.ai-coustics.io](https://artifacts.ai-coustics.io/)
 - Model is downloaded and cached on first use
@@ -78980,6 +79424,606 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 Tested with Pipecat v0.0.106. Check the [source
 repository](https://github.com/rahulsolanki001/pipecat-ten-vad) for the latest
 tested version and changelog.
+
+# ServiceSwitcher
+Source: https://docs.pipecat.ai/api-reference/server/composite-services/service-switcher.md
+
+Dynamically switch between different service instances at runtime using configurable strategies
+
+## Overview
+
+`ServiceSwitcher` is a specialized parallel pipeline that enables dynamic switching between multiple service instances at runtime. This is useful when you need to change between different STT providers, TTS providers, or other frame processors based on user preferences, costs, performance requirements, or other runtime conditions.
+
+The switcher uses a strategy pattern to determine which service is active. Two built-in strategies are provided: manual switching for explicit control, and automatic failover for handling service errors.
+
+## How It Works
+
+`ServiceSwitcher` wraps multiple services in a parallel pipeline where only the active service processes frames. Each service is "sandwiched" between two filters that check if it's the currently active service before allowing frames to pass through. When you switch services, the filters update to redirect frame flow to the newly active service.
+
+A `ServiceMetadataFrame` from a service outside the switcher reaches every member, active or not, so a member that reads another service's metadata has it when it becomes active. Only the active service's own metadata leaves the switcher.
+
+## Constructor
+
+```python
+from pipecat.pipeline.service_switcher import ServiceSwitcher
+
+# Uses ServiceSwitcherStrategyManual by default
+switcher = ServiceSwitcher(services=[stt_service1, stt_service2])
+
+# Or explicitly specify a strategy
+from pipecat.pipeline.service_switcher import ServiceSwitcherStrategyFailover
+switcher = ServiceSwitcher(
+    services=[stt_service1, stt_service2],
+    strategy_type=ServiceSwitcherStrategyFailover
+)
+```
+
+<ParamField path="services" type="List[FrameProcessor]" required>
+  List of service instances to switch between. Can be any frame processors (STT,
+  TTS, or custom processors).
+</ParamField>
+
+<ParamField
+  path="strategy_type"
+  type="Type[ServiceSwitcherStrategy]"
+  default="ServiceSwitcherStrategyManual"
+>
+  The strategy class to use for switching logic. Pass the class itself, not an
+  instance. Defaults to ``ServiceSwitcherStrategyManual``.
+</ParamField>
+
+## Switching Strategies
+
+### ServiceSwitcherStrategyManual
+
+The manual strategy allows explicit control over which service is active by pushing `ManuallySwitchServiceFrame` frames into the pipeline.
+
+**Initial State**: The first service in the list is active by default.
+
+**Switching**: Push a `ManuallySwitchServiceFrame` with the desired service instance.
+
+### ServiceSwitcherStrategyFailover
+
+The failover strategy automatically switches away from the active service once it can no longer do its job. This enables automatic recovery from service failures without manual intervention.
+
+**Initial State**: The first service in the list is active by default.
+
+**Automatic Failover**: An error the active service can carry on from is ignored. When one leaves it unable to work at all — a rejected API key, an unknown model or voice — the strategy switches to the next service in the list that can still do its job, wrapping around from the end. A service that failed to connect during setup is already unusable, so the switch happens before the pipeline starts and every frame reaches a service that connected.
+
+**Recovery**: The failed service remains in the list. Bring it back with [`set_usable(True)`](/api-reference/server/events/frame-processor-events), then switch to it manually or from application logic in the `on_service_switched` event handler.
+
+```python
+from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
+
+switcher = ServiceSwitcher(
+    services=[primary_stt, backup_stt],
+    strategy_type=ServiceSwitcherStrategyFailover
+)
+
+@switcher.strategy.event_handler("on_service_switched")
+async def on_switched(strategy, service):
+    # Application decides when/how to recover the failed service
+    print(f"Switched to: {service.name}")
+```
+
+### Custom Strategies
+
+You can create your own switching strategy by subclassing `ServiceSwitcherStrategy` and implementing the `handle_frame` and/or `handle_error` methods.
+
+- **`handle_frame(frame, direction)`**: Called for control frames (like `ManuallySwitchServiceFrame`). Should return the newly active service if a switch occurred, or `None` otherwise.
+- **`handle_error(error)`**: Called for every error the active service reports, whether or not it can carry on from it. Override this to decide which errors are worth switching away from — `error.processor.is_usable` separates a service that is finished from one having a bad moment, and a strategy is free to switch on either. Should return the newly active service if a switch occurred, or `None` otherwise.
+
+Additionally, if you want to maintain either manual switching or automatic failover as an option when writing a custom strategy, your new strategy should inherit from `ServiceSwitcherStrategyManual` or `ServiceSwitcherStrategyFailover`, respectively.
+
+## Usage Examples
+
+### Switching Between TTS Services
+
+```python
+from pipecat.frames.frames import ManuallySwitchServiceFrame
+from pipecat.pipeline.service_switcher import ServiceSwitcher
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+
+# Create TTS services
+elevenlabs = ElevenLabsTTSService(
+    api_key=os.getenv("ELEVENLABS_API_KEY"),
+    settings=ElevenLabsTTSService.Settings(voice=os.getenv("ELEVENLABS_VOICE_ID")),
+)
+cartesia = CartesiaTTSService(
+    api_key=os.getenv("CARTESIA_API_KEY"),
+    settings=CartesiaTTSService.Settings(voice=os.getenv("CARTESIA_VOICE_ID")),
+)
+
+# Create switcher with both services (uses ServiceSwitcherStrategyManual by default)
+tts_switcher = ServiceSwitcher(services=[elevenlabs, cartesia])
+
+# Use in pipeline
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts_switcher,
+    transport.output(),
+    context_aggregator.assistant()
+])
+
+# Later, switch to Cartesia
+await worker.queue_frame(ManuallySwitchServiceFrame(service=cartesia))
+```
+
+## Event Handlers
+
+| Event                 | Description                 |
+| --------------------- | --------------------------- |
+| `on_service_switched` | Active service was switched |
+
+```python
+@switcher.strategy.event_handler("on_service_switched")
+async def on_service_switched(strategy, service):
+    print(f"Switched to: {service.name}")
+```
+
+**Parameters:**
+
+| Parameter  | Type                      | Description              |
+| ---------- | ------------------------- | ------------------------ |
+| `strategy` | `ServiceSwitcherStrategy` | The switcher's strategy  |
+| `service`  | `FrameProcessor`          | The newly active service |
+
+# LLMSwitcher
+Source: https://docs.pipecat.ai/api-reference/server/composite-services/llm-switcher.md
+
+Dynamically switch between different LLM services with support for ad-hoc inference and unified function registration
+
+## Overview
+
+`LLMSwitcher` is a specialized version of `ServiceSwitcher` designed specifically for managing multiple LLM services. Beyond basic service switching, it provides convenient methods for running ad-hoc inferences and registering function handlers across all LLMs simultaneously.
+
+This is particularly useful when you need to switch between different LLM providers based on task complexity, cost optimization, or specific model capabilities while maintaining a consistent function calling interface.
+
+## Constructor
+
+```python
+from pipecat.pipeline.llm_switcher import LLMSwitcher
+
+# Uses ServiceSwitcherStrategyManual by default
+switcher = LLMSwitcher(llms=[openai_service, gemini_service])
+```
+
+<ParamField path="llms" type="List[LLMService]" required>
+  List of LLM service instances to switch between.
+</ParamField>
+
+<ParamField
+  path="strategy_type"
+  type="Type[ServiceSwitcherStrategy]"
+  default="ServiceSwitcherStrategyManual"
+>
+  The strategy class to use for switching logic. Pass the class itself, not an
+  instance. Defaults to ``ServiceSwitcherStrategyManual``.
+</ParamField>
+
+## Properties
+
+<ParamField path="llms" type="List[LLMService]">
+  The list of LLM services managed by this switcher.
+</ParamField>
+
+<ParamField path="active_llm" type="LLMService | None">
+  The currently active LLM service, or None if no LLMs are configured.
+</ParamField>
+
+## Methods
+
+### run_inference()
+
+Run a one-shot inference with the currently active LLM, outside of the normal pipeline flow.
+
+```python
+result = await llm_switcher.run_inference(
+    context=llm_context,
+    max_tokens=1000,
+    system_instruction="You are a helpful assistant."
+)
+```
+
+<ParamField path="context" type="LLMContext" required>
+  The LLM context containing conversation history and messages.
+</ParamField>
+
+<ParamField path="**kwargs" type="Any">
+  Additional arguments forwarded to the active LLM's `run_inference` method.
+  Common options include `max_tokens` (maximum tokens to generate),
+  `system_instruction` (override the system prompt for this inference), and
+  `response_schema` (optional JSON schema the reply must follow).
+</ParamField>
+
+**Returns**: `str | None` - The LLM's response as a string, or None if no LLM is active.
+
+### register_function()
+
+<Note>
+  You don't need `register_function` when your tool's handler is bundled on its
+  `FunctionSchema`: listing it in `LLMContext(tools=[...])` or adding it via
+  `LLMSetToolsFrame` is enough.
+</Note>
+
+Register a function handler with all LLMs in the switcher, regardless of which is currently active.
+
+```python
+llm_switcher.register_function(
+    function_name="get_weather",
+    handler=handle_weather,
+    cancel_on_interruption=True
+)
+```
+
+<ParamField path="function_name" type="str | None" required>
+  The name of the function to handle. Use None for a catch-all handler that
+  processes all function calls.
+</ParamField>
+
+<ParamField path="handler" type="Callable" required>
+  The async function handler. Should accept a single `FunctionCallParams`
+  parameter.
+</ParamField>
+
+<ParamField path="cancel_on_interruption" type="bool | None" default="None">
+  Whether to cancel this function call when a user interruption occurs. When
+  `False`, the call is treated as asynchronous: the LLM continues the
+  conversation immediately without waiting for the result, and the result is
+  injected later via a developer message. Defaults to `None`, which falls back
+  to the handler's `@tool_options` value, then to `True`.
+</ParamField>
+
+<ParamField path="timeout_secs" type="float | None" default="None">
+  Optional per-tool timeout in seconds. Overrides the global
+  `function_call_timeout_secs` for this specific function.
+</ParamField>
+
+<ParamField path="cancellable_by_llm" type="bool | None" default="None">
+  Whether the LLM may cancel this call while it runs, through the
+  `cancel_<name>` tool advertised alongside it. Pair it with
+  `cancel_on_interruption=False`. Defaults to `None`, which falls back to the
+  handler's `@tool_options` value, then to `False`.
+</ParamField>
+
+### register_direct_function()
+
+<Warning>
+  **Deprecated since 1.4.0.** Direct functions now register automatically on
+  every member LLM (active or not) when you list them in
+  `LLMContext(tools=[...])`, so explicit registration is no longer needed — the
+  tools keep working across service switches. Push an `LLMSetToolsFrame` to
+  change tools mid-session. This method will be removed in a future version.
+</Warning>
+
+Register a direct function handler with all LLMs in the switcher, regardless of which is currently active.
+
+```python
+llm_switcher.register_direct_function(
+    handler=my_direct_function,
+    cancel_on_interruption=True,
+    timeout_secs=30.0
+)
+```
+
+<ParamField path="handler" type="DirectFunction" required>
+  The direct function to register. Must follow the DirectFunction protocol.
+</ParamField>
+
+<ParamField path="cancel_on_interruption" type="bool | None" default="None">
+  Whether to cancel this function call when a user interruption occurs. When
+  `False`, the call is treated as asynchronous: the LLM continues the
+  conversation immediately without waiting for the result, and the result is
+  injected later via a developer message. Defaults to `None`, which falls back
+  to the handler's `@tool_options` value, then to `True`.
+</ParamField>
+
+<ParamField path="timeout_secs" type="float | None" default="None">
+  Optional per-tool timeout in seconds. Overrides the global
+  `function_call_timeout_secs` for this specific function.
+</ParamField>
+
+## Usage Examples
+
+### Basic LLM Switching
+
+```python
+from pipecat.pipeline.llm_switcher import LLMSwitcher
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.google.llm import GoogleLLMService
+from pipecat.frames.frames import ManuallySwitchServiceFrame
+
+# Create LLM services
+openai = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+gemini = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Create switcher (uses ServiceSwitcherStrategyManual by default)
+llm_switcher = LLMSwitcher(llms=[openai, gemini])
+
+# Use in pipeline
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm_switcher,
+    tts,
+    transport.output(),
+    context_aggregator.assistant()
+])
+
+# Switch to cheaper model for simple tasks
+await worker.queue_frame(ManuallySwitchServiceFrame(service=gemini))
+```
+
+# LLMWithBackend
+Source: https://docs.pipecat.ai/api-reference/server/composite-services/llm-with-backend.md
+
+LLMWithBackend pairs a conversational frontend LLM with a backend LLM that handles work needing tools or careful reasoning.
+
+<Warning>
+  `LLMWithBackend` is in alpha: its API is likely to change between releases.
+</Warning>
+
+## Overview
+
+`LLMWithBackend` pairs a **frontend** LLM, which keeps the conversation with the user fluent, with a **backend** LLM that handles work needing tools or careful reasoning. It goes where the LLM goes in your pipeline and runs the backend as an agent of its own. The frontend hands work to the backend with a `delegate` tool and keeps talking with the user, and what the backend has to say comes back into the frontend's conversation for it to relay to the user.
+
+Composite services hold one or more services and stand in a pipeline where a single service would. `LLMWithBackend` holds the frontend service; the backend is a [`BackendLLMWorker`](/api-reference/server/workers/backend-llm-worker).
+
+For a walkthrough, see [LLM with a Backend](/pipecat/learn/llm-with-backend).
+
+<CardGroup cols={2}>
+  <Card
+    title="Example"
+    icon="code"
+    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/multi-worker/llm-with-backend"
+  >
+    An engineering assistant with text and speech-to-speech frontends
+  </Card>
+  <Card
+    title="BackendLLMWorker"
+    icon="server"
+    href="/api-reference/server/workers/backend-llm-worker"
+  >
+    The worker that runs the backend LLM
+  </Card>
+</CardGroup>
+
+```python
+from pipecat.pipeline.llm_with_backend import (
+    BackendConnector,
+    ExplicitBackendRequestStrategy,
+    LLMWithBackend,
+    PredictiveDelegation,
+    TranscriptBackendRequestStrategy,
+)
+```
+
+## LLMWithBackend
+
+`LLMWithBackend` is a `Pipeline`, not an `LLMService`: functions, settings updates, event handlers and a `FlowManager` go on its [`frontend`](#properties). The backend's tools go in the backend's own context.
+
+### Configuration
+
+<ParamField path="frontend" type="LLMService" required>
+  The conversational LLM service, text or speech-to-speech.
+</ParamField>
+
+<ParamField path="backend" type="BackendLLMWorker | str" required>
+  The backend worker, or the name of one registered elsewhere: in the app, or in
+  another process on a shared bus. A worker given here is added to the pipeline
+  worker when the pipeline starts.
+</ParamField>
+
+<ParamField path="connector" type="BackendConnector | None" default="None">
+  How delegation works. A default [`BackendConnector`](#backendconnector) when
+  `None`.
+</ParamField>
+
+<ParamField
+  path="predictive_delegation"
+  type="PredictiveDelegation | None"
+  default="None"
+>
+  A [`PredictiveDelegation`](#predictivedelegation), to start the backend sooner
+  on turns that need it. Text frontends only.
+</ParamField>
+
+Raises `ValueError` when:
+
+- The frontend is `InworldRealtimeLLMService`, `UltravoxRealtimeLLMService` or `OpenAILiveLLMService`, which can't be a frontend (see [Notes](#notes)).
+- The frontend is speech-to-speech and the request strategy is `TranscriptBackendRequestStrategy`, which reads the frontend's context.
+- `predictive_delegation` is given with a speech-to-speech frontend, or with `ExplicitBackendRequestStrategy`, whose `delegate` call takes a `request` argument.
+
+### Properties
+
+| Property                | Type                           | Description                                                                           |
+| ----------------------- | ------------------------------ | ------------------------------------------------------------------------------------- |
+| `frontend`              | `LLMService`                   | The frontend LLM service.                                                             |
+| `backend`               | `BackendLLMWorker \| str`      | The backend worker, or the name of one running elsewhere, such as in another process. |
+| `connector`             | `BackendConnector`             | The connector joining the two.                                                        |
+| `predictive_delegation` | `PredictiveDelegation \| None` | The predictive delegation that starts the backend sooner, or `None`.                  |
+| `tool`                  | `FunctionSchema`               | The `delegate` tool installed on the frontend.                                        |
+
+## BackendConnector
+
+`BackendConnector` manages the interaction between the frontend and the backend. It defines the `delegate` tool, holds the session with the backend for the pipeline's life, and turns what the backend produces into messages in the frontend's conversation.
+
+<ParamField
+  path="request_strategy"
+  type="BackendRequestStrategy | None"
+  default="None"
+>
+  How a `delegate` call becomes the backend's request. When `None`,
+  [`TranscriptBackendRequestStrategy`](#transcriptbackendrequeststrategy) for a
+  text frontend and
+  [`ExplicitBackendRequestStrategy`](#explicitbackendrequeststrategy) for a
+  speech-to-speech one.
+</ParamField>
+
+<ParamField
+  path="frontend_pairing_instruction"
+  type="str"
+  default="FRONTEND_PAIRING_INSTRUCTION"
+>
+  How the frontend's model works with a backend, appended to its system
+  instruction. A custom override has to cover everything the default does: when
+  and how to delegate, that to the user there is one assistant, what to do after
+  delegating, and what to do with the backend's messages. The request strategy's
+  guidance goes where `PAIRING_INSTRUCTION_STRATEGY_PLACEHOLDER` stands, or
+  after the text when it has none.
+</ParamField>
+
+<ParamField path="respond_on_delegate" type="bool" default="True">
+  Whether the frontend replies as soon as a delegation is sent, which is where
+  its acknowledgement comes from. Set `False` to delegate without a reply.
+</ParamField>
+
+<ParamField path="timeout_secs" type="float | None" default="30">
+  How long the backend may take to acknowledge a request, including the wait for
+  it to become ready.
+</ParamField>
+
+<ParamField path="client_trace" type="bool" default="False">
+  Whether to send every exchange with the backend to the client as an RTVI
+  `server-message`, for debugging. See [Frames](#frames).
+</ParamField>
+
+```python
+connector = BackendConnector(respond_on_delegate=False)
+```
+
+## Request Strategies
+
+A request strategy defines the `delegate` tool's parameters and description, and builds the request the backend receives from each `delegate` call.
+
+### TranscriptBackendRequestStrategy
+
+The frontend's model calls `delegate` with no arguments, and the request is the transcript of the user and assistant turns since the previous delegation (the whole conversation the first time). The default for a text frontend. Its `delegate` call needs no arguments, so it works with predictive delegation. It reads the frontend's context, so a speech-to-speech frontend refuses it.
+
+<ParamField
+  path="frontend_instruction"
+  type="str | None"
+  default="TRANSCRIPT_FRONTEND_INSTRUCTION"
+>
+  The strategy's guidance to the frontend's model, placed in the pairing
+  instruction.
+</ParamField>
+
+<ParamField
+  path="tool_description"
+  type="str"
+  default="TRANSCRIPT_TOOL_DESCRIPTION"
+>
+  How the `delegate` tool is described.
+</ParamField>
+
+<ParamField
+  path="request_instruction"
+  type="str"
+  default="TRANSCRIPT_REQUEST_INSTRUCTION"
+>
+  What the backend should do with the transcript, placed after it.
+</ParamField>
+
+### ExplicitBackendRequestStrategy
+
+The frontend's model words the request itself, in the `delegate` tool's `request` argument. The default for a speech-to-speech frontend, which replies to the user's audio before that audio's transcript reaches its context.
+
+<ParamField
+  path="frontend_instruction"
+  type="str | None"
+  default="EXPLICIT_FRONTEND_INSTRUCTION"
+>
+  The strategy's guidance to the frontend's model, placed in the pairing
+  instruction.
+</ParamField>
+
+<ParamField
+  path="tool_description"
+  type="str"
+  default="EXPLICIT_TOOL_DESCRIPTION"
+>
+  How the `delegate` tool is described.
+</ParamField>
+
+<ParamField
+  path="request_instruction"
+  type="str"
+  default="EXPLICIT_REQUEST_INSTRUCTION"
+>
+  What the backend should do with the request, placed after it.
+</ParamField>
+
+## PredictiveDelegation
+
+<Warning>
+  `PredictiveDelegation` is in alpha: its API is likely to change between
+  releases.
+</Warning>
+
+`PredictiveDelegation` starts the backend sooner on turns that need it.
+
+How it works: on each user turn, a yes/no classifier races the frontend's inference, asking whether the turn needs the backend. A "yes" that arrives before the frontend's first output delegates the turn at once and cancels the inference. A "no", a late answer, or a classifier error leaves the turn to the frontend as usual. The frontend is never slowed down waiting for the classifier.
+
+The classifier reads what the frontend's model reads: its system instruction, pairing instruction included, the `delegate` tool's description, and the latest messages of the conversation.
+
+<ParamField path="classifier" type="BaseClassifier" required>
+  The yes/no [classifier](/api-reference/server/classifiers/overview) to ask,
+  such as [`JevClassifier`](/api-reference/server/classifiers/jev).
+</ParamField>
+
+```python
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+
+llm = LLMWithBackend(
+    frontend=frontend,
+    backend=backend,
+    predictive_delegation=PredictiveDelegation(
+        JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY"))
+    ),
+)
+```
+
+It needs a text frontend and a request strategy whose `delegate` call takes no arguments, such as the default `TranscriptBackendRequestStrategy`. It leaves speculative turns (eager end of turn) to the frontend, and every turn while the frontend filters incomplete user turns. The classifier's metrics are pushed as `MetricsFrame`s.
+
+## Constants
+
+The constants are in `pipecat.pipeline.llm_with_backend.prompts`, except the request instructions, which are in `pipecat.workers.llm.backend_llm_worker`, and `DELEGATE_TOOL_NAME`, which is in `pipecat.pipeline.llm_with_backend.connector`. Read the [source](https://github.com/pipecat-ai/pipecat/blob/main/src/pipecat/pipeline/llm_with_backend/prompts.py) for the default texts' wording.
+
+| Constant                                   | What it is                                                                         |
+| ------------------------------------------ | ---------------------------------------------------------------------------------- |
+| `FRONTEND_PAIRING_INSTRUCTION`             | The default `frontend_pairing_instruction`.                                        |
+| `PAIRING_INSTRUCTION_STRATEGY_PLACEHOLDER` | `"{strategy}"`: where a pairing instruction takes the request strategy's guidance. |
+| `TRANSCRIPT_FRONTEND_INSTRUCTION`          | `TranscriptBackendRequestStrategy`'s default `frontend_instruction`.               |
+| `TRANSCRIPT_TOOL_DESCRIPTION`              | `TranscriptBackendRequestStrategy`'s default `tool_description`.                   |
+| `TRANSCRIPT_REQUEST_INSTRUCTION`           | `TranscriptBackendRequestStrategy`'s default `request_instruction`.                |
+| `EXPLICIT_FRONTEND_INSTRUCTION`            | `ExplicitBackendRequestStrategy`'s default `frontend_instruction`.                 |
+| `EXPLICIT_TOOL_DESCRIPTION`                | `ExplicitBackendRequestStrategy`'s default `tool_description`.                     |
+| `EXPLICIT_REQUEST_INSTRUCTION`             | `ExplicitBackendRequestStrategy`'s default `request_instruction`.                  |
+| `DELEGATE_TOOL_NAME`                       | `"delegate"`.                                                                      |
+
+## Frames
+
+### Pushed by
+
+| Frame                                                                                                        | Fields                                    | Effect                                                                                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`ExternalFunctionCall*Frame`](/api-reference/server/frames/system-frames#externalfunctioncallsstartedframe) | function name, call ID, arguments, result | One per phase of each function call the backend makes. [`RTVIObserver`](/api-reference/server/rtvi/rtvi-observer) reports them to the client as function-call events.                      |
+| `RTVIServerMessageFrame`                                                                                     | `data`                                    | With `client_trace=True`, one per exchange with the backend. `data["type"]` is `"llm-with-backend"`, and `data["event"]` is `"request"`, `"output"`, `"tool_call"`, `"error"` or `"idle"`. |
+
+## Notes
+
+- **Backend messages in the frontend's context**: What the backend produces is appended to the frontend's context as `developer` messages. A message for the user starts with `Backend: `, and the rest are silent: `Backend (note): ` for text not meant for the user, `Backend (working): ` for a function call the backend is making, and `Backend (thinking): ` for a reasoning summary.
+- **The `delegate` tool**: The frontend gets `delegate` as a built-in tool: it is sent with every inference beside the frontend's own tools and never enters the context's tool list.
+- **Services that can't be a frontend**:
+  - `InworldRealtimeLLMService`: its model calls `delegate` again in place of taking in the backend's messages.
+  - `UltravoxRealtimeLLMService`: built-in tools such as `delegate` don't reach its session.
+  - `OpenAILiveLLMService`: it is already a frontend with a backend of its own, set up with its [delegation modes](/api-reference/server/services/s2s/openai-live). It can't be a backend either.
 
 # BaseClassifier
 Source: https://docs.pipecat.ai/api-reference/server/classifiers/overview.md
@@ -83158,6 +84202,7 @@ Pipecat provides several built-in observers:
 - **LLMLogObserver**: Logs LLM activity and responses
 - **TranscriptionLogObserver**: Logs speech-to-text transcription events
 - **RTVIObserver**: Converts internal frames to RTVI protocol messages for server to client messaging
+- **[AICTytoObserver](/api-reference/server/utilities/observers/aic-tyto-observer)**: Scores the quality of the user's audio with the ai-coustics Tyto model
 - **[ServiceMetricsObserver](/api-reference/server/utilities/observers/service-metrics-observer)**: Reports service latency and usage metrics as structured records
 - **[StartupTimingObserver](/api-reference/server/utilities/observers/startup-timing-observer)**: Measures processor startup times and transport readiness
 - **[UserBotLatencyObserver](/api-reference/server/utilities/observers/user-bot-latency-observer)**: Measures user-to-bot response latency
@@ -83221,6 +84266,191 @@ Observers are particularly useful for:
 - Monitoring pipeline behavior
 - Collecting metrics
 - Converting internal frames to external messages
+
+# AIC Tyto Observer
+Source: https://docs.pipecat.ai/api-reference/server/utilities/observers/aic-tyto-observer.md
+
+AICTytoObserver scores the quality of the user's audio with the ai-coustics Tyto model and summarizes the scores at the end of a call.
+
+## Overview
+
+`AICTytoObserver` scores the quality of the user's audio with the ai-coustics Tyto model. It analyzes the latest 5-second window in a background thread after every 5 seconds of received audio, and emits each result through `on_analysis_result`. When the call ends, it emits a summary through `on_call_summary`.
+
+<CardGroup cols={2}>
+  <Card
+    title="AIC Tyto Observer API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.observers.aic_tyto_observer.html"
+  >
+    Pipecat's API methods for the Tyto observer
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-aicoustics-tyto.py"
+  >
+    Complete example with AICFilter and AICTytoObserver
+  </Card>
+  <Card
+    title="ai-coustics Documentation"
+    icon="book"
+    href="https://docs.ai-coustics.com/tutorials/pipecat-quickstart"
+  >
+    ai-coustics Pipecat quickstart and model guides
+  </Card>
+  <Card
+    title="ai-coustics Models"
+    icon="cube"
+    href="https://artifacts.ai-coustics.io/"
+  >
+    Browse available Tyto and Quail models
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[aic]"
+```
+
+## Prerequisites
+
+You need an ai-coustics license key. Get one at [developers.ai-coustics.io](https://developers.ai-coustics.io).
+
+### Required Environment Variables
+
+- `AIC_SDK_LICENSE`: Your ai-coustics SDK license key
+
+## Configuration
+
+```python
+from pipecat.observers.aic_tyto_observer import AICTytoObserver
+```
+
+<ParamField path="license_key" type="str" required>
+  ai-coustics SDK license key.
+</ParamField>
+
+<ParamField path="model_id" type="str | None" default='"tyto-1.1-l-16khz"'>
+  Tyto model identifier. Ignored if `model_path` is set. See
+  [artifacts.ai-coustics.io](https://artifacts.ai-coustics.io/) for available
+  models.
+</ParamField>
+
+<ParamField path="model_path" type="Path | None" default="None">
+  Path to a local `.aicmodel` file.
+</ParamField>
+
+<ParamField path="model_download_dir" type="Path | None" default="None">
+  Directory for downloaded models. Defaults to `~/.cache/pipecat/aic-models`.
+</ParamField>
+
+<ParamField path="degraded_threshold" type="float" default="0.3">
+  `risk_score` value at or above which the summary counts a window as degraded.
+  Must be between `0.0` and `1.0`. Calibrate it against the failures you see in
+  your application.
+</ParamField>
+
+<ParamField path="audio_filter" type="AICFilter | None" default="None">
+  The transport's
+  [`AICFilter`](/api-reference/server/services/audio-filters/aic-filter). When
+  set, the filter feeds the analysis with the audio before enhancement. When
+  `None`, the observer analyzes the `InputAudioRawFrame` audio that the input
+  transport pushes.
+</ParamField>
+
+Raises `ValueError` when neither `model_id` nor `model_path` is set, or when `degraded_threshold` is outside `0.0` to `1.0`.
+
+## Usage
+
+### Scoring Audio Before Enhancement
+
+Tyto must score the audio before enhancement. When `AICFilter` is the transport's `audio_in_filter`, pass the same filter as `audio_filter`:
+
+```python
+import os
+
+from loguru import logger
+
+from pipecat.audio.filters.aic_filter import AICFilter
+from pipecat.observers.aic_tyto_observer import AICTytoObserver
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
+
+aic_filter = AICFilter(
+    license_key=os.environ["AIC_SDK_LICENSE"],
+    model_id="quail-vf-2.2-l-16khz",
+)
+
+transport = DailyTransport(
+    room_url,
+    token,
+    "Bot",
+    DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        audio_in_filter=aic_filter,
+    ),
+)
+
+tyto = AICTytoObserver(
+    license_key=os.environ["AIC_SDK_LICENSE"],
+    audio_filter=aic_filter,
+)
+
+@tyto.event_handler("on_analysis_result")
+async def on_analysis_result(observer, scores, audio_secs):
+    logger.info(f"Risk score {scores.risk_score:.2f} at {audio_secs:.0f}s")
+
+@tyto.event_handler("on_call_summary")
+async def on_call_summary(observer, summary):
+    logger.info(f"Mean risk score: {summary.mean.risk_score}")
+
+worker = PipelineWorker(pipeline, observers=[tyto])
+```
+
+Without an `AICFilter` on the transport, leave out `audio_filter` and the observer analyzes the input audio frames directly.
+
+## Notes
+
+- **One filter per session**: The observer attaches itself to `audio_filter` and the filter holds one attachment at a time, so create a new `AICFilter` and observer for each session rather than sharing a filter between sessions.
+- **First result**: The first analysis waits for a full 5-second window, so calls with less than 5 seconds of user audio emit no results.
+- **Model load failure**: If the model fails to load, the observer logs an error and the call continues without analysis.
+- **Analysis failure**: If an analysis fails, the observer logs an error and stops analyzing for the rest of the call.
+- **Filter initialization**: When `audio_filter` is set and the filter fails to initialize, it passes audio through unenhanced and the observer analyzes nothing.
+
+## Event Handlers
+
+| Event                | Description                                                                                                                               |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `on_analysis_result` | A window was analyzed. Receives `scores` (`AICAudioQualityScores`) and `audio_secs` (`float`), the seconds of user audio received so far. |
+| `on_call_summary`    | The call ended. Receives `summary` (`AICAudioQualitySummary`). Not emitted when no window was analyzed.                                   |
+
+### AICAudioQualityScores
+
+All scores are in the range `0.0` to `1.0`. A higher value means more problematic audio.
+
+| Field                | Type    | Description                                                                                     |
+| -------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `risk_score`         | `float` | Likelihood that downstream models (STT, VAD, turn-taking, speech-to-speech) fail on this audio. |
+| `noise`              | `float` | Ambient or environmental noise.                                                                 |
+| `speaker_reverb`     | `float` | Speaker distance and reverberation.                                                             |
+| `speaker_loudness`   | `float` | Level of the main speaker. A neutral level, not a degradation.                                  |
+| `interfering_speech` | `float` | Speech from other speakers, live or from a device.                                              |
+| `packet_loss`        | `float` | Dropouts or discontinuities in the stream.                                                      |
+| `codec_degradation`  | `float` | Artifacts from lossy speech codecs.                                                             |
+
+### AICAudioQualitySummary
+
+| Field                | Type                    | Description                                                                                                                                                |
+| -------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `windows`            | `int`                   | Number of analyzed windows.                                                                                                                                |
+| `mean`               | `AICAudioQualityScores` | Mean of each score over all windows.                                                                                                                       |
+| `p95`                | `AICAudioQualityScores` | 95th percentile of each score over all windows.                                                                                                            |
+| `max`                | `AICAudioQualityScores` | Maximum of each score over all windows.                                                                                                                    |
+| `degraded_threshold` | `float`                 | `risk_score` value at or above which a window counts as degraded.                                                                                          |
+| `degraded_fraction`  | `float`                 | Fraction of windows that are degraded.                                                                                                                     |
+| `dominant_dimension` | `str`                   | Name of the score with the highest mean, excluding `risk_score` and `speaker_loudness`. It shows the largest degradation, not the cause of the risk score. |
 
 # Debug Log Observer
 Source: https://docs.pipecat.ai/api-reference/server/utilities/observers/debug-observer.md
@@ -86021,340 +87251,6 @@ room_name = helper.get_name_from_url("https://your-domain.daily.co/my-room")
 print(f"Room name: {room_name}")  # Outputs: "my-room"
 ```
 
-# ServiceSwitcher
-Source: https://docs.pipecat.ai/api-reference/server/utilities/service-switchers/service-switcher.md
-
-Dynamically switch between different service instances at runtime using configurable strategies
-
-## Overview
-
-`ServiceSwitcher` is a specialized parallel pipeline that enables dynamic switching between multiple service instances at runtime. This is useful when you need to change between different STT providers, TTS providers, or other frame processors based on user preferences, costs, performance requirements, or other runtime conditions.
-
-The switcher uses a strategy pattern to determine which service is active. Two built-in strategies are provided: manual switching for explicit control, and automatic failover for handling service errors.
-
-## How It Works
-
-`ServiceSwitcher` wraps multiple services in a parallel pipeline where only the active service processes frames. Each service is "sandwiched" between two filters that check if it's the currently active service before allowing frames to pass through. When you switch services, the filters update to redirect frame flow to the newly active service.
-
-A `ServiceMetadataFrame` from a service outside the switcher reaches every member, active or not, so a member that reads another service's metadata has it when it becomes active. Only the active service's own metadata leaves the switcher.
-
-## Constructor
-
-```python
-from pipecat.pipeline.service_switcher import ServiceSwitcher
-
-# Uses ServiceSwitcherStrategyManual by default
-switcher = ServiceSwitcher(services=[stt_service1, stt_service2])
-
-# Or explicitly specify a strategy
-from pipecat.pipeline.service_switcher import ServiceSwitcherStrategyFailover
-switcher = ServiceSwitcher(
-    services=[stt_service1, stt_service2],
-    strategy_type=ServiceSwitcherStrategyFailover
-)
-```
-
-<ParamField path="services" type="List[FrameProcessor]" required>
-  List of service instances to switch between. Can be any frame processors (STT,
-  TTS, or custom processors).
-</ParamField>
-
-<ParamField
-  path="strategy_type"
-  type="Type[ServiceSwitcherStrategy]"
-  default="ServiceSwitcherStrategyManual"
->
-  The strategy class to use for switching logic. Pass the class itself, not an
-  instance. Defaults to ``ServiceSwitcherStrategyManual``.
-</ParamField>
-
-## Switching Strategies
-
-### ServiceSwitcherStrategyManual
-
-The manual strategy allows explicit control over which service is active by pushing `ManuallySwitchServiceFrame` frames into the pipeline.
-
-**Initial State**: The first service in the list is active by default.
-
-**Switching**: Push a `ManuallySwitchServiceFrame` with the desired service instance.
-
-### ServiceSwitcherStrategyFailover
-
-The failover strategy automatically switches away from the active service once it can no longer do its job. This enables automatic recovery from service failures without manual intervention.
-
-**Initial State**: The first service in the list is active by default.
-
-**Automatic Failover**: An error the active service can carry on from is ignored. When one leaves it unable to work at all — a rejected API key, an unknown model or voice — the strategy switches to the next service in the list that can still do its job, wrapping around from the end. A service that failed to connect during setup is already unusable, so the switch happens before the pipeline starts and every frame reaches a service that connected.
-
-**Recovery**: The failed service remains in the list. Bring it back with [`set_usable(True)`](/api-reference/server/events/frame-processor-events), then switch to it manually or from application logic in the `on_service_switched` event handler.
-
-```python
-from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyFailover
-
-switcher = ServiceSwitcher(
-    services=[primary_stt, backup_stt],
-    strategy_type=ServiceSwitcherStrategyFailover
-)
-
-@switcher.strategy.event_handler("on_service_switched")
-async def on_switched(strategy, service):
-    # Application decides when/how to recover the failed service
-    print(f"Switched to: {service.name}")
-```
-
-### Custom Strategies
-
-You can create your own switching strategy by subclassing `ServiceSwitcherStrategy` and implementing the `handle_frame` and/or `handle_error` methods.
-
-- **`handle_frame(frame, direction)`**: Called for control frames (like `ManuallySwitchServiceFrame`). Should return the newly active service if a switch occurred, or `None` otherwise.
-- **`handle_error(error)`**: Called for every error the active service reports, whether or not it can carry on from it. Override this to decide which errors are worth switching away from — `error.processor.is_usable` separates a service that is finished from one having a bad moment, and a strategy is free to switch on either. Should return the newly active service if a switch occurred, or `None` otherwise.
-
-Additionally, if you want to maintain either manual switching or automatic failover as an option when writing a custom strategy, your new strategy should inherit from `ServiceSwitcherStrategyManual` or `ServiceSwitcherStrategyFailover`, respectively.
-
-## Usage Examples
-
-### Switching Between TTS Services
-
-```python
-from pipecat.frames.frames import ManuallySwitchServiceFrame
-from pipecat.pipeline.service_switcher import ServiceSwitcher
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
-from pipecat.services.cartesia.tts import CartesiaTTSService
-
-# Create TTS services
-elevenlabs = ElevenLabsTTSService(
-    api_key=os.getenv("ELEVENLABS_API_KEY"),
-    settings=ElevenLabsTTSService.Settings(voice=os.getenv("ELEVENLABS_VOICE_ID")),
-)
-cartesia = CartesiaTTSService(
-    api_key=os.getenv("CARTESIA_API_KEY"),
-    settings=CartesiaTTSService.Settings(voice=os.getenv("CARTESIA_VOICE_ID")),
-)
-
-# Create switcher with both services (uses ServiceSwitcherStrategyManual by default)
-tts_switcher = ServiceSwitcher(services=[elevenlabs, cartesia])
-
-# Use in pipeline
-pipeline = Pipeline([
-    transport.input(),
-    stt,
-    context_aggregator.user(),
-    llm,
-    tts_switcher,
-    transport.output(),
-    context_aggregator.assistant()
-])
-
-# Later, switch to Cartesia
-await worker.queue_frame(ManuallySwitchServiceFrame(service=cartesia))
-```
-
-## Event Handlers
-
-| Event                 | Description                 |
-| --------------------- | --------------------------- |
-| `on_service_switched` | Active service was switched |
-
-```python
-@switcher.strategy.event_handler("on_service_switched")
-async def on_service_switched(strategy, service):
-    print(f"Switched to: {service.name}")
-```
-
-**Parameters:**
-
-| Parameter  | Type                      | Description              |
-| ---------- | ------------------------- | ------------------------ |
-| `strategy` | `ServiceSwitcherStrategy` | The switcher's strategy  |
-| `service`  | `FrameProcessor`          | The newly active service |
-
-# LLMSwitcher
-Source: https://docs.pipecat.ai/api-reference/server/utilities/service-switchers/llm-switcher.md
-
-Dynamically switch between different LLM services with support for ad-hoc inference and unified function registration
-
-## Overview
-
-`LLMSwitcher` is a specialized version of `ServiceSwitcher` designed specifically for managing multiple LLM services. Beyond basic service switching, it provides convenient methods for running ad-hoc inferences and registering function handlers across all LLMs simultaneously.
-
-This is particularly useful when you need to switch between different LLM providers based on task complexity, cost optimization, or specific model capabilities while maintaining a consistent function calling interface.
-
-## Constructor
-
-```python
-from pipecat.pipeline.llm_switcher import LLMSwitcher
-
-# Uses ServiceSwitcherStrategyManual by default
-switcher = LLMSwitcher(llms=[openai_service, gemini_service])
-```
-
-<ParamField path="llms" type="List[LLMService]" required>
-  List of LLM service instances to switch between.
-</ParamField>
-
-<ParamField
-  path="strategy_type"
-  type="Type[ServiceSwitcherStrategy]"
-  default="ServiceSwitcherStrategyManual"
->
-  The strategy class to use for switching logic. Pass the class itself, not an
-  instance. Defaults to ``ServiceSwitcherStrategyManual``.
-</ParamField>
-
-## Properties
-
-<ParamField path="llms" type="List[LLMService]">
-  The list of LLM services managed by this switcher.
-</ParamField>
-
-<ParamField path="active_llm" type="LLMService | None">
-  The currently active LLM service, or None if no LLMs are configured.
-</ParamField>
-
-## Methods
-
-### run_inference()
-
-Run a one-shot inference with the currently active LLM, outside of the normal pipeline flow.
-
-```python
-result = await llm_switcher.run_inference(
-    context=llm_context,
-    max_tokens=1000,
-    system_instruction="You are a helpful assistant."
-)
-```
-
-<ParamField path="context" type="LLMContext" required>
-  The LLM context containing conversation history and messages.
-</ParamField>
-
-<ParamField path="**kwargs" type="Any">
-  Additional arguments forwarded to the active LLM's `run_inference` method.
-  Common options include `max_tokens` (maximum tokens to generate),
-  `system_instruction` (override the system prompt for this inference), and
-  `response_schema` (optional JSON schema the reply must follow).
-</ParamField>
-
-**Returns**: `str | None` - The LLM's response as a string, or None if no LLM is active.
-
-### register_function()
-
-<Note>
-  You don't need `register_function` when your tool's handler is bundled on its
-  `FunctionSchema`: listing it in `LLMContext(tools=[...])` or adding it via
-  `LLMSetToolsFrame` is enough.
-</Note>
-
-Register a function handler with all LLMs in the switcher, regardless of which is currently active.
-
-```python
-llm_switcher.register_function(
-    function_name="get_weather",
-    handler=handle_weather,
-    cancel_on_interruption=True
-)
-```
-
-<ParamField path="function_name" type="str | None" required>
-  The name of the function to handle. Use None for a catch-all handler that
-  processes all function calls.
-</ParamField>
-
-<ParamField path="handler" type="Callable" required>
-  The async function handler. Should accept a single `FunctionCallParams`
-  parameter.
-</ParamField>
-
-<ParamField path="cancel_on_interruption" type="bool | None" default="None">
-  Whether to cancel this function call when a user interruption occurs. When
-  `False`, the call is treated as asynchronous: the LLM continues the
-  conversation immediately without waiting for the result, and the result is
-  injected later via a developer message. Defaults to `None`, which falls back
-  to the handler's `@tool_options` value, then to `True`.
-</ParamField>
-
-<ParamField path="timeout_secs" type="float | None" default="None">
-  Optional per-tool timeout in seconds. Overrides the global
-  `function_call_timeout_secs` for this specific function.
-</ParamField>
-
-<ParamField path="cancellable_by_llm" type="bool | None" default="None">
-  Whether the LLM may cancel this call while it runs, through the
-  `cancel_<name>` tool advertised alongside it. Pair it with
-  `cancel_on_interruption=False`. Defaults to `None`, which falls back to the
-  handler's `@tool_options` value, then to `False`.
-</ParamField>
-
-### register_direct_function()
-
-<Warning>
-  **Deprecated since 1.4.0.** Direct functions now register automatically on
-  every member LLM (active or not) when you list them in
-  `LLMContext(tools=[...])`, so explicit registration is no longer needed — the
-  tools keep working across service switches. Push an `LLMSetToolsFrame` to
-  change tools mid-session. This method will be removed in a future version.
-</Warning>
-
-Register a direct function handler with all LLMs in the switcher, regardless of which is currently active.
-
-```python
-llm_switcher.register_direct_function(
-    handler=my_direct_function,
-    cancel_on_interruption=True,
-    timeout_secs=30.0
-)
-```
-
-<ParamField path="handler" type="DirectFunction" required>
-  The direct function to register. Must follow the DirectFunction protocol.
-</ParamField>
-
-<ParamField path="cancel_on_interruption" type="bool | None" default="None">
-  Whether to cancel this function call when a user interruption occurs. When
-  `False`, the call is treated as asynchronous: the LLM continues the
-  conversation immediately without waiting for the result, and the result is
-  injected later via a developer message. Defaults to `None`, which falls back
-  to the handler's `@tool_options` value, then to `True`.
-</ParamField>
-
-<ParamField path="timeout_secs" type="float | None" default="None">
-  Optional per-tool timeout in seconds. Overrides the global
-  `function_call_timeout_secs` for this specific function.
-</ParamField>
-
-## Usage Examples
-
-### Basic LLM Switching
-
-```python
-from pipecat.pipeline.llm_switcher import LLMSwitcher
-from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.google.llm import GoogleLLMService
-from pipecat.frames.frames import ManuallySwitchServiceFrame
-
-# Create LLM services
-openai = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
-gemini = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"))
-
-# Create switcher (uses ServiceSwitcherStrategyManual by default)
-llm_switcher = LLMSwitcher(llms=[openai, gemini])
-
-# Use in pipeline
-pipeline = Pipeline([
-    transport.input(),
-    stt,
-    context_aggregator.user(),
-    llm_switcher,
-    tts,
-    transport.output(),
-    context_aggregator.assistant()
-])
-
-# Switch to cheaper model for simple tasks
-await worker.queue_frame(ManuallySwitchServiceFrame(service=gemini))
-```
-
 # Smart Turn Overview
 Source: https://docs.pipecat.ai/api-reference/server/utilities/turn-detection/smart-turn-overview.md
 
@@ -87695,6 +88591,7 @@ The turn closes only when both are satisfied.
 | `SpeechTimeoutUserTurnStopStrategy`  | A fixed silence window (`user_speech_timeout`, default `0.6s`) elapses after the VAD reports the user stopped speaking. |
 | `TurnAnalyzerUserTurnStopStrategy`   | A turn-detection ("smart turn") model predicts end-of-turn from the audio and transcript.                               |
 | `FilterIncompleteUserTurnStrategies` | An LLM assesses whether the user's utterance is semantically complete.                                                  |
+| `ClassifierUserTurnStrategies`       | A [classifier](/api-reference/server/classifiers/overview) judges whether the turn so far is complete.                  |
 | Custom                               | Your own logic implementing the stop-strategy interface.                                                                |
 
 This is also where you tune responsiveness. For example, raise or lower `user_speech_timeout` on `SpeechTimeoutUserTurnStopStrategy` to give users more or less time to resume before the bot replies.
@@ -88260,6 +89157,50 @@ strategy = LLMTurnCompletionUserTurnStopStrategy()
   for the full LLM-gated turn-completion feature.
 </Tip>
 
+### ClassifierUserTurnStopStrategy
+
+Asks a [classifier](/api-reference/server/classifiers/overview) whether the user's turn is complete each time the user pauses with new words transcribed. It asks once the pause's words are in: when the STT finalizes the transcript, or when the STT's p99 latency has passed since the user stopped. The classifier sees the user's words so far and, when `context` is given, the assistant's last message. It answers one of:
+
+- `complete`: the strategy reports that the user is done.
+- `short`: the user stopped mid-sentence. The strategy reports after `short_timeout` seconds unless the user continues.
+- `long`: the user asked for time or only acknowledged the question. The strategy reports after `long_timeout` seconds unless the user continues.
+
+If the classifier raises an error or takes longer than `classification_timeout`, the strategy reports right away. A pause with no words transcribed isn't classified.
+
+Next to a turn analyzer in a `StrategyMode.ALL` list (the default), the turn ends once both have decided. As the only stop strategy, it ends the turn as soon as the classifier finds it complete.
+
+<ParamField path="classifier" type="BaseClassifier" required>
+  The classifier that decides whether the turn is complete.
+</ParamField>
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  The conversation, so the classifier sees the assistant's last message along
+  with the user's turn.
+</ParamField>
+
+<ParamField path="short_timeout" type="float" default="5.0">
+  Seconds to wait after a `short` verdict before reporting that the user is
+  done.
+</ParamField>
+
+<ParamField path="long_timeout" type="float" default="10.0">
+  Seconds to wait after a `long` verdict before reporting that the user is done.
+</ParamField>
+
+<ParamField path="classification_timeout" type="float" default="1.0">
+  Seconds to wait for the classifier before reporting without it.
+</ParamField>
+
+```python
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+from pipecat.turns.user_stop import ClassifierUserTurnStopStrategy
+
+strategy = ClassifierUserTurnStopStrategy(
+    classifier=JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY")),
+    context=context,
+)
+```
+
 ### deferred()
 
 <Warning>
@@ -88534,6 +89475,52 @@ The `start` and `stop` strategies default to the standard detector chain; overri
   Turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns)
   for the full feature documentation, markers, and timeout behavior.
 </Tip>
+
+## ClassifierUserTurnStrategies
+
+Preconfigures `UserTurnStrategies` so a classifier decides whether the user's turn is complete. It suits an LLM that doesn't follow the turn-completion markers of [`FilterIncompleteUserTurnStrategies`](#filterincompleteuserturnstrategies) well: the classifier decides, and the LLM only answers complete turns. It adds a [`ClassifierUserTurnStopStrategy`](#classifieruserturnstopstrategy) after the stop strategies given, or after the default ones when none are given, and the turn ends once all of them have decided. For the classifier alone, pass `UserTurnStrategies(stop=[ClassifierUserTurnStopStrategy(...)])`.
+
+```python
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+from pipecat.turns.user_turn_strategies import ClassifierUserTurnStrategies
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=ClassifierUserTurnStrategies(
+            classifier=JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY")),
+            context=context,
+        ),
+    ),
+)
+```
+
+<ParamField path="classifier" type="BaseClassifier" required>
+  The classifier that decides whether a turn is complete. Raises `ValueError` if
+  omitted.
+</ParamField>
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  The conversation, so the classifier sees the assistant's last message along
+  with the user's turn.
+</ParamField>
+
+<ParamField path="short_timeout" type="float" default="5.0">
+  Seconds to wait after a `short` verdict before the classifier strategy decides
+  the user is done.
+</ParamField>
+
+<ParamField path="long_timeout" type="float" default="10.0">
+  Seconds to wait after a `long` verdict before the classifier strategy decides
+  the user is done.
+</ParamField>
+
+<ParamField path="classification_timeout" type="float" default="1.0">
+  Seconds to wait for the classifier before leaving the decision to the other
+  stop strategies.
+</ParamField>
+
+The `start` and `stop` strategies take the same values as on `UserTurnStrategies`. With `UserTurnStrategiesParams(stop_merge_mode=MergeMode.EXTEND)`, the classifier strategy and any stop strategies given join the ones a service recommends instead.
 
 ## Usage Examples
 
@@ -88871,6 +89858,8 @@ This creates more natural conversations by:
 - Preventing the bot from responding to incomplete thoughts
 - Giving users time to finish speaking without interruption
 - Automatically prompting users to continue after pauses
+
+For an LLM that doesn't follow the markers well, a classifier can decide instead. See [`ClassifierUserTurnStrategies`](/api-reference/server/utilities/turn-management/user-turn-strategies#classifieruserturnstrategies).
 
 ## How It Works
 
@@ -94714,6 +95703,149 @@ Inherits `name`, `llm`, `active`, `bridged`, and `defer_tool_frames` from [`LLMW
 | `user_aggregator`      | `LLMUserAggregator`      | The user-side context aggregator      |
 | `assistant_aggregator` | `LLMAssistantAggregator` | The assistant-side context aggregator |
 
+# BackendLLMWorker
+Source: https://docs.pipecat.ai/api-reference/server/workers/backend-llm-worker.md
+
+BackendLLMWorker runs an LLM service as the backend a frontend delegates to, for LLMWithBackend and OpenAILiveLLMService.
+
+<Warning>
+  `BackendLLMWorker` is in alpha: its API is likely to change between releases.
+</Warning>
+
+## Overview
+
+`BackendLLMWorker` runs any Pipecat LLM service as the backend of a conversational frontend: the agent that handles work needing tools or careful reasoning while the frontend keeps talking with the user. It extends [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker), so the backend keeps a conversation of its own and calls its tools over as many steps as the work takes.
+
+Two frontends drive it: [`LLMWithBackend`](/api-reference/server/composite-services/llm-with-backend), with any LLM service as the frontend, and [`OpenAILiveLLMService`](/api-reference/server/services/s2s/openai-live) in client delegation. For a walkthrough, see [LLM with a Backend](/pipecat/learn/llm-with-backend).
+
+```python
+from pipecat.workers.llm import BackendLLMWorker, BackendOutput
+```
+
+```python
+backend = BackendLLMWorker(
+    llm=AnthropicLLMService(
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        settings=AnthropicLLMService.Settings(system_instruction=BACKEND_INSTRUCTIONS),
+    ),
+    context=LLMContext(tools=[search_codebase, read_file, apply_patch, run_tests]),
+)
+```
+
+## Configuration
+
+<ParamField path="llm" type="LLMService" required>
+  The backend LLM service. It runs at its provider's default thinking for the
+  model unless its settings configure thinking.
+</ParamField>
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  The backend's context, carrying its tools. A fresh empty context when `None`.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Unique name for this worker on the bus. Auto-generated when `None`; give one
+  when the backend runs in another process, where the frontend addresses it by
+  name.
+</ParamField>
+
+<ParamField
+  path="transform_output"
+  type="BackendOutputTransform | None"
+  default="None"
+>
+  Called with each [`BackendOutput`](#backendoutput) the model produces before
+  it is sent: return the output to send in its place, or `None` to send nothing.
+  Outputs sent with [`send_output()`](#send_output) skip it unless that call
+  asks for it.
+</ParamField>
+
+<ParamField
+  path="pairing_instruction"
+  type="str"
+  default="BACKEND_PAIRING_INSTRUCTION"
+>
+  How the model works with the frontend, appended to the LLM's system
+  instruction. A custom override has to cover everything the default does: that
+  the frontend sends it requests, that the user hears what it marks with
+  `SPOKEN_MARK` and nothing else, and how to take requests that arrive while it
+  works.
+</ParamField>
+
+<ParamField
+  path="user_params"
+  type="LLMUserAggregatorParams | None"
+  default="None"
+>
+  Parameters for the user aggregator. When `None`, external turn strategies: the
+  backend has no audio to detect turns in.
+</ParamField>
+
+<ParamField
+  path="assistant_params"
+  type="LLMAssistantAggregatorParams | None"
+  default="None"
+>
+  Parameters for the assistant aggregator.
+</ParamField>
+
+Raises `ValueError` when the LLM service refuses the role. `OpenAILiveLLMService` does.
+
+## BackendOutput
+
+One piece of output from the backend on its way to the frontend: what `transform_output` receives and returns, and what `send_output()` sends.
+
+| Field            | Type   | Default | Description                                                                              |
+| ---------------- | ------ | ------- | ---------------------------------------------------------------------------------------- |
+| `text`           | `str`  |         | The text.                                                                                |
+| `is_thought`     | `bool` | `False` | Whether this is a reasoning summary.                                                     |
+| `prefers_spoken` | `bool` | `True`  | Whether the backend would like the user to hear this. The frontend decides what it says. |
+
+`BackendOutputTransform` is the type of `transform_output`:
+
+```python
+async def transform_output(output: BackendOutput) -> BackendOutput | None
+```
+
+## Properties
+
+Inherits the properties of [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker).
+
+### working
+
+```python
+backend.working -> bool
+```
+
+`True` while the backend has work in hand: a request or model run outstanding, or a function call in flight.
+
+## Methods
+
+### send_output
+
+```python
+async def send_output(
+    self, output: BackendOutput, *, apply_transform_output: bool = False
+) -> None
+```
+
+Sends an output of the app's own to the frontend, as the model's outputs are sent. A tool can use it to tell the user something itself, such as a booking confirmation worded by the booking system. It skips `transform_output` unless `apply_transform_output` is `True`. With no frontend attached, the output is dropped with a warning.
+
+## Constants
+
+Module constants of `pipecat.workers.llm.backend_llm_worker`:
+
+| Constant                      | What it is                                                                 |
+| ----------------------------- | -------------------------------------------------------------------------- |
+| `BACKEND_PAIRING_INSTRUCTION` | The default `pairing_instruction`.                                         |
+| `SPOKEN_MARK`                 | `">>"`: the mark the model starts a message with to have the user told it. |
+
+## Notes
+
+- **What the user hears**: A message the model starts with `SPOKEN_MARK` is sent with `prefers_spoken=True`, mark removed, whether or not the same turn calls tools. Anything else it writes, reasoning summaries included, is sent with `prefers_spoken=False`: the frontend keeps it as a note and doesn't say it. When the mark starts a later line, the text before that line is a note and the rest is spoken.
+- **Requests while working**: A request that arrives while the backend is working joins that work. The model reads it against what it has under way, and stops a long-running tool through the `cancel_<tool>` tool that `cancellable_by_llm=True` gives it.
+- **One frontend at a time**: The worker serves one frontend. When that frontend lets go, such as when its pipeline ends, the backend's work in progress is cancelled.
+
 # UIWorker
 Source: https://docs.pipecat.ai/api-reference/server/workers/ui-worker.md
 
@@ -100296,7 +101428,7 @@ pcClient.connect({
 
 ```python server
 # See
-# https://github.com/pipecat-ai/pipecat-examples/blob/main/p2p-webrtc/video-transform/server/server.py
+# https://github.com/pipecat-ai/pipecat-examples/blob/main/p2p-webrtc/voice-agent/server.py
 # for a complete example of how to implement the server-side endpoint.
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
@@ -100527,8 +101659,8 @@ pcClient.startBotAndConnect({
 
 ```python server
 # See
-# https://github.com/pipecat-ai/pipecat-examples/blob/main/websocket/server/server.py
-# for a complete example of how to implement the server-side endpoint.
+# https://github.com/pipecat-ai/pipecat-examples/tree/main/websocket
+# for a complete WebSocket client and server example.
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -100547,7 +101679,7 @@ async def start(request: Request) -> Dict[Any, Any]:
 
 ```python bot
 # See
-# https://github.com/pipecat-ai/pipecat-examples/blob/main/websocket/server/bot_websocket_server.py
+# https://github.com/pipecat-ai/pipecat-examples/blob/main/websocket/bot.py
 # for a complete example of a bot script using the WebSocketTransport.
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.transports.websocket.fastapi import (
