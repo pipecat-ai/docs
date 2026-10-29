@@ -3121,8 +3121,9 @@ Pipecat uses [user turn strategies](/api-reference/server/utilities/turn-managem
 
 - Turn detection model (default): uses AI to understand if the user has finished their thought
 - Speech timeout: waits for silence after transcription to determine when the user is done
+- Turn completeness: an LLM or a classifier judges whether what the user said is a complete thought
 
-Custom strategies can also be implemented for specific use cases. By combining these techniques, you can create responsive yet natural conversations that don't interrupt users mid-sentence or wait too long after they've finished.
+Custom strategies can also be implemented for specific use cases. By [combining these techniques](#combining-strategies), you can create responsive yet natural conversations that don't interrupt users mid-sentence or wait too long after they've finished.
 
 ## Voice Activity Detection (VAD)
 
@@ -3206,8 +3207,8 @@ While VAD detects speech vs. silence, it can't understand linguistic context. A 
 
 ### How It Works
 
-1. **Turn Start**: When VAD detects speech (or transcription arrives), the start strategy emits `UserStartedSpeakingFrame` and optionally triggers an interruption
-2. **Turn End**: When the stop strategy determines the user is done, it emits `UserStoppedSpeakingFrame`
+1. **Turn Start**: When a start strategy decides the user started speaking (VAD detects speech, or a transcription arrives), the user aggregator emits `UserStartedSpeakingFrame` and optionally triggers an interruption
+2. **Turn End**: When the stop strategies decide the user is done, the user aggregator emits `UserStoppedSpeakingFrame` and pushes the user's message to the LLM context
 
 <Note>
   VAD also emits its own frames (`VADUserStartedSpeakingFrame`,
@@ -3237,6 +3238,40 @@ from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 
 stop_strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)
 ```
+
+**Turn Completeness**: Smart Turn and speech timeouts judge how the user spoke. To also judge what they said, add a stop strategy that checks whether the turn is a complete thought. [`FilterIncompleteUserTurnStrategies`](/api-reference/server/utilities/turn-management/filter-incomplete-turns) has the conversation LLM mark each turn complete or incomplete. [`ClassifierUserTurnStrategies`](/api-reference/server/utilities/turn-management/user-turn-strategies#classifieruserturnstrategies) asks a [classifier](/pipecat/learn/classifiers) instead, which suits an LLM that doesn't follow the markers well. Both add their check after Smart Turn, so a turn like "I'd go to Japan because I love" stays open until the user finishes or a timeout passes.
+
+### Combining Strategies
+
+`UserTurnStrategies` takes a list of start strategies and a list of stop strategies, and by default the two lists decide differently:
+
+- **Start**: the first strategy to decide starts the turn. That's what lets `TranscriptionUserTurnStartStrategy` act as a fallback, starting a turn VAD missed.
+- **Stop**: every strategy has to decide before the turn ends. Smart Turn next to a turn-completeness check ends the turn only once both say the user is done. If the user speaks again first, the decisions made so far are cleared.
+
+To change either rule, pass [`UserTurnStrategiesParams`](/api-reference/server/utilities/turn-management/user-turn-strategies#userturnstrategiesparams) as `user_turn_strategies_params`. This configuration ends the turn on whichever stop strategy decides first:
+
+```python
+from pipecat.turns.user_turn_strategies import (
+    StrategyMode,
+    UserTurnStrategies,
+    UserTurnStrategiesParams,
+)
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            stop=[
+                TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3()),
+                SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.5),
+            ],
+        ),
+        user_turn_strategies_params=UserTurnStrategiesParams(stop_mode=StrategyMode.FIRST),
+    ),
+)
+```
+
+An STT service with its own turn detection, such as [Deepgram Flux](/api-reference/server/services/stt/deepgram), recommends strategies of its own. The `user_turn_strategies` you pass replace them. To add yours to the service's instead, set `stop_merge_mode=MergeMode.EXTEND` (or `start_merge_mode`) on `UserTurnStrategiesParams`. For example, `FilterIncompleteUserTurnStrategies` with `stop_merge_mode=MergeMode.EXTEND` checks turn completeness on top of the service's turn detection.
 
 <CardGroup cols={2}>
 <Card
@@ -6094,6 +6129,7 @@ class ChurnDetector(FrameProcessor):
 Pipecat components that make small decisions take a `classifier` argument, so you choose what answers them. A few examples:
 
 - **[Voicemail detection](/pipecat/fundamentals/voicemail).** `VoicemailDetector` asks a choice question, a person or a voicemail, about the transcript so far after each transcription. It acts on the latest answer once the caller goes quiet.
+- **[Turn completion](/api-reference/server/utilities/turn-management/user-turn-strategies#classifieruserturnstrategies).** `ClassifierUserTurnStrategies` asks a choice question, whether the user's turn is complete, cut off mid-sentence, or waiting for time to think, at each pause with new words. The turn stays open until the classifier finds it complete or a timeout passes, so the LLM only answers finished turns.
 - **[Controlling the UI](/pipecat/learn/ui-worker).** `UIWorker` asks which element on screen the user means (a choice among the named elements), whether something is true of the screen (yes or no), and which elements match a description (one yes/no question per element, all in one call). That's how it finds, checks and acts on the page without an LLM turn.
 - **[Evals](/pipecat/evals/scenario-configuration#judging-with-a-classifier).** The eval judge asks a classifier whether each reply the agent gives meets a scenario's criterion: yes, no, or not answered yet. By default that is an `LLMClassifier` over a local model, and a scenario's `judge:` block can swap in a `JevClassifier`, which answers each check in a few hundred milliseconds.
 - **Your own code.** Anything that owns a classifier can ask it questions of its own. For example, a custom `UIWorker` job can ask which checkbox each item the user named refers to, one choice question per item in a single call.
@@ -8318,6 +8354,8 @@ When a [user turn start strategy](/api-reference/server/utilities/turn-managemen
 </Steps>
 
 The result: the bot goes silent within roughly one audio write, and the pipeline is clean and ready for the user's new turn.
+
+The bot can also start answering before a turn ends: the LLM runs to check the turn when [filtering incomplete turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns), and to answer an [eager end of turn](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies). If the user speaks again before the turn ends, that answer is void, so the user aggregator broadcasts an `InterruptionFrame` and cancels it the same way. A turn started with `enable_interruptions=False` broadcasts a [`UserTurnResponseCancelFrame`](/api-reference/server/frames/system-frames#userturnresponsecancelframe) instead, which withdraws an eager answer.
 
 ## What ends up in the context
 
@@ -22376,6 +22414,14 @@ Learn how to configure interruption strategies for your Pipecat bot.
 Use the LLM to detect when the user was cut off mid-thought, suppress the response, and re-engage after a timeout instead of answering half a sentence.
 
 [View Recipe →](https://github.com/pipecat-ai/pipecat/blob/main/examples/turn-management/turn-management-filter-incomplete-turns.py)
+
+</Update>
+
+<Update label={<><Icon icon="list-check" size={16} color="currentColor" /><span style={{marginLeft: '8px'}}>Classifier Turn Completion</span></>} tags={["User Interaction"]}>
+
+Use a classifier to keep the turn open when the user was cut off mid-thought or asked for time, so the LLM only answers complete turns.
+
+[View Recipe →](https://github.com/pipecat-ai/pipecat/blob/main/examples/turn-management/turn-management-classifier-turn-completion.py)
 
 </Update>
 
@@ -36790,7 +36836,7 @@ Each chunk of text the LLM streams. Sent to clients of protocol 2.2.0 or later, 
   `RTVIObserverParams(bot_llm_marker_enabled=True)`.
 </Note>
 
-The sideband marker the bot's LLM emitted in a response: structured output kept out of the spoken text, such as the turn-completion markers of `filter_incomplete_user_turns`. Sent once per response, when it ends. Because it carries the raw text of the whole response, it's meant for evaluation and debugging rather than for end-user clients.
+The sideband marker the bot's LLM emitted in a response: structured output kept out of the spoken text, such as the turn-completion markers of [`FilterIncompleteUserTurnStrategies`](/api-reference/server/utilities/turn-management/filter-incomplete-turns). Sent once per response, when it ends. Because it carries the raw text of the whole response, it's meant for evaluation and debugging rather than for end-user clients.
 
 - **type**: `'bot-llm-marker'`
 - **data**:
@@ -45341,7 +45387,8 @@ The server drives turn boundaries with the `ink-2` model, pushing structured eve
   Decides whether the committed transcript is close enough to the predicted one
   to keep the response, when `enable_eager_end_of_turn` is on. `None` uses
   `NormalizedMatch()`. Passed to the recommended `EagerUserTurnStrategies`, so
-  it has no effect if you pass your own `user_turn_strategies`. See [User Turn
+  it has no effect if you pass your own `user_turn_strategies`, unless
+  `stop_merge_mode=MergeMode.EXTEND` adds them to the service's. See [User Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
 </ParamField>
 
@@ -45827,7 +45874,8 @@ Fires the [`on_connection_error`](/api-reference/server/events/service-events#on
   Decides whether the committed transcript is close enough to the predicted one
   to keep the response, when `enable_eager_end_of_turn` is on. `None` uses
   `NormalizedMatch()`. Passed to the recommended `EagerUserTurnStrategies`, so
-  it has no effect if you pass your own `user_turn_strategies`. See [User Turn
+  it has no effect if you pass your own `user_turn_strategies`, unless
+  `stop_merge_mode=MergeMode.EXTEND` adds them to the service's. See [User Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
 </ParamField>
 
@@ -46121,7 +46169,8 @@ Supports the standard [service connection events](/api-reference/server/events/s
   Decides whether the committed transcript is close enough to the predicted one
   to keep the response, when `enable_eager_end_of_turn` is on. `None` uses
   `NormalizedMatch()`. Passed to the recommended `EagerUserTurnStrategies`, so
-  it has no effect if you pass your own `user_turn_strategies`. See [User Turn
+  it has no effect if you pass your own `user_turn_strategies`, unless
+  `stop_merge_mode=MergeMode.EXTEND` adds them to the service's. See [User Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies).
 </ParamField>
 
@@ -80498,7 +80547,7 @@ Reference for BaseClassifier, its YesNoQuestion, ChoiceQuestion and ScoreQuestio
 
 A classifier answers typed questions about some state. The state is plain text or structured data, such as a transcript with speaker labels or a screen snapshot. A question is a `YesNoQuestion`, a `ChoiceQuestion` among options, or a `ScoreQuestion` on a scale. Questions are asked by name, several about one state at once, and each gets a typed result with probabilities.
 
-A classifier is a plain object, not a frame processor. Whoever needs answers creates one, keeps it, and calls it. Nothing is added to a pipeline and no frames flow into it. Pipecat components that make small decisions take one as a `classifier` argument, such as [`VoicemailDetector`](/api-reference/server/extensions/voicemail), [`UIWorker`](/api-reference/server/workers/ui-worker), and the [eval judge](/pipecat/evals/scenario-configuration#judging-with-a-classifier).
+A classifier is a plain object, not a frame processor. Whoever needs answers creates one, keeps it, and calls it. Nothing is added to a pipeline and no frames flow into it. Pipecat components that make small decisions take one as a `classifier` argument, such as [`VoicemailDetector`](/api-reference/server/extensions/voicemail), [`ClassifierUserTurnStrategies`](/api-reference/server/utilities/turn-management/user-turn-strategies#classifieruserturnstrategies), [`UIWorker`](/api-reference/server/workers/ui-worker), and the [eval judge](/pipecat/evals/scenario-configuration#judging-with-a-classifier).
 
 For a walkthrough, see [Pipecat Classifiers](/pipecat/learn/classifiers).
 
@@ -90282,7 +90331,8 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 <Warning>
   Passing `user_turn_strategies` by hand replaces whatever the service
-  recommended, and `should_interrupt` is part of that recommendation. If you set
+  recommended, and `should_interrupt` is part of the recommended start strategy.
+  `start_merge_mode=MergeMode.EXTEND` keeps it. If you set
   `should_interrupt=False` on the service **and** pin
   `user_turn_strategies=ExternalUserTurnStrategies()` yourself, interruptions
   come back on. Either drop the manual `user_turn_strategies` (the service
@@ -91754,7 +91804,7 @@ Some speech-to-text services provide built-in turn detection. These services do 
 
 That means the strategies, not the service, own barge-in. Most services expose this as a `should_interrupt` constructor argument and pass it straight through to the strategies they recommend, so `should_interrupt=False` is the usual way to stop the bot being interrupted. Only reach for `ExternalUserTurnStrategies(enable_interruptions=False)` if you are pinning the strategies yourself.
 
-You do not normally need to configure anything: a turn-detecting service recommends `ExternalUserTurnStrategies` on its own. Pass them explicitly only when you want to override that recommendation:
+You do not normally need to configure anything: a turn-detecting service recommends `ExternalUserTurnStrategies` on its own. To add strategies to the service's, such as `FilterIncompleteUserTurnStrategies`, set `stop_merge_mode=MergeMode.EXTEND` on [`UserTurnStrategiesParams`](/api-reference/server/utilities/turn-management/user-turn-strategies#userturnstrategiesparams). Pass `ExternalUserTurnStrategies` explicitly only when you want to override the recommendation:
 
 ```python
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -91788,7 +91838,7 @@ Realtime mode adapts the pair's behavior in two ways:
 1. **Context writes are decoupled from `UserStoppedSpeakingFrame`.** Instead, the assistant response start triggers the user message write. This keeps the context correct even when the realtime service provides no turn frames and local turn detection (VAD) is disabled.
 2. **`UserStoppedSpeakingFrame` can fire without waiting for transcripts.** When local turn detection drives the conversation, this frame triggers the assistant response — letting it fire earlier reduces latency. The pair flips `wait_for_transcript=False` on the [stop strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#stop-strategies) that support it.
 
-Separately from realtime mode, services that propose turn boundaries from server-side VAD (OpenAI Realtime, Azure Realtime, Grok, Inworld) replace the default turn strategies with `ExternalUserTurnStrategies`, which resolve those proposals into `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and drive `on_user_turn_started` / `on_user_turn_stopped`. Services that propose nothing, either because they never do (Gemini Live, Nova Sonic, Ultravox) or because server-side turn detection was disabled at runtime (e.g. OpenAI Realtime with `turn_detection=False`), keep the defaults so locally-driven turn detection (e.g. local VAD) can fire the events. Passing custom `user_turn_strategies` opts out of this swap.
+Separately from realtime mode, services that propose turn boundaries from server-side VAD (OpenAI Realtime, Azure Realtime, Grok, Inworld) replace the default turn strategies with `ExternalUserTurnStrategies`, which resolve those proposals into `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and drive `on_user_turn_started` / `on_user_turn_stopped`. Services that propose nothing, either because they never do (Gemini Live, Nova Sonic, Ultravox) or because server-side turn detection was disabled at runtime (e.g. OpenAI Realtime with `turn_detection=False`), keep the defaults so locally-driven turn detection (e.g. local VAD) can fire the events. Passing custom `user_turn_strategies` opts out of this swap, unless `UserTurnStrategiesParams` extends a list.
 
 <Note>
   In realtime mode, subscribe to
@@ -93086,9 +93136,9 @@ worker = PipelineWorker(
 
 <ParamField path="bot_llm_marker_enabled" default="False">
   Indicates if the bot's LLM marker reports (`LLMMarkerResponseFrame`, e.g. from
-  `filter_incomplete_user_turns`) should be sent. A report carries the marker
-  the LLM emitted and the raw text of the whole response, which is meant for
-  evaluation, not for clients, so this is off by default.
+  `FilterIncompleteUserTurnStrategies`) should be sent. A report carries the
+  marker the LLM emitted and the raw text of the whole response, which is meant
+  for evaluation, not for clients, so this is off by default.
 </ParamField>
 
 <ParamField path="bot_tts_enabled" default="True">
