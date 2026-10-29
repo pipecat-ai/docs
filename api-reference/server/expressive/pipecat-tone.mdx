@@ -1,0 +1,127 @@
+---
+title: "Pipecat Tone"
+description: "Reference for PipecatToneReader, which reads how each user turn was meant, and PipecatToneTagger, which writes tags for the LLM."
+---
+
+## Overview
+
+Pipecat Tone is two small models for [expressive conversation](/api-reference/server/expressive/overview) that run on the CPU:
+
+- [`PipecatToneReader`](#pipecattonereader) reads how each user turn was meant from its words, a perception producer that tells the LLM how the user sounded.
+- [`PipecatToneTagger`](#pipecattonetagger) writes the expression tags for the LLM's plain replies, a sentence at a time.
+
+For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-conversation).
+
+<CardGroup cols={2}>
+  <Card
+    title="Models"
+    icon="cube"
+    href="https://huggingface.co/pipecat-ai/tone-models"
+  >
+    Pipecat Tone's models on Hugging Face
+  </Card>
+  <Card
+    title="Examples"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/expressive-conversation"
+  >
+    Bots with the reader, and with the tagger
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[tone]"
+```
+
+## PipecatToneReader
+
+Reads each final user transcription, with the bot's reply before it, and sets the reading as the transcription's `perception`. Goes between the STT service and the user aggregator. A read takes a few milliseconds, and the transcription waits for it.
+
+```python
+from pipecat.processors.tone.reader import PipecatToneReader
+```
+
+### Configuration
+
+<ParamField path="revision" type="str" default='"reader-rc1"'>
+  The model's release on Hugging Face.
+</ParamField>
+
+<ParamField path="model_dir" type="str | Path | None" default="None">
+  A folder to load the model from instead of downloading it, laid out as a
+  release's `reader` folder. `revision` is then unused.
+</ParamField>
+
+<ParamField path="precision" type='Literal["fp16", "fp32"]' default='"fp16"'>
+  The weights to load.
+</ParamField>
+
+<ParamField path="threads" type="int" default="4">
+  The CPU threads for one read.
+</ParamField>
+
+### Signals
+
+| Signal    | Read as | Reading                                                                                                              |
+| --------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `emotion` | Labels  | The two likeliest emotions the words show, with their confidences. `neutral` means the words show no strong feeling. |
+| `sarcasm` | Value   | The chance the turn is sarcastic, from 0 to 1. A sarcastic turn can read as a happy emotion.                         |
+
+The LLM reads them as `([emotion angry=0.81, neutral=0.12],[sarcasm value=0.04])` at the head of the user's message, and is taught what each signal means. The emotion labels are the model's: see its model card.
+
+## PipecatToneTagger
+
+Labels each sentence of the LLM's reply with the call so far, how the user sounded and the pipeline's expression policy, and sends it on with tags the TTS service performs. Goes between the LLM and the TTS service. A sentence takes about 15 milliseconds with the `17m` model, and waits for it.
+
+At start, the tagger broadcasts an `ExpressionMetadataFrame`, so the LLM is taught no tags, writes plain words, and the context keeps its replies plain.
+
+```python
+from pipecat.processors.tone.tagger import PipecatToneTagger
+```
+
+### Configuration
+
+<ParamField path="size" type='Literal["17m", "32m"]' default='"17m"'>
+  The model's size. `32m` agrees with the model it was trained from a little
+  more often, and takes nearly three times as long a sentence.
+</ParamField>
+
+<ParamField path="revision" type="str" default='"tagger-rc1"'>
+  The model's release on Hugging Face.
+</ParamField>
+
+<ParamField path="model_dir" type="str | Path | None" default="None">
+  A folder to load the model from instead of downloading it, laid out as a
+  release's `tagger/17m` folder. `size` and `revision` are then unused.
+</ParamField>
+
+<ParamField path="threads" type="int" default="1">
+  The CPU threads for one sentence.
+</ParamField>
+
+<ParamField path="vocabulary" type="dict[ExpressionDelivery | ExpressionSound, list[str]] | None" default="None">
+  Names to write in place of a label's universal name, best first, such as
+  `{ExpressionDelivery.WARM: ["cheerful"]}`. A name is written only where the
+  TTS service performs it and the policy offers it. A name for
+  `ExpressionSound.BREATH` is written for every breath. Raises `ValueError` when
+  a key is a label the tagger doesn't write.
+</ParamField>
+
+### What It Writes
+
+| Tags     | Names                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------------------------- |
+| Delivery | The [core deliveries](/api-reference/server/expressive/overview#core-names), and slow spans for details |
+| Sounds   | The core sounds, before or after a sentence                                                             |
+| Breaths  | `light breath`, `deep breath` or `exhale` before a sentence, only with `ExpressionGuidance.BREATHE`     |
+| Emphasis | Stressed words                                                                                          |
+
+It writes only tags the TTS service performs. The policy's `delivery` and `sounds` narrow the names it writes, and its `ExpressionGuidance` presets steer it. The policy's own lines go to the LLM.
+
+## Notes
+
+- **Model download**: each model loads while the pipeline is set up, once a process, shared by every reader or tagger. The first load downloads it from Hugging Face, which holds the pipeline's start, so download it ahead, such as when you build your image, or pass `model_dir`.
+- **A model that can't load**: it's reported as an error that leaves the processor unusable. The reader passes transcriptions through unread, and with the tagger the LLM writes tags itself. The worker's [`processor_unusable_policy`](/api-reference/server/pipeline/pipeline-worker) decides whether the pipeline goes on.
+- **Expressive conversation off**: both processors need `PipelineParams(enable_expressive_conversation=True)` for the LLM to read readings or for tags to be performed.
