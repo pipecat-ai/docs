@@ -16685,6 +16685,210 @@ See the [Roark analytics observer](/api-reference/server/services/analytics/roar
   </Card>
 </CardGroup>
 
+# Expressive Conversation
+Source: https://docs.pipecat.ai/pipecat/features/expressive-conversation.md
+
+Let your Pipecat bot hear how the user sounded and choose how to say its reply: tones, sounds and pauses, performed by the TTS.
+
+## Overview
+
+With expressive conversation on, the LLM writes expression tags into its reply, such as `<<sympathetic>>` or `[[laugh]]`, and the TTS service performs them instead of speaking them. Add Pipecat Tone's reader, and the LLM also reads how the user sounded. This is Pipecat's implementation of the [Real-time Context Standard](/api-reference/standards/real-time-context-standard).
+
+<Warning>
+  Expressive conversation is alpha. Its tags, types and defaults may change
+  between releases.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card
+    title="Expressive Conversation Reference"
+    icon="code"
+    href="/api-reference/server/expressive/overview"
+  >
+    Parameters, policy, universal names, frames and events
+  </Card>
+  <Card
+    title="Expressive TTS Services"
+    icon="waveform-lines"
+    href="/api-reference/server/expressive/tts-services"
+  >
+    The TTS services and models that perform tags
+  </Card>
+  <Card
+    title="Pipecat Tone"
+    icon="face-smile"
+    href="/api-reference/server/expressive/pipecat-tone"
+  >
+    The reader and tagger models
+  </Card>
+  <Card
+    title="Examples"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/expressive-conversation"
+  >
+    A bot for each supported TTS service
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- **Pipecat 1.15.0 or later**
+- **A TTS service and model that performs tags**: see [Expressive TTS Services](/api-reference/server/expressive/tts-services). Any other TTS service speaks only the words.
+
+## Turn It On
+
+Set `enable_expressive_conversation=True` in `PipelineParams`. The pipeline is an ordinary STT, LLM and TTS pipeline:
+
+```python
+import os
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.services.elevenlabs.dialogue.tts import ElevenLabsDialogueTTSService
+
+tts = ElevenLabsDialogueTTSService(
+    api_key=os.getenv("ELEVENLABS_API_KEY"),
+    settings=ElevenLabsDialogueTTSService.Settings(
+        voice=os.getenv("ELEVENLABS_VOICE_ID"),
+        model="eleven_v4_turbo",
+    ),
+)
+
+pipeline = Pipeline(
+    [transport.input(), stt, user_aggregator, llm, tts, transport.output(), assistant_aggregator]
+)
+
+worker = PipelineWorker(
+    pipeline,
+    params=PipelineParams(enable_expressive_conversation=True),
+)
+```
+
+At start, the TTS service declares what it performs, and the LLM is taught those tags in its system instruction. A reply such as `<<sympathetic>> I'm so sorry about the wait.` is spoken sympathetically. Tags never reach the speech, the transcripts or the client's text, and the conversation's context keeps them, so the LLM sees what it wrote.
+
+## Choose What the Bot Expresses
+
+By default, the LLM is offered Pipecat's core names that the TTS service performs, with no guidance on when to use them. An `ExpressionPolicy` chooses the names and adds guidance, from presets or your own lines:
+
+```python
+from pipecat.expressive.expression import ExpressionDelivery, ExpressionSound
+from pipecat.expressive.policy import ExpressionGuidance, ExpressionPolicy
+
+policy = ExpressionPolicy(
+    guidance=[
+        ExpressionGuidance.MATCH_STYLE,
+        ExpressionGuidance.SLOW_FOR_DETAILS,
+        "Some feelings have no delivery of their own: to reassure, use calm or sympathetic.",
+    ],
+    delivery=[
+        ExpressionDelivery.SLOW,
+        ExpressionDelivery.CALM,
+        ExpressionDelivery.WARM,
+        ExpressionDelivery.SYMPATHETIC,
+        ExpressionDelivery.EXCITED,
+    ],
+    sounds=[ExpressionSound.LAUGH, ExpressionSound.SIGH],
+)
+
+worker = PipelineWorker(
+    pipeline,
+    params=PipelineParams(enable_expressive_conversation=True, expression_policy=policy),
+)
+```
+
+Names the TTS service can't perform are left out, with a warning in the log.
+
+<Tip>
+  Offer about 15 deliveries or fewer. Offered more, the LLM starts inventing
+  names of its own as the conversation goes on, and the TTS service leaves them
+  out.
+</Tip>
+
+## Hear How the User Sounds
+
+Pipecat Tone's reader reads each user turn and sets how it was meant on the transcription: the user's emotion and how likely the turn is sarcastic. Install it:
+
+```bash
+uv add "pipecat-ai[tone]"
+```
+
+Add `PipecatToneReader` between the STT service and the user aggregator:
+
+```python
+from pipecat.processors.tone.reader import PipecatToneReader
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        PipecatToneReader(),
+        user_aggregator,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+The LLM reads the reading at the head of each user message, such as `([emotion angry=0.81, neutral=0.12],[sarcasm value=0.04]) Where's my order?`, and is taught how to read it. Say what to do with a reading in the policy's guidance:
+
+```python
+policy = ExpressionPolicy(
+    guidance=[
+        ExpressionGuidance.MATCH_STYLE,
+        "If the user sounds angry at 0.7 or above, apologize once, then focus on helping.",
+        "If sarcasm is 0.7 or above, the user means the opposite of their words: answer what they mean.",
+    ],
+)
+```
+
+The reader's model downloads from Hugging Face the first time the pipeline starts, which holds the start. Download it ahead, such as when you build your image.
+
+## Let Pipecat Tone Write the Tags
+
+Pipecat Tone's tagger writes the tags for the LLM. The LLM is taught no tags, writes plain words, and the context keeps its replies plain. The tagger labels each sentence from the call so far and how the user sounded, in about 15 milliseconds on the CPU. Add `PipecatToneTagger` between the LLM and the TTS service:
+
+```python
+from pipecat.processors.tone.tagger import PipecatToneTagger
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        PipecatToneReader(),
+        user_aggregator,
+        llm,
+        PipecatToneTagger(),
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+The policy's presets steer the tagger, and its own lines go to the LLM.
+
+## Show Expression in Your App
+
+Client apps receive expression through [RTVI](/api-reference/standards/rtvi-standard) 2.3.0 and later: `bot-output` carries the delivery of the words just spoken, each sound and pause is a `bot-output` segment of its own, and `user-input` carries the reading of a transcription.
+
+On the server, the user aggregator's `on_user_turn_stopped` event carries the turn's reading:
+
+```python
+from pipecat.expressive.perception import format_perception
+
+
+@user_aggregator.event_handler("on_user_turn_stopped")
+async def on_user_turn_stopped(aggregator, strategy, message):
+    if message.perception:
+        logger.info(f"Tone: {format_perception(message.perception)}")
+```
+
+## Use an Avatar
+
+With [`TavusTransport`](/api-reference/server/services/transport/tavus), the replica's face follows the bot's delivery, such as happiness for `warm`. There is nothing to set: see [Avatars](/api-reference/server/expressive/tts-services#avatars) for the emotion each delivery shows.
+
 # Krisp VIVA
 Source: https://docs.pipecat.ai/pipecat/features/krisp-viva.md
 
@@ -35676,14 +35880,14 @@ Transcripts and `bot-output` text never contain tags or readings.
 
 ### Pipecat
 
-Pipecat 1.15.0 and later implement RCS Alpha with expressive conversation, turned on with `PipelineParams(enable_expressive_conversation=True)`. See the [examples](https://github.com/pipecat-ai/pipecat/tree/main/examples/expressive-conversation).
+Pipecat 1.15.0 and later implement RCS Alpha with [expressive conversation](/pipecat/features/expressive-conversation), turned on with `PipelineParams(enable_expressive_conversation=True)`. See the [reference](/api-reference/server/expressive/overview) and the [examples](https://github.com/pipecat-ai/pipecat/tree/main/examples/expressive-conversation).
 
 | Context type | Producers                                                                                  | Consumers                                                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
 | Perception   | Pipecat Tone's reader (`PipecatToneReader`)                                                | Every LLM service                                                                                                               |
 | Expression   | Every LLM service; Pipecat Tone's tagger (`PipecatToneTagger`) for an LLM that writes none | TTS: Azure, Cartesia, ElevenLabs, Fish Audio, Gemini, Inworld, MiniMax, Mistral and Soniox, on supported models. Avatars: Tavus |
 
-Unless `PipelineParams(expression_policy=...)` names others, Pipecat offers the LLM its core names: the deliveries `calm`, `sympathetic`, `apologetic`, `warm`, `excited`, `surprised`, `sad`, `grateful`, `curious`, `confident`, `slow` and `fast`, and the sounds `laugh`, `chuckle`, `sigh` and `breath`.
+By default, Pipecat offers the LLM its [core names](/api-reference/server/expressive/overview#core-names) that the TTS service performs.
 
 ## Roadmap
 
@@ -35704,8 +35908,8 @@ The RTVI standard for real-time voice interaction: the open protocol connecting 
 The RTVI (Real-Time Voice and Video Inference) standard defines a set of message types and structures sent between clients and servers. It is designed to facilitate real-time interactions between clients and AI applications that require voice, video, and text communication. It provides a consistent framework for building applications that can communicate with AI models and the backends running those models in real-time.
 
 <Note>
-  This page documents version 2.2.0 of the RTVI standard (Pipecat 1.13.0,
-  client-js 1.14.0). See [Protocol Versions](#protocol-versions) for what each
+  This page documents version 2.3.0 of the RTVI standard (Pipecat 1.15.0,
+  client-js 1.16.0). See [Protocol Versions](#protocol-versions) for what each
   version changed.
 </Note>
 
@@ -35794,6 +35998,7 @@ Messages added in a minor version are only sent to clients of that version or la
 
 | Version | Pipecat | client-js | Changes                                                                                                                                                                     |
 | ------- | ------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2.3.0   | 1.15.0  | 1.16.0    | `delivery` in `bot-output`; `expression_sound` and `expression_pause` output types; `perception` in `user-input`.                                                           |
 | 2.2.0   | 1.13.0  | 1.14.0    | `send-file` client message; `capabilities` in `bot-ready`; `stt-raw-text`, `llm-raw-text`, and `tts-raw-text`; `backchannel` text type.                                     |
 | 2.1.0   | 1.6.0   | 1.13.0    | `dtmf` carries a `buttons` list instead of a single `button`.                                                                                                               |
 | 2.0.0   | 1.4.0   | 1.12.0    | `bot-output` adds `will_be_spoken`, `spoken_status`, `spoken_progress`, and `segment_id`, and reports word-level progress through them instead of separate `word` messages. |
@@ -36087,6 +36292,21 @@ What the user said or typed. The observer sends one for each transcription (befo
 
     For `chat`, the id of the client's `send-text` message.
 
+  - **perception**: `array` (2.3.0+, optional)
+
+    For a transcription, how the user said it, when the server reads it. Each item is a signal of a [perception](/api-reference/standards/real-time-context-standard#perception) reading:
+    - **name**: `string`
+
+      What is read, such as `"tone"`.
+
+    - **labels**: `array`
+
+      For a signal read as labels, its likeliest labels, likeliest first, each with a `label` (`string`) and a `confidence` (`number`) from 0 to 1. Empty for a signal read as a value.
+
+    - **value**: `number` (optional)
+
+      For a signal read as a value, the measure, such as a speech rate.
+
 #### bot-output 🤖
 
 The best-effort representation of the bot's output text, including both spoken and unspoken text. In addition to transcriptions of spoken text, this message type may also include text that the bot outputs but does not speak (e.g., text sent to the client for display purposes only). Along with the text, this event includes an `output_type` field to indicate what the text represents (e.g. "sentence", "word", "code", "url") and fields describing whether and how far the bot has spoken it.
@@ -36109,6 +36329,8 @@ Text the bot won't speak is sent once, with `will_be_spoken: false` and `spoken_
     Indicates what kind of text this is (e.g., "sentence", "word", "code", "url"). "sentence", "word", and "backchannel" are reserved output types defined by the RTVI standard. Other output types may be defined by custom text aggregators used by the server.
 
     A short acknowledgment the bot says, such as "Mm-hmm.", has type `backchannel`. It is only sent to clients of protocol 2.2.0 or later.
+
+    A sound or pause the bot performs in [expressive conversation](/pipecat/features/expressive-conversation) has type `expression_sound` or `expression_pause`. Its `text` is the sound's name, such as `"laugh"`, or the pause's length in milliseconds, such as `"600"`. Each is a segment of its own, sent once as it's performed, with `spoken_status: "completed"`. They are only sent to clients of protocol 2.3.0 or later.
 
   - **text_type**: `string` (deprecated)
 
@@ -36140,6 +36362,10 @@ Text the bot won't speak is sent once, with `will_be_spoken: false` and `spoken_
     - **remaining_text**: `string`
 
       The text not yet spoken.
+
+  - **delivery**: `string[]` (2.3.0+, optional)
+
+    In [expressive conversation](/pipecat/features/expressive-conversation), the delivery of the text just spoken, by its universal names, such as `["warm", "emphasis"]`. Empty for the voice's baseline. It changes within a segment where the delivery does, so a segment's `"new"` message has none.
 
   - **spoken**: `boolean` (1.x)
 
@@ -81209,6 +81435,437 @@ The reply is then turned into results:
 - When a single question was asked and the reply has no name around its answer, the answer is taken as that question's.
 
 A call that fails, times out, or cannot be parsed raises `ClassifierError`, as does a choice that is not one of the options.
+
+# Expressive Conversation
+Source: https://docs.pipecat.ai/api-reference/server/expressive/overview.md
+
+Reference for expressive conversation: PipelineParams, ExpressionPolicy, the universal names, perception types, frames and events.
+
+## Overview
+
+With expressive conversation on, the LLM writes expression tags into its reply and the TTS service performs them, and a perception producer, such as [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader), tells the LLM how the user sounded. Tags and readings follow the [Real-time Context Standard](/api-reference/standards/real-time-context-standard), which defines their syntax.
+
+For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-conversation).
+
+<Warning>
+  Expressive conversation is alpha. Its tags, types and defaults may change
+  between releases.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card
+    title="Expressive TTS Services"
+    icon="waveform-lines"
+    href="/api-reference/server/expressive/tts-services"
+  >
+    The TTS services and models that perform tags, and what each performs
+  </Card>
+  <Card
+    title="Pipecat Tone"
+    icon="face-smile"
+    href="/api-reference/server/expressive/pipecat-tone"
+  >
+    The reader, which hears how the user sounded, and the tagger, which writes
+    tags for the LLM
+  </Card>
+</CardGroup>
+
+```python
+from pipecat.expressive.expression import (
+    CORE_DELIVERY,
+    CORE_SOUNDS,
+    ExpressionDelivery,
+    ExpressionSound,
+)
+from pipecat.expressive.perception import (
+    PerceptionCapabilities,
+    PerceptionSignal,
+    PerceptionTerm,
+    format_perception,
+)
+from pipecat.expressive.policy import ExpressionGuidance, ExpressionPolicy
+```
+
+## Configuration
+
+### PipelineParams
+
+<ParamField path="enable_expressive_conversation" type="bool" default="False">
+  Whether the agent takes part in expressive conversation. The LLM is taught the
+  tags the TTS service performs and how to read the user's perception, and the
+  TTS service performs the tags instead of speaking them.
+</ParamField>
+
+<ParamField
+  path="expression_policy"
+  type="ExpressionPolicy | None"
+  default="None"
+>
+  Which tags the LLM is offered, and when to use them. `None` offers the [core
+  names](#core-names) the TTS service performs, with no guidance. Has no effect,
+  with a warning, unless `enable_expressive_conversation` is `True`.
+</ParamField>
+
+### ExpressionPolicy
+
+<ParamField path="guidance" type="list[ExpressionGuidance | str]" default="[]">
+  Lines on when and how much to express: [presets](#expressionguidance) or your
+  own, joined in order, so a later line can refine an earlier one. Your own
+  lines reach the LLM whenever it has tags to write or a reading to act on. The
+  presets go to whoever writes the tags: the LLM, or
+  [`PipecatToneTagger`](/api-reference/server/expressive/pipecat-tone#pipecattonetagger)
+  in its place.
+</ParamField>
+
+<ParamField
+  path="delivery"
+  type="list[ExpressionDelivery | str] | None"
+  default="None"
+>
+  The deliveries to offer, by their universal names. `None` offers the core
+  deliveries. A name that isn't universal, such as an accent, is offered as
+  written. Names the TTS service can't perform are left out, with a warning.
+</ParamField>
+
+<ParamField
+  path="sounds"
+  type="list[ExpressionSound | str] | None"
+  default="None"
+>
+  The sounds to offer, as `delivery` offers deliveries. `None` offers the core
+  sounds, and `breath` only with `ExpressionGuidance.BREATHE`.
+</ParamField>
+
+### ExpressionGuidance
+
+Presets for `ExpressionPolicy.guidance`. Each is a short paragraph on one aspect of delivery, written to combine with the others and with your own lines. A preset is about writing tags, so an LLM taught no tags isn't given it.
+
+| Preset             | Guidance                                                                                                                                                  |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MATCH_STYLE`      | Match the user's mood and energy: excited for good news, sympathetic with bad news, a laugh when they're funny. Stay calm with hostility.                 |
+| `SLOW_FOR_DETAILS` | Say just what the user may need to write down, such as a code or a phone number, slowly, in a span. For a TTS service that performs `slow`.               |
+| `BREATHE`          | Take an audible breath now and then before a long or difficult sentence, at most once a reply. For a TTS service that performs a breath. Offers `breath`. |
+
+## Universal Names
+
+`ExpressionDelivery` and `ExpressionSound` name every delivery and sound the expressive TTS services perform, the same on each. A TTS service translates a universal name into its own, such as `warm` into ElevenLabs' `warmly`, while transcripts, frames and RTVI messages keep the universal name. The members are strings: `ExpressionDelivery.WARM` is `"warm"`, and `ExpressionSound.CLEAR_THROAT` is `"clear throat"`. The [Real-time Context Standard](/api-reference/standards/real-time-context-standard#universal-names) lists every name.
+
+### Core Names
+
+The core names are what the LLM is offered when the policy names none, and what `PipecatToneTagger` writes:
+
+| Constant        | Names                                                                                                                          |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `CORE_DELIVERY` | `calm`, `sympathetic`, `apologetic`, `warm`, `excited`, `surprised`, `sad`, `grateful`, `curious`, `confident`, `slow`, `fast` |
+| `CORE_SOUNDS`   | `laugh`, `chuckle`, `sigh`, `breath`                                                                                           |
+
+A breath is offered only with `ExpressionGuidance.BREATHE`.
+
+## Perception
+
+A perception producer reads how the user spoke each turn and sets it as the transcription's `perception`. The LLM reads it at the head of the user's message, formatted by `format_perception()`.
+
+### PerceptionSignal
+
+One signal of a reading, read either as labels or as a value.
+
+| Field    | Type                      | Description                                                                                                          |
+| -------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `name`   | `str`                     | What is read, such as `"emotion"`.                                                                                   |
+| `labels` | `list[tuple[str, float]]` | The likeliest labels, likeliest first, each with a confidence from 0 to 1. Empty for a signal read as a value.       |
+| `value`  | `float \| None`           | The measure, for a signal read as a value, such as a probability or words per second. `None` for one read as labels. |
+
+### PerceptionTerm
+
+One signal a perception producer reports, as it declares it at start.
+
+| Field         | Type        | Description                                                                  |
+| ------------- | ----------- | ---------------------------------------------------------------------------- |
+| `name`        | `str`       | The signal's name, as in `PerceptionSignal.name`.                            |
+| `description` | `str`       | A short line on how to read it, such as its unit or range. Defaults to `""`. |
+| `labels`      | `list[str]` | The labels it can report, for a signal read as labels. Empty for a value.    |
+
+### PerceptionCapabilities
+
+| Field     | Type                   | Description                          |
+| --------- | ---------------------- | ------------------------------------ |
+| `signals` | `list[PerceptionTerm]` | Each signal the producer can report. |
+
+### format_perception
+
+```python
+format_perception(signals: list[PerceptionSignal]) -> str
+```
+
+Returns a reading as the LLM reads it: `([emotion angry=0.81, neutral=0.12],[sarcasm value=0.04])`.
+
+## Frames
+
+| Frame                                                                        | Field        | Contents                                                                                                                                                                                                |
+| ---------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TTSMetadataFrame`                                                           | `expression` | What the TTS service performs, an [`ExpressionCapabilities`](/api-reference/server/expressive/tts-services#expressioncapabilities), or `None`. Broadcast at start and when a settings change alters it. |
+| `PerceptionMetadataFrame`                                                    | `perception` | The `PerceptionCapabilities` of a perception producer, broadcast at start.                                                                                                                              |
+| `ExpressionMetadataFrame`                                                    |              | Broadcast at start by a processor that writes the tags after the LLM, such as `PipecatToneTagger`, so the LLM is taught none.                                                                           |
+| `TranscriptionFrame`, `InterimTranscriptionFrame`, `EagerTranscriptionFrame` | `perception` | `list[PerceptionSignal] \| None`: how the user said the words, when a perception producer read them.                                                                                                    |
+| `TTSTextFrame`                                                               | `delivery`   | `list[str] \| None`: the delivery of the word just spoken, by its universal names, such as `["warm", "emphasis"]`. Empty for the voice's baseline.                                                      |
+| `LLMContextAssistantTurnFrame`                                               | `text`       | The reply's words alone, without tags.                                                                                                                                                                  |
+
+## Events
+
+The user aggregator's [`on_user_turn_stopped`](/api-reference/server/utilities/turn-management/turn-events) message carries `perception`, the turn's final reading, or `None` without a perception producer.
+
+## Notes
+
+- **Context keeps the tags**: the reply is stored in the context as the LLM wrote it, so the LLM sees the tags it used. With `PipecatToneTagger`, the context keeps the reply plain.
+- **Tags never reach text**: transcripts, `LLMContextAssistantTurnFrame` and RTVI `bot-output` text carry the words alone.
+- **Tags the TTS service can't perform**: they are left out of the speech and kept in the context.
+- **Unfinished tags**: a tag cut off at the end of a reply or by an interruption is removed.
+- **A TTS service after the LLM**: the LLM is taught the tags of the TTS service that speaks its replies. When a settings change, such as a new model or voice, changes what it performs, the LLM is taught the new tags.
+
+# Expressive TTS Services
+Source: https://docs.pipecat.ai/api-reference/server/expressive/tts-services.md
+
+The TTS services and models that perform expression tags, what each performs, the Tavus avatar, and ExpressionCapabilities.
+
+## Overview
+
+A TTS service performs expression tags through its expression adapter, which declares what the service performs and writes each tag in the provider's markup. The services below have one for the models or voices listed. Any other TTS service, or model, speaks only the words: tags are left out of its speech.
+
+For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-conversation).
+
+## Supported Services
+
+| Service                                                                                       | Models or voices                                 | Sounds              | Deliveries                   | Pauses (ms) | Emphasis | Delivery changes  |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------ | ------------------- | ---------------------------- | ----------- | -------- | ----------------- |
+| [`AzureTTSService`, `AzureHttpTTSService`](/api-reference/server/services/tts/azure)          | DragonHD and DragonHD Omni voices                | Listed              | Listed                       |             |          | Anywhere          |
+| [`CartesiaTTSService`, `CartesiaHttpTTSService`](/api-reference/server/services/tts/cartesia) | All                                              | Laughter            | Listed                       | 100–5000    |          | Between sentences |
+| [`ElevenLabsHttpTTSService`](/api-reference/server/services/tts/elevenlabs)                   | `eleven_v3`, `eleven_v4` models                  | Listed or free text | Listed or free text          | 100–3000    | Yes      | Anywhere          |
+| [`ElevenLabsDialogueTTSService`](/api-reference/server/services/tts/elevenlabs)               | All                                              | Listed or free text | Listed or free text          | 100–3000    | Yes      | Anywhere          |
+| [`FishAudioTTSService`](/api-reference/server/services/tts/fish)                              | S2 models                                        | Listed or free text | Listed or free text          | 100–1500    | Yes      | Anywhere          |
+| [`GeminiTTSService`](/api-reference/server/services/tts/google)                               | Gemini 3.8 TTS models, on the Gemini API         | Listed              | Free text, `slow` and `fast` | 100–2000    | Yes      | Between sentences |
+| [`InworldTTSService`, `InworldHttpTTSService`](/api-reference/server/services/tts/inworld)    | `inworld-tts-2`                                  | Listed              | Free text, `slow` and `fast` | 100–10000   | Yes      | Anywhere          |
+| [`InworldTTSService`, `InworldHttpTTSService`](/api-reference/server/services/tts/inworld)    | `inworld-tts-2-flash`                            | Listed              |                              | 100–10000   |          | Anywhere          |
+| [`MiniMaxHttpTTSService`](/api-reference/server/services/tts/minimax)                         | `speech-2.8` models                              | Listed              | Listed                       | 10–99990    |          | Between sentences |
+| [`MistralTTSService`](/api-reference/server/services/tts/mistral)                             | Voxtral 3 models, such as `voxtral-mini-tts-3-0` | Listed              | Listed                       |             |          | Anywhere          |
+| [`SonioxTTSService`](/api-reference/server/services/tts/soniox)                               | `tts-rt-v2`                                      | Listed              | Listed                       | 100–2000    | Yes      | Anywhere          |
+
+- **Listed**: the service performs the names it declares, the provider's own, which the LLM is offered by their universal names. See the provider's documentation for its list.
+- **Free text**: the service also takes a delivery or sound described in a few words, so any name is passed through as written.
+- **Pauses**: a pause outside the range is clamped to it. A service without a range performs no pauses.
+- **Delivery changes**: where in a reply the delivery can change. Between sentences, a sentence is spoken in the delivery its words start in, and a span's whole sentence is spoken in the span's delivery.
+
+The expression adapter is chosen by the service's model or voice, so a settings change can change what the service performs, and the LLM is taught the new tags.
+
+## Avatars
+
+### Tavus
+
+[`TavusTransport`](/api-reference/server/services/transport/tavus) sets the replica's facial emotion to follow the delivery of the bot's speech, as each word is spoken. The replica shows the emotion of the delivery's first name other than `slow`, `fast` and emphasis, such as happiness for `["warm", "slow"]`. The voice's baseline, and a delivery not in the table, show neutral. At start, a warning names the policy's deliveries that have no emotion.
+
+| Delivery                               | `TavusEmotion` |
+| -------------------------------------- | -------------- |
+| `calm`, `curious`, `confident`         | `NEUTRAL`      |
+| `warm`, `excited`, `grateful`, `happy` | `HAPPINESS`    |
+| `sympathetic`, `apologetic`, `sad`     | `SADNESS`      |
+| `surprised`                            | `SURPRISE`     |
+| `angry`                                | `ANGER`        |
+| `fearful`, `scared`                    | `FEAR`         |
+| `disgusted`                            | `DISGUST`      |
+| `contemptuous`                         | `CONTEMPT`     |
+
+```python
+from pipecat.transports.tavus.transport import TAVUS_DELIVERY_EMOTIONS, TavusEmotion
+```
+
+`TAVUS_DELIVERY_EMOTIONS` holds this table, as `dict[str, TavusEmotion]`.
+
+## ExpressionCapabilities
+
+What a TTS service performs, as its expression adapter declares it and as `TTSMetadataFrame.expression` carries it at start.
+
+```python
+from pipecat.expressive.expression import (
+    DeliveryScope,
+    ExpressionCapabilities,
+    ExpressionTerm,
+)
+```
+
+| Field                       | Type                                                     | Description                                                                                                                                                                 |
+| --------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sounds`                    | `list[ExpressionTerm]`                                   | Sounds the service makes, by its own names.                                                                                                                                 |
+| `delivery`                  | `list[ExpressionTerm]`                                   | Deliveries the service applies to the words after them, by its own names.                                                                                                   |
+| `allows_free_text_sounds`   | `bool`                                                   | Whether the service also takes sounds outside `sounds`, described in a few words. Defaults to `False`.                                                                      |
+| `allows_free_text_delivery` | `bool`                                                   | Whether the service also takes deliveries outside `delivery`. Defaults to `False`.                                                                                          |
+| `pause_range_ms`            | `tuple[int, int] \| None`                                | The shortest and longest pause, in milliseconds, or `None` when the service can't pause.                                                                                    |
+| `emphasis`                  | `bool`                                                   | Whether the service stresses words marked `^^word^^`. Defaults to `False`.                                                                                                  |
+| `delivery_scope`            | `DeliveryScope`                                          | Where in a reply the delivery can change: `ANYWHERE` (the default) or `SENTENCE`.                                                                                           |
+| `service_vocabulary`        | `dict[ExpressionDelivery \| ExpressionSound, list[str]]` | The service's names for universal names it calls something else, best first, such as `{ExpressionDelivery.WARM: ["warmly"]}`. A universal name left out is sent as written. |
+
+`ExpressionTerm` is one sound or delivery: its `name`, by the service's own name, and a `description` of when to use it, which the LLM is shown, or `""`.
+
+### delivery_name
+
+```python
+delivery_name(name: str) -> str | None
+```
+
+Returns the name the service performs a delivery by, given the name written in its tag, or `None` when it can't perform it.
+
+### sound_name
+
+```python
+sound_name(name: str) -> str | None
+```
+
+Returns the name the service performs a sound by, or `None` when it can't perform it.
+
+## Adding an Adapter
+
+To make another TTS service expressive, subclass `BaseExpressionAdapter` and set it as the service's `expression_adapter_class`, or override `get_expression_adapter()` to choose an adapter by model or voice. The service calls the adapter only with what its capabilities say it performs, by the service's own names.
+
+```python
+from pipecat.adapters.tts.base_expression_adapter import BaseExpressionAdapter
+```
+
+| Method                                           | Returns                                                                                                                          |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `capabilities()`                                 | The service's `ExpressionCapabilities`, or `None` for none.                                                                      |
+| `format_text(text, delivery, previous_delivery)` | The words to send, in their delivery. `previous_delivery` is that of the words before them, or `None` for a reply's first words. |
+| `format_sound(name)`                             | The markup for a sound at its place in the text.                                                                                 |
+| `format_pause(duration_ms)`                      | The markup for a pause, its length within the service's range.                                                                   |
+| `format_end(delivery)`                           | Text to end a sentence's request with, for markup that would otherwise last past it, or `""`.                                    |
+| `request_settings(delivery)`                     | Settings to send beside a request's text, for a service that takes some expression as settings, such as a speed, or `{}`.        |
+
+Set the markup apart from the words with spaces, so the word timestamps a service reports line up with the text it was sent.
+
+# Pipecat Tone
+Source: https://docs.pipecat.ai/api-reference/server/expressive/pipecat-tone.md
+
+Reference for PipecatToneReader, which reads how each user turn was meant, and PipecatToneTagger, which writes tags for the LLM.
+
+## Overview
+
+Pipecat Tone is two small models for [expressive conversation](/api-reference/server/expressive/overview) that run on the CPU:
+
+- [`PipecatToneReader`](#pipecattonereader) reads how each user turn was meant from its words, a perception producer that tells the LLM how the user sounded.
+- [`PipecatToneTagger`](#pipecattonetagger) writes the expression tags for the LLM's plain replies, a sentence at a time.
+
+For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-conversation).
+
+<CardGroup cols={2}>
+  <Card
+    title="Models"
+    icon="cube"
+    href="https://huggingface.co/pipecat-ai/tone-models"
+  >
+    Pipecat Tone's models on Hugging Face
+  </Card>
+  <Card
+    title="Examples"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/tree/main/examples/expressive-conversation"
+  >
+    Bots with the reader, and with the tagger
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[tone]"
+```
+
+## PipecatToneReader
+
+Reads each final user transcription, with the bot's reply before it, and sets the reading as the transcription's `perception`. Goes between the STT service and the user aggregator. A read takes a few milliseconds, and the transcription waits for it.
+
+```python
+from pipecat.processors.tone.reader import PipecatToneReader
+```
+
+### Configuration
+
+<ParamField path="revision" type="str" default='"reader-rc1"'>
+  The model's release on Hugging Face.
+</ParamField>
+
+<ParamField path="model_dir" type="str | Path | None" default="None">
+  A folder to load the model from instead of downloading it, laid out as a
+  release's `reader` folder. `revision` is then unused.
+</ParamField>
+
+<ParamField path="precision" type='Literal["fp16", "fp32"]' default='"fp16"'>
+  The weights to load.
+</ParamField>
+
+<ParamField path="threads" type="int" default="4">
+  The CPU threads for one read.
+</ParamField>
+
+### Signals
+
+| Signal    | Read as | Reading                                                                                                              |
+| --------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `emotion` | Labels  | The two likeliest emotions the words show, with their confidences. `neutral` means the words show no strong feeling. |
+| `sarcasm` | Value   | The chance the turn is sarcastic, from 0 to 1. A sarcastic turn can read as a happy emotion.                         |
+
+The LLM reads them as `([emotion angry=0.81, neutral=0.12],[sarcasm value=0.04])` at the head of the user's message, and is taught what each signal means. The emotion labels are the model's: see its model card.
+
+## PipecatToneTagger
+
+Labels each sentence of the LLM's reply with the call so far, how the user sounded and the pipeline's expression policy, and sends it on with tags the TTS service performs. Goes between the LLM and the TTS service. A sentence takes about 15 milliseconds with the `17m` model, and waits for it.
+
+At start, the tagger broadcasts an `ExpressionMetadataFrame`, so the LLM is taught no tags, writes plain words, and the context keeps its replies plain.
+
+```python
+from pipecat.processors.tone.tagger import PipecatToneTagger
+```
+
+### Configuration
+
+<ParamField path="size" type='Literal["17m", "32m"]' default='"17m"'>
+  The model's size. `32m` agrees with the model it was trained from a little
+  more often, and takes nearly three times as long a sentence.
+</ParamField>
+
+<ParamField path="revision" type="str" default='"tagger-rc1"'>
+  The model's release on Hugging Face.
+</ParamField>
+
+<ParamField path="model_dir" type="str | Path | None" default="None">
+  A folder to load the model from instead of downloading it, laid out as a
+  release's `tagger/17m` folder. `size` and `revision` are then unused.
+</ParamField>
+
+<ParamField path="threads" type="int" default="1">
+  The CPU threads for one sentence.
+</ParamField>
+
+<ParamField path="vocabulary" type="dict[ExpressionDelivery | ExpressionSound, list[str]] | None" default="None">
+  Names to write in place of a label's universal name, best first, such as
+  `{ExpressionDelivery.WARM: ["cheerful"]}`. A name is written only where the
+  TTS service performs it and the policy offers it. A name for
+  `ExpressionSound.BREATH` is written for every breath. Raises `ValueError` when
+  a key is a label the tagger doesn't write.
+</ParamField>
+
+### What It Writes
+
+| Tags     | Names                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------------------------- |
+| Delivery | The [core deliveries](/api-reference/server/expressive/overview#core-names), and slow spans for details |
+| Sounds   | The core sounds, before or after a sentence                                                             |
+| Breaths  | `light breath`, `deep breath` or `exhale` before a sentence, only with `ExpressionGuidance.BREATHE`     |
+| Emphasis | Stressed words                                                                                          |
+
+It writes only tags the TTS service performs. The policy's `delivery` and `sounds` narrow the names it writes, and its `ExpressionGuidance` presets steer it. The policy's own lines go to the LLM.
+
+## Notes
+
+- **Model download**: each model loads while the pipeline is set up, once a process, shared by every reader or tagger. The first load downloads it from Hugging Face, which holds the pipeline's start, so download it ahead, such as when you build your image, or pass `model_dir`.
+- **A model that can't load**: it's reported as an error that leaves the processor unusable. The reader passes transcriptions through unread, and with the tagger the LLM writes tags itself. The worker's [`processor_unusable_policy`](/api-reference/server/pipeline/pipeline-worker) decides whether the pipeline goes on.
+- **Expressive conversation off**: both processors need `PipelineParams(enable_expressive_conversation=True)` for the LLM to read readings or for tags to be performed.
 
 # IVRNavigator
 Source: https://docs.pipecat.ai/api-reference/server/extensions/ivr.md
