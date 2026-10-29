@@ -23,7 +23,7 @@ You can customize this behavior by providing your own strategies for more sophis
 
 ## How It Works
 
-1. **Turn Start Detection**: When any start strategy triggers, the user aggregator:
+1. **Turn Start Detection**: When the start strategies decide the user started speaking (by default, when the first one does), the user aggregator:
 
    - Marks the start of a user turn
    - Optionally emits `UserStartedSpeakingFrame`
@@ -31,13 +31,13 @@ You can customize this behavior by providing your own strategies for more sophis
 
 2. **During User Turn**: The aggregator collects transcriptions and audio frames.
 
-3. **Turn Stop Detection**: When a stop strategy triggers, the user aggregator:
+3. **Turn Stop Detection**: When the stop strategies decide the user is done (by default, when every one has), the turn controller runs the turn's inference, and the user aggregator:
 
    - Marks the end of the user turn
    - Emits `UserStoppedSpeakingFrame`
    - Pushes the aggregated user message to the LLM context
 
-4. **Timeout Handling**: If a turn stays open for `user_turn_stop_timeout` seconds (default: 5.0) while the user isn't speaking, with no speech, transcription, or turn activity in that time, the turn is automatically ended. This timeout is configurable via `LLMUserAggregatorParams` (see [Configuration](#configuration) below). When the timeout fires, the [`on_user_turn_stop_timeout`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_stop_timeout) event is emitted.
+4. **Timeout Handling**: If a turn stays open for `user_turn_stop_timeout` seconds (default: 5.0) while the user isn't speaking, with no speech, transcription, or turn activity in that time, the turn is automatically ended, unless a stop strategy has a decision of its own scheduled, in which case the timeout waits for it. This timeout is configurable via `LLMUserAggregatorParams` (see [Configuration](#configuration) below). When the timeout fires, the [`on_user_turn_stop_timeout`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_stop_timeout) event is emitted.
 
 ### When a user turn ends
 
@@ -118,6 +118,16 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 ### Additional Parameters
 
 In addition to `user_turn_strategies`, `LLMUserAggregatorParams` accepts these turn-related parameters:
+
+<ParamField
+  path="user_turn_strategies_params"
+  type="UserTurnStrategiesParams"
+  default="UserTurnStrategiesParams()"
+>
+  How the strategies combine and decide. See
+  [`UserTurnStrategiesParams`](#userturnstrategiesparams). `UserTurnProcessor`
+  and `UserTurnController` take the same parameter.
+</ParamField>
 
 <ParamField path="user_turn_stop_timeout" type="float" default="5.0">
   Safety-net timeout in seconds. If a user turn stays open this long while the
@@ -201,7 +211,7 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 ## Start Strategies
 
-Start strategies determine when a user's turn begins. Multiple strategies can be provided, and the first one to trigger will signal the start of a user turn.
+Start strategies determine when a user's turn begins. Multiple strategies can be provided. With the default `start_mode=StrategyMode.FIRST`, the first one to decide the user started signals the start of a user turn. See [`UserTurnStrategiesParams`](#userturnstrategiesparams).
 
 ### Base Parameters
 
@@ -220,7 +230,7 @@ All start strategies inherit these parameters:
 >
   _Deprecated since 1.8.0, removed in 2.0.0._ Whether a turn is announced is a
   per-turn decision: pass `enable_user_speaking_frames` to
-  `trigger_user_turn_started()` where the strategy decides the turn.
+  `report_user_turn_started()` where the strategy decides the turn.
 </ParamField>
 
 ### VADUserTurnStartStrategy
@@ -276,7 +286,7 @@ strategy = MinWordsUserTurnStartStrategy(min_words=3)
 
 ### WakePhraseUserTurnStartStrategy
 
-Requires a wake phrase to be detected before allowing interaction. This strategy blocks subsequent strategies until a wake phrase is detected in a transcription, then allows interaction for a configurable timeout period.
+Requires a wake phrase to be detected before allowing interaction. Once it hears a wake phrase in a final transcription, it starts a turn, and for a configurable timeout period afterward it starts a turn whenever the user speaks or a final transcription arrives. Speech before the wake phrase is dropped from the aggregation.
 
 <ParamField path="phrases" type="List[str]" required>
   List of wake phrases to detect (e.g., `["hey pipecat", "ok pipecat"]`).
@@ -330,10 +340,11 @@ async def on_wake_phrase_timeout(strategy):
 ```
 
 <Note>
-  This strategy should be placed **first** in the start strategies list to
-  properly gate all subsequent strategies. Use
-  `default_user_turn_start_strategies()` to extend the defaults with wake phrase
-  detection.
+  This strategy starts turns on its own, so use it as the only start strategy:
+  `start=[WakePhraseUserTurnStartStrategy(...)]`. In a `StrategyMode.FIRST`
+  list, the start strategies after it don't decide once it's awake. To combine
+  it with others, such as `MinWordsUserTurnStartStrategy`, use
+  `start_mode=StrategyMode.ALL`.
 </Note>
 
 ### KrispVivaIPUserTurnStartStrategy
@@ -427,7 +438,7 @@ All stop strategies inherit these parameters:
 >
   _Deprecated since 1.8.0, removed in 2.0.0._ Whether a turn is announced is a
   per-turn decision: pass `enable_user_speaking_frames` to
-  `trigger_user_turn_stopped()` where the strategy decides the turn.
+  `report_user_turn_stopped()` where the strategy decides the turn.
 </ParamField>
 
 ### SpeechTimeoutUserTurnStopStrategy
@@ -521,7 +532,7 @@ Delegates turn stop detection to another component in the pipeline. The end-of-t
 - `ProposedUserStoppedSpeakingFrame`: a service proposing that the turn has ended. This strategy decides, and emits the `UserStoppedSpeakingFrame` itself. It may also hold the turn open past the proposal, which is what `wait_for_transcript` does.
 - `UserStoppedSpeakingFrame`: the turn end was already decided and announced elsewhere, typically by a shared [`UserTurnProcessor`](/api-reference/server/utilities/turn-management/external-turn-management#userturnprocessor). This strategy adopts that decision and emits nothing.
 
-To shift the timing further, subclass it and override `trigger_user_turn_stopped()`, which both paths reach once they decide the turn is over.
+To shift the timing further, subclass it and override `report_user_turn_stopped()`, which both paths reach once they decide the turn is over.
 
 <ParamField path="timeout" type="float" default="0.5">
   A short delay in seconds used to handle consecutive or slightly delayed
@@ -549,7 +560,7 @@ Answers an eager end of turn while the turn is still open. Some STT services pre
 
 The prediction can be wrong in three ways, and each withdraws the response:
 
-- The user resumes speaking, and the service withdraws the eager end of turn with an `EagerEndOfTurnCancelFrame`.
+- The user resumes speaking, and the service withdraws the eager end of turn with a `UserTurnResponseCancelFrame`.
 - The committed transcript differs from the eager one, per `match_policy`.
 - The turn never commits within `speculation_timeout`.
 
@@ -578,32 +589,21 @@ strategy = EagerUserTurnStopStrategy(match_policy=ExactMatch())
 
 ### ExternalUserTurnCompletionStopStrategy
 
-Finalizes the user turn whenever a `UserTurnInferenceCompletedFrame` arrives, regardless of which component produced it. Use this when an external component — an LLM with completion markers, an STT service with built-in turn detection, a dedicated end-of-turn classifier, or custom code — decides when a turn is semantically complete and emits that frame.
+<Warning>
+  _Deprecated since 1.15.0, removed in 2.0.0._ Use
+  [`ExternalUserTurnStopStrategy`](#externaluserturnstopstrategy) instead, and
+  push a `ProposedUserStoppedSpeakingFrame` once the user is done. For the LLM's
+  turn-completion markers, use
+  [`LLMTurnCompletionUserTurnStopStrategy`](#llmturncompletionuserturnstopstrategy).
+</Warning>
 
-Pair it with one or more detector strategies wrapped in [`deferred(...)`](#deferring-finalization), which drive inference but leave finalization to this strategy:
-
-```python
-from pipecat.turns.user_stop import (
-    ExternalUserTurnCompletionStopStrategy,
-    TurnAnalyzerUserTurnStopStrategy,
-    deferred,
-)
-
-stop = [
-    deferred(TurnAnalyzerUserTurnStopStrategy(turn_analyzer=...)),
-    ExternalUserTurnCompletionStopStrategy(),
-]
-```
-
-<Note>
-  If the producer never emits `UserTurnInferenceCompletedFrame`, the
-  `user_turn_stop_timeout` watchdog finalizes the turn after no activity. Tune
-  that timeout if your producer can take longer than the default to respond.
-</Note>
+Finalizes the user turn whenever a `UserTurnInferenceCompletedFrame` arrives, regardless of which component produced it.
 
 ### LLMTurnCompletionUserTurnStopStrategy
 
-A subclass of `ExternalUserTurnCompletionStopStrategy` that adds the LLM-specific setup for the marker-based completion protocol. On `StartFrame` it enables turn-completion filtering on the LLM; finalization then happens when the LLM emits a `●` marker. This is the finalizer used by [`FilterIncompleteUserTurnStrategies`](#filterincompleteuserturnstrategies).
+Decides the user is done only when the LLM marks the turn complete. On `StartFrame` it enables turn-completion markers on the LLM, which then starts every response with `●` (complete), `◐` (the user will continue shortly), or `○` (the user needs more time). This is the strategy [`FilterIncompleteUserTurnStrategies`](#filterincompleteuserturnstrategies) adds.
+
+The strategy waits for the turn's inference instead of listening to the user, so it needs other stop strategies to decide the user stopped. Once they have, the inference runs, and this strategy decides the user is done on its `●`, on a tool call, or on a response with no marker. `◐` and `○` leave the turn open. If the user then stays quiet for `incomplete_short_timeout` or `incomplete_long_timeout`, the strategy decides the user is done and asks the LLM to re-engage them. The turn's stop timeout waits for that decision.
 
 <ParamField path="config" type="UserTurnCompletionConfig" default="None">
   Configuration applied to the LLM (turn-completion instructions,
@@ -667,22 +667,33 @@ strategy = ClassifierUserTurnStopStrategy(
 )
 ```
 
-### Deferring finalization
+### deferred()
 
-Some stop strategies should trigger LLM inference without ending the turn — finalization is owned by another strategy in the chain (such as the two above). Wrap a detector strategy with `deferred(...)` to suppress its `on_user_turn_stopped` event while keeping its [`on_user_turn_inference_triggered`](/api-reference/server/utilities/turn-management/turn-events#on_user_turn_inference_triggered) trigger:
+<Warning>
+  _Deprecated since 1.15.0, removed in 2.0.0._ No replacement. Pass the wrapped
+  strategy itself: once the stop strategies have decided, the turn's inference
+  runs, and strategies such as `LLMTurnCompletionUserTurnStopStrategy` decide on
+  it. `DeferredUserTurnStopStrategy` is deprecated the same way.
+</Warning>
 
-```python
-from pipecat.turns.user_stop import (
-    LLMTurnCompletionUserTurnStopStrategy,
-    TurnAnalyzerUserTurnStopStrategy,
-    deferred,
-)
+### Custom stop strategies
 
-stop = [
-    deferred(TurnAnalyzerUserTurnStopStrategy(turn_analyzer=...)),
-    LLMTurnCompletionUserTurnStopStrategy(),
-]
-```
+A stop strategy reports that the user is done with `report_user_turn_stopped()`. The turn controller combines the strategies' reports and runs the turn's inference itself. A strategy calls `start_user_turn_speculation()` only to answer ahead of the turn ending, and `cancel_user_turn_speculation()` to withdraw that answer. Two properties tell the controller how to treat a strategy:
+
+- `waits_for_inference` (default `False`): return `True` when the strategy decides from the turn's inference rather than from the user. The controller runs the inference once the other stop strategies have decided, and this strategy then decides from it. A strategy that decides from the inference but doesn't return `True` is treated as one that listens to the user: with `StrategyMode.ALL` the inference doesn't run until `user_turn_stop_timeout` ends the turn, and with `StrategyMode.FIRST` the turn ends without waiting for it.
+- `decision_scheduled` (default `False`): return `True` while the strategy is sure to decide soon on its own, such as while a timer of its own is pending. `user_turn_stop_timeout` then waits instead of ending the turn.
+
+`BaseUserTurnStartStrategy` and `BaseUserTurnStopStrategy` have deprecated methods with replacements:
+
+| Deprecated                                                           | Replacement                      |
+| -------------------------------------------------------------------- | -------------------------------- |
+| `BaseUserTurnStartStrategy.trigger_user_turn_started()`              | `report_user_turn_started()`     |
+| `BaseUserTurnStopStrategy.trigger_user_turn_stopped()`               | `report_user_turn_stopped()`     |
+| `BaseUserTurnStopStrategy.trigger_user_turn_finalized()`             | `report_user_turn_stopped()`     |
+| `BaseUserTurnStopStrategy.trigger_user_turn_inference_triggered()`   | `start_user_turn_speculation()`  |
+| `BaseUserTurnStopStrategy.trigger_user_turn_speculation_cancelled()` | `cancel_user_turn_speculation()` |
+
+All are deprecated since 1.15.0 and removed in 2.0.0. A subclass that overrides `trigger_user_turn_started()` or `trigger_user_turn_stopped()` keeps receiving the reports until then. `trigger_user_turn_inference_triggered()` ignores a call that isn't a speculation.
 
 ## Helper Functions
 
@@ -692,16 +703,16 @@ Pipecat provides helper functions to compose custom strategy lists that extend t
 
 Returns the default user turn start strategies: `[VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy]`.
 
-Useful when building a custom strategy list that extends the defaults, such as adding wake phrase detection before the standard strategies.
+Useful when building a custom strategy list that extends the defaults.
 
 ```python
-from pipecat.turns.user_start import WakePhraseUserTurnStartStrategy
+from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import default_user_turn_start_strategies
 
-# Add wake phrase detection before the defaults
+# Extend the defaults with another start strategy
 start_strategies = [
-    WakePhraseUserTurnStartStrategy(phrases=["hey pipecat"]),
     *default_user_turn_start_strategies(),
+    MinWordsUserTurnStartStrategy(min_words=3),
 ]
 ```
 
@@ -727,10 +738,10 @@ Container for configuring user turn start and stop strategies.
   type="list[BaseUserTurnStartStrategy] | None"
   default="None"
 >
-  List of strategies used to detect when the user starts speaking. The first
-  strategy to trigger will signal the start of the user's turn. `None` or an
-  empty list uses `[VADUserTurnStartStrategy(),
-  TranscriptionUserTurnStartStrategy()]`.
+  List of strategies used to detect when the user starts speaking. With
+  `start_mode=StrategyMode.FIRST`, the first strategy to decide signals the
+  start of the user's turn. `None` or an empty list uses
+  `[VADUserTurnStartStrategy(), TranscriptionUserTurnStartStrategy()]`.
 </ParamField>
 
 <ParamField
@@ -739,9 +750,69 @@ Container for configuring user turn start and stop strategies.
   default="None"
 >
   List of strategies used to detect when the user stops speaking and expects a
-  response. `None` or an empty list uses AI-powered turn detection:
+  response. With `stop_mode=StrategyMode.ALL`, every strategy has to decide
+  before the turn ends. `None` or an empty list uses AI-powered turn detection:
   `[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]`.
 </ParamField>
+
+## UserTurnStrategiesParams
+
+Chooses how user turn strategies combine and decide. Pass it as `user_turn_strategies_params` to `LLMUserAggregatorParams`, `UserTurnProcessor`, or `UserTurnController`.
+
+```python
+from pipecat.turns.user_turn_strategies import (
+    MergeMode,
+    StrategyMode,
+    UserTurnStrategiesParams,
+)
+
+user_params = LLMUserAggregatorParams(
+    user_turn_strategies_params=UserTurnStrategiesParams(
+        stop_mode=StrategyMode.FIRST,
+    ),
+)
+```
+
+<ParamField path="start_mode" type="StrategyMode" default="StrategyMode.FIRST">
+  `FIRST` starts the turn on the first start strategy that decides the user
+  started. `ALL` waits until every start strategy has. In an `ALL` list each
+  strategy is a condition the turn needs, so a fallback such as
+  `TranscriptionUserTurnStartStrategy` belongs in a `FIRST` list.
+</ParamField>
+
+<ParamField path="stop_mode" type="StrategyMode" default="StrategyMode.ALL">
+  `ALL` ends the turn once every stop strategy has decided the user is done.
+  `FIRST` ends it on the first one that does. For example,
+  `TurnAnalyzerUserTurnStopStrategy` next to `SpeechTimeoutUserTurnStopStrategy`
+  ends the turn only once both say the user is done in `ALL` mode. A stop
+  strategy that waits for the turn's inference, such as
+  `LLMTurnCompletionUserTurnStopStrategy`, decides on it in either mode. The
+  user speaking again clears the decisions made so far. A list with a single
+  stop strategy behaves the same in both modes.
+</ParamField>
+
+<ParamField
+  path="start_merge_mode"
+  type="MergeMode"
+  default="MergeMode.REPLACE"
+>
+  How the bot's start strategies combine with the ones a service recommends.
+  `REPLACE` uses the bot's strategies instead of the service's. `EXTEND` adds
+  them to the service's list, or to the defaults when no service recommends any.
+</ParamField>
+
+<ParamField path="stop_merge_mode" type="MergeMode" default="MergeMode.REPLACE">
+  How the bot's stop strategies combine with the ones a service recommends, with
+  the same values as `start_merge_mode`.
+</ParamField>
+
+<Note>
+  `ProcessFrameResult` is deprecated since 1.15.0 and removed in 2.0.0. Use
+  `StrategyMode` instead: strategies don't return anything from
+  `process_frame()`, and every strategy sees every frame. Until 2.0.0, a
+  `StrategyMode.FIRST` list still honors `ProcessFrameResult.STOP`, with a
+  deprecation warning.
+</Note>
 
 ## ExternalUserTurnStrategies
 
@@ -833,7 +904,18 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 ## FilterIncompleteUserTurnStrategies
 
-A convenience class that preconfigures `UserTurnStrategies` for LLM-gated turn completion. It wraps your detector chain with `deferred(...)` and appends an `LLMTurnCompletionUserTurnStopStrategy`, so the public `on_user_turn_stopped` event fires only when the LLM confirms the turn is complete (`●`). Detector strategies still drive LLM inference via `on_user_turn_inference_triggered`.
+A convenience class that preconfigures `UserTurnStrategies` for LLM-gated turn completion. It keeps your stop strategies and appends an `LLMTurnCompletionUserTurnStopStrategy`. Once the other stop strategies decide the user stopped, the turn's inference runs, and the turn ends only when the LLM confirms it is complete (`●`). It works with either `stop_mode`.
+
+To add the LLM gate and any stop strategies you pass to the ones a service recommends, such as an STT service's own turn detection, set `stop_merge_mode=MergeMode.EXTEND`:
+
+```python
+user_params = LLMUserAggregatorParams(
+    user_turn_strategies=FilterIncompleteUserTurnStrategies(),
+    user_turn_strategies_params=UserTurnStrategiesParams(
+        stop_merge_mode=MergeMode.EXTEND,
+    ),
+)
+```
 
 ```python
 from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
@@ -950,23 +1032,17 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 ### Wake Phrase Detection
 
-Require a wake phrase before allowing interaction, then use the default turn strategies:
+Require a wake phrase before allowing interaction, then use the default stop strategies:
 
 ```python
 from pipecat.turns.user_start import WakePhraseUserTurnStartStrategy
-from pipecat.turns.user_turn_strategies import (
-    UserTurnStrategies,
-    default_user_turn_start_strategies,
-)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
     context,
     user_params=LLMUserAggregatorParams(
         user_turn_strategies=UserTurnStrategies(
-            start=[
-                WakePhraseUserTurnStartStrategy(phrases=["hey pipecat"]),
-                *default_user_turn_start_strategies(),
-            ],
+            start=[WakePhraseUserTurnStartStrategy(phrases=["hey pipecat"])],
         ),
     ),
 )
