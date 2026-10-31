@@ -70,15 +70,16 @@ Requires Python 3.11 or later, like `pipecat-ai`.
 
 ## Prerequisites
 
-- **No API key.** The model (75 MB) downloads from Hugging Face on first use
-  and is cached.
-- **CPU.** With the default settings the filter uses 2 CPU threads per call.
-  See [Choosing the CPU settings](#choosing-the-cpu-settings).
+- **No API key.** The model (74 MB) downloads from Hugging Face on first use
+  and is cached. `voxlock download` fetches it ahead of time, e.g. while
+  building a Docker image.
+- **CPU.** With the default settings the filter takes 61% of one CPU core per
+  call. See [Choosing the CPU settings](#choosing-the-cpu-settings).
 
 ## Configuration
 
 <ParamField path="voice_sample" type="np.ndarray | None" default="None">
-  About 3 seconds of the caller's voice, 16 kHz mono float32. When given,
+  At least 3 seconds of the caller's voice, 16 kHz mono float32. When given,
   isolation starts from the first audio frame.
 </ParamField>
 
@@ -89,19 +90,26 @@ Requires Python 3.11 or later, like `pipecat-ai`.
 
 <ParamField path="chunk_ms" type="int" default="80">
   Audio is run through the model in chunks of this length. Larger chunks use
-  less CPU and add their length to the delay.
+  less CPU and add to the delay.
 </ParamField>
 
-<ParamField path="threads" type="int" default="2">
+<ParamField path="threads" type="int" default="1">
   onnxruntime threads for this filter.
 </ParamField>
 
 <ParamField path="precision" type="str" default='"int8"'>
-  Model files: `"int8"`, `"int8-full"` (fastest), `"fp16"` or `"fp32"`.
+  Model files: `"int8"`, `"int8-full"`, `"fp16"` or `"fp32"` (the benchmarked
+  model).
 </ParamField>
 
 <ParamField path="model_dir" type="str | None" default="None">
-  Folder with the ONNX files. `None` downloads them from Hugging Face.
+  Folder with the ONNX files. `None` downloads them from Hugging Face. The model
+  is loaded once per process and shared by every call.
+</ParamField>
+
+<ParamField path="delay_ms" type="float | None" default="None">
+  How far the output trails the input. `None` is two chunks plus 24 ms, plus
+  the resampling delay when the transport is not at 16 kHz.
 </ParamField>
 
 ## Usage
@@ -135,13 +143,14 @@ audio_filter = VoxLockFilter(voice_sample=sample)
 
 ### Choosing the CPU settings
 
-| CPU                                     | Settings                                 | Real-time factor |
-| --------------------------------------- | ---------------------------------------- | ---------------- |
-| 2 or more threads (default)             | `VoxLockFilter()`                        | 0.67             |
-| One vCPU, e.g. Pipecat Cloud `agent-2x` | `VoxLockFilter(chunk_ms=160, threads=1)` | 0.73             |
+| Settings                      | CPU per call     | Delay at 16 kHz |
+| ----------------------------- | ---------------- | --------------- |
+| `VoxLockFilter()` (default)   | 61% of one core  | 184 ms          |
+| `VoxLockFilter(chunk_ms=40)`  | 77% of one core  | 104 ms          |
 
-Measured on an 8-vCPU Xeon server; below 1 keeps up with the call. Half a vCPU
-(Pipecat Cloud `agent-1x`) is too little.
+One thread on a Google Cloud Xeon @ 2.20 GHz. The default fits a single vCPU
+such as Pipecat Cloud's `agent-2x`; half a vCPU (`agent-1x`) is too little.
+Resampling adds 39 ms to the delay at 48 kHz and 120 ms at 8 kHz.
 
 ## Input Frames
 
@@ -165,11 +174,13 @@ await worker.queue_frame(FilterEnableFrame(enable=True))
 - Input is 16-bit mono PCM at the transport's sample rate. The filter resamples
   to 16 kHz for the model and back, so 8 kHz telephony and 48 kHz WebRTC both
   work.
-- Audio is collected into `chunk_ms` chunks, so some calls to `filter()`
-  return no audio; the input transport skips those.
+- The model runs on its own thread, so the transport's audio loop never waits
+  for it. Every call to `filter()` returns as many bytes as it received, a
+  fixed delay behind; a stretch the model has not finished in time, such as the
+  first seconds after it locks on to the caller, goes out unprocessed.
 
 ## Compatibility
 
-Tested with Pipecat 1.12.0. See the
+Requires `voxlock` 1.3.0 or later. Tested with Pipecat 1.15.0. See the
 [changelog](https://github.com/arbazsiddiqui/voxlock/blob/main/CHANGELOG.md)
 for the latest tested version.
