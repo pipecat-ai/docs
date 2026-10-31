@@ -6,7 +6,7 @@ description: "Real-time STT with ZoomAISTTService over the Zoom AI Services Scri
 
 ## Overview
 
-`ZoomAISTTService` provides real-time speech recognition with the [Scribe API](https://developers.zoom.us/docs/ai-services/scribe/) from Zoom AI Services, streaming audio over a WebSocket in [Live mode](https://developers.zoom.us/docs/ai-services/scribe/live-mode/). Scribe detects when each user turn ends, so the service drives turn detection for live streaming without a local VAD. It supports Scribe's additional features, including English Pro model, multilingual models, language detection, speaker diarization, custom vocabulary, and text polishing, etc.
+`ZoomAISTTService` provides real-time speech recognition with the [Scribe API](https://developers.zoom.us/docs/ai-services/scribe/) from Zoom AI Services, streaming audio over a WebSocket in [Live mode](https://developers.zoom.us/docs/ai-services/scribe/live-mode/). By default, Scribe detects when each user turn ends, so the service drives turn detection without a local VAD. With `vad_force_turn_endpoint=True`, Pipecat's VAD and turn strategies (such as Smart Turn) decide when the user is done instead, and the service asks Scribe for the final transcript at each VAD stop. It supports Scribe's additional features, including English Pro model, multilingual models, language detection, speaker diarization, custom vocabulary, and text polishing, etc.
 
 <CardGroup cols={2}>
   <Card
@@ -79,13 +79,34 @@ Before using Zoom AI STT, you need:
   rate. Audio is resampled to 16 kHz for Scribe.
 </ParamField>
 
+<ParamField path="vad_force_turn_endpoint" type="bool" default="False">
+  Controls turn detection mode. When `False` (Scribe turn detection, default):
+  Scribe's voice activity detection ends each turn after `silence_duration_ms`
+  of silence, and the service proposes each turn boundary. When `True` (Pipecat
+  mode): Scribe's voice activity detection is turned off, and each
+  `VADUserStoppedSpeakingFrame` sends `input_audio_buffer.commit`, so Scribe
+  returns that turn's final transcript right away. The service emits no turn
+  frames; the user aggregator's VAD and turn strategies decide when the user is
+  done. Requires a VAD analyzer in the pipeline. See [With Pipecat Turn
+  Detection](#with-pipecat-turn-detection).
+</ParamField>
+
 <ParamField path="should_interrupt" type="bool" default="True">
-  Whether a user turn started by Scribe interrupts the bot.
+  Whether a user turn started by Scribe interrupts the bot. Only applies with
+  Scribe turn detection (`vad_force_turn_endpoint=False`). See [User Turn
+  Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstrategies)
+  if you pass your own `user_turn_strategies`.
 </ParamField>
 
 <ParamField path="settings" type="ZoomAISTTService.Settings" default="None">
   Runtime-configurable settings for the STT service. See [Settings](#settings)
   below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float | None" default="0.53">
+  P99 latency from speech end to final transcript in seconds, reported with
+  `vad_force_turn_endpoint=True`. Override for your deployment. See
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark).
 </ParamField>
 
 ### Settings
@@ -96,7 +117,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | --------------------- | ------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`               | `str \| None`       | `None`           | Recognition model, such as `zoom-scribe-en-pro` or `zoom-scribe-multilingual`. `None` lets Scribe choose a compatible model. See [Select a model](https://developers.zoom.us/docs/ai-services/scribe/speech-understanding/#select-a-model).                                                                                                          |
 | `language`            | `Language \| str`   | `Language.EN_US` | Language of the audio; with language detection, the preferred initial language.                                                                                                                                                                                                                                                                      |
-| `silence_duration_ms` | `int \| None`       | `350`            | Milliseconds of silence that end a turn. Pipecat's default is 350ms optimized for voice agent use case. `None` uses Scribe's default.                                                                                                                                                                                                                |
+| `silence_duration_ms` | `int \| None`       | `350`            | Milliseconds of silence that end a turn. Pipecat's default is 350ms optimized for voice agent use case. `None` uses Scribe's default. Not used with `vad_force_turn_endpoint=True`.                                                                                                                                                                  |
 | `diarization`         | `bool \| None`      | `False`          | Whether Scribe labels each transcript with its speaker. See [Configuring Scribe Features](#configuring-scribe-features).                                                                                                                                                                                                                             |
 | `language_detection`  | `str \| None`       | `None`           | Language detection mode; Live mode supports `"continuous"`. `None` turns it off. See [With the Multilingual Model](#with-the-multilingual-model).                                                                                                                                                                                                    |
 | `vocabulary`          | `list[str] \| None` | `None`           | [Custom vocabulary](https://developers.zoom.us/docs/ai-services/scribe/custom-vocabulary/): names, acronyms, and terms to recognize. See [Configuring Scribe Features](#configuring-scribe-features).                                                                                                                                                |
@@ -166,6 +187,31 @@ stt = ZoomAISTTService(
 
 See [Detect languages](https://developers.zoom.us/docs/ai-services/scribe/speech-understanding/#detect-languages) and [Multilingual model languages](https://developers.zoom.us/docs/ai-services/scribe/speech-understanding/#multilingual-model-languages) for the supported languages.
 
+### With Pipecat Turn Detection
+
+Set `vad_force_turn_endpoint=True` to let Pipecat decide when the user is done. Scribe's voice activity detection is turned off, and the service commits each turn when the local VAD stops, so the final transcript comes back right after the user stops speaking. Pipecat's default user turn strategies (VAD with Smart Turn) apply, so configure a VAD analyzer:
+
+```python
+import os
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.services.zoom_ai.stt import ZoomAISTTService
+
+stt = ZoomAISTTService(
+    api_key=os.getenv("ZOOM_AI_API_KEY"),
+    vad_force_turn_endpoint=True,  # Pipecat's VAD and turn strategies end each turn
+)
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+)
+```
+
 ### Updating Settings Mid-Stream
 
 Send an `STTUpdateSettingsFrame` to change settings during a conversation. The service reconnects with a new Scribe session once the current turn ends:
@@ -185,7 +231,10 @@ await worker.queue_frame(
 - **Final transcripts only**: The service pushes a final transcript per turn, with no interim results.
 - **Idle sessions**: Scribe ends a session after 30 seconds without audio, so the service sends keepalive silence when input stops (see [Session limits](https://developers.zoom.us/docs/ai-services/scribe/live-mode/#session-limits)). Keepalive silence and the silence sent to end a turn count toward usage.
 - **Errors**: If Zoom refuses the connection (for example, an invalid API key), the error includes Zoom's reason. If Scribe rejects the session's settings, the error has the `INVALID_REQUEST` category, since a new session would be rejected the same way. Errors include the session's tracking ID (`x-zm-trackingid`), which Zoom support uses to find a session. See [Error Handling](/pipecat/fundamentals/error-handling).
-- **Time to final segment (TTFS)**: Scribe defines the turn boundary, so the service reports no TTFS metric.
+- **Turn detection modes**:
+  - **Scribe mode** (`vad_force_turn_endpoint=False`, default): Scribe's voice activity detection ends each turn after `silence_duration_ms` of silence. The service proposes each turn boundary and automatically requests `ExternalUserTurnStrategies`, so no local VAD is needed. `should_interrupt` (default `True`) sets whether the user starting to speak, as detected by Scribe, interrupts the bot.
+  - **Pipecat mode** (`vad_force_turn_endpoint=True`): Scribe's voice activity detection is off (`turn_detection: {"type": "none"}` in the session), and each `VADUserStoppedSpeakingFrame` sends `input_audio_buffer.commit`. Scribe has often decoded the turn by then, so the final comes back quickly. The service emits no turn frames, and silence is not sent to end a turn when input stops, since the commit ends it.
+- **Time to final segment (TTFS)**: In Scribe mode, Scribe defines the turn boundary, so the service reports no TTFS metric. In Pipecat mode it reports `ttfs_p99_latency` (default 0.53 s, measured with the default model and `VADParams.stop_secs=0.2`).
 
 ## Event Handlers
 
