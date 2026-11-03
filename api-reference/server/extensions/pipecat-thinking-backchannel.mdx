@@ -1,6 +1,6 @@
 ---
 title: "Pipecat Thinking Backchannel"
-description: "Backchannel implementation that plays short fillers while the bot is thinking or running tools"
+description: "Signal processor that fires when the bot has gone quiet thinking or running tools, so the app can speak a filler"
 ---
 
 import { CommunityMaintained } from "/snippets/community-maintained.mdx";
@@ -13,29 +13,23 @@ import { CommunityMaintained } from "/snippets/community-maintained.mdx";
 
 ## Overview
 
-`ThinkingBackchannel` makes your bot sound like it's working while it works. It
-plays short fillers ("hmm", "one sec", "let me check") into the silences an
-agentic pipeline leaves: the wait for the LLM's first token, and the wait for
-each tool call. An agent that calls three tools before answering can leave the
-user listening to nothing for tens of seconds, spread over five gaps.
+`BotWorkingIdleProcessor` tells your app when the bot has gone quiet at work.
+An agentic pipeline leaves silences the user can't tell from a hang: the wait
+for the LLM's first token, and the wait for each tool call. The processor
+watches the reply and function-call frames, and fires
+`on_bot_working_idle(kind, function_name)` when a wait runs long. What to say
+about it — a phrase, a clip, nothing — is the app's decision.
 
-It is the companion to [`Pipecat
-Backchannel`](/api-reference/server/extensions/pipecat-backchannel): that one
-makes the bot sound like it's *listening* while the user talks; this one makes
-it sound like it's *working* while it thinks.
+The split is the same as `UserIdleController` on the user side: the signal
+knows *that* the bot is quietly working; the handler decides *what* happens.
 
-A thinking-backchannel takes no turn: every frame passes through unchanged, and
-clips play with `append_to_context=False`, so the bot's conversation history
-has no record that anything happened.
+The processor also watches the transport's `BotStarted/StoppedSpeakingFrame`
+upstream, so nothing fires while the bot is actually speaking. A wait that
+expires mid-speech is held and fires the moment the silence opens.
 
-The gate is a frame state machine, not a model: no VAD, no turn analyzer, no
-ONNX, and zero added inference while the user speaks. It watches the frames
-already flowing downstream of the TTS service — `LLMFullResponseStartFrame`,
-`FunctionCallInProgressFrame`, and the audio frames that mean real output.
-
-Clips are recorded once from your own TTS service and cached on disk, so they
-come out in the bot's voice and cost no LLM call and no network round trip at
-playback time.
+The default action (`speak_filler`) speaks through your real TTS with
+`append_to_context=False`, so fillers behave like any other utterance for turn
+tracking, RTVI events and interruptions, and never reach the LLM context.
 
 <CardGroup cols={2}>
   <Card
@@ -64,98 +58,89 @@ uv add pipecat-thinking-backchannel
 
 ## Prerequisites
 
-No account or API key of its own. Clips are recorded through the TTS service
-already in your pipeline, so whichever keys that service needs are the only
-ones involved.
+No account or API key of its own.
 
 - **Pipecat 1.6.0 or later**: `pipecat-ai>=1.6.0,<2`
-- **A TTS service in the pipeline**: used once to record the clips
-- **A function-calling LLM in the pipeline**: the gate watches
-  `FunctionCall*` frames; without tools it only covers the first-token wait
-- **Writable working directory**: clips are cached in `.clip_cache/` by
-  default. Delete that directory after changing voice.
-
-The first session records the clips and is held in startup while it does. Call
-`prewarm()` at application start to move that cost out of the request path.
+- **A pipeline agent** (STT, LLM, TTS): the signal watches reply and
+  function-call frames; speech-to-speech models don't emit them
+- **A TTS service**, if you use the default `speak_filler` action
 
 ## Configuration
 
-Constructor arguments for `ThinkingBackchannel`. Every default works
-unconfigured; each argument replaces one part of that default.
+Constructor arguments for `BotWorkingIdleProcessor`. Every default works
+unconfigured.
 
-<ParamField path="params" type="ThinkingParams" default="None">
-  Timing and frequency of the gate. See [Params](#params) below.
-</ParamField>
-
-<ParamField
-  path="clip_groups"
-  type="Mapping[str, Sequence[str]]"
-  default="None"
->
-  The clip inventory, grouped by conversational function: `thinking` for the
-  first-token wait, `working` for tool runs. Give each group at least two
-  clips, or it repeats itself.
-</ParamField>
-
-<ParamField path="cache" type="ClipCache" default="None">
-  Where clips are kept between runs. Defaults to
-  `FileClipCache(".clip_cache")`.
-</ParamField>
-
-<ParamField path="volume" type="float" default="1.0">
-  How loud clips play, where `1.0` is exactly as recorded. Unlike the
-  user-side backchannel — which sits under someone else's speech and defaults
-  to 0.6 — here the bot has the floor and the silence, so full volume is
-  right.
+<ParamField path="params" type="BotWorkingIdleParams" default="None">
+  The dials for the wait timings and how chatty the signal is. See
+  [Params](#params) below.
 </ParamField>
 
 ### Params
 
 Runtime tuning passed via the `params` constructor argument using
-`ThinkingParams(...)`.
+`BotWorkingIdleParams(...)`.
 
-| Parameter          | Type    | Default | Description                                                                                  |
-| ------------------ | ------- | ------- | -------------------------------------------------------------------------------------------- |
-| `llm_delay_s`      | `float` | `1.0`   | How long to wait for the first token before saying anything.                                  |
-| `tool_delay_s`     | `float` | `0.8`   | How long to wait for a running tool before saying anything. Parallel batches re-arm, not stack. |
-| `cooldown_s`       | `float` | `4.0`   | Minimum time between two clips.                                                               |
-| `fire_probability` | `float` | `0.9`   | Chance of firing at an otherwise eligible moment. Below 1.0, or it sounds mechanical.         |
-| `max_per_episode`  | `int`   | `2`     | Most clips within one episode: from the first arm until real audio or the end of the response. |
+| Parameter          | Type    | Default | Description                                                                                     |
+| ------------------ | ------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `llm_delay_s`      | `float` | `1.0`   | How long the bot must be quiet waiting for its first token before the event fires.               |
+| `tool_delay_s`     | `float` | `0.8`   | How long the bot must be quiet waiting on a tool. Parallel calls re-arm the timer, never stack.   |
+| `cooldown_s`       | `float` | `4.0`   | Minimum time between two events.                                                                 |
+| `fire_probability` | `float` | `0.9`   | Chance of firing at an otherwise eligible moment. Below 1.0, or it sounds mechanical.             |
+| `max_per_episode`  | `int`   | `2`     | Most events within one reply, from the first arm until the reply ends or an interruption lands.   |
 
 <Note>
-  Speech-to-speech models don't emit the frames the gate watches, so this
-  integration covers pipeline agents only. See the [source
+  The processor adds no inference: it is a frame state machine with one
+  timer — no VAD, no turn model, no ONNX. See the [source
   repository](https://github.com/iamdgarcia/pipecat-thinking-backchannel) for
-  the authoritative, up-to-date list of parameters, defaults, and limitations.
+  the authoritative, up-to-date list of parameters and defaults.
 </Note>
 
 ## Usage
 
-`ThinkingBackchannel` is a wrapper around your processor list, not a service
-you place yourself. It inserts its processors directly after the TTS service
-and returns a new list:
+Place the processor between the LLM and the TTS, and wire the event. The
+default action speaks a filler through your real TTS, out of the LLM context:
 
 ```python
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat_thinking_backchannel import ThinkingBackchannel
+from pipecat_thinking_backchannel import (
+    BotWorkingIdleProcessor,
+    speak_filler,
+)
 
-thinking = ThinkingBackchannel()  # one per process, not per session
+idle = BotWorkingIdleProcessor()
+idle.add_event_handler("on_bot_working_idle", speak_filler(tts))
 
-pipeline = Pipeline(thinking([
+pipeline = Pipeline([
     transport.input(),
     stt,
     context_aggregator.user(),
-    llm,          # with function-calling tools
+    llm,
+    idle,  # between the LLM and the TTS
     tts,
     transport.output(),
     context_aggregator.assistant(),
-]))
+])
 ```
 
-Record the clips at application startup so the first caller doesn't wait:
+Bring your own words, keyed by signal kind:
 
 ```python
-await thinking.prewarm(tts=make_tts())  # throwaway TTS instance
+idle.add_event_handler(
+    "on_bot_working_idle",
+    speak_filler(tts, {
+        "llm": ("Let me think.", "Good question."),
+        "tool": ("Let me check on that.", "One moment."),
+    }),
+)
+```
+
+Or handle the event yourself — the event carries `function_name`, so per-tool
+phrases and learned tool durations are a small handler away:
+
+```python
+@idle.event_handler("on_bot_working_idle")
+async def on_bot_working_idle(processor, kind, function_name=None):
+    phrase = PHRASES.get(function_name) or PHRASES[kind]
+    await tts.queue_frame(TTSSpeakFrame(phrase, append_to_context=False))
 ```
 
 ## Compatibility
