@@ -13,7 +13,7 @@ Idle detection monitors user activity and:
 
 1. Starts a timer when the bot finishes speaking (`BotStoppedSpeakingFrame`)
 2. Cancels the timer when the user or bot starts speaking
-3. Suppresses the timer during function calls and active user turns (to avoid false triggers during interruptions)
+3. Suppresses the timer during function calls and active user turns (to avoid false triggers during interruptions), and while work the conversation waits on is in flight, which the [waiting timer](#reassuring-a-waiting-user) covers
 4. Restarts the timer after a user turn that ends with no transcript and gets no reply (e.g. background noise)
 5. Emits an `on_user_turn_idle` event when the timer expires
 6. Allows you to implement escalating responses or gracefully end the conversation in your application code
@@ -118,6 +118,45 @@ await worker.queue_frame(UserIdleTimeoutUpdateFrame(timeout=0))
 **Immediate application**: Timeout updates take effect immediately. If an idle timer is currently running, it restarts with the new duration. If the bot is waiting for the user to speak and you enable a positive timeout (e.g., upgrading from `0` to `10.0`), the timer arms right away without waiting for the next bot turn.
 
 This is useful when you want to enable idle detection only at certain points in the conversation, or adjust the timeout based on context.
+
+## Reassuring a Waiting User
+
+A quiet conversation can also be the bot's silence: it holds the turn while work it started runs, such as an asynchronous function call (`cancel_on_interruption=False`) or an [`LLMWithBackend`](/pipecat/learn/llm-with-backend) backend's delegated task. Such work is announced by a [`BackgroundWorkStartedFrame`](/api-reference/server/frames/system-frames#backgroundworkstartedframe), and while it is in flight the idle timer does not run. `user_waiting_timeout` times that silence instead, and `on_user_waiting` fires when it has lasted that long:
+
+```python
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_idle_timeout=5.0,
+        user_waiting_timeout=10.0,  # Quiet for 10 seconds while work runs
+    ),
+)
+
+@user_aggregator.event_handler("on_user_waiting")
+async def on_user_waiting(aggregator):
+    await aggregator.push_frame(TTSSpeakFrame("Still working on it."))
+```
+
+The event fires once per start of its timer, and the bot speaking again starts the timer over, so a reply like the one above gets another event after the next `user_waiting_timeout` of quiet. The last work finishing hands the silence back to the idle timer.
+
+For a remark in the LLM's own words, shaped by what the user asked for, place a [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) after the LLM instead of handling the event:
+
+```python
+from pipecat.processors.wait_reassurance import WaitReassurance
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        WaitReassurance(),  # Asks the LLM whether to say a word after 10 seconds of quiet
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
 
 ## Best Practices
 

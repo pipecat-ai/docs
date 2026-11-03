@@ -4556,7 +4556,7 @@ async def get_current_weather(params: FunctionCallParams, location: str, format:
 
 With `cancel_on_interruption=True` (the default), the call is **synchronous**: the LLM waits for the result before generating its next response. This ensures the LLM has complete information before responding.
 
-With `cancel_on_interruption=False`, the call is **asynchronous**: the conversation is not held while the function runs. If the result arrives before the conversation has moved on (before a new user message, developer message, or intermediate update from the call itself), it settles in place as an ordinary tool result, indistinguishable from a synchronous call. Assistant messages — text the model generates or filler spoken with a `TTSSpeakFrame` while the call runs — do not cause deferral. If the result arrives after the conversation has moved on, it's injected back into the context as a developer message, triggering a new LLM inference at that point. This enables truly non-blocking calls where the conversation proceeds while the function runs in the background. Async calls can also send [intermediate updates](#intermediate-results-for-async-functions) before their final result.
+With `cancel_on_interruption=False`, the call is **asynchronous**: the conversation is not held while the function runs. If the result arrives before the conversation has moved on (before a new user message, developer message, or intermediate update from the call itself), it settles in place as an ordinary tool result, indistinguishable from a synchronous call. Assistant messages — text the model generates or filler spoken with a `TTSSpeakFrame` while the call runs — do not cause deferral. If the result arrives after the conversation has moved on, it's injected back into the context as a developer message, triggering a new LLM inference at that point. This enables truly non-blocking calls where the conversation proceeds while the function runs in the background. Async calls can also send [intermediate updates](#intermediate-results-for-async-functions) before their final result. An async call is bracketed by a [`BackgroundWorkStartedFrame` and a `BackgroundWorkFinishedFrame`](/api-reference/server/frames/system-frames#backgroundworkstartedframe), so the user aggregator does not report the user idle while it runs, and a [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) placed after the LLM can keep the conversation from going silent.
 
 #### Async function call cancellation
 
@@ -7890,6 +7890,29 @@ When the backend has something the user really needs to hear, such as a result o
 
 To the user there is one assistant: the frontend never mentions the backend, and talks about the work as its own.
 
+## While the Backend Works
+
+Between the acknowledgement and the backend's first message for the user, the frontend has nothing to relay, and on a long task the silence leaves the user unable to tell working from broken. A [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) placed after `llm` keeps the conversation going: once nothing has been said for ten seconds while the backend works, it asks the frontend's model whether to say a brief word, and the model answers in its own voice from what it knows of the work, or stays silent if the user asked not to be kept posted:
+
+```python
+from pipecat.processors.wait_reassurance import WaitReassurance
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        WaitReassurance(),
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+The user aggregator's idle timer does not run while the backend works, so an idle prompt never lands on the user mid-task. The speech-to-speech frontends do without the processor, since a silent reply cannot be read out of audio.
+
 ## Speech-to-Speech Frontends
 
 The frontend can be a speech-to-speech service, such as [`OpenAIRealtimeLLMService`](/api-reference/server/services/s2s/openai) or [`GeminiLiveLLMService`](/api-reference/server/services/s2s/gemini-live), in place of the STT, LLM and TTS services. Its model then words each request to the backend itself. Two can't be a frontend: `InworldRealtimeLLMService`, because its model calls `delegate` again in place of taking in the backend's messages, and `UltravoxRealtimeLLMService`, because built-in tools such as `delegate` don't reach its session.
@@ -8808,7 +8831,7 @@ Idle detection monitors user activity and:
 
 1. Starts a timer when the bot finishes speaking (`BotStoppedSpeakingFrame`)
 2. Cancels the timer when the user or bot starts speaking
-3. Suppresses the timer during function calls and active user turns (to avoid false triggers during interruptions)
+3. Suppresses the timer during function calls and active user turns (to avoid false triggers during interruptions), and while work the conversation waits on is in flight, which the [waiting timer](#reassuring-a-waiting-user) covers
 4. Restarts the timer after a user turn that ends with no transcript and gets no reply (e.g. background noise)
 5. Emits an `on_user_turn_idle` event when the timer expires
 6. Allows you to implement escalating responses or gracefully end the conversation in your application code
@@ -8913,6 +8936,45 @@ await worker.queue_frame(UserIdleTimeoutUpdateFrame(timeout=0))
 **Immediate application**: Timeout updates take effect immediately. If an idle timer is currently running, it restarts with the new duration. If the bot is waiting for the user to speak and you enable a positive timeout (e.g., upgrading from `0` to `10.0`), the timer arms right away without waiting for the next bot turn.
 
 This is useful when you want to enable idle detection only at certain points in the conversation, or adjust the timeout based on context.
+
+## Reassuring a Waiting User
+
+A quiet conversation can also be the bot's silence: it holds the turn while work it started runs, such as an asynchronous function call (`cancel_on_interruption=False`) or an [`LLMWithBackend`](/pipecat/learn/llm-with-backend) backend's delegated task. Such work is announced by a [`BackgroundWorkStartedFrame`](/api-reference/server/frames/system-frames#backgroundworkstartedframe), and while it is in flight the idle timer does not run. `user_waiting_timeout` times that silence instead, and `on_user_waiting` fires when it has lasted that long:
+
+```python
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_idle_timeout=5.0,
+        user_waiting_timeout=10.0,  # Quiet for 10 seconds while work runs
+    ),
+)
+
+@user_aggregator.event_handler("on_user_waiting")
+async def on_user_waiting(aggregator):
+    await aggregator.push_frame(TTSSpeakFrame("Still working on it."))
+```
+
+The event fires once per start of its timer, and the bot speaking again starts the timer over, so a reply like the one above gets another event after the next `user_waiting_timeout` of quiet. The last work finishing hands the silence back to the idle timer.
+
+For a remark in the LLM's own words, shaped by what the user asked for, place a [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) after the LLM instead of handling the event:
+
+```python
+from pipecat.processors.wait_reassurance import WaitReassurance
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        WaitReassurance(),  # Asks the LLM whether to say a word after 10 seconds of quiet
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
 
 ## Best Practices
 
@@ -13813,6 +13875,17 @@ The judge sees the whole conversation so far, so it can resolve terse or context
 
 The judge handles interim replies gracefully: if the agent says "Let me check on that." before the real answer, the judge answers `continue` rather than yes or no, and the harness keeps accumulating response text and re-judges until the criterion is met or the time budget runs out. A turn whose budget runs out that way fails with the kind `judge_continue`. When every reply you judge is a final answer, [`allow_continue: false`](/pipecat/evals/scenario-configuration#final-answers-with-allow_continue) in the `judge.eval:` block limits the judge to yes or no.
 
+One expectation can limit the judge the same way, for a reply that is final by nature while the rest of the scenario keeps `continue`: a word the agent says on its own while its work runs reads as the judge's "still checking", so it is judged as it stands:
+
+```yaml
+- expect:
+    - event: response
+      eval: "says it is still working on the task, reporting no result"
+      allow_continue: false
+    - event: response
+      eval: "reports the result"
+```
+
 A `no` on a complete reply fails the turn with the kind `judge_no` (a `no` on a reply still arriving is judged again as more comes), and its reason is the [explainer's](/pipecat/evals/scenario-configuration#reasons-from-the-explainer) followed by the classifier's probabilities.
 
 `eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`) and on the `expression` its TTS performed.
@@ -14775,7 +14848,7 @@ judge:
     allow_continue: false # every judged reply is a final answer
 ```
 
-The judge then answers only yes or no, so it never waits for more of a reply that is already complete. With `continue` allowed, a judge that wrongly waits on a complete reply lets the turn run out its time budget, and the turn fails as `judge_continue` instead of as a `no` with a reason. A reply that is still arriving is judged again as more of it comes either way. `allow_continue:` only affects an `eval:` on a reply: a function call's `eval:` and a simulation have no `continue` to begin with.
+The judge then answers only yes or no, so it never waits for more of a reply that is already complete. With `continue` allowed, a judge that wrongly waits on a complete reply lets the turn run out its time budget, and the turn fails as `judge_continue` instead of as a `no` with a reason. A reply that is still arriving is judged again as more of it comes either way. `allow_continue:` only affects an `eval:` on a reply: a function call's `eval:` and a simulation have no `continue` to begin with. One expectation can set `allow_continue: false` of its own, for a reply that is final by nature in a scenario that otherwise keeps `continue` (see [Semantic judging with `eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval)).
 
 ## Custom services with `factory:`
 
@@ -79665,15 +79738,16 @@ Requires Python 3.11 or later, like `pipecat-ai`.
 
 ## Prerequisites
 
-- **No API key.** The model (75 MB) downloads from Hugging Face on first use
-  and is cached.
-- **CPU.** With the default settings the filter uses 2 CPU threads per call.
-  See [Choosing the CPU settings](#choosing-the-cpu-settings).
+- **No API key.** The model (74 MB) downloads from Hugging Face on first use
+  and is cached. `voxlock download` fetches it ahead of time, e.g. while
+  building a Docker image.
+- **CPU.** With the default settings the filter takes 61% of one CPU core per
+  call. See [Choosing the CPU settings](#choosing-the-cpu-settings).
 
 ## Configuration
 
 <ParamField path="voice_sample" type="np.ndarray | None" default="None">
-  About 3 seconds of the caller's voice, 16 kHz mono float32. When given,
+  At least 3 seconds of the caller's voice, 16 kHz mono float32. When given,
   isolation starts from the first audio frame.
 </ParamField>
 
@@ -79684,19 +79758,26 @@ Requires Python 3.11 or later, like `pipecat-ai`.
 
 <ParamField path="chunk_ms" type="int" default="80">
   Audio is run through the model in chunks of this length. Larger chunks use
-  less CPU and add their length to the delay.
+  less CPU and add to the delay.
 </ParamField>
 
-<ParamField path="threads" type="int" default="2">
+<ParamField path="threads" type="int" default="1">
   onnxruntime threads for this filter.
 </ParamField>
 
 <ParamField path="precision" type="str" default='"int8"'>
-  Model files: `"int8"`, `"int8-full"` (fastest), `"fp16"` or `"fp32"`.
+  Model files: `"int8"`, `"int8-full"`, `"fp16"` or `"fp32"` (the benchmarked
+  model).
 </ParamField>
 
 <ParamField path="model_dir" type="str | None" default="None">
-  Folder with the ONNX files. `None` downloads them from Hugging Face.
+  Folder with the ONNX files. `None` downloads them from Hugging Face. The model
+  is loaded once per process and shared by every call.
+</ParamField>
+
+<ParamField path="delay_ms" type="float | None" default="None">
+  How far the output trails the input. `None` is two chunks plus 24 ms, plus
+  the resampling delay when the transport is not at 16 kHz.
 </ParamField>
 
 ## Usage
@@ -79730,13 +79811,14 @@ audio_filter = VoxLockFilter(voice_sample=sample)
 
 ### Choosing the CPU settings
 
-| CPU                                     | Settings                                 | Real-time factor |
-| --------------------------------------- | ---------------------------------------- | ---------------- |
-| 2 or more threads (default)             | `VoxLockFilter()`                        | 0.67             |
-| One vCPU, e.g. Pipecat Cloud `agent-2x` | `VoxLockFilter(chunk_ms=160, threads=1)` | 0.73             |
+| Settings                      | CPU per call     | Delay at 16 kHz |
+| ----------------------------- | ---------------- | --------------- |
+| `VoxLockFilter()` (default)   | 61% of one core  | 184 ms          |
+| `VoxLockFilter(chunk_ms=40)`  | 77% of one core  | 104 ms          |
 
-Measured on an 8-vCPU Xeon server; below 1 keeps up with the call. Half a vCPU
-(Pipecat Cloud `agent-1x`) is too little.
+One thread on a Google Cloud Xeon @ 2.20 GHz. The default fits a single vCPU
+such as Pipecat Cloud's `agent-2x`; half a vCPU (`agent-1x`) is too little.
+Resampling adds 39 ms to the delay at 48 kHz and 120 ms at 8 kHz.
 
 ## Input Frames
 
@@ -79760,12 +79842,14 @@ await worker.queue_frame(FilterEnableFrame(enable=True))
 - Input is 16-bit mono PCM at the transport's sample rate. The filter resamples
   to 16 kHz for the model and back, so 8 kHz telephony and 48 kHz WebRTC both
   work.
-- Audio is collected into `chunk_ms` chunks, so some calls to `filter()`
-  return no audio; the input transport skips those.
+- The model runs on its own thread, so the transport's audio loop never waits
+  for it. Every call to `filter()` returns as many bytes as it received, a
+  fixed delay behind; a stretch the model has not finished in time, such as the
+  first seconds after it locks on to the caller, goes out unprocessed.
 
 ## Compatibility
 
-Tested with Pipecat 1.12.0. See the
+Requires `voxlock` 1.3.0 or later. Tested with Pipecat 1.15.0. See the
 [changelog](https://github.com/arbazsiddiqui/voxlock/blob/main/CHANGELOG.md)
 for the latest tested version.
 
@@ -81219,10 +81303,11 @@ The constants are in `pipecat.pipeline.llm_with_backend.prompts`, except the req
 
 ### Pushed by
 
-| Frame                                                                                                        | Fields                                    | Effect                                                                                                                                                                                     |
-| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`ExternalFunctionCall*Frame`](/api-reference/server/frames/system-frames#externalfunctioncallsstartedframe) | function name, call ID, arguments, result | One per phase of each function call the backend makes. [`RTVIObserver`](/api-reference/server/rtvi/rtvi-observer) reports them to the client as function-call events.                      |
-| `RTVIServerMessageFrame`                                                                                     | `data`                                    | With `client_trace=True`, one per exchange with the backend. `data["type"]` is `"llm-with-backend"`, and `data["event"]` is `"request"`, `"output"`, `"tool_call"`, `"error"` or `"idle"`. |
+| Frame                                                                                                                                | Fields                                    | Effect                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`ExternalFunctionCall*Frame`](/api-reference/server/frames/system-frames#externalfunctioncallsstartedframe)                         | function name, call ID, arguments, result | One per phase of each function call the backend makes. [`RTVIObserver`](/api-reference/server/rtvi/rtvi-observer) reports them to the client as function-call events.                                                                                                                                                                    |
+| `RTVIServerMessageFrame`                                                                                                             | `data`                                    | With `client_trace=True`, one per exchange with the backend. `data["type"]` is `"llm-with-backend"`, and `data["event"]` is `"request"`, `"output"`, `"tool_call"`, `"error"` or `"idle"`.                                                                                                                                               |
+| [`BackgroundWorkStartedFrame`, `BackgroundWorkFinishedFrame`](/api-reference/server/frames/system-frames#backgroundworkstartedframe) | `work_id`: the backend's name             | Around the backend's work: started on the delegation that puts it to work, finished when it reports idle, errors, or its session ends. The user aggregator's idle timer does not run in between; a [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) after the service keeps the conversation going. |
 
 ## Notes
 
@@ -89360,11 +89445,11 @@ the cache and are checked by their sha256, when the analyzer is created.
 
 `AlkoveTurnAnalyzer(params=AlkoveTurnParams(...), min_duration=0.7)`
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `threshold` | `0.6` | End of turn probability over which the turn is complete. Lower answers sooner and cuts the user off more often. |
-| `min_pause` | `0.3` | Seconds of pause before any read can complete the turn. |
-| `max_pause` | `1.5` | Seconds of pause after which the turn is complete, whatever the head says. |
+| Parameter   | Default | Description                                                                                                     |
+| ----------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `threshold` | `0.6`   | End of turn probability over which the turn is complete. Lower answers sooner and cuts the user off more often. |
+| `min_pause` | `0.3`   | Seconds of pause before any read can complete the turn.                                                         |
+| `max_pause` | `1.5`   | Seconds of pause after which the turn is complete, whatever the head says.                                      |
 
 <ParamField path="min_duration" type="float" default="0.7">
   Seconds the user's speech must span, short gaps included, to start their turn
@@ -92016,22 +92101,23 @@ Turn events provide hooks into the conversation turn lifecycle, allowing you to 
 
 ## Events Summary
 
-| Event                              | Emitter                | Description                                         |
-| ---------------------------------- | ---------------------- | --------------------------------------------------- |
-| `on_user_turn_started`             | `user_aggregator`      | User begins speaking                                |
-| `on_user_turn_inference_triggered` | `user_aggregator`      | Enough signal to start LLM inference                |
-| `on_user_turn_stopped`             | `user_aggregator`      | User finishes speaking (includes transcript)        |
-| `on_user_turn_message_added`       | `user_aggregator`      | A user message was written to the LLM context       |
-| `on_user_turn_stop_timeout`        | `user_aggregator`      | User turn ended due to timeout                      |
-| `on_user_turn_idle`                | `user_aggregator`      | User has been idle (not speaking) for timeout       |
-| `on_user_mute_started`             | `user_aggregator`      | User input was muted                                |
-| `on_user_mute_stopped`             | `user_aggregator`      | User input was unmuted                              |
-| `on_user_backchannel`              | `user_aggregator`      | User acknowledged the bot without interrupting      |
-| `on_assistant_turn_started`        | `assistant_aggregator` | Assistant begins responding                         |
-| `on_assistant_turn_stopped`        | `assistant_aggregator` | Assistant finishes responding (includes transcript) |
-| `on_assistant_thought`             | `assistant_aggregator` | Assistant produced a thought (reasoning models)     |
-| `on_assistant_backchannel`         | `assistant_aggregator` | Assistant said a short acknowledgment               |
-| `on_summary_applied`               | `assistant_aggregator` | Context summarization was applied                   |
+| Event                              | Emitter                | Description                                           |
+| ---------------------------------- | ---------------------- | ----------------------------------------------------- |
+| `on_user_turn_started`             | `user_aggregator`      | User begins speaking                                  |
+| `on_user_turn_inference_triggered` | `user_aggregator`      | Enough signal to start LLM inference                  |
+| `on_user_turn_stopped`             | `user_aggregator`      | User finishes speaking (includes transcript)          |
+| `on_user_turn_message_added`       | `user_aggregator`      | A user message was written to the LLM context         |
+| `on_user_turn_stop_timeout`        | `user_aggregator`      | User turn ended due to timeout                        |
+| `on_user_turn_idle`                | `user_aggregator`      | User has been idle (not speaking) for timeout         |
+| `on_user_waiting`                  | `user_aggregator`      | User has waited quietly on work in flight for timeout |
+| `on_user_mute_started`             | `user_aggregator`      | User input was muted                                  |
+| `on_user_mute_stopped`             | `user_aggregator`      | User input was unmuted                                |
+| `on_user_backchannel`              | `user_aggregator`      | User acknowledged the bot without interrupting        |
+| `on_assistant_turn_started`        | `assistant_aggregator` | Assistant begins responding                           |
+| `on_assistant_turn_stopped`        | `assistant_aggregator` | Assistant finishes responding (includes transcript)   |
+| `on_assistant_thought`             | `assistant_aggregator` | Assistant produced a thought (reasoning models)       |
+| `on_assistant_backchannel`         | `assistant_aggregator` | Assistant said a short acknowledgment                 |
+| `on_summary_applied`               | `assistant_aggregator` | Context summarization was applied                     |
 
 ## User Turn Events
 
@@ -92198,7 +92284,31 @@ async def on_user_turn_idle(aggregator):
 <Note>
   The idle timer starts when the bot stops speaking and is cancelled when the
   user or bot starts speaking. It is suppressed during function calls and active
-  user turns. This event can fire multiple times if the user remains idle.
+  user turns, and while work the conversation waits on is in flight, which
+  `on_user_waiting` covers. This event can fire multiple times if the user
+  remains idle.
+</Note>
+
+### on_user_waiting
+
+Fired when the user has waited quietly on work in flight for `user_waiting_timeout` seconds: an asynchronous function call, or an `LLMWithBackend` backend's delegated task, whichever a [`BackgroundWorkStartedFrame`](/api-reference/server/frames/system-frames#backgroundworkstartedframe) announced. The timer starts when the bot finishes speaking with such work in flight, or when the work starts in a quiet conversation, and is cancelled when the user or bot starts speaking again. Use it to reassure the user in your own way; [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) does it in the LLM's words.
+
+```python
+@user_aggregator.event_handler("on_user_waiting")
+async def on_user_waiting(aggregator):
+    await aggregator.push_frame(TTSSpeakFrame("Still working on it."))
+```
+
+**Parameters:**
+
+| Parameter    | Type                | Description                  |
+| ------------ | ------------------- | ---------------------------- |
+| `aggregator` | `LLMUserAggregator` | The user aggregator instance |
+
+<Note>
+  The event fires once per start of the timer; the bot speaking again starts it
+  over, so a handler that stays silent gets no second event until the bot
+  speaks. The last work finishing hands the silence back to the idle timer.
 </Note>
 
 ### on_user_mute_started
@@ -92711,6 +92821,15 @@ Separately from realtime mode, services that propose turn boundaries from server
   Users](/pipecat/fundamentals/detecting-user-idle) for details.
 </ParamField>
 
+<ParamField path="user_waiting_timeout" type="float" default="0">
+  Seconds of quiet, while work the conversation waits on is in flight (an
+  asynchronous function call, or an `LLMWithBackend` backend's delegated task),
+  before the processor emits an `on_user_waiting` event. Set to `0` to disable
+  waiting detection. See [Detecting Idle
+  Users](/pipecat/fundamentals/detecting-user-idle#reassuring-a-waiting-user)
+  for details.
+</ParamField>
+
 ### Event Handlers
 
 `UserTurnProcessor` provides event handlers for turn lifecycle events:
@@ -92823,6 +92942,75 @@ pipeline = Pipeline(
 - [Parallel Pipeline](/api-reference/server/pipeline/parallel-pipeline) - Run multiple pipeline branches concurrently
 - [Turn Events](/api-reference/server/utilities/turn-management/turn-events) - Handle turn lifecycle events
 
+# Wait Reassurance
+Source: https://docs.pipecat.ai/api-reference/server/utilities/turn-management/wait-reassurance.md
+
+WaitReassurance: a brief remark from the LLM while the user waits on an async function call or an LLMWithBackend backend's work.
+
+## Overview
+
+`WaitReassurance` keeps a conversation from going silent while the user waits on work in flight: once nothing has been said for `interval_secs`, it asks the LLM, in a developer message, whether to say a brief word, and the model answers in its own voice or stays silent. For the other ways to answer the wait, see [Detecting Idle Users](/pipecat/fundamentals/detecting-user-idle#reassuring-a-waiting-user).
+
+```python
+from pipecat.processors.wait_reassurance import WaitReassurance
+```
+
+## Configuration
+
+<ParamField path="interval_secs" type="float" default="10.0">
+  Seconds the conversation stays quiet, with work in flight, before the LLM is
+  asked whether to say something.
+</ParamField>
+
+<ParamField path="prompt" type="str" default="WAIT_REASSURANCE_PROMPT">
+  The developer message appended to the conversation each time. A template with
+  `{quiet_secs}`, how long nothing has been said, and `{mark}`, the silent mark,
+  so any other brace in it is doubled.
+</ParamField>
+
+<ParamField path="silent_mark" type="str" default="∅">
+  What a reply opens with to say nothing. A reply that opens with it is dropped
+  unspoken.
+</ParamField>
+
+## Usage
+
+Place the processor after the LLM, a text `LLMService` or an [`LLMWithBackend`](/api-reference/server/composite-services/llm-with-backend):
+
+```python
+from pipecat.processors.wait_reassurance import WaitReassurance
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        WaitReassurance(),
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+Work in flight is what a [`BackgroundWorkStartedFrame`](/api-reference/server/frames/system-frames#backgroundworkstartedframe) announced: an asynchronous function call (`cancel_on_interruption=False`), or a backend's delegated task. The model decides what to say with the user's wishes and what it knows of the work in view: "keep me posted in detail" gets the step under way, "just tell me when you're done" gets nothing.
+
+## Frames
+
+### Pushed by
+
+| Frame                                                                                       | Fields                                                          | Effect                                                                                               |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| [`LLMMessagesAppendFrame`](/api-reference/server/frames/data-frames#llmmessagesappendframe) | `messages`: the prompt as a `developer` message; `run_llm=True` | One per interval of quiet with work in flight. The assistant aggregator appends it and runs the LLM. |
+
+## Notes
+
+- **Text LLMs only**: Every response the LLM streams is read for the silent mark, its opening held back until the first character shows whether the reply is one, so the processor belongs after a text LLM. A speech-to-speech service's audio cannot be read.
+- **What sees a dropped reply**: Nothing after the processor: not the TTS, the output transport or the assistant aggregator. An observer of the LLM's own output, such as the RTVI observer's `bot-llm-text` and `llm-raw-text` messages, still sees the mark the model wrote.
+- **The interval starts over**: A spoken remark starts it over through the bot's speech, and a silent decision starts it over directly, so a long wait gets a fresh decision every `interval_secs`.
+- **With `filter_incomplete_user_turns`**: The mark is read after any turn-completion marker, so a declined reply of `● ∅` is dropped like one of `∅` alone.
+
 # Events Overview
 Source: https://docs.pipecat.ai/api-reference/server/events/overview.md
 
@@ -92930,19 +93118,20 @@ Events on every [`FrameProcessor`](/api-reference/server/events/frame-processor-
 
 Events on context aggregators from [`LLMContextAggregatorPair`](/api-reference/server/utilities/turn-management/turn-events).
 
-| Event                              | Emitter                | Description                                         |
-| ---------------------------------- | ---------------------- | --------------------------------------------------- |
-| `on_user_turn_started`             | `user_aggregator`      | User begins speaking                                |
-| `on_user_turn_inference_triggered` | `user_aggregator`      | Enough signal to start LLM inference                |
-| `on_user_turn_stopped`             | `user_aggregator`      | User finishes speaking (includes transcript)        |
-| `on_user_turn_message_added`       | `user_aggregator`      | A user message was written to the LLM context       |
-| `on_user_turn_stop_timeout`        | `user_aggregator`      | User turn ended due to timeout                      |
-| `on_user_turn_idle`                | `user_aggregator`      | User has been idle for configured timeout           |
-| `on_user_mute_started`             | `user_aggregator`      | User input was muted                                |
-| `on_user_mute_stopped`             | `user_aggregator`      | User input was unmuted                              |
-| `on_assistant_turn_started`        | `assistant_aggregator` | Assistant begins responding                         |
-| `on_assistant_turn_stopped`        | `assistant_aggregator` | Assistant finishes responding (includes transcript) |
-| `on_assistant_thought`             | `assistant_aggregator` | Assistant produced a thought (reasoning models)     |
+| Event                              | Emitter                | Description                                           |
+| ---------------------------------- | ---------------------- | ----------------------------------------------------- |
+| `on_user_turn_started`             | `user_aggregator`      | User begins speaking                                  |
+| `on_user_turn_inference_triggered` | `user_aggregator`      | Enough signal to start LLM inference                  |
+| `on_user_turn_stopped`             | `user_aggregator`      | User finishes speaking (includes transcript)          |
+| `on_user_turn_message_added`       | `user_aggregator`      | A user message was written to the LLM context         |
+| `on_user_turn_stop_timeout`        | `user_aggregator`      | User turn ended due to timeout                        |
+| `on_user_turn_idle`                | `user_aggregator`      | User has been idle for configured timeout             |
+| `on_user_waiting`                  | `user_aggregator`      | User has waited quietly on work in flight for timeout |
+| `on_user_mute_started`             | `user_aggregator`      | User input was muted                                  |
+| `on_user_mute_stopped`             | `user_aggregator`      | User input was unmuted                                |
+| `on_assistant_turn_started`        | `assistant_aggregator` | Assistant begins responding                           |
+| `on_assistant_turn_stopped`        | `assistant_aggregator` | Assistant finishes responding (includes transcript)   |
+| `on_assistant_thought`             | `assistant_aggregator` | Assistant produced a thought (reasoning models)       |
 
 ### STT Services
 
@@ -96130,6 +96319,24 @@ An external function call was cancelled.
 
 <ParamField path="tool_call_id" type="str" required>
   Unique identifier of the call.
+</ParamField>
+
+## Background Work
+
+### BackgroundWorkStartedFrame
+
+Work the conversation is waiting on has started: work the bot started on the user's behalf that runs while the conversation goes on and finishes on its own. `LLMService` broadcasts one for each [asynchronous function call](/pipecat/learn/function-calling#synchronous-vs-asynchronous-calls) (`cancel_on_interruption=False`), with the call's `tool_call_id`, and [`BackendConnector`](/api-reference/server/composite-services/llm-with-backend#backendconnector) one when an `LLMWithBackend` backend starts on a delegation, with the backend's name. A component that dispatches other such work, such as a job sent to another worker, broadcasts the same pair. While work is in flight the user aggregator's idle timer does not run; its `user_waiting_timeout` and [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) time the wait instead.
+
+<ParamField path="work_id" type="str" required>
+  Identifies the work. The finished frame carries the same one.
+</ParamField>
+
+### BackgroundWorkFinishedFrame
+
+Work the conversation was waiting on is over, by result, error or cancellation. A consumer tracks open work by `work_id`, so a finish for work it never saw start, or already saw finish, is ignored.
+
+<ParamField path="work_id" type="str" required>
+  The work that finished, as its started frame named it.
 </ParamField>
 
 ## User Interaction

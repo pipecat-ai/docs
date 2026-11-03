@@ -1,0 +1,68 @@
+---
+title: "Wait Reassurance"
+description: "WaitReassurance: a brief remark from the LLM while the user waits on an async function call or an LLMWithBackend backend's work."
+---
+
+## Overview
+
+`WaitReassurance` keeps a conversation from going silent while the user waits on work in flight: once nothing has been said for `interval_secs`, it asks the LLM, in a developer message, whether to say a brief word, and the model answers in its own voice or stays silent. For the other ways to answer the wait, see [Detecting Idle Users](/pipecat/fundamentals/detecting-user-idle#reassuring-a-waiting-user).
+
+```python
+from pipecat.processors.wait_reassurance import WaitReassurance
+```
+
+## Configuration
+
+<ParamField path="interval_secs" type="float" default="10.0">
+  Seconds the conversation stays quiet, with work in flight, before the LLM is
+  asked whether to say something.
+</ParamField>
+
+<ParamField path="prompt" type="str" default="WAIT_REASSURANCE_PROMPT">
+  The developer message appended to the conversation each time. A template with
+  `{quiet_secs}`, how long nothing has been said, and `{mark}`, the silent mark,
+  so any other brace in it is doubled.
+</ParamField>
+
+<ParamField path="silent_mark" type="str" default="∅">
+  What a reply opens with to say nothing. A reply that opens with it is dropped
+  unspoken.
+</ParamField>
+
+## Usage
+
+Place the processor after the LLM, a text `LLMService` or an [`LLMWithBackend`](/api-reference/server/composite-services/llm-with-backend):
+
+```python
+from pipecat.processors.wait_reassurance import WaitReassurance
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        WaitReassurance(),
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+Work in flight is what a [`BackgroundWorkStartedFrame`](/api-reference/server/frames/system-frames#backgroundworkstartedframe) announced: an asynchronous function call (`cancel_on_interruption=False`), or a backend's delegated task. The model decides what to say with the user's wishes and what it knows of the work in view: "keep me posted in detail" gets the step under way, "just tell me when you're done" gets nothing.
+
+## Frames
+
+### Pushed by
+
+| Frame                                                                                       | Fields                                                          | Effect                                                                                               |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| [`LLMMessagesAppendFrame`](/api-reference/server/frames/data-frames#llmmessagesappendframe) | `messages`: the prompt as a `developer` message; `run_llm=True` | One per interval of quiet with work in flight. The assistant aggregator appends it and runs the LLM. |
+
+## Notes
+
+- **Text LLMs only**: Every response the LLM streams is read for the silent mark, its opening held back until the first character shows whether the reply is one, so the processor belongs after a text LLM. A speech-to-speech service's audio cannot be read.
+- **What sees a dropped reply**: Nothing after the processor: not the TTS, the output transport or the assistant aggregator. An observer of the LLM's own output, such as the RTVI observer's `bot-llm-text` and `llm-raw-text` messages, still sees the mark the model wrote.
+- **The interval starts over**: A spoken remark starts it over through the bot's speech, and a silent decision starts it over directly, so a long wait gets a fresh decision every `interval_secs`.
+- **With `filter_incomplete_user_turns`**: The mark is read after any turn-completion marker, so a declined reply of `● ∅` is dropped like one of `∅` alone.
