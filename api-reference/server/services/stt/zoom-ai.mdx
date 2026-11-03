@@ -6,7 +6,7 @@ description: "Real-time STT with ZoomAISTTService over the Zoom AI Services Scri
 
 ## Overview
 
-`ZoomAISTTService` provides real-time speech recognition with the [Scribe API](https://developers.zoom.us/docs/ai-services/scribe/) from Zoom AI Services, streaming audio over a WebSocket in [Live mode](https://developers.zoom.us/docs/ai-services/scribe/live-mode/). Scribe detects when each user turn ends, so the service drives turn detection for live streaming without a local VAD. It supports Scribe's additional features, including English Pro model, multilingual models, language detection, speaker diarization, custom vocabulary, and text polishing, etc.
+`ZoomAISTTService` provides real-time speech recognition with the [Scribe API](https://developers.zoom.us/docs/ai-services/scribe/) from Zoom AI Services, streaming audio over a WebSocket in [Live mode](https://developers.zoom.us/docs/ai-services/scribe/live-mode/). By default, Scribe detects when each user turn ends, so the service drives turn detection for live streaming without a local VAD. With `vad_force_turn_endpoint=True`, Pipecat's VAD and turn strategies decide instead. It supports Scribe's additional features, including English Pro model, multilingual models, language detection, speaker diarization, custom vocabulary, and text polishing, etc.
 
 <CardGroup cols={2}>
   <Card
@@ -80,12 +80,28 @@ Before using Zoom AI STT, you need:
 </ParamField>
 
 <ParamField path="should_interrupt" type="bool" default="True">
-  Whether a user turn started by Scribe interrupts the bot.
+  Whether a user turn started by Scribe interrupts the bot. Only applies with
+  Scribe turn detection (`vad_force_turn_endpoint=False`).
+</ParamField>
+
+<ParamField path="vad_force_turn_endpoint" type="bool" default="False">
+  Selects the turn detection mode. When `False`, Scribe's voice activity
+  detection ends each turn. When `True`, Scribe's voice activity detection is
+  off and each `VADUserStoppedSpeakingFrame` commits the turn, so Pipecat's VAD
+  and user turn strategies (such as Smart Turn) decide when the user is done.
+  Requires a local VAD analyzer. See
+  [With Pipecat Turn Detection](#with-pipecat-turn-detection).
 </ParamField>
 
 <ParamField path="settings" type="ZoomAISTTService.Settings" default="None">
   Runtime-configurable settings for the STT service. See [Settings](#settings)
   below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float | None" default="ZOOM_AI_TTFS_P99">
+  P99 latency from speech end to final transcript, in seconds. Used with
+  `vad_force_turn_endpoint=True`; override it for your deployment. See the [STT
+  benchmark](https://github.com/pipecat-ai/stt-benchmark).
 </ParamField>
 
 ### Settings
@@ -96,7 +112,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | --------------------- | ------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`               | `str \| None`       | `None`           | Recognition model, such as `zoom-scribe-en-pro` or `zoom-scribe-multilingual`. `None` lets Scribe choose a compatible model. See [Select a model](https://developers.zoom.us/docs/ai-services/scribe/speech-understanding/#select-a-model).                                                                                                          |
 | `language`            | `Language \| str`   | `Language.EN_US` | Language of the audio; with language detection, the preferred initial language.                                                                                                                                                                                                                                                                      |
-| `silence_duration_ms` | `int \| None`       | `350`            | Milliseconds of silence that end a turn. Pipecat's default is 350ms optimized for voice agent use case. `None` uses Scribe's default.                                                                                                                                                                                                                |
+| `silence_duration_ms` | `int \| None`       | `350`            | Milliseconds of silence that end a turn. Pipecat's default is 350ms optimized for voice agent use case. `None` uses Scribe's default. Not used with `vad_force_turn_endpoint=True`.                                                                                                                                                                                                                |
 | `diarization`         | `bool \| None`      | `False`          | Whether Scribe labels each transcript with its speaker. See [Configuring Scribe Features](#configuring-scribe-features).                                                                                                                                                                                                                             |
 | `language_detection`  | `str \| None`       | `None`           | Language detection mode; Live mode supports `"continuous"`. `None` turns it off. See [With the Multilingual Model](#with-the-multilingual-model).                                                                                                                                                                                                    |
 | `vocabulary`          | `list[str] \| None` | `None`           | [Custom vocabulary](https://developers.zoom.us/docs/ai-services/scribe/custom-vocabulary/): names, acronyms, and terms to recognize. See [Configuring Scribe Features](#configuring-scribe-features).                                                                                                                                                |
@@ -166,6 +182,31 @@ stt = ZoomAISTTService(
 
 See [Detect languages](https://developers.zoom.us/docs/ai-services/scribe/speech-understanding/#detect-languages) and [Multilingual model languages](https://developers.zoom.us/docs/ai-services/scribe/speech-understanding/#multilingual-model-languages) for the supported languages.
 
+### With Pipecat Turn Detection
+
+Set `vad_force_turn_endpoint=True` to turn off Scribe's voice activity detection and let Pipecat's VAD and turn strategies decide when the user is done. Each `VADUserStoppedSpeakingFrame` commits the turn, and Scribe returns its final transcript. The service keeps the default user turn strategies, so the user aggregator needs a VAD analyzer:
+
+```python
+import os
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.services.zoom_ai.stt import ZoomAISTTService
+
+stt = ZoomAISTTService(
+    api_key=os.getenv("ZOOM_AI_API_KEY"),
+    vad_force_turn_endpoint=True,
+)
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+)
+```
+
 ### Updating Settings Mid-Stream
 
 Send an `STTUpdateSettingsFrame` to change settings during a conversation. The service reconnects with a new Scribe session once the current turn ends:
@@ -185,7 +226,7 @@ await worker.queue_frame(
 - **Final transcripts only**: The service pushes a final transcript per turn, with no interim results.
 - **Idle sessions**: Scribe ends a session after 30 seconds without audio, so the service sends keepalive silence when input stops (see [Session limits](https://developers.zoom.us/docs/ai-services/scribe/live-mode/#session-limits)). Keepalive silence and the silence sent to end a turn count toward usage.
 - **Errors**: If Zoom refuses the connection (for example, an invalid API key), the error includes Zoom's reason. If Scribe rejects the session's settings, the error has the `INVALID_REQUEST` category, since a new session would be rejected the same way. Errors include the session's tracking ID (`x-zm-trackingid`), which Zoom support uses to find a session. See [Error Handling](/pipecat/fundamentals/error-handling).
-- **Time to final segment (TTFS)**: Scribe defines the turn boundary, so the service reports no TTFS metric.
+- **Time to final segment (TTFS)**: With Scribe turn detection, Scribe defines the turn boundary, so the service reports no TTFS metric. With `vad_force_turn_endpoint=True`, it reports TTFS using `ttfs_p99_latency`.
 
 ## Event Handlers
 
