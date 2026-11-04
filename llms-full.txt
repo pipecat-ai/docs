@@ -51955,7 +51955,7 @@ SonioxSTTService streams real-time STT over Soniox's WebSocket API: 60+ language
 
 `SonioxSTTService` provides real-time speech-to-text transcription using Soniox's WebSocket API with support for over 60 languages, custom context, multiple languages in the same conversation, and advanced features for accurate multilingual transcription.
 
-By default, Soniox uses the `stt-rt-v5` model with `vad_force_turn_endpoint=True`, which disables Soniox's native turn detection and relies on Pipecat's local VAD to finalize transcripts. This configuration significantly reduces the time to final segment (~250ms median). Pipecat enables smart-turn detection by default using `LocalSmartTurnAnalyzerV3`. To use Soniox's native turn detection instead, set `vad_force_turn_endpoint=False`.
+By default, Soniox uses the `stt-rt-v5` model with `vad_force_turn_endpoint=True`, where Pipecat's user turn strategies decide turn endings and the local VAD finalizes transcripts early. This configuration significantly reduces the time to final segment (~250ms median). Pipecat enables smart-turn detection by default using `LocalSmartTurnAnalyzerV3`. To use Soniox's native turn detection instead, set `vad_force_turn_endpoint=False`.
 
 <CardGroup cols={2}>
   <Card
@@ -52068,14 +52068,16 @@ Before using Soniox STT services, you need:
 </ParamField>
 
 <ParamField path="vad_force_turn_endpoint" type="bool" default="True">
-  Controls turn detection mode. When `True` (Pipecat mode, default): Soniox
-  endpoint detection is disabled and a `VADUserStoppedSpeakingFrame` sends a
-  finalize message to Soniox. When `False` (Soniox turn detection mode): Soniox
-  endpoint detection is enabled and controls turn endings. The service proposes
-  a turn start on the local VAD signal when a VAD analyzer is configured (most
-  responsive) or on the first transcript token otherwise, and proposes a turn
-  stop when the endpoint is detected. The user turn strategies resolve those
-  proposals into `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame`.
+  Controls turn detection mode. When `True` (Pipecat mode, default): Pipecat's
+  user turn strategies decide turn endings, and a `VADUserStoppedSpeakingFrame`
+  sends a finalize message to Soniox. Soniox endpoint detection still ends the
+  transcript when the VAD misses speech, but never the turn. When `False`
+  (Soniox turn detection mode): Soniox endpoint detection controls turn endings.
+  The service proposes a turn start on the local VAD signal when a VAD analyzer
+  is configured (most responsive) or on the first transcript token otherwise,
+  and proposes a turn stop when the endpoint is detected. The user turn
+  strategies resolve those proposals into `UserStartedSpeakingFrame` and
+  `UserStoppedSpeakingFrame`.
 </ParamField>
 
 <ParamField path="should_interrupt" type="bool" default="True">
@@ -52099,9 +52101,9 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `context`                           | `SonioxContextObject \| str` | `None`        | Customization for transcription. Either a `SonioxContextObject` (structured context for steering transcription and translation) or a plain string of background text. Soniox caps the context object at 8k tokens. |
 | `enable_speaker_diarization`        | `bool`                       | `False`       | Enable speaker diarization. Tokens are annotated with speaker IDs.                                                                                                                                                 |
 | `enable_language_identification`    | `bool`                       | `False`       | Enable language identification. Tokens are annotated with language IDs, and the detected language is included in the final `TranscriptionFrame`.                                                                   |
-| `max_endpoint_delay_ms`             | `int`                        | `None`        | Maximum delay in milliseconds before endpoint detection finalizes the turn. Valid range: 500-3000. Only effective when `vad_force_turn_endpoint=False`.                                                            |
-| `endpoint_sensitivity`              | `float`                      | `None`        | Endpoint detection sensitivity (-1.0 to 1.0); higher values finalize turns sooner, lower values delay finalization. Introduced in the v5 model. Only effective when `vad_force_turn_endpoint=False`.               |
-| `endpoint_latency_adjustment_level` | `int`                        | `None`        | Reduces endpoint latency vs. the default (0-3); higher values finalize turns sooner but may reduce accuracy. Only effective when `vad_force_turn_endpoint=False`.                                                  |
+| `max_endpoint_delay_ms`             | `int`                        | `None`        | Maximum delay in milliseconds after speech ends before endpoint detection returns an endpoint. Valid range: 500-3000.                                                                                              |
+| `endpoint_sensitivity`              | `float`                      | `None`        | Endpoint detection sensitivity (-1.0 to 1.0); higher values finalize turns sooner, lower values delay finalization. Introduced in the v5 model.                                                                    |
+| `endpoint_latency_adjustment_level` | `int`                        | `None`        | Reduces endpoint latency vs. the default (0-3); higher values finalize turns sooner but may reduce accuracy.                                                                                                       |
 | `client_reference_id`               | `str`                        | `None`        | Client reference ID for transcription tracking.                                                                                                                                                                    |
 
 ## Usage
@@ -52192,9 +52194,9 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 ## Notes
 
 - **Turn detection modes**:
-  - **Pipecat mode** (`vad_force_turn_endpoint=True`, default): Soniox endpoint detection is disabled and a `VADUserStoppedSpeakingFrame` sends a finalize message to Soniox to get the final transcript immediately. This significantly reduces latency. The service emits no turn frames; the user aggregator runs local VAD/smart-turn analysis.
+  - **Pipecat mode** (`vad_force_turn_endpoint=True`, default): a `VADUserStoppedSpeakingFrame` sends a finalize message to Soniox to get the final transcript immediately. This significantly reduces latency. Soniox endpoint detection still ends the transcript when the VAD misses speech, but never the turn. The service emits no turn frames; the user aggregator runs local VAD/smart-turn analysis.
   - **Soniox mode** (`vad_force_turn_endpoint=False`): Soniox endpoint detection is enabled and controls turn endings. The service proposes each turn boundary based on Soniox's detection. The turn opens on the local VAD signal when a VAD analyzer is configured (most responsive) or on the first transcript token otherwise. `should_interrupt` (default `True`) controls barge-in: see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies).
-- **Endpoint detection settings**: The `max_endpoint_delay_ms`, `endpoint_sensitivity`, and `endpoint_latency_adjustment_level` settings control Soniox's native endpoint detection and only take effect when `vad_force_turn_endpoint=False`. When `vad_force_turn_endpoint=True` (the default), Pipecat's local VAD handles turn detection and these settings are ignored.
+- **Endpoint detection settings**: The `max_endpoint_delay_ms`, `endpoint_sensitivity`, and `endpoint_latency_adjustment_level` settings control Soniox's native endpoint detection, which runs in both modes. When `vad_force_turn_endpoint=True` (the default), the endpoint only ends transcripts, so `max_endpoint_delay_ms` bounds how long the transcript of speech the local VAD missed waits.
 - **Keepalive**: The service automatically sends protocol-level keepalive messages to maintain the WebSocket connection.
 - **Context**: The `context` setting accepts either a `SonioxContextObject` (structured context that steers transcription and translation) or a plain string of background text. Works on any current Soniox model. Soniox caps the context object at 8k tokens. See the [Soniox context documentation](https://soniox.com/docs/stt/concepts/context) for details.
 
