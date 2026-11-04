@@ -4255,14 +4255,6 @@ llm = YourLLMService(
   complete. The deadline covers the handler's execution as a whole, so reporting
   an intermediate result neither clears it nor restarts it. Work the handler
   spawns into a task of its own isn't cancelled with it.
-- **`honor_silent_mark`** (default `"∅"`, `LLM_SILENT_MARK`): The silent mark:
-  a reply that starts with it means the model chose to say nothing. Such a reply is dropped
-  before anything downstream or any observer sees it, nothing is recorded in
-  the context, and the decision is reported as an
-  [`LLMMarkerResponseFrame`](/api-reference/server/frames/data-frames#llmmarkerresponseframe)
-  of kind `"silent"`. A prompt that offers the model silence, such as
-  [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance)'s,
-  names the same mark. `None` honors no mark: every reply goes out as written.
 - **`file_resolver`** (default `None`): A
   [`FileResolver`](/api-reference/server/utilities/file-handling) that fetches
   file URLs in the context (from RTVI `send-file` messages) that the provider
@@ -92956,7 +92948,7 @@ WaitReassurance: a brief remark from the LLM while the user waits on an async fu
 
 ## Overview
 
-`WaitReassurance` keeps a conversation from going silent while the user waits on background work: once nothing has been said for `interval_secs`, it asks the LLM, in a developer message, whether to say a brief word, and the model answers in its own voice or stays silent. For the other ways to answer the wait, see [Detecting Idle Users](/pipecat/fundamentals/detecting-user-idle#reassuring-a-waiting-user).
+`WaitReassurance` keeps a conversation from going silent while the user waits on background work: once nothing has been said for `interval_secs`, it asks the LLM, in a short developer message, to reassure the user if needed, and the model answers in its own voice or stays silent. What the message means, how to answer it with silence and how to word a reassurance are in the LLM's system instruction, which the processor adds to at start. For the other ways to answer the wait, see [Detecting Idle Users](/pipecat/fundamentals/detecting-user-idle#reassuring-a-waiting-user).
 
 ```python
 from pipecat.processors.wait_reassurance import WaitReassurance
@@ -92969,15 +92961,26 @@ from pipecat.processors.wait_reassurance import WaitReassurance
   the LLM is asked whether to say something.
 </ParamField>
 
+<ParamField
+  path="instruction"
+  type="str"
+  default="WAIT_REASSURANCE_INSTRUCTION"
+>
+  The standing guidance added to the LLM's system instruction at start: what the
+  message is, how to answer it with silence, and what to say otherwise. A
+  template with `{mark}`, the silent mark, so any other brace in it is doubled.
+</ParamField>
+
 <ParamField path="prompt" type="str" default="WAIT_REASSURANCE_PROMPT">
-  The developer message appended to the conversation each time. A template with
-  `{quiet_secs}`, how long nothing has been said, and `{mark}`, the silent mark,
-  so any other brace in it is doubled.
+  The developer message appended to the conversation each time: the facts of the
+  moment and the ask. A template with `{quiet_secs}`, how long nothing has been
+  said, and `{mark}` if it wants it. Its opening is what the instruction names
+  it by.
 </ParamField>
 
 <ParamField path="silent_mark" type="str" default="∅">
-  What the prompt tells the model to answer with to say nothing. The LLM
-  service's `honor_silent_mark` must name the same mark.
+  What the model answers with to say nothing. The LLM service honors it once the
+  processor announces it at start.
 </ParamField>
 
 ## Usage
@@ -93007,13 +93010,14 @@ Background work is what a [`BackgroundWorkStartedFrame`](/api-reference/server/f
 
 ### Pushed by
 
-| Frame                                                                                       | Fields                                                          | Effect                                                                                                            |
-| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| [`LLMMessagesAppendFrame`](/api-reference/server/frames/data-frames#llmmessagesappendframe) | `messages`: the prompt as a `developer` message; `run_llm=True` | One per interval of quiet with background work in progress. The assistant aggregator appends it and runs the LLM. |
+| Frame                                                                                                 | Fields                                                              | Effect                                                                                                                           |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| [`LLMInstructorMetadataFrame`](/api-reference/server/frames/system-frames#llminstructormetadataframe) | `instruction`: the standing guidance, mark filled in; `silent_mark` | Broadcast once, at start. The LLM service composes the instruction into its system instruction and honors the mark from then on. |
+| [`LLMMessagesAppendFrame`](/api-reference/server/frames/data-frames#llmmessagesappendframe)           | `messages`: the prompt as a `developer` message; `run_llm=True`     | One per interval of quiet with background work in progress. The assistant aggregator appends it and runs the LLM.                |
 
 ## Notes
 
-- **The silent mark is the LLM service's to honor**: A reply that opens with `silent_mark` is dropped by the service itself ([`honor_silent_mark`](/pipecat/learn/llm#base-class-configuration)), before the TTS, the context or any observer sees it, and the decision is reported as an [`LLMMarkerResponseFrame`](/api-reference/server/frames/data-frames#llmmarkerresponseframe) of kind `"silent"`, on which the processor starts the interval over.
+- **The silent mark is the LLM service's to honor**: A reply that opens with `silent_mark` is dropped by the service itself, which learns the mark from the processor's announcement at start, before the TTS, the context or any observer sees it, and the decision is reported as an [`LLMMarkerResponseFrame`](/api-reference/server/frames/data-frames#llmmarkerresponseframe) of kind `"silent"`, on which the processor starts the interval over.
 - **Text LLMs only**: The processor belongs after a text LLM. A speech-to-speech service's audio carries no mark to read.
 - **The interval starts over**: A spoken remark starts it over through the bot's speech, and a silent decision starts it over directly, so a long wait gets a fresh decision every `interval_secs`.
 - **With `filter_incomplete_user_turns`**: The service reads the mark after its turn-completion filter, so a declined reply of `● ∅` is dropped like one of `∅` alone, and the `●` already pushed for the context is discarded with it.
@@ -96446,6 +96450,22 @@ Inherits from `ServiceMetadataFrame`.
 
 <ParamField path="is_realtime_service" type="bool" default="False">
   Whether the broadcasting service is a realtime (speech-to-speech) LLM service.
+</ParamField>
+
+### LLMInstructorMetadataFrame
+
+Broadcast at pipeline start by a processor that instructs the LLM: it contributes standing guidance to the LLM's system instruction, prompts the model itself, or both. The LLM service composes the instruction onto the end of its system instruction, after the app's own, and keeps it across context resets, as `append_system_instruction` does. It honors the mark once announced: a reply that opens with it is dropped unspoken and reported as an [`LLMMarkerResponseFrame`](/api-reference/server/frames/data-frames#llmmarkerresponseframe) of kind `"silent"`. Each instructor's instruction is kept; a later mark replaces an earlier one. [`WaitReassurance`](/api-reference/server/utilities/turn-management/wait-reassurance) broadcasts one.
+
+Inherits from `ServiceMetadataFrame`.
+
+<ParamField path="instruction" type="str | None" default="None">
+  What the instructor adds to the system instruction, or `None` when it adds
+  nothing.
+</ParamField>
+
+<ParamField path="silent_mark" type="str | None" default="None">
+  What the instructor's prompts tell the model to answer with to say nothing, or
+  `None` when they offer no silence.
 </ParamField>
 
 ## RTVI
