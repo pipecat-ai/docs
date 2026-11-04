@@ -50,7 +50,7 @@ Before using GenesysAudioHookSerializer, you need:
 - **Protocol Handshake**: Automatic handling of open/opened, close/closed, and ping/pong messages
 - **DTMF Handling**: Process touch-tone events from callers
 - **Barge-in Support**: Notify Genesys when the user interrupts bot audio
-- **Pause/Resume**: Handle hold scenarios when audio streaming is temporarily suspended
+- **Pause/Resume**: Handle hold scenarios, and pause or resume the stream from your bot
 - **Architect Variables**: Pass input/output variables between Architect flows and your bot
 - **Stereo Support**: Process external (customer) audio, internal (agent) audio, or both channels
 
@@ -73,7 +73,7 @@ Before using GenesysAudioHookSerializer, you need:
 | `process_internal`           | `bool`                 | `False`      | Whether to process internal (agent) audio.                                                                                                                                                           |
 | `supported_languages`        | `list[str]`            | `None`       | List of language codes the bot supports (e.g., `["en-US", "es-ES"]`).                                                                                                                                |
 | `selected_language`          | `str`                  | `None`       | Default language code to use.                                                                                                                                                                        |
-| `start_paused`               | `bool`                 | `False`      | Whether to start the session in paused state.                                                                                                                                                        |
+| `start_paused`               | `bool`                 | `False`      | Whether Genesys starts the audio stream paused. Send `create_resume_request()` to start it.                                                                                                                                                        |
 | `ignore_rtvi_messages`       | `bool`                 | `True`       | Whether to ignore RTVI protocol messages during serialization.                                                                                                                                       |
 | `resampler_clear_after_secs` | `float \| None`        | `0.2`        | Seconds of inactivity after which the stream resampler clears its internal history to avoid audio artefacts. Set to `None` to never clear (recommended for telephony providers with irregular gaps). |
 
@@ -96,7 +96,7 @@ transport = FastAPIWebsocketTransport(
         audio_in_enabled=True,
         audio_out_enabled=True,
         serializer=serializer,
-        fixed_audio_packet_size=1600,
+        audio_out_10ms_chunks=20,
     ),
 )
 ```
@@ -160,7 +160,7 @@ await worker.queue_frame(OutputTransportMessageUrgentFrame(message=disconnect_ms
 
 ### Event Handlers
 
-The serializer emits an event for each AudioHook message it receives from Genesys: `on_open`, `on_close`, `on_ping`, `on_pause`, `on_update` (participant or configuration changes), `on_error`, and `on_dtmf`. Each handler receives the serializer and the Genesys message as a dict:
+The serializer emits an event for each AudioHook message it receives from Genesys: `on_open`, `on_close`, `on_ping`, `on_paused`, `on_resumed`, `on_update` (participant or configuration changes), `on_error`, and `on_dtmf`. Each handler receives the serializer and the Genesys message as a dict:
 
 ```python
 @serializer.event_handler("on_open")
@@ -176,10 +176,20 @@ async def on_dtmf(serializer, message):
     digit = message.get("parameters", {}).get("digit")
     logger.info(f"DTMF digit pressed: {digit}")
 
-@serializer.event_handler("on_pause")
-async def on_pause(serializer, message):
+@serializer.event_handler("on_paused")
+async def on_paused(serializer, message):
     logger.info("Audio paused (caller on hold)")
+
+@serializer.event_handler("on_resumed")
+async def on_resumed(serializer, message):
+    logger.info("Audio resumed")
 ```
+
+`on_pause` is also emitted when Genesys pauses the stream.
+
+<ParamField path="on_pause" type="event" deprecated>
+  _Deprecated since 1.16.0, removed in 2.0.0._ Use `on_paused` instead.
+</ParamField>
 
 ## Frames
 
@@ -199,19 +209,41 @@ async def on_pause(serializer, message):
 
 ## Methods
 
+### create_pause_request()
+
+```python
+def create_pause_request() -> dict[str, Any]
+```
+
+Returns a `pause` message asking Genesys to pause the audio stream. Genesys answers with `paused`, which pauses the session. Send it in an `OutputTransportMessageUrgentFrame`:
+
+```python
+await worker.queue_frame(
+    OutputTransportMessageUrgentFrame(message=serializer.create_pause_request())
+)
+```
+
+### create_resume_request()
+
+```python
+def create_resume_request() -> dict[str, Any]
+```
+
+Returns a `resume` message asking Genesys to resume the audio stream. Genesys answers with `resumed`, which resumes the session. Send it in an `OutputTransportMessageUrgentFrame`, including to start a session opened with `start_paused=True`:
+
+```python
+await worker.queue_frame(
+    OutputTransportMessageUrgentFrame(message=serializer.create_resume_request())
+)
+```
+
 ### create_resumed_response()
 
 ```python
 def create_resumed_response() -> dict[str, Any]
 ```
 
-Returns a `resumed` message for Genesys and ends the pause, so the serializer passes audio again. Send it in an `OutputTransportMessageUrgentFrame`:
-
-```python
-await worker.queue_frame(
-    OutputTransportMessageUrgentFrame(message=serializer.create_resumed_response())
-)
-```
+_Deprecated since 1.16.0, removed in 2.0.0._ Use `create_resume_request()` instead.
 
 ## Protocol Details
 
@@ -219,7 +251,7 @@ await worker.queue_frame(
 
 The Genesys AudioHook protocol uses WebSocket connections with two frame types:
 
-- **Text frames**: JSON control messages for session lifecycle (open, close, ping, pause, etc.)
+- **Text frames**: JSON control messages for session lifecycle (open, close, ping, pause, resume, etc.)
 - **Binary frames**: Raw audio data in PCMU or L16 format
 
 ### Message Flow
@@ -241,8 +273,8 @@ A typical session follows this sequence:
 
 ## Notes
 
-- **Fixed packet size**: Set `fixed_audio_packet_size=1600` on your transport parameters. This batches outbound audio into consistent chunks and prevents 429 rate limiting from Genesys.
+- **Fixed packet size**: Set `audio_out_10ms_chunks=20` on your transport parameters. This sends outbound audio in 200 ms packets, since Genesys rate-limits incoming messages.
 - **No extra dependencies**: The serializer uses Pipecat's built-in audio conversion utilities (`pcm_to_ulaw`, `ulaw_to_pcm`) and SOXR resampler.
-- **Pause/resume**: When Genesys sends a `pause` message (e.g., caller placed on hold), audio processing is suspended. The serializer drops incoming and outgoing audio while paused. Use the `on_pause` event handler and `create_resumed_response()` to control when streaming resumes.
+- **Pause/resume**: When Genesys pauses the stream (e.g., caller placed on hold) it sends `paused`, and the serializer drops incoming and outgoing audio until Genesys sends `resumed`. Use `create_pause_request()` and `create_resume_request()` to ask Genesys to pause or resume.
 - **Output variables**: Variables set via `set_output_variables()` are included in the `closed` response when Genesys terminates the session. These variables become available in the Architect flow for routing decisions.
 - **L16 format**: The serializer accepts `AudioHookMediaFormat.L16` as a configuration option but drops all audio in both directions with it. Use PCMU (the default).
