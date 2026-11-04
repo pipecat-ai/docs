@@ -1,7 +1,7 @@
 ---
 title: "Vobiz Frame Serializer"
 sidebarTitle: "Vobiz"
-description: "VobizFrameSerializer connects Pipecat to phone calls on Vobiz through bidirectional audio streams."
+description: "VobizFrameSerializer connects Pipecat to phone calls on Vobiz over bidirectional audio streams, with μ-law and L16 audio up to 24 kHz."
 ---
 
 import { CommunityMaintained } from "/snippets/community-maintained.mdx";
@@ -64,9 +64,15 @@ Or use `pip install pipecat-vobiz` if you manage dependencies with `pip`.
 ## Prerequisites
 
 1. **A [Vobiz account](https://console.vobiz.ai)** with a phone number.
-2. **`VOBIZ_AUTH_ID` and `VOBIZ_AUTH_TOKEN`**, which automatic hang-up uses.
-3. **A public HTTPS URL for your server**, so that Vobiz can request your answer
+2. **A public HTTPS URL for your server**, so that Vobiz can request your answer
    URL and open the WebSocket.
+
+### Required Environment Variables
+
+- `VOBIZ_AUTH_ID`: Your Vobiz Auth ID, used for automatic hang-up.
+- `VOBIZ_AUTH_TOKEN`: Your Vobiz Auth Token, used for automatic hang-up.
+
+### Answer URL
 
 Your answer URL returns XML that opens a bidirectional stream:
 
@@ -95,13 +101,18 @@ Your answer URL returns XML that opens a bidirectional stream:
   Vobiz Auth Token. Required while `auto_hang_up` is on.
 </ParamField>
 
-<ParamField path="params" type="VobizFrameSerializer.InputParams" default="None">
+<ParamField
+  path="params"
+  type="VobizFrameSerializer.InputParams"
+  default="None"
+>
   Optional settings: `encoding` and `vobiz_sample_rate` (inbound),
   `output_encoding` and `output_sample_rate` (outbound), `sample_rate` and
   `auto_hang_up`.
 </ParamField>
 
-Inbound and outbound formats are set independently:
+Inbound and outbound formats are set independently. Raises `ValueError` for a
+format not marked Yes:
 
 | Direction | μ-law 8 kHz | L16 8 kHz | L16 16 kHz | L16 24 kHz |
 | --------- | ----------- | --------- | ---------- | ---------- |
@@ -123,6 +134,8 @@ Read the `start` event, then pass the serializer to a
 import os
 
 from fastapi import WebSocket
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -137,8 +150,8 @@ async def run_bot(websocket: WebSocket):
     serializer = VobizFrameSerializer(
         stream_id=start["stream_id"],
         call_id=start["call_id"],
-        auth_id=os.environ["VOBIZ_AUTH_ID"],
-        auth_token=os.environ["VOBIZ_AUTH_TOKEN"],
+        auth_id=os.getenv("VOBIZ_AUTH_ID"),
+        auth_token=os.getenv("VOBIZ_AUTH_TOKEN"),
         params=VobizFrameSerializer.InputParams(
             encoding=start["encoding"],
             vobiz_sample_rate=start["sample_rate"],
@@ -152,7 +165,23 @@ async def run_bot(websocket: WebSocket):
             serializer=serializer,
         ),
     )
-    # ... build the pipeline with transport.input() and transport.output()
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            # ... VAD, STT, LLM, TTS, etc.
+            transport.output(),
+        ]
+    )
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(
+            audio_in_sample_rate=start["sample_rate"],
+            audio_out_sample_rate=start["sample_rate"],
+        ),
+    )
+
+    # ... run the worker
 ```
 
 <Tip>
@@ -163,8 +192,8 @@ async def run_bot(websocket: WebSocket):
 
 ## Compatibility
 
-Tested on real phone calls with Pipecat v1.15.0 in every format above, including
-interruptions. DTMF digits sent through the Vobiz REST API did not reach the
-stream in testing, so DTMF is not listed as supported. Check the
+Tested with Pipecat v1.15.0 on real phone calls, in every format above, including
+interruptions and automatic hang-up. DTMF is not listed as supported: digits sent
+during test calls did not reach the stream. Check the
 [source repository](https://github.com/Piyush-sahoo/Pipecat-Vobiz) for the latest
 tested versions and the changelog.
