@@ -16867,7 +16867,7 @@ uv add "pipecat-ai[tone]"
 Add `PipecatToneReader` between the STT service and the user aggregator:
 
 ```python
-from pipecat.processors.tone.reader import PipecatToneReader
+from pipecat.expressive.processors.tone_reader import PipecatToneReader
 
 pipeline = Pipeline(
     [
@@ -16902,7 +16902,7 @@ The reader's model downloads from Hugging Face the first time the pipeline start
 Pipecat Tone's tagger writes the tags for the LLM. The LLM is taught no tags, writes plain words, and the context keeps its replies plain. The tagger labels each sentence from the call so far and how the user sounded, in about 15 milliseconds on the CPU. Add `PipecatToneTagger` between the LLM and the TTS service:
 
 ```python
-from pipecat.processors.tone.tagger import PipecatToneTagger
+from pipecat.expressive.processors.tone_tagger import PipecatToneTagger
 
 pipeline = Pipeline(
     [
@@ -82427,6 +82427,14 @@ For a walkthrough, see [Pipecat Classifiers](/pipecat/learn/classifiers).
   >
     Answers through any Pipecat LLM service that supports `run_inference()`.
   </Card>
+  <Card
+    title="PipecatToneClassifier"
+    icon="face-smile"
+    href="/api-reference/server/expressive/pipecat-tone#pipecattoneclassifier"
+  >
+    Answers Pipecat Tone's own emotion, move, sarcasm and backchannel questions
+    on the CPU.
+  </Card>
 </CardGroup>
 
 ```python
@@ -83495,6 +83503,49 @@ A breath is offered only with `ExpressionGuidance.BREATHE`.
 
 A perception producer reads how the user spoke each turn and sets it as the transcription's `perception`. The LLM reads it at the head of the user's message, formatted by `format_perception()`.
 
+### PerceptionReader
+
+A perception producer that asks any [classifier](/api-reference/server/classifiers/overview) about each final user transcription, with the bot's previous reply, and sets the answers as the transcription's `perception`, one signal per question. Goes between the STT service and the user aggregator. A transcription passes unread when its reading is late or the classifier fails. A classifier that can't be set up is reported as an error that leaves the reader unusable. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
+
+```python
+from pipecat.expressive.processors.perception_reader import PerceptionQuestion, PerceptionReader
+
+reader = PerceptionReader(
+    classifier=JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY")),
+    questions={
+        "frustration": PerceptionQuestion(
+            question=YesNoQuestion(instructions="Is the user frustrated?"),
+            description="The chance the user is frustrated, from 0 to 1.",
+        ),
+    },
+)
+```
+
+<ParamField path="classifier" type="BaseClassifier" required>
+  What answers the questions about each turn.
+</ParamField>
+
+<ParamField path="questions" type="Mapping[str, PerceptionQuestion]" required>
+  The questions, by the name of the signal each reports. Raises `ValueError`
+  when a name has a space or one of `=`, `,`, `[`, `]`, `(` or `)`.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="0.5">
+  Seconds a transcription waits for its reading.
+</ParamField>
+
+A `ChoiceQuestion` is reported as labels, a `YesNoQuestion` as its probability, and a `ScoreQuestion` as its position on the scale.
+
+### PerceptionQuestion
+
+One signal a `PerceptionReader` reports.
+
+| Field         | Type                 | Description                                                                               |
+| ------------- | -------------------- | ----------------------------------------------------------------------------------------- |
+| `question`    | `ClassifierQuestion` | What the classifier is asked.                                                             |
+| `description` | `str`                | A short line telling the LLM how to read the signal, such as its range. Defaults to `""`. |
+| `max_labels`  | `int`                | The most labels a choice reports, likeliest first. At least 1. Defaults to `2`.           |
+
 ### PerceptionSignal
 
 One signal of a reading, read either as labels or as a value.
@@ -83684,13 +83735,13 @@ Set the markup apart from the words with spaces, so the word timestamps a servic
 # Pipecat Tone
 Source: https://docs.pipecat.ai/api-reference/server/expressive/pipecat-tone.md
 
-Reference for PipecatToneReader, which reads how each user turn was meant, and PipecatToneTagger, which writes tags for the LLM.
+Reference for PipecatToneReader, which reads how each user turn was meant, PipecatToneClassifier, and PipecatToneTagger, which writes tags for the LLM.
 
 ## Overview
 
 Pipecat Tone is two small models for [expressive conversation](/api-reference/server/expressive/overview) that run on the CPU:
 
-- [`PipecatToneReader`](#pipecattonereader) reads how each user turn was meant from its words, a perception producer that tells the LLM how the user sounded.
+- [`PipecatToneReader`](#pipecattonereader) reads how each user turn was meant from its words, a perception producer that tells the LLM how the user sounded. [`PipecatToneClassifier`](#pipecattoneclassifier) puts the same model behind the [classifier](/api-reference/server/classifiers/overview) interface.
 - [`PipecatToneTagger`](#pipecattonetagger) writes the expression tags for the LLM's plain replies, a sentence at a time.
 
 For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-conversation).
@@ -83720,10 +83771,10 @@ uv add "pipecat-ai[tone]"
 
 ## PipecatToneReader
 
-Reads each final user transcription, with the bot's reply before it, and sets the reading as the transcription's `perception`. Goes between the STT service and the user aggregator. A read takes a few milliseconds, and the transcription waits for it.
+Reads each final user transcription, with the bot's reply before it, and sets the reading as the transcription's `perception`. Goes between the STT service and the user aggregator. A read takes a few milliseconds, and the transcription waits for it, up to `timeout` seconds. It is a [`PerceptionReader`](/api-reference/server/expressive/overview#perceptionreader) that asks a `PipecatToneClassifier` its `emotion` and `sarcasm` questions. With metrics enabled, it pushes the classifier's processing metrics.
 
 ```python
-from pipecat.processors.tone.reader import PipecatToneReader
+from pipecat.expressive.processors.tone_reader import PipecatToneReader
 ```
 
 ### Configuration
@@ -83746,6 +83797,10 @@ from pipecat.processors.tone.reader import PipecatToneReader
   The CPU threads for one read.
 </ParamField>
 
+<ParamField path="timeout" type="float" default="0.5">
+  Seconds a transcription waits for its reading. After that it passes unread.
+</ParamField>
+
 ### Signals
 
 | Signal    | Read as | Reading                                                                                                              |
@@ -83755,6 +83810,40 @@ from pipecat.processors.tone.reader import PipecatToneReader
 
 The LLM reads them as `([emotion angry=0.81, neutral=0.12],[sarcasm value=0.04])` at the head of the user's message, and is taught what each signal means. The emotion labels are the model's: see its model card.
 
+## PipecatToneClassifier
+
+A [classifier](/api-reference/server/classifiers/overview) backed by the reader model. It answers only the questions built into the model, listed in `questions`, and any other question raises `ClassifierError`. `setup()` loads the model, and `questions` raises `ClassifierError` until then.
+
+```python
+from pipecat.classifiers.tone.classifier import PipecatToneClassifier
+```
+
+### Configuration
+
+Takes the same `revision`, `model_dir`, `precision` and `threads` as [`PipecatToneReader`](#configuration).
+
+### Questions
+
+| Question      | Kind             | Asks                                                                                   |
+| ------------- | ---------------- | -------------------------------------------------------------------------------------- |
+| `emotion`     | `ChoiceQuestion` | Which feeling the turn's words show, among the model's emotions.                       |
+| `move`        | `ChoiceQuestion` | What the turn does in the conversation, among the model's moves.                       |
+| `sarcasm`     | `YesNoQuestion`  | Whether the turn is sarcastic.                                                         |
+| `backchannel` | `YesNoQuestion`  | Whether the turn is only a listening sound, such as "mhm", that doesn't take the turn. |
+
+The state is the turn's text, or `{"user": ..., "assistant": ...}` to read it with the bot's words before it. Any other state raises `ClassifierError`.
+
+```python
+classifier = PipecatToneClassifier()
+await classifier.setup(task_manager)
+
+results = await classifier.ask(
+    {"assistant": "Your next visit is in forty minutes.", "user": "Oh great."},
+    classifier.questions,
+)
+sarcastic = results["sarcasm"].probability
+```
+
 ## PipecatToneTagger
 
 Labels each sentence of the LLM's reply with the call so far, how the user sounded and the pipeline's expression policy, and sends it on with tags the TTS service performs. Goes between the LLM and the TTS service. A sentence takes about 15 milliseconds with the `17m` model, and waits for it.
@@ -83762,7 +83851,7 @@ Labels each sentence of the LLM's reply with the call so far, how the user sound
 At start, the tagger broadcasts an `ExpressionMetadataFrame`, so the LLM is taught no tags, writes plain words, and the context keeps its replies plain.
 
 ```python
-from pipecat.processors.tone.tagger import PipecatToneTagger
+from pipecat.expressive.processors.tone_tagger import PipecatToneTagger
 ```
 
 ### Configuration
