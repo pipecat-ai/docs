@@ -57,6 +57,7 @@ from pipecat.classifiers.base_classifier import (
     BaseClassifier,
     ChoiceQuestion,
     ChoiceResult,
+    ClassifierAudio,
     ClassifierError,
     ClassifierImage,
     ScoreQuestion,
@@ -169,6 +170,33 @@ results = await classifier.yes_no(
 )
 ```
 
+## Audio
+
+A classifier that can hear takes one clip of audio alongside the state, through the `audio` argument of `ask()`, `yes_no()`, `choice()` and `score()`. Check `supports_audio` to find out whether a classifier can. Each classifier declares the clips it accepts with `min_audio_secs`, `max_audio_secs` and `audio_sample_rate`. A clip outside the accepted length raises `ClassifierError`, and a clip is resampled to `audio_sample_rate` before the classifier gets it.
+
+### ClassifierAudio
+
+A clip of audio the questions can hear.
+
+<ParamField path="audio" type="bytes" required>
+  The clip, as 16-bit mono PCM.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" required>
+  The clip's sample rate in Hz.
+</ParamField>
+
+`duration_secs` returns how long the clip is, in seconds.
+
+```python
+clip = ClassifierAudio(audio=pcm_bytes, sample_rate=16000)
+results = await classifier.yes_no(
+    "A caller on the phone.",
+    {"angry": YesNoQuestion(instructions="Does the caller sound angry?")},
+    audio=clip,
+)
+```
+
 ## Results
 
 ### YesNoResult
@@ -209,7 +237,7 @@ result.probability("angry")  # 0.12
 
 ### ClassifierError
 
-Raised when a classifier cannot answer: the backend failed or did not reply in time, its reply could not be turned into results, or it was given images and cannot see them. Every classifier answers or raises within a time bound of its own, so a caller waiting on one is never left hanging.
+Raised when a classifier cannot answer: the backend failed or did not reply in time, its reply could not be turned into results, it was given images and cannot see them, or it was given a clip of audio and cannot hear it or does not accept its length. Every classifier answers or raises within a time bound of its own, so a caller waiting on one is never left hanging.
 
 ## BaseClassifier
 
@@ -225,20 +253,21 @@ async def ask(
     questions: Mapping[str, ClassifierQuestion],
     *,
     images: Sequence[ClassifierImage] | None = None,
+    audio: ClassifierAudio | None = None,
 ) -> dict[str, ClassifierResult]
 ```
 
-Answers several questions about one state, in one call. `questions` can mix kinds. Returns one result per question, under the same names, each of the type its question calls for. `images` are images the questions can look at, for a classifier that [supports them](#images). A classifier that cannot see images raises `ClassifierError` when given some.
+Answers several questions about one state, in one call. `questions` can mix kinds. Returns one result per question, under the same names, each of the type its question calls for. `images` are images the questions can look at, for a classifier that [supports them](#images). A classifier that cannot see images raises `ClassifierError` when given some. `audio` is a clip the questions can hear, for a classifier that [supports it](#audio). A classifier that cannot hear raises `ClassifierError` when given one, as does one whose accepted length the clip falls outside of.
 
 #### yes_no, choice, score
 
 ```python
-async def yes_no(state, questions: Mapping[str, YesNoQuestion], *, images=None) -> dict[str, YesNoResult]
-async def choice(state, questions: Mapping[str, ChoiceQuestion], *, images=None) -> dict[str, ChoiceResult]
-async def score(state, questions: Mapping[str, ScoreQuestion], *, images=None) -> dict[str, ScoreResult]
+async def yes_no(state, questions: Mapping[str, YesNoQuestion], *, images=None, audio=None) -> dict[str, YesNoResult]
+async def choice(state, questions: Mapping[str, ChoiceQuestion], *, images=None, audio=None) -> dict[str, ChoiceResult]
+async def score(state, questions: Mapping[str, ScoreQuestion], *, images=None, audio=None) -> dict[str, ScoreResult]
 ```
 
-Typed versions of `ask()` for questions of one kind, taking the same `images`. They return results already typed, so no `isinstance` check is needed.
+Typed versions of `ask()` for questions of one kind, taking the same `images` and `audio`. They return results already typed, so no `isinstance` check is needed.
 
 All four raise `ClassifierError` when the answers could not be produced.
 
@@ -260,10 +289,14 @@ Releases the classifier's resources. Call it when you are done asking.
 
 ### Properties
 
-| Property          | Type          | Description                                                                           |
-| ----------------- | ------------- | ------------------------------------------------------------------------------------- |
-| `model`           | `str \| None` | The model that answers, as named in the metrics.                                      |
-| `supports_images` | `bool`        | Whether questions can come with images. `False` unless the classifier says otherwise. |
+| Property            | Type            | Description                                                                                    |
+| ------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
+| `model`             | `str \| None`   | The model that answers, as named in the metrics.                                               |
+| `supports_images`   | `bool`          | Whether questions can come with images. `False` unless the classifier says otherwise.          |
+| `supports_audio`    | `bool`          | Whether questions can come with a clip of audio. `False` unless the classifier says otherwise. |
+| `min_audio_secs`    | `float`         | The shortest clip the classifier accepts, in seconds. `0.0` by default.                        |
+| `max_audio_secs`    | `float \| None` | The longest clip the classifier accepts, in seconds, or `None` for no limit.                   |
+| `audio_sample_rate` | `int \| None`   | The sample rate clips are resampled to, or `None` to keep their own.                           |
 
 ### Event Handlers
 
@@ -300,7 +333,7 @@ class MyProcessor(FrameProcessor):
 
 ## Writing a Classifier
 
-To back classifiers with another model or service, subclass `BaseClassifier` and implement `_ask()`. It receives the state, the questions and the `images` (always empty unless the classifier overrides `supports_images` to return `True`), and returns the results by name, plus the tokens the call used when that is known (or `None`). Raise `ClassifierError` when the backend fails. The public methods, typing and metrics are handled by the base class.
+To back classifiers with another model or service, subclass `BaseClassifier` and implement `_ask()`. It receives the state, the questions and the `images` (always empty unless the classifier overrides `supports_images` to return `True`), and returns the results by name, plus the tokens the call used when that is known (or `None`). A classifier that can hear overrides `supports_audio` and declares the clips it accepts; `_ask()` then also receives `audio`, a clip of an accepted length at `audio_sample_rate`, when there is one. A classifier that cannot hear needs no `audio` parameter. Raise `ClassifierError` when the backend fails. The public methods, typing and metrics are handled by the base class.
 
 ```python
 from pipecat.classifiers.base_classifier import BaseClassifier, ClassifierError
