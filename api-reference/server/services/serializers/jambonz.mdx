@@ -1,0 +1,124 @@
+---
+title: "jambonz Frame Serializer"
+sidebarTitle: "jambonz"
+description: "JambonzFrameSerializer connects Pipecat pipelines to phone calls on jambonz through the listen verb's raw PCM WebSocket protocol."
+---
+
+## Overview
+
+`JambonzFrameSerializer` connects a Pipecat pipeline to calls on [jambonz](https://jambonz.org) through the `listen` verb's WebSocket protocol. Audio is raw 16-bit signed little-endian mono PCM, and the call's sample rate is read from the preamble jambonz sends when the socket opens, so it needs no configuration.
+
+<CardGroup cols={2}>
+  <Card
+    title="jambonz Serializer API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.serializers.jambonz.html"
+  >
+    Pipecat's API methods for jambonz WebSocket integration
+  </Card>
+  <Card
+    title="jambonz listen Verb"
+    icon="book"
+    href="https://docs.jambonz.org/verbs/verbs/listen"
+  >
+    Official jambonz documentation for the `listen` verb
+  </Card>
+</CardGroup>
+
+## Installation
+
+The `JambonzFrameSerializer` does not require any additional dependencies beyond the core Pipecat library:
+
+```bash
+uv add "pipecat-ai"
+```
+
+## Prerequisites
+
+1. **A jambonz account or server** with an application that runs the `listen` verb.
+2. **A public WebSocket URL** for your bot, which the verb's `url` points to.
+
+### listen Verb
+
+The verb needs three settings stated explicitly:
+
+```json
+{
+  "verb": "listen",
+  "url": "wss://your-bot.example.com/ws",
+  "sampleRate": 16000,
+  "mixType": "mono",
+  "bidirectionalAudio": {
+    "enabled": true,
+    "streaming": true,
+    "sampleRate": 16000
+  }
+}
+```
+
+- `bidirectionalAudio.streaming` defaults to `false`. While it is, audio sent back is ignored and the caller hears nothing.
+- `sampleRate` defaults to `8000`. Other allowed values are 16000, 24000, 48000 and 64000.
+- `bidirectionalAudio.sampleRate` has no default. Set it to the same value as `sampleRate`: the serializer sends audio at the `sampleRate` from the preamble, so a mismatch plays back too fast or too slow.
+- `mixType` must be `mono`. Audio is dropped with a warning for `stereo` or `mixed`.
+- Set `passDtmf` to receive keypad digits as `InputDTMFFrame`.
+
+## Configuration
+
+<ParamField
+  path="params"
+  type="JambonzFrameSerializer.InputParams | None"
+  default="None"
+>
+  Configuration parameters. See [InputParams](#inputparams) below.
+</ParamField>
+
+### InputParams
+
+| Parameter                    | Type            | Default | Description                                                                                                                                            |
+| ---------------------------- | --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `jambonz_sample_rate`        | `int \| None`   | `None`  | Overrides the rate jambonz forks audio at. When `None`, the rate comes from the connection's preamble.                                                 |
+| `sample_rate`                | `int \| None`   | `None`  | Optional override for the pipeline input sample rate. When `None`, uses the pipeline's configured rate.                                                |
+| `disconnect_on_end`          | `bool`          | `True`  | Sends `disconnect` when the pipeline ends, which ends the `listen` verb so jambonz runs the verb's `actionHook` or hangs up. Needs no API credentials. |
+| `ignore_rtvi_messages`       | `bool`          | `True`  | Whether to ignore RTVI protocol messages during serialization.                                                                                         |
+| `resampler_clear_after_secs` | `float \| None` | `None`  | Seconds of inactivity after which the stream resampler clears its internal history. `None` never clears.                                               |
+
+### Properties
+
+Populated from the preamble once it arrives.
+
+| Property              | Type             | Description                                |
+| --------------------- | ---------------- | ------------------------------------------ |
+| `jambonz_sample_rate` | `int \| None`    | The rate jambonz is forking the call at.   |
+| `mix_type`            | `str \| None`    | The channel layout stated in the preamble. |
+| `call_sid`            | `str \| None`    | The jambonz call identifier.               |
+| `trace_id`            | `str \| None`    | The jambonz trace identifier.              |
+| `call_meta`           | `dict[str, Any]` | A copy of the full preamble.               |
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.serializers.jambonz import JambonzFrameSerializer
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
+
+serializer = JambonzFrameSerializer()
+
+transport = FastAPIWebsocketTransport(
+    websocket=websocket,
+    params=FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        serializer=serializer,
+    ),
+)
+```
+
+## Notes
+
+- **Interruptions**: An `InterruptionFrame` sends `killAudio`, which flushes audio jambonz is playing or has buffered.
+- **DTMF support**: With `passDtmf` set on the verb, digits are converted to `InputDTMFFrame` objects. `mark` and `playDone` events are ignored.
+- **Preamble first**: Audio that arrives before the preamble is dropped.
