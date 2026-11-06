@@ -6049,7 +6049,7 @@ results = await classifier.yes_no(
 
 ## Asking About Audio
 
-A classifier that can hear takes one clip of audio as `audio=`, a `ClassifierAudio` of 16-bit mono PCM. A classifier's `supports_audio` property says whether it can, and one that cannot raises `ClassifierError` when given a clip. Each classifier that hears declares how long a clip it accepts, and clips are resampled to the rate it needs.
+A classifier that can hear takes one clip of audio as `audio=`, a `ClassifierAudio` of 16-bit mono PCM. A classifier's `supports_audio` property says whether it can, and one that cannot raises `ClassifierError` when given a clip. Each classifier that hears declares how long a clip it accepts, and clips are resampled to the rate it needs. `HumeAudioClassifier` hears audio, and takes clips of 5 seconds to 5 minutes.
 
 ```python
 from pipecat.classifiers.base_classifier import ClassifierAudio
@@ -37492,11 +37492,12 @@ Audio filters reduce background noise and isolate the speaker's voice in the inp
 
 Classifiers answer typed questions about some state, such as whether a call reached voicemail or which element on screen the user means. See [Pipecat Classifiers](/pipecat/learn/classifiers).
 
-| Classifier                                     | Setup                             | Maintainer |
-| ---------------------------------------------- | --------------------------------- | ---------- |
-| [Clef](/api-reference/server/classifiers/clef) | `uv add "pipecat-ai[cloudflare]"` | Pipecat    |
-| [Jev](/api-reference/server/classifiers/jev)   | `uv add "pipecat-ai[typesafe]"`   | Pipecat    |
-| [LLM](/api-reference/server/classifiers/llm)   | Built in                          | Pipecat    |
+| Classifier                                                 | Setup                             | Maintainer |
+| ---------------------------------------------------------- | --------------------------------- | ---------- |
+| [Clef](/api-reference/server/classifiers/clef)             | `uv add "pipecat-ai[cloudflare]"` | Pipecat    |
+| [Hume Audio](/api-reference/server/classifiers/hume-audio) | `uv add "pipecat-ai[hume]"`       | Pipecat    |
+| [Jev](/api-reference/server/classifiers/jev)               | `uv add "pipecat-ai[typesafe]"`   | Pipecat    |
+| [LLM](/api-reference/server/classifiers/llm)               | Built in                          | Pipecat    |
 
 ## Composite Services
 
@@ -82719,6 +82720,13 @@ For a walkthrough, see [Pipecat Classifiers](/pipecat/learn/classifiers).
     Answers through Cloudflare's Clef model on Workers AI.
   </Card>
   <Card
+    title="HumeAudioClassifier"
+    icon="waveform-lines"
+    href="/api-reference/server/classifiers/hume-audio"
+  >
+    Answers questions about a clip of audio through Hume's Audio Decisions API.
+  </Card>
+  <Card
     title="OpenAIDecisionsClassifier"
     icon="sparkles"
     href="/api-reference/server/classifiers/openai-decisions"
@@ -82967,7 +82975,7 @@ All four raise `ClassifierError` when the answers could not be produced.
 async def setup(task_manager: BaseTaskManager)
 ```
 
-An owner that runs inside an agent calls this with its task manager before the first question. `JevClassifier`, `ClefClassifier`, and `OpenAIDecisionsClassifier` also open their connection here, so the first question does not pay for it.
+An owner that runs inside an agent calls this with its task manager before the first question. `JevClassifier`, `ClefClassifier`, `HumeAudioClassifier`, and `OpenAIDecisionsClassifier` also open their connection here, so the first question does not pay for it.
 
 #### cleanup
 
@@ -83231,6 +83239,177 @@ After every call, a `ClefClassifier` reports the time it took as `ProcessingMetr
 - **Images**: a call takes up to 4 images, available as `CLEF_MAX_IMAGES` in `pipecat.classifiers.cloudflare.clef.classifier`, of at most 4 MiB each and 8 MiB in all. More than 4 raises `ClassifierError` before anything is sent.
 - **Errors**: a rejected request, a busy Workers AI after every retry, an unreachable server, or a reply missing an answer all raise `ClassifierError`. The message carries the reason Cloudflare gave, such as `HTTP 401: Authentication error`.
 - **Idle connections** are kept open for 240 seconds, so a gap between questions does not cost a new TLS handshake.
+
+# HumeAudioClassifier
+Source: https://docs.pipecat.ai/api-reference/server/classifiers/hume-audio.md
+
+HumeAudioClassifier and HumeAudioDecisionsClient answer classifier questions about a clip of audio through Hume's Audio Decisions API.
+
+## Overview
+
+`HumeAudioClassifier` answers [classifier questions](/api-reference/server/classifiers/overview) about a clip of audio through Hume's Audio Decisions API. Hume hears the clip, and reads the state as the clip's context, such as who is speaking and what they said. All the questions about one clip go to Hume in one request. Its probabilities estimate the share of human raters who would give each answer.
+
+A `HumeAudioClassifier` asks through a `HumeAudioDecisionsClient`, which holds the HTTP/2 connection, adds the auth header, retries when Hume is busy, and counts tokens. Build the classifier with an API key to give it a client of its own, or pass a `HumeAudioDecisionsClient` to share one connection between several classifiers.
+
+## Installation
+
+```bash
+uv add "pipecat-ai[hume]"
+```
+
+## Prerequisites
+
+A Hume API key, usually set as an environment variable:
+
+```bash
+HUME_API_KEY=...
+```
+
+## Configuration
+
+### HumeAudioClassifier
+
+```python
+from pipecat.classifiers.hume.audio_decisions.classifier import HumeAudioClassifier
+```
+
+<ParamField path="api_key" type="str | None" default="None">
+  Hume API key, when the classifier should have a client of its own. One of
+  `api_key` and `client` is required.
+</ParamField>
+
+<ParamField path="client" type="HumeAudioDecisionsClient | None" default="None">
+  A client to share with other classifiers. One of `api_key` and `client` is
+  required.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.cloud.hume.ai">
+  Where a client of its own sends its questions.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="10.0">
+  Seconds a client of its own waits for an answer before raising
+  `ClassifierError`.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Name of the classifier, as it appears in logs and metrics.
+</ParamField>
+
+### HumeAudioDecisionsClient
+
+```python
+from pipecat.classifiers.hume.audio_decisions.client import HumeAudioDecisionsClient
+```
+
+<ParamField path="api_key" type="str" required>
+  Hume API key.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.cloud.hume.ai">
+  Where the API is served.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="10.0">
+  Seconds to wait for a reply before raising `ClassifierError`.
+</ParamField>
+
+<ParamField path="max_retries" type="int" default="2">
+  How many times to retry a request Hume couldn't answer because it was busy
+  (HTTP 429, 500 or 503).
+</ParamField>
+
+## Usage
+
+### Basic Usage
+
+Every question needs a clip. A question asked without one raises `ClassifierError`.
+
+```python
+import os
+
+from pipecat.classifiers.base_classifier import ClassifierAudio, YesNoQuestion
+from pipecat.classifiers.hume.audio_decisions.classifier import HumeAudioClassifier
+
+classifier = HumeAudioClassifier(api_key=os.getenv("HUME_API_KEY"))
+
+clip = ClassifierAudio(audio=pcm_bytes, sample_rate=16000)  # 5 seconds to 5 minutes
+results = await classifier.yes_no(
+    "A caller on the phone.",
+    {"angry": YesNoQuestion(instructions="Does the caller sound angry?")},
+    audio=clip,
+)
+results["angry"].probability
+```
+
+### Reading How the User Sounded
+
+Pass the classifier to a [`PerceptionReader`](/api-reference/server/expressive/overview#perceptionreader), which cuts a clip of the user's speech each time they stop speaking and sets the answers as the transcription's `perception`.
+
+### Sharing a Client
+
+Several classifiers can share one `HumeAudioDecisionsClient`, and with it one connection pool and one token count:
+
+```python
+from pipecat.classifiers.hume.audio_decisions.client import HumeAudioDecisionsClient
+
+client = HumeAudioDecisionsClient(api_key=os.getenv("HUME_API_KEY"))
+first = HumeAudioClassifier(client=client)
+second = HumeAudioClassifier(client=client)
+```
+
+A client the classifier created is closed in the classifier's `cleanup()`. A shared client is left open, so close it yourself with `await client.close()` when every classifier using it is done.
+
+### Opening the Connection Early
+
+`setup()` opens the connection to Hume ahead of the first question. Components that own a classifier, such as `PerceptionReader`, call it for you. If the connection cannot be opened at setup, a warning is logged and the first question opens it instead.
+
+## HumeAudioClassifier Properties
+
+| Property            | Type                       | Description                                                 |
+| ------------------- | -------------------------- | ----------------------------------------------------------- |
+| `client`            | `HumeAudioDecisionsClient` | The client this classifier asks through.                    |
+| `supports_audio`    | `bool`                     | Always `True`: Hume hears audio.                            |
+| `min_audio_secs`    | `float`                    | `5.0`: the shortest clip Hume hears.                        |
+| `max_audio_secs`    | `float`                    | `300.0`: the longest clip Hume hears.                       |
+| `audio_sample_rate` | `int`                      | `16000`: clips are resampled to 16 kHz before they're sent. |
+
+## HumeAudioDecisionsClient Reference
+
+### Properties
+
+| Property | Type                      | Description                                                       |
+| -------- | ------------------------- | ----------------------------------------------------------------- |
+| `usage`  | `HumeAudioDecisionsUsage` | Input tokens billed so far over every request, as `input_tokens`. |
+
+### Methods
+
+#### connect
+
+```python
+await client.connect()
+```
+
+Opens the connection to Hume with a lightweight request that also checks the key. It counts toward the rate limit like any request. It connects once: a client shared by several classifiers is connected by each of them, and only the first call sends anything. Raises `ClassifierError` if Hume could not be reached or refused the request.
+
+#### close
+
+```python
+await client.close()
+```
+
+Closes the connection pool.
+
+## Metrics
+
+After every call, a `HumeAudioClassifier` reports the time it took as `ProcessingMetricsData` and the input tokens used as `LLMUsageMetricsData` through its [`on_metrics`](/api-reference/server/classifiers/overview#on_metrics) event.
+
+## Notes
+
+- **Context**: the state is sent to Hume as the clip's context, as text or as JSON for structured state. Hume reads at most 1000 characters of it, so a longer state keeps its last 1000 characters. The limit is available as `HUME_MAX_CONTEXT` in `pipecat.classifiers.hume.audio_decisions.classifier`.
+- **Audio**: clips are sent as 16 kHz mono WAV, which is how the model hears them.
+- **Images**: `HumeAudioClassifier` cannot see images. Passing some raises `ClassifierError`.
+- **Errors**: a rejected request, a busy Hume after every retry, an unreachable server, or a reply missing an answer all raise `ClassifierError`.
 
 # JevClassifier
 Source: https://docs.pipecat.ai/api-reference/server/classifiers/jev.md
@@ -83843,7 +84022,9 @@ A perception producer reads how the user spoke each turn and sets it as the tran
 
 ### PerceptionReader
 
-A perception producer that asks any [classifier](/api-reference/server/classifiers/overview) about each final user transcription, with the bot's previous reply, and sets the answers as the transcription's `perception`, one signal per question. Goes between the STT service and the user aggregator. A transcription passes unread when its reading is late or the classifier fails. A classifier that can't be set up is reported as an error that leaves the reader unusable. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
+A perception producer that asks any [classifier](/api-reference/server/classifiers/overview) how the user spoke, and sets the answers as the transcription's `perception`, one signal per question. Goes between the STT service and the user aggregator. Every reading is also broadcast in a `PerceptionFrame` as soon as it's made. A transcription passes unread when its reading is late or the classifier fails. A classifier that can't be set up is reported as an error that leaves the reader unusable.
+
+A text classifier reads each final transcription, with the bot's previous reply. A classifier that can hear, as its `supports_audio` says, such as [`HumeAudioClassifier`](/api-reference/server/classifiers/hume-audio), hears the user's audio each time they stop speaking: their speech, plus the audio heard just before it when the speech is shorter than the classifier's `min_audio_secs`. Audio heard while the user is muted counts as silence. The transcriptions of that speech are held until the speech is read and pushed on together, with the reading, and only the last one is finalized. The STT's `ttfs_p99_latency` is raised by `timeout` so the user's turn waits for them. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
 
 ```python
 from pipecat.expressive.processors.perception_reader import PerceptionQuestion, PerceptionReader
@@ -83868,8 +84049,10 @@ reader = PerceptionReader(
   when a name has a space or one of `=`, `,`, `[`, `]`, `(` or `)`.
 </ParamField>
 
-<ParamField path="timeout" type="float" default="0.5">
-  Seconds a transcription waits for its reading.
+<ParamField path="timeout" type="float | None" default="None">
+  Seconds a transcription waits for its reading. By default `0.5` for a text
+  classifier, counted from when the transcription arrives, and `2` for a
+  classifier that hears audio, counted from when the user stops speaking.
 </ParamField>
 
 A `ChoiceQuestion` is reported as labels, a `YesNoQuestion` as its probability, and a `ScoreQuestion` as its position on the scale.
@@ -83936,6 +84119,7 @@ The user aggregator uses it to merge all the final readings of a user turn, so a
 | ---------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TTSMetadataFrame`                                                           | `expression` | What the TTS service performs, an [`ExpressionCapabilities`](/api-reference/server/expressive/tts-services#expressioncapabilities), or `None`. Broadcast at start and when a settings change alters it. |
 | `PerceptionMetadataFrame`                                                    | `perception` | The `PerceptionCapabilities` of a perception producer, broadcast at start.                                                                                                                              |
+| `PerceptionFrame`                                                            | `perception` | `list[PerceptionSignal]`: a reading of how the user spoke, broadcast by a perception producer as soon as it's made, before a transcription carries it. A `SystemFrame`.                                 |
 | `ExpressionMetadataFrame`                                                    |              | Broadcast at start by a processor that writes the tags after the LLM, such as `PipecatToneTagger`, so the LLM is taught none.                                                                           |
 | `TranscriptionFrame`, `InterimTranscriptionFrame`, `EagerTranscriptionFrame` | `perception` | `list[PerceptionSignal] \| None`: how the user said the words, when a perception producer read them.                                                                                                    |
 | `TTSTextFrame`                                                               | `delivery`   | `list[str] \| None`: the delivery of the word just spoken, by its universal names, such as `["warm", "emphasis"]`. Empty for the voice's baseline.                                                      |
@@ -84135,8 +84319,9 @@ from pipecat.expressive.processors.tone_reader import PipecatToneReader
   The CPU threads for one read.
 </ParamField>
 
-<ParamField path="timeout" type="float" default="0.5">
-  Seconds a transcription waits for its reading. After that it passes unread.
+<ParamField path="timeout" type="float | None" default="None">
+  Seconds a transcription waits for its reading, `0.5` by default. After that it
+  passes unread.
 </ParamField>
 
 ### Signals
