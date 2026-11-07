@@ -1,15 +1,16 @@
 ---
 title: "Sarvam AI Speech-to-Text"
 sidebarTitle: "Sarvam"
-description: "SarvamSTTService and SarvamRealtimeSTTService stream real-time STT for Indian languages with VAD-based or server-side endpointing."
+description: "SarvamSTTService, SarvamRealtimeSTTService, and SarvamHttpSTTService provide STT for Indian languages over WebSocket or REST."
 ---
 
 ## Overview
 
-Sarvam AI offers two real-time speech recognition services for Indian languages:
+Sarvam AI offers three speech recognition services for Indian languages:
 
 - **`SarvamSTTService`**: Uses Sarvam's transcription WebSocket API with VAD-based segmentation and multiple audio formats (`saaras:v4` model by default)
 - **`SarvamRealtimeSTTService`**: Uses Sarvam's realtime WebSocket endpoint (`saaras:v3-realtime` and `saaras:v4` models) with server-side endpointing, in-band configuration updates, and lower latency
+- **`SarvamHttpSTTService`**: Sends each VAD-detected speech segment to Sarvam's REST API and returns the transcription (`saaras:v4` model by default, or `saaras:v3`)
 
 <CardGroup cols={2}>
   <Card
@@ -68,6 +69,7 @@ Before using Sarvam STT services, you need:
 3. **Model Access**:
    - `SarvamSTTService`: Access to `saaras:v3` and `saaras:v4` models with support for multiple modes (transcribe, translate, verbatim, translit, codemix)
    - `SarvamRealtimeSTTService`: Access to `saaras:v3-realtime` and `saaras:v4` models
+   - `SarvamHttpSTTService`: Access to `saaras:v3` and `saaras:v4` models
 
 ### Required Environment Variables
 
@@ -245,6 +247,49 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `silence_duration_ms`    | `int \| None`                                                           | `None`               | Optional silence duration for end-of-speech detection (only applies under `endpointing="vad"`).                                                                                                           |
 | `min_speech_duration_ms` | `int \| None`                                                           | `None`               | Optional minimum speech duration (only applies under `endpointing="vad"`).                                                                                                                                |
 
+### SarvamHttpSTTService
+
+<ParamField path="api_key" type="str" required>
+  Sarvam API key for authentication.
+</ParamField>
+
+<ParamField
+  path="mode"
+  type="Literal['transcribe', 'translate', 'verbatim', 'translit', 'codemix']"
+  default="None"
+>
+  Mode of operation. Defaults to the model's default mode (`transcribe`).
+</ParamField>
+
+<ParamField path="keyterms" type="list[str]" default="None">
+  Recognition hints for `saaras:v4`, sent with every request. At most 50 terms
+  of 64 characters each; put each phrase in a separate item.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the pipeline's input sample rate.
+  Sarvam's REST API performs best with 16 kHz audio.
+</ParamField>
+
+<ParamField path="settings" type="SarvamHttpSTTService.Settings" default="None">
+  Runtime-configurable settings for the STT service. See [HTTP
+  Settings](#http-settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="SARVAM_HTTP_TTFS_P99">
+  P99 latency from speech end to final transcript in seconds. Override for your
+  deployment. See [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark).
+</ParamField>
+
+### HTTP Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `SarvamHttpSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`, and take effect on the next request.
+
+| Parameter  | Type              | Default       | Description                                                                                                                        |
+| ---------- | ----------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `model`    | `str`             | `"saaras:v4"` | STT model identifier. Allowed values: `saaras:v3`, `saaras:v4`. Any other value raises `ValueError`.                               |
+| `language` | `Language \| str` | `None`        | Target language for transcription. `None` lets Sarvam detect the language of each utterance. _(Inherited from base STT settings.)_ |
+
 ## Usage
 
 ### Basic Setup (SarvamSTTService)
@@ -286,6 +331,18 @@ stt = SarvamSTTService(
         vad_signals=True,
         high_vad_sensitivity=True,
     ),
+)
+```
+
+### Basic HTTP Setup
+
+```python
+from pipecat.services.sarvam.stt import SarvamHttpSTTService
+from pipecat.transcriptions.language import Language
+
+stt = SarvamHttpSTTService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    settings=SarvamHttpSTTService.Settings(language=Language.HI_IN),
 )
 ```
 
@@ -380,6 +437,12 @@ await worker.queue_frame(
 - **In-band configuration updates**: Settings can be updated mid-conversation with `STTUpdateSettingsFrame` without reconnecting. Connection-only values (`sample_rate`, `return_timestamps`, `keyterms`, `prefix_padding_ms`, `endpointing`) cannot be updated at runtime.
 - **Stream types**: `fast` provides lowest latency, `balanced` provides moderate latency with better quality, and `simulated` is for testing. The stream type controls server-side flush cadence; the client always sends audio in 50ms chunks.
 - **Reconnection**: A dropped connection is reopened in the background unless `reconnect_on_error=False`; audio that arrives meanwhile isn't transcribed. An utterance cut short by the drop ends with its latest partial transcript, and speech after the reconnect starts a new one (under `endpointing="manual"`, an open turn is resent as `speech_start`). A setting Sarvam rejects, such as an unknown model or language, raises a permanent error instead of a retry. After three consecutive connections fail to be confirmed with `session.begin`, the service stops reconnecting, so a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) moves to its next service.
+
+### SarvamHttpSTTService
+
+- **Supported models**: `saaras:v3` and `saaras:v4`. The default is `saaras:v4`.
+- **VAD required**: The service transcribes each speech segment that Pipecat's VAD detects, so the pipeline needs a VAD analyzer.
+- **Segment length**: The REST API accepts at most 30 seconds of audio per request. A longer segment is sent as consecutive 30-second pieces, and their transcripts are joined into one `TranscriptionFrame`. A word spoken across a piece boundary may be transcribed less accurately.
 
 ## Event Handlers
 
