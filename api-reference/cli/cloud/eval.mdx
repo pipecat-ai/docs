@@ -11,9 +11,12 @@ The `eval` command group runs [Pipecat eval scenarios](/pipecat/evals/overview) 
   real tools. Use test credentials or a staging deployment.
 </Warning>
 
+Where evals are not enabled, every command fails with `Evals aren't available
+yet.`
+
 ## run
 
-Create an eval run from a scenario file.
+Create an eval run from a scenario file. Without `--session`, the run is synthetic. With it, the run judges that finished session.
 
 **Usage:**
 
@@ -34,32 +37,35 @@ pipecat cloud eval run [ARGS] [OPTIONS]
 **Options:**
 
 <ParamField path="--scenario" type="string">
-  The scenario to run, when the file holds more than one.
+  Name of the scenario in the file. Optional when the file holds one scenario.
+  When it holds several, the command lists their names and asks for one.
 </ParamField>
 
 <ParamField path="--session" type="string">
-  ID of an ended session of the agent. The run is a session run, which judges
-  that session's conversation. Without it, the run is synthetic.
+  ID of an ended session of the agent. The run judges that session's
+  conversation by the scenario's `success:` and `metrics:`.
 </ParamField>
 
 <ParamField path="--param" type="string">
-  A synthetic run's setting as `KEY=VALUE`. Repeat the option for several. Not
-  allowed on a session run.
+  A synthetic run's setting as `KEY=VALUE`, where the value is a number. Repeat
+  the option for several. The settings are `connectTimeoutSeconds`,
+  `botReadyTimeoutSeconds` and `defaultTimeoutMs`. Not allowed with `--session`.
 </ParamField>
 
 <ParamField path="--deadline" type="integer">
-  Seconds the run may take from its creation. A synthetic run takes at least 90
-  and defaults to 1800. A session run takes 240 to 1800 and defaults to 600.
+  Seconds the run may take from its creation. The API sets the bounds: see
+  [Limits](/pipecat-cloud/guides/evals#limits).
 </ParamField>
 
 <ParamField path="--root" type="path">
-  Directory the scenario's files are read from. Defaults to the scenario file's
-  directory. The files under it that the scenario can include are sent with the
-  run.
+  Directory the scenario's included files are read from, and may not leave.
+  Defaults to the scenario file's directory. The scenario file must be inside
+  it.
 </ParamField>
 
 <ParamField path="--wait" type="boolean" default="false">
-  Wait for the run to end, then print its verdict and reason.
+  Wait for the run to end, then print the result and exit with the verdict's
+  code.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -68,35 +74,45 @@ pipecat cloud eval run [ARGS] [OPTIONS]
 </ParamField>
 
 <ParamField path="--json" type="boolean" default="false">
-  Print the run as JSON.
+  Print the run as JSON on stdout. Alias for the global [`--output
+  json`](/api-reference/cli/cloud/output).
 </ParamField>
 
-The command prints the run's ID and status. It refuses a bundle over the API's
-size limit before it sends anything.
+Without `--wait`, the command prints the run and exits `0` once the API accepts it.
 
 ```shell
 pipecat cloud eval run my-agent scenarios/greeting.yaml --scenario capital_question --wait
 ```
 
+### The files a run sends
+
+A run sends the scenario file and every file it pulls in with `!include`, keyed by path relative to `--root`. Includes resolve relative to the file that names them, and nothing else in the directory is sent. Before any request, the CLI refuses a bundle that breaks one of these rules, and names the file:
+
+- The files total at most 256 KiB of UTF-8 text.
+- An include stays inside the root. Absolute paths and `..` that leave it are refused, and so is a symlink that points outside the root.
+- Hidden files and folders (any path part starting with `.`) are refused, and so are files named `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `id_rsa*`, `id_dsa*`, `id_ecdsa*` or `id_ed25519*`. A symlink to such a file is refused too.
+- Files must be UTF-8 text with no NUL characters.
+- Includes nest at most 8 deep and don't include themselves. The expanded scenario loads at most 200 files, and an include counts each time it is named.
+
 ### Exit codes
 
 With `--wait`, the exit code is the verdict:
 
-| Code | Meaning                                                    |
-| ---- | ---------------------------------------------------------- |
-| `0`  | The verdict is `passed`.                                   |
-| `1`  | The verdict is `failed`.                                   |
-| `2`  | The run ended without a verdict, a cancelled run included. |
-| `3`  | An API or usage error.                                     |
+| Code  | Meaning                                                      |
+| ----- | ------------------------------------------------------------ |
+| `0`   | The verdict is `passed` or `skipped`.                        |
+| `1`   | The verdict is `failed`.                                     |
+| `2`   | The run ended without a verdict, a cancelled run included.   |
+| `3`   | An API error, a usage error, or a bundle that can't be sent. |
+| `130` | You pressed Ctrl-C.                                          |
 
-Without `--wait`, `0` means the API accepted the request.
+Without `--wait`, `0` means the API accepted the request. Usage errors exit `3`, not the `2` that shells usually use, so that `2` always means a run with no verdict.
 
-Pressing Ctrl-C while waiting stops the wait. It does not cancel the run, and
-the CLI prints the [`cancel`](#cancel) command that does.
+Pressing Ctrl-C while waiting stops the wait. The run keeps going. The CLI prints the `status` command to check on it and the [`cancel`](#cancel) command to stop it. If you press Ctrl-C while the run is being created, a run may exist: `pipecat cloud eval list` shows it.
 
 ## status
 
-Show a run, and optionally wait for it to end.
+Show a run. With `--wait`, wait for it to end.
 
 **Usage:**
 
@@ -112,12 +128,13 @@ pipecat cloud eval status [ARGS] [OPTIONS]
 
 **Options:**
 
-<ParamField path="--agent" type="string" required>
-  Name of the agent the run belongs to.
+<ParamField path="--agent / -a" type="string" required>
+  Name of the agent the run is on.
 </ParamField>
 
 <ParamField path="--wait" type="boolean" default="false">
-  Wait for the run to end. The [exit codes](#exit-codes) apply.
+  Wait for the run to end, then print the result and exit with the verdict's
+  code. See [exit codes](#exit-codes).
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -126,8 +143,10 @@ pipecat cloud eval status [ARGS] [OPTIONS]
 </ParamField>
 
 <ParamField path="--json" type="boolean" default="false">
-  Print the run as JSON.
+  Print the run as JSON on stdout.
 </ParamField>
+
+A finished run prints its verdict, reason, failures with their turns, and metrics.
 
 ## list
 
@@ -147,8 +166,13 @@ pipecat cloud eval list [ARGS] [OPTIONS]
 
 **Options:**
 
-<ParamField path="--limit" type="integer">
-  Maximum number of runs to show.
+<ParamField path="--limit / -n" type="integer" default="10">
+  How many runs to show, from 1 to 200.
+</ParamField>
+
+<ParamField path="--offset" type="integer" default="0">
+  How many of the newest runs to skip. When more runs remain, the command prints
+  the `--offset` for the next page.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -157,14 +181,12 @@ pipecat cloud eval list [ARGS] [OPTIONS]
 </ParamField>
 
 <ParamField path="--json" type="boolean" default="false">
-  Print the runs as JSON.
+  Print the page as JSON on stdout.
 </ParamField>
 
 ## cancel
 
-Ask for a run to stop. A queued run is cancelled at once. A running run stops
-shortly after, and a session it already started stays started. Cancelling a
-run that finished returns an error.
+Ask for a run to stop. A queued run is cancelled at once. A running run ends as soon as it can, and a session it already started stays started. Cancelling a run that has finished is an error.
 
 **Usage:**
 
@@ -180,8 +202,8 @@ pipecat cloud eval cancel [ARGS] [OPTIONS]
 
 **Options:**
 
-<ParamField path="--agent" type="string" required>
-  Name of the agent the run belongs to.
+<ParamField path="--agent / -a" type="string" required>
+  Name of the agent the run is on.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -190,5 +212,5 @@ pipecat cloud eval cancel [ARGS] [OPTIONS]
 </ParamField>
 
 <ParamField path="--json" type="boolean" default="false">
-  Print the run as JSON.
+  Print the run as JSON on stdout.
 </ParamField>
