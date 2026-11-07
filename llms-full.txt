@@ -30893,7 +30893,7 @@ Proper capacity planning ensures your agents are always ready to respond immedia
   </Card>
 </CardGroup>
 
-# Evals
+# Pipecat Cloud Evals
 Source: https://docs.pipecat.ai/pipecat-cloud/guides/evals.md
 
 Run Pipecat scenario evals against a deployed Pipecat Cloud agent, or judge a finished session, with the CLI or the REST API.
@@ -30915,7 +30915,7 @@ An eval run checks a deployed agent against a [Pipecat eval scenario](/pipecat/e
 | `synthetic` | A simulated caller, or the scripted turns of the scenario, holds a conversation with a new session of your deployed agent. The default.                                                            |
 | `session`   | Judges a session of the agent that has already ended, by the scenario's `success:` and `metrics:`. It starts no session. Needs [conversation publishing](#publish-conversations-for-session-runs). |
 
-Both kinds take the same scenario files you use with [`pipecat eval`](/api-reference/cli/eval), and both end with a verdict of `passed` or `failed` when they can reach one.
+Both kinds take the same scenario files you use with [`pipecat eval`](/api-reference/cli/eval), and both end with a verdict of `passed`, `failed` or `skipped` when they can reach one.
 
 ## Write a scenario
 
@@ -30939,9 +30939,23 @@ scenarios:
 
 A [simulated scenario](/pipecat/evals/simulated-scenarios) works the same way. An LLM plays the caller, and the judge decides `success:` once the call is over.
 
+### Included files
+
+A scenario can pull in other YAML files with `!include`. A nested include resolves relative to the file that names it, and every included file must be inside the root the run is built from.
+
+Pipecat's own examples include files with paths like `!include ../simulator.yaml`, which leave the scenario's directory. Set `--root` to the directory they share. With `scenarios/simulated/book_table.yaml` including `../simulator.yaml`:
+
+```shell
+pipecat cloud eval run my-agent scenarios/simulated/book_table.yaml --root scenarios --wait
+```
+
+The run then carries `simulated/book_table.yaml` and `simulator.yaml`. With the API, the keys of `files` are those root-relative paths.
+
 ### A session scenario
 
-A session run judges a conversation that already happened, so it has no caller to play. It uses the scenario's `success:` and `metrics:`. The scenario file still needs the `persona:` and `goal:` that the simulated format requires.
+A session run judges a conversation that already happened, so it has no caller to play. It uses the scenario's `success:` and `metrics:`. The scenario must still be a [simulated scenario](/pipecat/evals/simulated-scenarios), so it needs the `persona:` and `goal:` that format requires.
+
+Use only judged metrics (`criterion:`) on a session run. A `measure:` metric, `function_calls` included, is refused, and the API answers `400`.
 
 ```yaml scenarios/book_table.yaml
 name: book_table
@@ -30957,13 +30971,12 @@ scenarios:
       - name: politeness
         criterion: "the reply is courteous, never curt or dismissive"
         min_score: 1
-      - measure: function_calls
-        calls:
-          - name: book_table
-            args: { party_size: 2 }
+      - name: confirms_booking
+        criterion: "when the caller has given a name and a time, the reply confirms the booking details"
+        min_score: 0.8
 ```
 
-Measured metrics that need a live run, such as `latency`, are not scored on a session run. See [Metrics](/pipecat/evals/simulated-scenarios#metrics) for the judged and measured kinds.
+See [Metrics](/pipecat/evals/simulated-scenarios#metrics) for how a judged metric is scored.
 
 The `result.ignored` field of a finished run lists the scenario's keys that had no effect, the first 20 of them. `result.ignoredTotal` counts them all.
 
@@ -30980,10 +30993,11 @@ Publishing needs:
 - The Pipecat Cloud base image `0.2.12` or later.
 - `pipecat-ai` 1.13 or later in the agent.
 
-Then deploy or restart the agent. Only sessions that start afterwards publish a conversation. The published conversation includes what the caller and the agent said and the agent's tool calls with their arguments.
+Then redeploy the agent. Only sessions that start afterwards publish a conversation. The published conversation includes what the caller and the agent said and the agent's tool calls with their arguments.
 
 - A session whose process is killed, by a crash or a forced stop, publishes nothing.
-- Setting `PCC_EXCLUDE_CONTENT=true` or `PCC_WITHHOLD_CONTENT=true` keeps the content out of the conversation, so a session run on that agent ends as `not_started`.
+- With HIPAA controls on, or with `PCC_WITHHOLD_CONTENT=true`, the agent publishes no conversation, and a session run ends `not_started`.
+- Publishing stops 10 seconds after the session ends, so a long conversation can be published only in part. A session run on it ends `error`.
 - A session run on a session that hasn't ended is refused with `409`.
 
 Synthetic runs don't need this setting.
@@ -30996,6 +31010,8 @@ Eval runs use OpenAI models, on Daily's OpenAI account with zero data retention:
 - **A session run** sends the conversation your agent published and the scenario's criteria to the judge.
 
 The conversation includes the tool calls the agent made and their arguments.
+
+Synthetic runs send their conversation to OpenAI for organizations with HIPAA controls too.
 
 For a session run, enable [conversation publishing](#publish-conversations-for-session-runs) only for agents whose conversations you're willing to send.
 
@@ -31103,6 +31119,8 @@ curl -X POST "https://api.pipecat.daily.co/v1/organizations/$ORG/services/my-age
   -H "Authorization: Bearer $PIPECAT_TOKEN"
 ```
 
+A cancel takes no body. If you send `{}`, add `-H "Content-Type: application/json"`.
+
 ### Request fields
 
 | Field             | Description                                                                                                                                                                 |
@@ -31133,21 +31151,21 @@ Cancelling works while the organization is suspended.
 
 A run has these fields:
 
-| Field                                                  | Description                                                             |
-| ------------------------------------------------------ | ----------------------------------------------------------------------- |
-| `id`, `kind`, `scenarioPath`, `scenarioName`, `params` | What was requested.                                                     |
-| `status`                                               | Where the run is. See [Statuses](#statuses).                            |
-| `verdict`                                              | `passed`, `failed`, or `null` when the run ended without one.           |
-| `sessionId`                                            | The session the run talked to, or for a session run, the one it judged. |
-| `createdAt`, `startedAt`, `finishedAt`, `deadlineAt`   | Timestamps. `startedAt` is when a worker first took the run up.         |
-| `result`                                               | `null` while the run is live. Otherwise the result below.               |
+| Field                                                  | Description                                                              |
+| ------------------------------------------------------ | ------------------------------------------------------------------------ |
+| `id`, `kind`, `scenarioPath`, `scenarioName`, `params` | What was requested.                                                      |
+| `status`                                               | Where the run is. See [Statuses](#statuses).                             |
+| `verdict`                                              | `passed`, `failed`, `skipped`, or `null` when the run ended without one. |
+| `sessionId`                                            | The session the run talked to, or for a session run, the one it judged.  |
+| `createdAt`, `startedAt`, `finishedAt`, `deadlineAt`   | Timestamps. `startedAt` is when the run first left the queue.            |
+| `result`                                               | `null` while the run is live. Otherwise the result below.                |
 
 `result` holds:
 
 - `reason`: why the run got its verdict, or why it has none. A failed run says what fell short, such as `The agent fell short on the metric 'politeness', scoring 0.50 where it needs 1.00: ...`.
 - `metrics`: each metric's `name`, `score`, `passed` and `reason`.
 - `details`: `kind` (`script` or `simulation`), `turns` with the checks on each, `failures`, and a simulation's `goal` with the judge's verdict on `success:`. `null` when the result was too large to keep.
-- `conversation`: the conversation in Pipecat's format.
+- `conversation`: the conversation in Pipecat's format. It is `[]` for a scripted scenario.
 - `ignored` and `ignoredTotal`: the scenario's keys that had no effect (the first 20), and how many there were in all.
 - `truncated`: `true` when the result was too large, in which case the conversation, details, and metric reasons are left out.
 
@@ -31171,11 +31189,27 @@ A finished run of the greeting scenario:
     "metrics": [],
     "details": {
       "kind": "script",
-      "turns": ["..."],
+      "turns": [
+        {
+          "turn": 1,
+          "speaker": null,
+          "status": "passed",
+          "reason": null,
+          "checks": [
+            {
+              "name": "response",
+              "passed": true,
+              "verdict": null,
+              "reason": null,
+              "matched": "The capital of France is Paris."
+            }
+          ]
+        }
+      ],
       "failures": [],
       "goal": null
     },
-    "conversation": ["..."],
+    "conversation": [],
     "ignored": [],
     "ignoredTotal": 0,
     "truncated": false
@@ -31189,14 +31223,14 @@ A run is live while it is `queued`, `starting`, or `running`. It ends in one of:
 
 | Status               | Meaning                                                                                                        |
 | -------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `completed`          | The run reached a verdict, `passed` or `failed`.                                                               |
+| `completed`          | The run reached a verdict, `passed`, `failed` or `skipped`.                                                    |
 | `refused`            | The scenario can't run, or a session run's conversation is too long to judge. `result.reason` says why.        |
 | `target_unavailable` | The agent never connected.                                                                                     |
 | `not_started`        | A session run's session published no conversation, or none with its content. `result.reason` says what to do.  |
 | `spend_limited`      | The organization's [spend limit](/api-reference/cli/cloud/spend-limit) was reached, so no session could start. |
 | `expired`            | The run's deadline passed before it finished.                                                                  |
 | `cancelled`          | The run was cancelled as requested. `result.reason` says whether it had started a session of your agent.       |
-| `timed_out`          | The run took longer than an eval may.                                                                          |
+| `timed_out`          | The eval itself ran past its [time limit](#limits).                                                            |
 | `error`, `abandoned` | The run failed without a verdict. `abandoned` is a run that failed on every attempt.                           |
 
 Every status except `completed` has a `null` verdict.
@@ -31208,12 +31242,14 @@ Every status except `completed` has a `null` verdict.
 | Files in a run         | 256 KiB of UTF-8 in all, and at most 3.5 MiB as JSON with paths counted. The request body is at most 3 MiB. Paths are at most 1024 characters. |
 | Synthetic run deadline | `deadlineSeconds` from 90 to 7200. 1800 (30 minutes) by default.                                                                               |
 | Session run deadline   | `deadlineSeconds` from 240 to 1800. 600 (10 minutes) by default.                                                                               |
+| Eval time limit        | The smaller of one hour and the deadline less 30 seconds. An eval still going then ends as `timed_out`.                                        |
+| Scenario loading       | A scenario's includes load at most 200 files, 256 KiB and 20,000 values in all. An include counts each time it is named.                       |
 | Conversation judged    | 256,000 characters or 2,000 messages. A longer one is `refused`.                                                                               |
 | Scenario name          | 256 characters.                                                                                                                                |
 
-The deadline counts from the run's creation, including time spent waiting for the agent to have room. A run still going at its deadline ends as `expired`.
+The deadline counts from the run's creation, including time spent waiting for the agent to have room. A run still going at its deadline ends as `expired`. The eval itself is a part of that time, and has the limit above.
 
-Evals are not on for every deployment. Where they aren't, every route answers `503` with the code `EVALS-NOT-AVAILABLE`.
+Hosted evals are not available in every region. Creating a run for an agent in a region without them is refused with `400`.
 
 ## Next steps
 
@@ -31249,8 +31285,8 @@ Personal Access Tokens (PATs) let you authenticate with Pipecat Cloud without an
 <Note>
   PATs are different from **API keys**. API keys authenticate REST API requests
   to start agent sessions or manage resources. PATs authenticate _you_ (or a
-  service account) to the **CLI**. The one exception is the [eval run
-  endpoints](/pipecat-cloud/guides/evals), which also accept a PAT as a Bearer
+  service account) to the **CLI**. The [eval run
+  endpoints](/pipecat-cloud/guides/evals) are also meant for PATs, as a Bearer
   token.
 </Note>
 
@@ -114452,8 +114488,7 @@ The `eval` command group runs [Pipecat eval scenarios](/pipecat/evals/overview) 
   real tools. Use test credentials or a staging deployment.
 </Warning>
 
-Where evals are not enabled, every command fails with `Evals aren't available
-yet.`
+Creating a run for an agent in a region without hosted evals is refused by the API. When the API answers that evals are not available, a command fails with `Evals aren't available yet.`
 
 ## run
 
@@ -114479,7 +114514,8 @@ pipecat cloud eval run [ARGS] [OPTIONS]
 
 <ParamField path="--scenario" type="string">
   Name of the scenario in the file. Optional when the file holds one scenario.
-  When it holds several, the command lists their names and asks for one.
+  When it holds several and you leave it out, the command lists their names and
+  exits `3`.
 </ParamField>
 
 <ParamField path="--session" type="string">
@@ -114501,7 +114537,8 @@ pipecat cloud eval run [ARGS] [OPTIONS]
 <ParamField path="--root" type="path">
   Directory the scenario's included files are read from, and may not leave.
   Defaults to the scenario file's directory. The scenario file must be inside
-  it.
+  it. A scenario that includes `../` files needs `--root` set to the directory
+  above, as in the [guide](/pipecat-cloud/guides/evals#included-files).
 </ParamField>
 
 <ParamField path="--wait" type="boolean" default="false">
@@ -114533,7 +114570,7 @@ A run sends the scenario file and every file it pulls in with `!include`, keyed 
 - An include stays inside the root. Absolute paths and `..` that leave it are refused, and so is a symlink that points outside the root.
 - Hidden files and folders (any path part starting with `.`) are refused, and so are files named `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `id_rsa*`, `id_dsa*`, `id_ecdsa*` or `id_ed25519*`. A symlink to such a file is refused too.
 - Files must be UTF-8 text with no NUL characters.
-- Includes nest at most 8 deep and don't include themselves. The expanded scenario loads at most 200 files, and an include counts each time it is named.
+- Includes nest at most 8 deep and don't include themselves. One load of the scenario reads at most 200 files, 256 KiB and 20,000 values, and an include counts each time it is named.
 
 ### Exit codes
 
