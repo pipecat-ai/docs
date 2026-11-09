@@ -1,0 +1,125 @@
+---
+title: "Rime Speech-to-Text"
+sidebarTitle: "Rime"
+description: "Streaming STT with RimeSTTService: each VAD speech segment goes to Rime as its own request, with interim transcripts and one final."
+---
+
+## Overview
+
+`RimeSTTService` transcribes speech with Rime's streaming recognition. Rime transcribes one utterance per stream, so the service streams each VAD speech segment as its own request and pushes interim transcripts followed by one final.
+
+<CardGroup cols={2}>
+  <Card
+    title="Rime STT API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.rime.stt.html"
+  >
+    Pipecat's API methods for Rime STT integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/transcription/transcription-rime.py"
+  >
+    Complete example with Rime STT
+  </Card>
+  <Card title="Rime Documentation" icon="book" href="https://docs.rime.ai/">
+    Official Rime API documentation
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[rime]"
+```
+
+## Prerequisites
+
+### Rime Account Setup
+
+Before using `RimeSTTService`, you need:
+
+1. **Rime Account**: Sign up at [Rime AI](https://docs.rime.ai/)
+2. **API Key**: Generate an API key from your account dashboard
+
+### Required Environment Variables
+
+- `RIME_API_KEY`: Your Rime API key for authentication
+
+### Voice Activity Detection
+
+`RimeSTTService` starts a request on `VADUserStartedSpeakingFrame` and ends it on `VADUserStoppedSpeakingFrame`. Use the user aggregator's VAD analyzer or a `VADProcessor` so these frames reach the service.
+
+## Configuration
+
+### RimeSTTService
+
+```python
+from pipecat.services.rime.stt import RimeSTTService
+```
+
+<ParamField path="api_key" type="str | None" default="None">
+  Rime API key. When `None`, the `RIME_API_KEY` environment variable is used.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None" default="None">
+  Audio sample rate in Hz. When `None`, the pipeline's input sample rate is
+  used. Rime takes 8000, 16000, 24000, and 48000 Hz; any other rate is resampled
+  to 16000 Hz before sending.
+</ParamField>
+
+<ParamField path="settings" type="RimeSTTService.Settings" default="None">
+  Runtime-configurable settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float | None" default="RIME_TTFS_P99">
+  P99 latency from speech end to final transcript, in seconds. Override it for
+  your deployment. See the [STT
+  benchmark](https://github.com/pipecat-ai/stt-benchmark).
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `RimeSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`, and apply to speech segments that start afterwards. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter         | Type                                                | Default                | Description                                                                                                                                                                                  |
+| ----------------- | --------------------------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`           | `None`                                              | `None`                 | Must be `None`: Rime selects the recognizer. _(Inherited from base STT settings.)_                                                                                                           |
+| `language`        | `Language \| str`                                   | `"en"`                 | Spoken language as a BCP-47 tag, passed to Rime unchanged. See Rime's documentation for supported languages. Must be a nonempty string. _(Inherited from base STT settings.)_                |
+| `mode`            | `Literal["written", "verbatim"]`                    | `"written"`            | `"written"` formats the transcript as written text. `"verbatim"` transcribes the words as spoken.                                                                                            |
+| `context_terms`   | `Sequence[str]`                                     | `()`                   | Recognition hints, such as product names, kept in order. Each term must be nonempty and free of `<\|...\|>` control markers, and the terms joined with `", "` must fit in 1,024 UTF-8 bytes. |
+| `output_contract` | `Literal["revised_hypotheses", "append_fragments"]` | `"revised_hypotheses"` | How Rime sends interim results: as replacement hypotheses or as append-only fragments. Both produce cumulative interim transcripts and one final.                                            |
+
+The constructor raises `ValueError` for an invalid value or a non-empty `extra`. An invalid settings update pushes an `ErrorFrame` and leaves the settings unchanged.
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+
+from pipecat.services.rime.stt import RimeSTTService
+
+stt = RimeSTTService(api_key=os.getenv("RIME_API_KEY"))
+```
+
+### With Context Terms
+
+```python
+stt = RimeSTTService(
+    api_key=os.getenv("RIME_API_KEY"),
+    settings=RimeSTTService.Settings(
+        language="en",
+        mode="verbatim",
+        context_terms=["Pipecat", "Rime"],
+    ),
+)
+```
+
+## Notes
+
+- **Segment length**: A speech segment that runs about 90 to 110 seconds without a pause fails with no transcript.
+- **Transcript order**: Finals are pushed in speech order. When the user resumes speaking before an earlier segment's final arrives, only the latest segment's final finalizes the turn.
+- **Errors**: A failed request pushes a non-fatal `ErrorFrame` naming the Rime error type and request ID.

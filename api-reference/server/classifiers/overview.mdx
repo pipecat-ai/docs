@@ -29,6 +29,13 @@ For a walkthrough, see [Pipecat Classifiers](/pipecat/learn/classifiers).
     Answers through Cloudflare's Clef model on Workers AI.
   </Card>
   <Card
+    title="HumeAudioClassifier"
+    icon="waveform-lines"
+    href="/api-reference/server/classifiers/hume-audio"
+  >
+    Answers questions about a clip of audio through Hume's Audio Decisions API.
+  </Card>
+  <Card
     title="OpenAIDecisionsClassifier"
     icon="sparkles"
     href="/api-reference/server/classifiers/openai-decisions"
@@ -59,6 +66,7 @@ from pipecat.classifiers.base_classifier import (
     ChoiceResult,
     ClassifierAudio,
     ClassifierError,
+    ClassifierFile,
     ClassifierImage,
     ScoreQuestion,
     ScoreResult,
@@ -143,7 +151,7 @@ Where the state falls on an ordered scale.
 
 ## Images
 
-A classifier that can see images takes them alongside the state, through the `images` argument of `ask()`, `yes_no()`, `choice()` and `score()`. Check `supports_images` to find out whether a classifier can: `ClefClassifier`, `JevClassifier`, `OpenAIDecisionsClassifier` and `LLMClassifier` can.
+A classifier that can see images takes them alongside the state, in the `inputs` argument of `ask()`, `yes_no()`, `choice()` and `score()`. Check `supports_images` to find out whether a classifier can: `ClefClassifier`, `JevClassifier`, `OpenAIDecisionsClassifier` and `LLMClassifier` can.
 
 ### ClassifierImage
 
@@ -166,13 +174,13 @@ image = await ClassifierImage.from_frame(frame)
 results = await classifier.yes_no(
     "A frame from the user's camera.",
     {"person": YesNoQuestion(instructions="Is there a person in the frame?")},
-    images=[image],
+    inputs=[image],
 )
 ```
 
 ## Audio
 
-A classifier that can hear takes one clip of audio alongside the state, through the `audio` argument of `ask()`, `yes_no()`, `choice()` and `score()`. Check `supports_audio` to find out whether a classifier can. Each classifier declares the clips it accepts with `min_audio_secs`, `max_audio_secs` and `audio_sample_rate`. A clip outside the accepted length raises `ClassifierError`, and a clip is resampled to `audio_sample_rate` before the classifier gets it.
+A classifier that can hear takes clips of audio alongside the state, in the `inputs` argument of `ask()`, `yes_no()`, `choice()` and `score()`. Check `supports_audio` to find out whether a classifier can. Each classifier declares the clips it accepts with `min_audio_secs`, `max_audio_secs` and `audio_sample_rate`. A clip outside the accepted length raises `ClassifierError`, and a clip is resampled to `audio_sample_rate` before the classifier gets it.
 
 ### ClassifierAudio
 
@@ -193,9 +201,32 @@ clip = ClassifierAudio(audio=pcm_bytes, sample_rate=16000)
 results = await classifier.yes_no(
     "A caller on the phone.",
     {"angry": YesNoQuestion(instructions="Does the caller sound angry?")},
-    audio=clip,
+    inputs=[clip],
 )
 ```
+
+## Files
+
+A classifier that takes files, such as a PDF or a video, accepts them alongside the state in `inputs`. Its `file_types` property lists the MIME types it takes, and a file of any other type raises `ClassifierError`. None of the classifiers Pipecat includes takes files by default.
+
+### ClassifierFile
+
+An encoded file the questions can look at. One of `data` and `url` is required.
+
+<ParamField path="content_type" type="str" required>
+  The file's MIME type, such as `application/pdf` or `video/mp4`.
+</ParamField>
+
+<ParamField path="data" type="bytes | None" default="None">
+  The file's bytes.
+</ParamField>
+
+<ParamField path="url" type="str | None" default="None">
+  Where the file can be fetched from, for a classifier whose provider fetches
+  files itself.
+</ParamField>
+
+A `ValueError` is raised if both or neither of `data` and `url` is given. `ClassifierFile.from_frame(frame)` builds a file from a `FileRawFrame`, such as a file the user sent, from its base64 data or its URL.
 
 ## Results
 
@@ -237,7 +268,7 @@ result.probability("angry")  # 0.12
 
 ### ClassifierError
 
-Raised when a classifier cannot answer: the backend failed or did not reply in time, its reply could not be turned into results, it was given images and cannot see them, or it was given a clip of audio and cannot hear it or does not accept its length. Every classifier answers or raises within a time bound of its own, so a caller waiting on one is never left hanging.
+Raised when a classifier cannot answer: the backend failed or did not reply in time, its reply could not be turned into results, it was given an input of a kind it does not take (images it cannot see, audio it cannot hear, or a file of a type not in `file_types`), or a clip of audio whose length it does not accept. Every classifier answers or raises within a time bound of its own, so a caller waiting on one is never left hanging.
 
 ## BaseClassifier
 
@@ -252,22 +283,30 @@ async def ask(
     state: str | dict[str, Any] | list[Any],
     questions: Mapping[str, ClassifierQuestion],
     *,
+    inputs: Sequence[ClassifierImage | ClassifierAudio | ClassifierFile] | None = None,
     images: Sequence[ClassifierImage] | None = None,
-    audio: ClassifierAudio | None = None,
 ) -> dict[str, ClassifierResult]
 ```
 
-Answers several questions about one state, in one call. `questions` can mix kinds. Returns one result per question, under the same names, each of the type its question calls for. `images` are images the questions can look at, for a classifier that [supports them](#images). A classifier that cannot see images raises `ClassifierError` when given some. `audio` is a clip the questions can hear, for a classifier that [supports it](#audio). A classifier that cannot hear raises `ClassifierError` when given one, as does one whose accepted length the clip falls outside of.
+Answers several questions about one state, in one call. `questions` can mix kinds. Returns one result per question, under the same names, each of the type its question calls for. `inputs` are the images, clips of audio and files that come with the state, of the kinds the classifier takes: [images](#images), [audio](#audio) and [files](#files). A classifier raises `ClassifierError` when given an input of a kind it does not take, or a clip whose length it does not accept.
+
+<ParamField path="images" type="Sequence[ClassifierImage] | None" default="None">
+  Images the questions can look at.
+
+_Deprecated since 1.16.0, removed in 2.0.0._ Pass the images in `inputs`
+instead.
+
+</ParamField>
 
 #### yes_no, choice, score
 
 ```python
-async def yes_no(state, questions: Mapping[str, YesNoQuestion], *, images=None, audio=None) -> dict[str, YesNoResult]
-async def choice(state, questions: Mapping[str, ChoiceQuestion], *, images=None, audio=None) -> dict[str, ChoiceResult]
-async def score(state, questions: Mapping[str, ScoreQuestion], *, images=None, audio=None) -> dict[str, ScoreResult]
+async def yes_no(state, questions: Mapping[str, YesNoQuestion], *, inputs=None, images=None) -> dict[str, YesNoResult]
+async def choice(state, questions: Mapping[str, ChoiceQuestion], *, inputs=None, images=None) -> dict[str, ChoiceResult]
+async def score(state, questions: Mapping[str, ScoreQuestion], *, inputs=None, images=None) -> dict[str, ScoreResult]
 ```
 
-Typed versions of `ask()` for questions of one kind, taking the same `images` and `audio`. They return results already typed, so no `isinstance` check is needed.
+Typed versions of `ask()` for questions of one kind, taking the same `inputs` and `images`. They return results already typed, so no `isinstance` check is needed.
 
 All four raise `ClassifierError` when the answers could not be produced.
 
@@ -277,7 +316,7 @@ All four raise `ClassifierError` when the answers could not be produced.
 async def setup(task_manager: BaseTaskManager)
 ```
 
-An owner that runs inside an agent calls this with its task manager before the first question. `JevClassifier`, `ClefClassifier`, and `OpenAIDecisionsClassifier` also open their connection here, so the first question does not pay for it.
+An owner that runs inside an agent calls this with its task manager before the first question. `JevClassifier`, `ClefClassifier`, `HumeAudioClassifier`, and `OpenAIDecisionsClassifier` also open their connection here, so the first question does not pay for it.
 
 #### cleanup
 
@@ -289,14 +328,15 @@ Releases the classifier's resources. Call it when you are done asking.
 
 ### Properties
 
-| Property            | Type            | Description                                                                                    |
-| ------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
-| `model`             | `str \| None`   | The model that answers, as named in the metrics.                                               |
-| `supports_images`   | `bool`          | Whether questions can come with images. `False` unless the classifier says otherwise.          |
-| `supports_audio`    | `bool`          | Whether questions can come with a clip of audio. `False` unless the classifier says otherwise. |
-| `min_audio_secs`    | `float`         | The shortest clip the classifier accepts, in seconds. `0.0` by default.                        |
-| `max_audio_secs`    | `float \| None` | The longest clip the classifier accepts, in seconds, or `None` for no limit.                   |
-| `audio_sample_rate` | `int \| None`   | The sample rate clips are resampled to, or `None` to keep their own.                           |
+| Property            | Type             | Description                                                                                    |
+| ------------------- | ---------------- | ---------------------------------------------------------------------------------------------- |
+| `model`             | `str \| None`    | The model that answers, as named in the metrics.                                               |
+| `supports_images`   | `bool`           | Whether questions can come with images. `False` unless the classifier says otherwise.          |
+| `supports_audio`    | `bool`           | Whether questions can come with a clip of audio. `False` unless the classifier says otherwise. |
+| `min_audio_secs`    | `float`          | The shortest clip the classifier accepts, in seconds. `0.0` by default.                        |
+| `max_audio_secs`    | `float \| None`  | The longest clip the classifier accepts, in seconds, or `None` for no limit.                   |
+| `audio_sample_rate` | `int \| None`    | The sample rate clips are resampled to, or `None` to keep their own.                           |
+| `file_types`        | `frozenset[str]` | The MIME types of the files questions can come with. Empty by default.                         |
 
 ### Event Handlers
 
@@ -333,14 +373,14 @@ class MyProcessor(FrameProcessor):
 
 ## Writing a Classifier
 
-To back classifiers with another model or service, subclass `BaseClassifier` and implement `_ask()`. It receives the state, the questions and the `images` (always empty unless the classifier overrides `supports_images` to return `True`), and returns the results by name, plus the tokens the call used when that is known (or `None`). A classifier that can hear overrides `supports_audio` and declares the clips it accepts; `_ask()` then also receives `audio`, a clip of an accepted length at `audio_sample_rate`, when there is one. A classifier that cannot hear needs no `audio` parameter. Raise `ClassifierError` when the backend fails. The public methods, typing and metrics are handled by the base class.
+To back classifiers with another model or service, subclass `BaseClassifier` and implement `_ask()`. It receives the state, the questions and `inputs`, which holds only the kinds the classifier takes, and returns the results by name, plus the tokens the call used when that is known (or `None`). A classifier overrides `supports_images`, `supports_audio` or `file_types` to take those kinds. A classifier that hears also declares the clips it accepts, and the clips in `inputs` are of an accepted length at `audio_sample_rate`. Raise `ClassifierError` when the backend fails. The public methods, typing and metrics are handled by the base class.
 
 ```python
 from pipecat.classifiers.base_classifier import BaseClassifier, ClassifierError
 
 
 class MyClassifier(BaseClassifier):
-    async def _ask(self, state, questions, images=()):
+    async def _ask(self, state, questions, inputs=()):
         results = {}
         for name, question in questions.items():
             results[name] = ...  # a YesNoResult, ChoiceResult or ScoreResult
