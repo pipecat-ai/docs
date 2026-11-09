@@ -24,6 +24,7 @@ apiRequire("ts-node").register({
   transpileOnly: true,
 });
 const { default: Ajv } = apiRequire("ajv");
+const { parse: parseYaml } = apiRequire("yaml");
 const { evalRunSummary, evalRunView } = apiRequire(
   "./src/services/evals/view.ts",
 );
@@ -63,9 +64,9 @@ function jsonSchemaBounds(value) {
 const base = "/organizations/{organizationName}/services/{agentName}/eval-runs";
 const cancel = document.paths[`${base}/{runId}/cancel`].post;
 const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
-function validator(schema) {
+function validator(schema, components = document.components) {
   return ajv.compile({
-    components: jsonSchemaBounds(document.components),
+    components: jsonSchemaBounds(components),
     ...schema,
   });
 }
@@ -75,6 +76,47 @@ const validateDetail = validator(
 const validatePage = validator(
   document.paths[base].get.responses["200"].content["application/json"].schema,
 );
+// Check the literal guide examples against both public docs and the current
+// API contract. The latter also pins dashboard identity fields that the
+// narrower public reference does not yet describe.
+const apiDocument = parseYaml(
+  readFileSync(path.resolve(apiRoot, "src/docs/oas.yaml"), "utf8"),
+);
+const validateApiDetail = validator(
+  { $ref: "#/components/schemas/EvalRun" },
+  apiDocument.components,
+);
+const guide = readFileSync(
+  path.join(docsRoot, "pipecat-cloud/guides/evals.mdx"),
+  "utf8",
+);
+const guideExamples = [
+  ...guide.matchAll(/^```json(?:[ \t][^\r\n]*)?\r?\n([\s\S]*?)^```[ \t]*$/gm),
+];
+assert.ok(
+  guideExamples.length > 0,
+  "The evals guide must contain a response JSON example.",
+);
+for (const match of guideExamples) {
+  const line = guide.slice(0, match.index).split("\n").length;
+  const example = JSON.parse(match[1]);
+  for (const [name, validate] of [
+    ["public", validateDetail],
+    ["API", validateApiDetail],
+  ]) {
+    assert.equal(
+      validate(example),
+      true,
+      `Guide JSON at line ${line} (${name}): ${ajv.errorsText(validate.errors)}`,
+    );
+  }
+  // A full run response always includes params, even when no overrides were
+  // requested; OAS currently does not mark this serializer field required.
+  assert.ok(
+    Object.hasOwn(example, "params"),
+    `Guide JSON at line ${line}: missing params`,
+  );
+}
 const createdAt = new Date("2026-11-05T12:00:00.000Z");
 const startedAt = new Date("2026-11-05T12:00:04.000Z");
 const finishedAt = new Date("2026-11-05T12:01:30.000Z");
@@ -187,5 +229,5 @@ assert.deepEqual(Object.keys(cancel.responses), [
 ]);
 assert.equal(cancel.responses["200"].headers, undefined);
 console.log(
-  `Validated ${cases.length} serialized detail responses and ${cases.length} nonempty list pages; rejected an unknown verdict.`,
+  `Validated ${guideExamples.length} actual guide JSON examples, ${cases.length} serialized detail responses and ${cases.length} nonempty list pages; rejected an unknown verdict.`,
 );
