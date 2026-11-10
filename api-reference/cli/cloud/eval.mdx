@@ -15,7 +15,7 @@ Creating a run for an agent in a region without hosted evals is refused by the A
 
 ## run
 
-Create an eval run from a scenario file. Without `--session`, the run is synthetic. With it, the run judges that finished session.
+Create synthetic eval runs from a scenario file. With `--session`, judge that finished session instead.
 
 **Usage:**
 
@@ -30,20 +30,20 @@ pipecat cloud eval run [ARGS] [OPTIONS]
 </ParamField>
 
 <ParamField path="scenario_file" type="path" required>
-  The scenario YAML file to run.
+  The scenario YAML file to run. Each selected scenario creates a separate run.
 </ParamField>
 
 **Options:**
 
 <ParamField path="--scenario" type="string">
-  Name of the scenario in the file. Optional when the file holds one scenario.
-  When it holds several and you leave it out, the command lists their names and
-  exits `3`.
+  Name of a scenario in the file. Repeat to select several, in the order named.
+  Each name runs once. When omitted, runs every scenario in file order.
 </ParamField>
 
 <ParamField path="--session" type="string">
   ID of an ended session of the agent. The run judges that session's
-  conversation by the scenario's `success:` and `metrics:`.
+  conversation by the scenario's `success:` and `metrics:`. Exactly one scenario
+  must be selected; use `--scenario` when the file holds several.
 </ParamField>
 
 <ParamField path="--param" type="string">
@@ -53,7 +53,7 @@ pipecat cloud eval run [ARGS] [OPTIONS]
 </ParamField>
 
 <ParamField path="--deadline" type="integer">
-  Seconds the run may take from its creation. The API sets the bounds: see
+  Seconds each run may take from its creation. The API sets the bounds: see
   [Limits](/pipecat-cloud/guides/evals#limits).
 </ParamField>
 
@@ -64,9 +64,14 @@ pipecat cloud eval run [ARGS] [OPTIONS]
   above, as in the [guide](/pipecat-cloud/guides/evals#included-files).
 </ParamField>
 
-<ParamField path="--wait" type="boolean" default="false">
-  Wait for the run to end, then print the result and exit with the verdict's
-  code.
+<ParamField path="--wait / --no-wait" type="boolean" default="true">
+  Wait for the runs to end, then print their results and exit with the combined
+  verdict's code. With `--no-wait`, print the accepted runs and return.
+</ParamField>
+
+<ParamField path="--verbose / -v" type="boolean" default="false">
+  Print each run's conversation and the checks or judgments that decided it
+  after it ends. Has no effect on JSON output.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
@@ -75,15 +80,27 @@ pipecat cloud eval run [ARGS] [OPTIONS]
 </ParamField>
 
 <ParamField path="--json" type="boolean" default="false">
-  Print the run as JSON on stdout. Alias for the global [`--output
+  Print the result as JSON on stdout. Alias for the global [`--output
   json`](/api-reference/cli/cloud/output).
 </ParamField>
 
-Without `--wait`, the command prints the run and exits `0` once the API accepts it.
+Runs are submitted separately: an accepted run continues even if another request fails. The CLI does not retry creation requests or automatically cancel accepted runs.
 
 ```shell
-pipecat cloud eval run my-agent scenarios/greeting.yaml --scenario capital_question --wait
+pipecat cloud eval run my-agent scenarios/greeting.yaml --scenario capital_question
 ```
+
+### JSON Output
+
+For one selected scenario, `run --json` prints the acknowledged run as one object. For several selected scenarios, normal completion, `--no-wait` and Ctrl-C print a list in selection order. Acknowledged runs keep their API fields, including `id`; scenarios without an acknowledged run use these fields:
+
+| Field                          | Meaning                                                                                                                                                                               |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scenarioPath`, `scenarioName` | The selected scenario.                                                                                                                                                                |
+| `submissionStatus`             | `error` for a returned creation failure; `unknown` for an interrupted creation request that may have reached the API; `not_submitted` for a scenario whose request was not attempted. |
+| `error`                        | Original error details, when present. Fields such as `error`, `code` or `reason` depend on the API response.                                                                          |
+
+These entries describe submission, not a server run's terminal `status`. An interruption during submission preserves known run IDs, marks the in-flight request `unknown` and leaves the remaining scenarios `not_submitted`. An interruption while waiting preserves the latest known runs and any submission failures. For a single-scenario creation interrupted before acknowledgment, stdout is an error object with code `CLI-INTERRUPTED`; a run may exist. Read stdout even when the command exits nonzero.
 
 ### The files a run sends
 
@@ -97,19 +114,19 @@ A run sends the scenario file and every file it pulls in with `!include`, keyed 
 
 ### Exit codes
 
-With `--wait`, the exit code is the verdict:
+When waiting, the exit code combines every selected run's outcome. If several codes apply, the priority is `3`, then `1`, then `2`, then `0`:
 
-| Code  | Meaning                                                      |
-| ----- | ------------------------------------------------------------ |
-| `0`   | The verdict is `passed` or `skipped`.                        |
-| `1`   | The verdict is `failed`.                                     |
-| `2`   | The run ended without a verdict, a cancelled run included.   |
-| `3`   | An API error, a usage error, or a bundle that can't be sent. |
-| `130` | You pressed Ctrl-C.                                          |
+| Code  | Meaning                                                             |
+| ----- | ------------------------------------------------------------------- |
+| `0`   | Every verdict is `passed` or `skipped`.                             |
+| `1`   | At least one verdict is `failed`.                                   |
+| `2`   | At least one run ended without a verdict, a cancelled run included. |
+| `3`   | An API error, a usage error, or a bundle that can't be sent.        |
+| `130` | You pressed Ctrl-C.                                                 |
 
-Without `--wait`, `0` means the API accepted the request. Usage errors exit `3`, not the `2` that shells usually use, so that `2` always means a run with no verdict.
+With `--no-wait`, `0` means the API accepted every request. Usage errors exit `3`, not the `2` that shells usually use, so that `2` always means a run with no verdict.
 
-Pressing Ctrl-C while waiting stops the wait. The run keeps going. The CLI prints the `status` command to check on it and the [`cancel`](#cancel) command to stop it. If you press Ctrl-C while the run is being created, a run may exist: `pipecat cloud eval list` shows it.
+Pressing Ctrl-C stops submission or waiting and exits `130`; it does not cancel accepted runs. A creation request in flight may have reached the API. Use `pipecat cloud eval list AGENT` to find it, [`status`](#status) to check a known run ID, or [`cancel`](#cancel) to request cancellation.
 
 ## status
 
@@ -136,6 +153,11 @@ pipecat cloud eval status [ARGS] [OPTIONS]
 <ParamField path="--wait" type="boolean" default="false">
   Wait for the run to end, then print the result and exit with the verdict's
   code. See [exit codes](#exit-codes).
+</ParamField>
+
+<ParamField path="--verbose / -v" type="boolean" default="false">
+  Print the run's conversation and the checks or judgments that decided it after
+  it ends. Has no effect on JSON output.
 </ParamField>
 
 <ParamField path="--organization / -o" type="string">
