@@ -28653,6 +28653,14 @@ This means that secrets can be shared across all agent deployments within the sa
 
 To access secrets, your deployment must specify the secret set to use.
 
+## Secret Value Access
+
+The Pipecat Cloud API receives your values over HTTPS when you create or update a managed secret set. For sets using the sealed backend, values are sealed to an organization-specific key held in the target region; the control plane cannot decrypt stored ciphertext with the keys it holds. Legacy managed sets stored in Vault do not have this regional-key guarantee. The public `source` field does not identify a managed set's storage backend; [ask Daily](/pipecat-cloud/support) to identify the backend for your set before relying on the sealed-storage guarantee. Code running in a compromised API could capture values submitted during that compromise.
+
+The control plane also authorizes agent deployments. A compromised control plane could deploy code that reads secrets already attached to an agent, including values materialized before the compromise.
+
+Agents receive the values through Kubernetes Secrets and environment variables. Daily personnel with cluster-administrator access to the hosted region can read those Secrets. For sealed sets in a Daily-hosted region, Daily holds the regional wrapping key and the operator role; separate organization keys share a [regional custody boundary](/pipecat-cloud/enterprise/what-daily-can-see#sealed-storage-and-regional-keys). To keep self-hosted secret values out of the managed-secret write path, create them in your cluster and [reference them](/pipecat-cloud/enterprise/secrets).
+
 ## Working with secrets
 
 Secrets can be managed via either the CLI or the [Dashboard <Icon icon="arrow-up-right-from-square" iconType="solid" />](https://pipecat.daily.co).
@@ -34170,7 +34178,9 @@ Running a {productNameSingular} keeps your data in your region while giving Pipe
 - **Always:** session records and per-session metrics (start and end times, outcome, CPU and memory usage), and the region's own health — connected agents, component versions, certificate expiry.
 - **By default, on request:** a read-only diagnostic snapshot of the platform components, which Daily support can pull when you ask for help. It never includes secret values or your agents' logs.
 - **Only when you enable it:** agent log lines, and only when someone in your organization queries them.
-- **Never, to the control plane:** session audio or media, secret values, environment variables, or the contents of your configuration. Daily WebRTC sessions carry media over Daily's WebRTC infrastructure, as they do in every region.
+- **Never read from your region:** session media does not pass through the control plane; reference/status and support-bundle responses do not include Secret or ConfigMap values.
+
+Daily WebRTC media uses Daily's media infrastructure. Configuration you submit to Pipecat Cloud, including managed-secret values and deployment settings, reaches the control plane when you submit it. Enabled log queries can also return values if your agents log them.
 
 The full breakdown is on [What Pipecat Cloud Can See](/pipecat-cloud/enterprise/what-daily-can-see).
 
@@ -34276,7 +34286,9 @@ Source: https://docs.pipecat.ai/pipecat-cloud/enterprise/what-daily-can-see.md
 
 Exactly what data the Pipecat Cloud control plane reads from a self-hosted region, what it never reads, and how to turn each channel off.
 
-Running a {productNameSingular} means Pipecat Cloud manages your region without holding your data. This page lists exactly what the control plane receives or can read, what it structurally cannot, and how to turn each channel off. The access described here is enforced by the region package's own Kubernetes roles, which you can inspect with `helm get manifest pipecat -n pipecat-system`.
+Pipecat Cloud manages a {productNameSingular} through the region connection. The region package's Kubernetes roles constrain the region agent's direct resource access. The agent also checks allowed namespaces and filters secret-status and support-bundle responses. You can inspect the package's Kubernetes roles with `helm get manifest pipecat -n pipecat-system`. The sections below describe what each operation can return and how to turn each optional channel off.
+
+Information you submit to Pipecat Cloud, such as deployment configuration or values sent in a managed-secret write, reaches the control plane when you submit it. Log lines returned by an enabled log query also pass through the API and can contain session content or secrets if your agents log them. A restriction on the reference and status routes does not apply to those other inputs.
 
 ## Always: session records and region health
 
@@ -34305,14 +34317,22 @@ Disable it with `region-agent.supportBundle.enabled: false`, which removes both 
 
 With the [log store](/pipecat-cloud/enterprise/logs) enabled, agent log lines are stored in your region and read **only** when a member of your organization queries them through the CLI, dashboard, or API. Each query returns the lines that match its filters and nothing else; no log data is collected or stored by Pipecat Cloud, and Daily does not pull agent logs on its own. Log collection is off by default.
 
-## Never
+## Sealed Storage and Regional Keys
 
-Independent of any setting:
+For Daily-hosted sets using the [sealed backend](/pipecat-cloud/fundamentals/secrets#secret-value-access), each organization has a separate key ring in each region. One KMS key per region wraps all of those organization ring keys. An operator with access to the wrapped rings and that KMS key can decrypt values belonging to any organization in the region. This is shared regional KMS authorization, not independently authorized KMS keys per organization. In a self-hosted region, you control the operator, key custody, and wrapping configuration. These sealed-storage guarantees do not apply to legacy managed sets stored in Vault.
 
-- **Session audio, video, or messages.** WebSocket and telephony sessions connect directly to your region; Daily WebRTC sessions connect to Daily's media infrastructure as they do for every region. In neither case does session media pass through the Pipecat Cloud control plane.
-- **Secret values.** [Referenced secrets](/pipecat-cloud/enterprise/secrets) are checked for existence and type only, and the status response cannot carry keys or values.
-- **Environment variables or configuration contents** of your agents or the platform components.
-- **Anything in namespaces other than the system and workloads namespaces.** The platform's roles are scoped to those two.
+## Deployment Authority
+
+The control plane is trusted to authorize agent deployments, including the image and attached secret sets. An actively compromised control plane could deploy code that reads existing attached Secrets. Keeping decryption keys in your region, or encrypting values before submitting them to the API, does not remove this workload-control authority. Independent admission, image, and egress policies in your cluster can further constrain it.
+
+## Never Read From Your Region
+
+The operations above have these limits, independent of their settings:
+
+- **Session traffic.** WebSocket and telephony sessions connect directly to your region; Daily WebRTC sessions connect to Daily's media infrastructure as they do for every region. In neither case does session media pass through the Pipecat Cloud control plane.
+- **Referenced Secret values.** [Reference and status operations](/pipecat-cloud/enterprise/secrets) check existence and type only; their responses cannot carry keys or values.
+- **Environment variable values, Secret data, or ConfigMap contents** through the support-bundle or deployment-status routes. Support bundles include the allowlisted deployment settings described above.
+- **Support-bundle resources outside the system and workloads namespaces.** The bundle's read-only Roles are scoped to those two.
 
 ## Inbound access
 
@@ -34792,7 +34812,11 @@ Source: https://docs.pipecat.ai/pipecat-cloud/enterprise/secrets.md
 
 Reference Kubernetes Secrets in your cluster as Pipecat Cloud secret sets: env and image-pull secrets, readiness states, and what is recorded.
 
-In {productName}, secret values never leave your cluster. Instead of uploading values to Pipecat Cloud, you create a Kubernetes Secret in your workloads namespace and **reference** it. The platform records only the secret's name, region, type, and readiness — never its keys or values — and your agents use it by set name exactly as they use [managed secret sets](/pipecat-cloud/fundamentals/secrets) in {hostedName}.
+With **referenced secrets** in {productName}, you create a Kubernetes Secret in your workloads namespace and register its name with Pipecat Cloud. The reference operation does not upload its keys or values. The platform records the secret's name, region, type, and readiness, and your agents use it by set name exactly as they use [managed secret sets](/pipecat-cloud/fundamentals/secrets) in {hostedName}.
+
+The reference and status operations do not read back Secret contents. Your agents and cluster administrators with permission to read Kubernetes Secrets can access the values in your cluster. If you submit values to a managed-secret API instead, the control plane receives those values during the write.
+
+The control plane also remains trusted to authorize [deployments that use these Secrets](/pipecat-cloud/enterprise/what-daily-can-see#deployment-authority).
 
 ## Referencing a secret
 
@@ -35549,7 +35573,10 @@ pipecat cloud deploy my-agent my-image:latest --credentials my-pull-secret --sec
 
 <Info>
   Secrets are encrypted at rest and in transit, then securely injected as
-  environment variables in your agent's runtime.
+  environment variables in your agent's runtime. The API receives plaintext on
+  managed-secret writes and controls agent deployments; see the [storage
+  guarantees and access
+  boundaries](/pipecat-cloud/fundamentals/secrets#secret-value-access).
 </Info>
 
 <Warning>
@@ -35669,6 +35696,8 @@ Pipecat Cloud encrypts your data throughout the platform:
 - **In Transit**: TLS 1.3 encryption for all API communications
 - **At Rest**: AES-256 encryption for stored data
 - **Database**: Hardware-level encryption for database content, such as public API keys which developers control the rotation of
+
+For managed secrets, the API receives plaintext on writes and controls deployments that consume them; see the [storage guarantees and access boundaries](/pipecat-cloud/fundamentals/secrets#secret-value-access).
 
 ### Where is my data stored?
 
