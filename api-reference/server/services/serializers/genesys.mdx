@@ -50,7 +50,7 @@ Before using GenesysAudioHookSerializer, you need:
 - **Protocol Handshake**: Automatic handling of open/opened, close/closed, and ping/pong messages
 - **DTMF Handling**: Process touch-tone events from callers
 - **Barge-in Support**: Notify Genesys when the user interrupts bot audio
-- **Pause/Resume**: Handle hold scenarios when audio streaming is temporarily suspended
+- **Pause/Resume**: Handle hold scenarios, and pause or resume the stream from your bot
 - **Architect Variables**: Pass input/output variables between Architect flows and your bot
 - **Stereo Support**: Process external (customer) audio, internal (agent) audio, or both channels
 
@@ -63,19 +63,21 @@ Before using GenesysAudioHookSerializer, you need:
 
 ### InputParams
 
-| Parameter                    | Type                   | Default      | Description                                                                                                                                                                                          |
-| ---------------------------- | ---------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `genesys_sample_rate`        | `int`                  | `8000`       | Sample rate used by Genesys (Hz).                                                                                                                                                                    |
-| `sample_rate`                | `int`                  | `None`       | Optional override for pipeline input sample rate. When `None`, uses the pipeline's configured rate.                                                                                                  |
-| `channel`                    | `AudioHookChannel`     | `"external"` | Which audio channels to process: `"external"` (customer), `"internal"` (agent), or `"both"` (stereo).                                                                                                |
-| `media_format`               | `AudioHookMediaFormat` | `"PCMU"`     | Audio format: `"PCMU"` (mu-law) or `"L16"` (16-bit linear PCM).                                                                                                                                      |
-| `process_external`           | `bool`                 | `True`       | Whether to process external (customer) audio.                                                                                                                                                        |
-| `process_internal`           | `bool`                 | `False`      | Whether to process internal (agent) audio.                                                                                                                                                           |
-| `supported_languages`        | `list[str]`            | `None`       | List of language codes the bot supports (e.g., `["en-US", "es-ES"]`).                                                                                                                                |
-| `selected_language`          | `str`                  | `None`       | Default language code to use.                                                                                                                                                                        |
-| `start_paused`               | `bool`                 | `False`      | Whether to start the session in paused state.                                                                                                                                                        |
-| `ignore_rtvi_messages`       | `bool`                 | `True`       | Whether to ignore RTVI protocol messages during serialization.                                                                                                                                       |
-| `resampler_clear_after_secs` | `float \| None`        | `0.2`        | Seconds of inactivity after which the stream resampler clears its internal history to avoid audio artefacts. Set to `None` to never clear (recommended for telephony providers with irregular gaps). |
+| Parameter                    | Type                   | Default      | Description                                                                                                                       |
+| ---------------------------- | ---------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `audio_in_sample_rate`       | `int`                  | `8000`       | Sample rate of the audio Genesys sends (Hz). Incoming audio is converted to the pipeline's input rate.                            |
+| `audio_out_sample_rate`      | `int`                  | `8000`       | Sample rate of the audio sent to Genesys (Hz).                                                                                    |
+| `genesys_sample_rate`        | `int \| None`          | `None`       | _Deprecated since 1.16.0._ Use `audio_in_sample_rate` and `audio_out_sample_rate` instead. Removed in 2.0.0.                      |
+| `sample_rate`                | `int \| None`          | `None`       | _Deprecated since 1.16.0._ Has no effect: incoming audio is converted to `PipelineParams.audio_in_sample_rate`. Removed in 2.0.0. |
+| `channel`                    | `AudioHookChannel`     | `"external"` | Which audio channels to process: `"external"` (customer), `"internal"` (agent), or `"both"` (stereo).                             |
+| `media_format`               | `AudioHookMediaFormat` | `"PCMU"`     | Audio format: `"PCMU"` (mu-law) or `"L16"` (16-bit linear PCM).                                                                   |
+| `process_external`           | `bool`                 | `True`       | Whether to process external (customer) audio.                                                                                     |
+| `process_internal`           | `bool`                 | `False`      | Whether to process internal (agent) audio.                                                                                        |
+| `supported_languages`        | `list[str]`            | `None`       | List of language codes the bot supports (e.g., `["en-US", "es-ES"]`).                                                             |
+| `selected_language`          | `str`                  | `None`       | Default language code to use.                                                                                                     |
+| `start_paused`               | `bool`                 | `False`      | Whether Genesys starts the audio stream paused. Send `create_resume_request()` to start it.                                       |
+| `ignore_rtvi_messages`       | `bool`                 | `True`       | Whether to ignore RTVI protocol messages during serialization.                                                                    |
+| `resampler_clear_after_secs` | `float \| None`        | `0.2`        | _Deprecated since 1.16.0._ Has no effect. No replacement. Removed in 2.0.0.                                                       |
 
 ## Usage
 
@@ -96,7 +98,7 @@ transport = FastAPIWebsocketTransport(
         audio_in_enabled=True,
         audio_out_enabled=True,
         serializer=serializer,
-        audio_out_fixed_packet_size=1600,
+        audio_out_10ms_chunks=20,
     ),
 )
 ```
@@ -160,7 +162,7 @@ await worker.queue_frame(OutputTransportMessageUrgentFrame(message=disconnect_ms
 
 ### Event Handlers
 
-The serializer emits events that you can handle for custom logic:
+The serializer emits an event for each AudioHook message it receives from Genesys: `on_open`, `on_close`, `on_ping`, `on_paused`, `on_resumed`, `on_update` (participant or configuration changes), `on_error`, and `on_dtmf`. Each handler receives the serializer and the Genesys message as a dict:
 
 ```python
 @serializer.event_handler("on_open")
@@ -176,10 +178,74 @@ async def on_dtmf(serializer, message):
     digit = message.get("parameters", {}).get("digit")
     logger.info(f"DTMF digit pressed: {digit}")
 
-@serializer.event_handler("on_pause")
-async def on_pause(serializer, message):
+@serializer.event_handler("on_paused")
+async def on_paused(serializer, message):
     logger.info("Audio paused (caller on hold)")
+
+@serializer.event_handler("on_resumed")
+async def on_resumed(serializer, message):
+    logger.info("Audio resumed")
 ```
+
+`on_pause` is also emitted when Genesys pauses the stream.
+
+<ParamField path="on_pause" type="event" deprecated>
+  _Deprecated since 1.16.0, removed in 2.0.0._ Use `on_paused` instead.
+</ParamField>
+
+## Frames
+
+**Sent to the serializer:**
+
+| Frame                                                              | Fields    | Effect                                                                                                                             |
+| ------------------------------------------------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `EndFrame`, `CancelFrame`                                          |           | Sends a `disconnect` message with reason `"completed"`, action `"transfer"`, and the output variables                              |
+| `InterruptionFrame`                                                |           | Sends a barge-in event, so Genesys stops playing the audio it has queued                                                           |
+| `OutputTransportMessageFrame`, `OutputTransportMessageUrgentFrame` | `message` | Sends `message` as JSON when it is a `dict` with a `"version"` field, as the serializer's messages are. Other messages are dropped |
+
+**Pushed by the serializer:**
+
+| Frame            | Fields   | Meaning                         |
+| ---------------- | -------- | ------------------------------- |
+| `InputDTMFFrame` | `button` | The caller pressed a keypad key |
+
+## Methods
+
+### create_pause_request()
+
+```python
+def create_pause_request() -> dict[str, Any]
+```
+
+Returns a `pause` message asking Genesys to pause the audio stream. Genesys answers with `paused`, which pauses the session. Send it in an `OutputTransportMessageUrgentFrame`:
+
+```python
+await worker.queue_frame(
+    OutputTransportMessageUrgentFrame(message=serializer.create_pause_request())
+)
+```
+
+### create_resume_request()
+
+```python
+def create_resume_request() -> dict[str, Any]
+```
+
+Returns a `resume` message asking Genesys to resume the audio stream. Genesys answers with `resumed`, which resumes the session. Send it in an `OutputTransportMessageUrgentFrame`, including to start a session opened with `start_paused=True`:
+
+```python
+await worker.queue_frame(
+    OutputTransportMessageUrgentFrame(message=serializer.create_resume_request())
+)
+```
+
+### create_resumed_response()
+
+```python
+def create_resumed_response() -> dict[str, Any]
+```
+
+_Deprecated since 1.16.0, removed in 2.0.0._ Use `create_resume_request()` instead.
 
 ## Protocol Details
 
@@ -187,7 +253,7 @@ async def on_pause(serializer, message):
 
 The Genesys AudioHook protocol uses WebSocket connections with two frame types:
 
-- **Text frames**: JSON control messages for session lifecycle (open, close, ping, pause, etc.)
+- **Text frames**: JSON control messages for session lifecycle (open, close, ping, pause, resume, etc.)
 - **Binary frames**: Raw audio data in PCMU or L16 format
 
 ### Message Flow
@@ -204,15 +270,13 @@ A typical session follows this sequence:
 ### Audio Format
 
 - **Default encoding**: PCMU (mu-law) at 8kHz mono
-- **Automatic resampling**: The serializer converts between the 8kHz Genesys format and your pipeline's sample rate using SOXR resampling
+- **Automatic resampling**: The serializer converts between the 8kHz Genesys format and your pipeline's sample rate using Pipecat's built-in resampling
 - **Stereo handling**: When channel is set to `"both"`, Genesys sends stereo audio with external (customer) on the left channel and internal (agent) on the right. The serializer extracts the external channel for processing.
 
 ## Notes
 
-- **Fixed packet size**: Set `audio_out_fixed_packet_size=1600` on your transport parameters. This batches outbound audio into consistent chunks and prevents 429 rate limiting from Genesys.
-- **No extra dependencies**: The serializer uses Pipecat's built-in audio conversion utilities (`pcm_to_ulaw`, `ulaw_to_pcm`) and SOXR resampler.
-- **Barge-in**: When the pipeline emits an `InterruptionFrame`, the serializer automatically sends a barge-in event to Genesys, which stops any queued audio playback on the Genesys side.
-- **Pause/resume**: When Genesys sends a `pause` message (e.g., caller placed on hold), audio processing is suspended. The serializer drops incoming and outgoing audio while paused. Use the `on_pause` event handler and `create_resumed_response()` to control when streaming resumes.
+- **Fixed packet size**: Set `audio_out_10ms_chunks=20` on your transport parameters. This sends outbound audio in 200 ms packets, since Genesys rate-limits incoming messages.
+- **No extra dependencies**: The serializer uses Pipecat's built-in G.711 conversion functions (`pcm_to_ulaw`, `ulaw_to_pcm` in `pipecat.audio.g711`) and audio resampler.
+- **Pause/resume**: When Genesys pauses the stream (e.g., caller placed on hold) it sends `paused`, and the serializer drops incoming and outgoing audio until Genesys sends `resumed`. Use `create_pause_request()` and `create_resume_request()` to ask Genesys to pause or resume.
 - **Output variables**: Variables set via `set_output_variables()` are included in the `closed` response when Genesys terminates the session. These variables become available in the Architect flow for routing decisions.
-- **DTMF support**: Phone keypad events are converted to `InputDTMFFrame` objects and can be processed in your pipeline.
-- **L16 format**: While the serializer accepts `AudioHookMediaFormat.L16` as a configuration option, L16 support is not yet fully implemented. Use PCMU (the default) for production deployments.
+- **L16 format**: The serializer accepts `AudioHookMediaFormat.L16` as a configuration option but drops all audio in both directions with it. Use PCMU (the default).

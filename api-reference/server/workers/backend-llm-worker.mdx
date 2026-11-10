@@ -1,0 +1,142 @@
+---
+title: "BackendLLMWorker"
+description: "BackendLLMWorker runs an LLM service as the backend a frontend delegates to, for LLMWithBackend and OpenAILiveLLMService."
+---
+
+<Warning>
+  `BackendLLMWorker` is in alpha: its API is likely to change between releases.
+</Warning>
+
+## Overview
+
+`BackendLLMWorker` runs any Pipecat LLM service as the backend of a conversational frontend: the agent that handles work needing tools or careful reasoning while the frontend keeps talking with the user. It extends [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker), so the backend keeps a conversation of its own and calls its tools over as many steps as the work takes.
+
+Two frontends drive it: [`LLMWithBackend`](/api-reference/server/composite-services/llm-with-backend), with any LLM service as the frontend, and [`OpenAILiveLLMService`](/api-reference/server/services/s2s/openai-live) in client delegation. For a walkthrough, see [LLM with a Backend](/pipecat/learn/llm-with-backend).
+
+```python
+from pipecat.workers.llm import BackendLLMWorker, BackendOutput
+```
+
+```python
+backend = BackendLLMWorker(
+    llm=AnthropicLLMService(
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        settings=AnthropicLLMService.Settings(system_instruction=BACKEND_INSTRUCTIONS),
+    ),
+    context=LLMContext(tools=[search_codebase, read_file, apply_patch, run_tests]),
+)
+```
+
+## Configuration
+
+<ParamField path="llm" type="LLMService" required>
+  The backend LLM service. It runs at its provider's default thinking for the
+  model unless its settings configure thinking.
+</ParamField>
+
+<ParamField path="context" type="LLMContext | None" default="None">
+  The backend's context, carrying its tools. A fresh empty context when `None`.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Unique name for this worker on the bus. Auto-generated when `None`; give one
+  when the backend runs in another process, where the frontend addresses it by
+  name.
+</ParamField>
+
+<ParamField
+  path="transform_output"
+  type="BackendOutputTransform | None"
+  default="None"
+>
+  Called with each [`BackendOutput`](#backendoutput) the model produces before
+  it is sent: return the output to send in its place, or `None` to send nothing.
+  Outputs sent with [`send_output()`](#send_output) skip it unless that call
+  asks for it.
+</ParamField>
+
+<ParamField
+  path="pairing_instruction"
+  type="str"
+  default="BACKEND_PAIRING_INSTRUCTION"
+>
+  How the model works with the frontend, appended to the LLM's system
+  instruction. A custom override has to cover everything the default does: that
+  the frontend sends it requests, that the user hears what it marks with
+  `SPOKEN_MARK` and nothing else, and how to take requests that arrive while it
+  works.
+</ParamField>
+
+<ParamField
+  path="user_params"
+  type="LLMUserAggregatorParams | None"
+  default="None"
+>
+  Parameters for the user aggregator. When `None`, external turn strategies: the
+  backend has no audio to detect turns in.
+</ParamField>
+
+<ParamField
+  path="assistant_params"
+  type="LLMAssistantAggregatorParams | None"
+  default="None"
+>
+  Parameters for the assistant aggregator.
+</ParamField>
+
+Raises `ValueError` when the LLM service refuses the role. `OpenAILiveLLMService` does.
+
+## BackendOutput
+
+One piece of output from the backend on its way to the frontend: what `transform_output` receives and returns, and what `send_output()` sends.
+
+| Field            | Type   | Default | Description                                                                              |
+| ---------------- | ------ | ------- | ---------------------------------------------------------------------------------------- |
+| `text`           | `str`  |         | The text.                                                                                |
+| `is_thought`     | `bool` | `False` | Whether this is a reasoning summary.                                                     |
+| `prefers_spoken` | `bool` | `True`  | Whether the backend would like the user to hear this. The frontend decides what it says. |
+
+`BackendOutputTransform` is the type of `transform_output`:
+
+```python
+async def transform_output(output: BackendOutput) -> BackendOutput | None
+```
+
+## Properties
+
+Inherits the properties of [`LLMContextWorker`](/api-reference/server/workers/llm-context-worker).
+
+### working
+
+```python
+backend.working -> bool
+```
+
+`True` while the backend has work in hand: a request or model run outstanding, or a function call in flight.
+
+## Methods
+
+### send_output
+
+```python
+async def send_output(
+    self, output: BackendOutput, *, apply_transform_output: bool = False
+) -> None
+```
+
+Sends an output of the app's own to the frontend, as the model's outputs are sent. A tool can use it to tell the user something itself, such as a booking confirmation worded by the booking system. It skips `transform_output` unless `apply_transform_output` is `True`. With no frontend attached, the output is dropped with a warning.
+
+## Constants
+
+Module constants of `pipecat.workers.llm.backend_llm_worker`:
+
+| Constant                      | What it is                                                                 |
+| ----------------------------- | -------------------------------------------------------------------------- |
+| `BACKEND_PAIRING_INSTRUCTION` | The default `pairing_instruction`.                                         |
+| `SPOKEN_MARK`                 | `">>"`: the mark the model starts a message with to have the user told it. |
+
+## Notes
+
+- **What the user hears**: A message the model starts with `SPOKEN_MARK` is sent with `prefers_spoken=True`, mark removed, whether or not the same turn calls tools. Anything else it writes, reasoning summaries included, is sent with `prefers_spoken=False`: the frontend keeps it as a note and doesn't say it. When the mark starts a later line, the text before that line is a note and the rest is spoken.
+- **Requests while working**: A request that arrives while the backend is working joins that work. The model reads it against what it has under way, and stops a long-running tool through the `cancel_<tool>` tool that `cancellable_by_llm=True` gives it.
+- **One frontend at a time**: The worker serves one frontend. When that frontend lets go, such as when its pipeline ends, the backend's work in progress is cancelled.

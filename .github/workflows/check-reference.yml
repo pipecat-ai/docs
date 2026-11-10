@@ -1,0 +1,75 @@
+name: Check API Reference Against Pipecat
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**/*.mdx"
+      - "scripts/check-reference.py"
+      - "scripts/check-reference-ignore.txt"
+      - "scripts/tests/**"
+      - ".github/workflows/check-reference.yml"
+  # A full check on demand. Drift that pipecat changes cause is caught by the
+  # update-docs skill, which runs this checker on each pipecat PR.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-reference:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout docs
+        uses: actions/checkout@v4
+        with:
+          # The PR merge commit and its first parent (the base), to list the
+          # pages the PR changes.
+          fetch-depth: 2
+
+      - name: Checkout pipecat
+        uses: actions/checkout@v4
+        with:
+          repository: pipecat-ai/pipecat
+          path: _pipecat
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A PR fails only on the pages it changes: drift that pipecat introduced
+      # on other pages is for the update-docs bot to fix when it next touches
+      # them, not this PR. A change to the checker or its ignore list
+      # re-checks every page. A change to the checker, its ignore list, its
+      # tests or this workflow runs the checker's tests.
+      - name: Select pages
+        id: scope
+        if: github.event_name == 'pull_request'
+        run: |
+          git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed.txt"
+          if grep -qE '^(scripts/check-reference\.py|scripts/check-reference-ignore\.txt|scripts/tests/|\.github/workflows/check-reference\.yml)' "$RUNNER_TEMP/changed.txt"; then
+            echo "tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '^(scripts/check-reference\.py|scripts/check-reference-ignore\.txt|\.github/workflows/check-reference\.yml)' "$RUNNER_TEMP/changed.txt"; then
+            echo "The checker changed; checking every page."
+            echo "args=" >> "$GITHUB_OUTPUT"
+          else
+            grep -E '\.mdx$' "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/pages.txt" || true
+            echo "Checking $(wc -l < "$RUNNER_TEMP/pages.txt") changed page(s)."
+            echo "args=--pages-from $RUNNER_TEMP/pages.txt" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test the checker
+        if: github.event_name != 'pull_request' || steps.scope.outputs.tests == 'true'
+        run: python3 -m unittest discover -s scripts/tests -v
+
+      - name: Check the API reference against pipecat
+        run: |
+          python3 scripts/check-reference.py --pipecat _pipecat \
+            ${{ steps.scope.outputs.args }} --format summary >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/check-reference.py --pipecat _pipecat \
+            ${{ steps.scope.outputs.args }} --format github

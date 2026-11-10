@@ -1,0 +1,186 @@
+---
+title: "VoxLock Audio Filter"
+sidebarTitle: "VoxLock"
+description: "Keeps the caller's voice and removes the other voices in the room before VAD and speech-to-text, on the CPU"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="arbazsiddiqui"
+  maintainerUrl="https://github.com/arbazsiddiqui"
+  repo="https://github.com/arbazsiddiqui/voxlock"
+/>
+
+## Overview
+
+`VoxLockFilter` is a `BaseAudioFilter` implementation backed by
+[VoxLock](https://huggingface.co/arbazsiddiqui/voxlock), an open-source
+(Apache-2.0) voice isolation model. You attach it to a transport's
+`audio_in_filter`, and it keeps the caller's voice and removes the other people
+talking in the caller's room, so VAD and your STT service only hear the caller.
+It runs locally with onnxruntime on the CPU: no API key and no network calls
+after the model download.
+
+VoxLock locks on to one voice. Until it has heard 3 seconds of the caller's
+speech, the filter passes audio through unchanged; it then takes that speech as
+the voice sample and isolates from then on. If you already have a sample of the
+caller, pass it in and isolation starts with the first frame.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/arbazsiddiqui/voxlock"
+  >
+    Code, Pipecat example bot, benchmark harness and changelog
+  </Card>
+  <Card
+    title="Model"
+    icon="cube"
+    href="https://huggingface.co/arbazsiddiqui/voxlock"
+  >
+    Model card, benchmark results and ONNX files on Hugging Face
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="box"
+    href="https://pypi.org/project/voxlock/"
+  >
+    The `voxlock` package on PyPI
+  </Card>
+  <Card
+    title="Live Demo"
+    icon="play"
+    href="https://www.arbazsiddiqui.me/voxlock"
+  >
+    Listen to calls with the filter off and on, in the browser
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add "voxlock[pipecat]"
+```
+
+Requires Python 3.11 or later, like `pipecat-ai`.
+
+## Prerequisites
+
+- **No API key.** The model (74 MB) downloads from Hugging Face on first use
+  and is cached. `voxlock download` fetches it ahead of time, e.g. while
+  building a Docker image.
+- **CPU.** With the default settings the filter takes 61% of one CPU core per
+  call. See [Choosing the CPU settings](#choosing-the-cpu-settings).
+
+## Configuration
+
+<ParamField path="voice_sample" type="np.ndarray | None" default="None">
+  At least 3 seconds of the caller's voice, 16 kHz mono float32. When given,
+  isolation starts from the first audio frame.
+</ParamField>
+
+<ParamField path="sample_seconds" type="float" default="3.0">
+  Seconds of speech to collect as the voice sample when `voice_sample` is not
+  given. Audio passes through unchanged until then.
+</ParamField>
+
+<ParamField path="chunk_ms" type="int" default="80">
+  Audio is run through the model in chunks of this length. Larger chunks use
+  less CPU and add to the delay.
+</ParamField>
+
+<ParamField path="threads" type="int" default="1">
+  onnxruntime threads for this filter.
+</ParamField>
+
+<ParamField path="precision" type="str" default='"int8"'>
+  Model files: `"int8"`, `"int8-full"`, `"fp16"` or `"fp32"` (the benchmarked
+  model).
+</ParamField>
+
+<ParamField path="model_dir" type="str | None" default="None">
+  Folder with the ONNX files. `None` downloads them from Hugging Face. The model
+  is loaded once per process and shared by every call.
+</ParamField>
+
+<ParamField path="delay_ms" type="float | None" default="None">
+  How far the output trails the input. `None` is two chunks plus 24 ms, plus
+  the resampling delay when the transport is not at 16 kHz.
+</ParamField>
+
+## Usage
+
+Create one filter per call and pass it to your transport as `audio_in_filter`:
+
+```python
+from pipecat.transports.base_transport import TransportParams
+from voxlock.pipecat import VoxLockFilter
+
+transport_params = TransportParams(
+    audio_in_enabled=True,
+    audio_in_filter=VoxLockFilter(),
+)
+```
+
+The transport drives the filter lifecycle (`start(sample_rate)`,
+`filter(audio)`, `process_frame(frame)` and `stop()`), so no additional wiring
+is needed. A complete voice agent is in
+[examples/pipecat_bot.py](https://github.com/arbazsiddiqui/voxlock/blob/main/examples/pipecat_bot.py).
+
+### With a voice sample
+
+```python
+import voxlock
+from voxlock.pipecat import VoxLockFilter
+
+sample = voxlock.load_audio("caller_sample.wav")  # about 3 s, any format
+audio_filter = VoxLockFilter(voice_sample=sample)
+```
+
+### Choosing the CPU settings
+
+| Settings                      | CPU per call     | Delay at 16 kHz |
+| ----------------------------- | ---------------- | --------------- |
+| `VoxLockFilter()` (default)   | 61% of one core  | 184 ms          |
+| `VoxLockFilter(chunk_ms=40)`  | 77% of one core  | 104 ms          |
+
+One thread on a Google Cloud Xeon @ 2.20 GHz. The default fits a single vCPU
+such as Pipecat Cloud's `agent-2x`; half a vCPU (`agent-1x`) is too little.
+Resampling adds 39 ms to the delay at 48 kHz and 120 ms at 8 kHz.
+
+## Input Frames
+
+<ParamField path="FilterEnableFrame" type="Frame">
+  Control frame to toggle isolation on and off at runtime. Queue the frame into the pipeline to toggle the filter used as `audio_in_filter`:
+
+```python
+from pipecat.frames.frames import FilterEnableFrame
+
+# Bypass isolation: audio passes through unchanged
+await worker.queue_frame(FilterEnableFrame(enable=False))
+
+# Resume isolation
+await worker.queue_frame(FilterEnableFrame(enable=True))
+```
+
+</ParamField>
+
+## Audio Requirements
+
+- Input is 16-bit mono PCM at the transport's sample rate. The filter resamples
+  to 16 kHz for the model and back, so 8 kHz telephony and 48 kHz WebRTC both
+  work.
+- The model runs on its own thread, so the transport's audio loop never waits
+  for it. Every call to `filter()` returns as many bytes as it received, a
+  fixed delay behind; a stretch the model has not finished in time, such as the
+  first seconds after it locks on to the caller, goes out unprocessed.
+
+## Compatibility
+
+Requires `voxlock` 1.3.0 or later. Tested with Pipecat 1.15.0. See the
+[changelog](https://github.com/arbazsiddiqui/voxlock/blob/main/CHANGELOG.md)
+for the latest tested version.

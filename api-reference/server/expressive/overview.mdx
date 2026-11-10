@@ -1,0 +1,264 @@
+---
+title: "Expressive Conversation"
+sidebarTitle: "Overview"
+"og:title": "Expressive Conversation API Reference"
+description: "Reference for expressive conversation: PipelineParams, ExpressionPolicy, the universal names, perception types, frames and events."
+---
+
+## Overview
+
+With expressive conversation on, the LLM writes expression tags into its reply and the TTS service performs them, and a perception producer, such as [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader), tells the LLM how the user sounded. Tags and readings follow the [Real-time Context Standard](/api-reference/standards/real-time-context-standard), which defines their syntax.
+
+For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-conversation).
+
+<Warning>
+  Expressive conversation is alpha. Its tags, types and defaults may change
+  between releases.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card
+    title="Expressive TTS Services"
+    icon="waveform-lines"
+    href="/api-reference/server/expressive/tts-services"
+  >
+    The TTS services and models that perform tags, and what each performs
+  </Card>
+  <Card
+    title="Pipecat Tone"
+    icon="face-smile"
+    href="/api-reference/server/expressive/pipecat-tone"
+  >
+    The reader, which hears how the user sounded, and the tagger, which writes
+    tags for the LLM
+  </Card>
+</CardGroup>
+
+```python
+from pipecat.expressive.expression import (
+    CORE_DELIVERY,
+    CORE_SOUNDS,
+    ExpressionDelivery,
+    ExpressionSound,
+)
+from pipecat.expressive.perception import (
+    PerceptionCapabilities,
+    PerceptionSignal,
+    PerceptionTerm,
+    format_perception,
+    merge_perception,
+)
+from pipecat.expressive.policy import ExpressionGuidance, ExpressionPolicy
+```
+
+## Configuration
+
+### PipelineParams
+
+<ParamField path="enable_expressive_conversation" type="bool" default="False">
+  Whether the agent takes part in expressive conversation. The LLM is taught the
+  tags the TTS service performs and how to read the user's perception, and the
+  TTS service performs the tags instead of speaking them.
+</ParamField>
+
+<ParamField
+  path="expression_policy"
+  type="ExpressionPolicy | None"
+  default="None"
+>
+  Which tags the LLM is offered, and when to use them. `None` offers the [core
+  names](#core-names) the TTS service performs, with no guidance. Has no effect,
+  with a warning, unless `enable_expressive_conversation` is `True`.
+</ParamField>
+
+### ExpressionPolicy
+
+<ParamField path="guidance" type="list[ExpressionGuidance | str]" default="[]">
+  Lines on when and how much to express: [presets](#expressionguidance) or your
+  own, joined in order, so a later line can refine an earlier one. Your own
+  lines reach the LLM whenever it has tags to write or a reading to act on. The
+  presets go to whoever writes the tags: the LLM, or
+  [`PipecatToneTagger`](/api-reference/server/expressive/pipecat-tone#pipecattonetagger)
+  in its place.
+</ParamField>
+
+<ParamField
+  path="delivery"
+  type="list[ExpressionDelivery | str] | None"
+  default="None"
+>
+  The deliveries to offer, by their universal names. `None` offers the core
+  deliveries. A name that isn't universal, such as an accent, is offered as
+  written. Names the TTS service can't perform are left out, with a warning.
+</ParamField>
+
+<ParamField
+  path="sounds"
+  type="list[ExpressionSound | str] | None"
+  default="None"
+>
+  The sounds to offer, as `delivery` offers deliveries. `None` offers the core
+  sounds, and `breath` only with `ExpressionGuidance.BREATHE`.
+</ParamField>
+
+### ExpressionGuidance
+
+Presets for `ExpressionPolicy.guidance`. Each is a short paragraph on one aspect of delivery, written to combine with the others and with your own lines. A preset is about writing tags, so an LLM taught no tags isn't given it.
+
+| Preset             | Guidance                                                                                                                                                  |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MATCH_STYLE`      | Match the user's mood and energy: excited for good news, sympathetic with bad news, a laugh when they're funny. Stay calm with hostility.                 |
+| `SLOW_FOR_DETAILS` | Say just what the user may need to write down, such as a code or a phone number, slowly, in a span. For a TTS service that performs `slow`.               |
+| `BREATHE`          | Take an audible breath now and then before a long or difficult sentence, at most once a reply. For a TTS service that performs a breath. Offers `breath`. |
+
+## Universal Names
+
+`ExpressionDelivery` and `ExpressionSound` name every delivery and sound the expressive TTS services perform, the same on each. A TTS service translates a universal name into its own, such as `warm` into ElevenLabs' `warmly`, while transcripts, frames and RTVI messages keep the universal name. The members are strings: `ExpressionDelivery.WARM` is `"warm"`, and `ExpressionSound.CLEAR_THROAT` is `"clear throat"`. The [Real-time Context Standard](/api-reference/standards/real-time-context-standard#universal-names) lists every name.
+
+### Core Names
+
+The core names are what the LLM is offered when the policy names none, and what `PipecatToneTagger` writes:
+
+| Constant        | Names                                                                                                                          |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `CORE_DELIVERY` | `calm`, `sympathetic`, `apologetic`, `warm`, `excited`, `surprised`, `sad`, `grateful`, `curious`, `confident`, `slow`, `fast` |
+| `CORE_SOUNDS`   | `laugh`, `chuckle`, `sigh`, `breath`                                                                                           |
+
+A breath is offered only with `ExpressionGuidance.BREATHE`.
+
+## Perception
+
+A perception producer reads how the user spoke each turn and sets it as the transcription's `perception`. The LLM reads it at the head of the user's message, formatted by `format_perception()`.
+
+### PerceptionReader
+
+A perception producer that asks classifiers how the user spoke, and sets the answers as the transcription's `perception`, one signal per question. Goes between the STT service and the user aggregator. Every classifier's reading is also broadcast in a `PerceptionFrame` as soon as it's made. A reader asks each of its `sources` about the same turn at once, and their signals go in the turn's one reading, in the sources' order. A transcription goes on once every source has read it or run out of time. A source that's late or whose classifier fails leaves only its own signals out, and a transcription none of them read passes unread. A classifier that can't be set up is reported as an error that leaves the reader unusable.
+
+A text classifier reads each final transcription, with the bot's previous reply. A classifier that can hear, as its `supports_audio` says, such as [`HumeAudioClassifier`](/api-reference/server/classifiers/hume-audio), hears the user's audio each time they stop speaking: their speech, plus the audio heard just before it when the speech is shorter than the classifier's `min_audio_secs`. Audio heard while the user is muted counts as silence. The transcriptions of that speech are held until the speech is read and pushed on together, with the reading, and only the last one is finalized. The STT's `ttfs_p99_latency` is raised by the longest source `timeout` so the user's turn waits for them. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
+
+```python
+from pipecat.expressive.processors.perception_reader import (
+    PerceptionQuestion,
+    PerceptionReader,
+    PerceptionSource,
+)
+from pipecat.expressive.processors.tone_reader import PipecatToneSource
+
+hume = PerceptionSource(
+    classifier=HumeAudioClassifier(api_key=os.getenv("HUME_API_KEY")),
+    questions={
+        "hesitation": PerceptionQuestion(
+            question=YesNoQuestion(instructions="Does the speaker sound unsure?"),
+            description="The chance the user sounded unsure, from 0 to 1.",
+        ),
+    },
+)
+reader = PerceptionReader(sources=[PipecatToneSource(), hume])
+```
+
+<ParamField path="sources" type="Sequence[PerceptionSource]" required>
+  The classifiers to ask, each with its questions and timeout. Raises
+  `ValueError` when there are no sources, when two sources report a signal of
+  the same name, or when two sources ask the same classifier.
+</ParamField>
+
+A `ChoiceQuestion` is reported as labels, a `YesNoQuestion` as its probability, and a `ScoreQuestion` as its position on the scale.
+
+### PerceptionSource
+
+One classifier a `PerceptionReader` asks, and the questions it's asked. A signal's name belongs to one source, and a classifier goes in one source, with all its questions. A classifier whose questions aren't known until it's set up, such as Pipecat Tone's, gets a subclass: [`PipecatToneSource`](/api-reference/server/expressive/pipecat-tone#pipecattonesource).
+
+<ParamField path="classifier" type="BaseClassifier" required>
+  What answers the questions about each turn.
+</ParamField>
+
+<ParamField path="questions" type="Mapping[str, PerceptionQuestion]" required>
+  The questions, by the name of the signal each reports. Raises `ValueError`
+  when a name has a space or one of `=`, `,`, `[`, `]`, `(` or `)`.
+</ParamField>
+
+<ParamField path="timeout" type="float | None" default="None">
+  Seconds a transcription waits for the classifier's answers. By default `0.5`
+  for a text classifier, counted from when the transcription arrives, and `2`
+  for a classifier that hears audio, counted from when the user stops speaking.
+</ParamField>
+
+### PerceptionQuestion
+
+One signal a `PerceptionSource` reports.
+
+| Field         | Type                 | Description                                                                               |
+| ------------- | -------------------- | ----------------------------------------------------------------------------------------- |
+| `question`    | `ClassifierQuestion` | What the classifier is asked.                                                             |
+| `description` | `str`                | A short line telling the LLM how to read the signal, such as its range. Defaults to `""`. |
+| `max_labels`  | `int`                | The most labels a choice reports, likeliest first. At least 1. Defaults to `2`.           |
+
+### PerceptionSignal
+
+One signal of a reading, read either as labels or as a value.
+
+| Field    | Type                      | Description                                                                                                          |
+| -------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `name`   | `str`                     | What is read, such as `"emotion"`.                                                                                   |
+| `labels` | `list[tuple[str, float]]` | The likeliest labels, likeliest first, each with a confidence from 0 to 1. Empty for a signal read as a value.       |
+| `value`  | `float \| None`           | The measure, for a signal read as a value, such as a probability or words per second. `None` for one read as labels. |
+
+### PerceptionTerm
+
+One signal a perception producer reports, as it declares it at start.
+
+| Field         | Type        | Description                                                                  |
+| ------------- | ----------- | ---------------------------------------------------------------------------- |
+| `name`        | `str`       | The signal's name, as in `PerceptionSignal.name`.                            |
+| `description` | `str`       | A short line on how to read it, such as its unit or range. Defaults to `""`. |
+| `labels`      | `list[str]` | The labels it can report, for a signal read as labels. Empty for a value.    |
+
+### PerceptionCapabilities
+
+| Field     | Type                   | Description                          |
+| --------- | ---------------------- | ------------------------------------ |
+| `signals` | `list[PerceptionTerm]` | Each signal the producer can report. |
+
+### format_perception
+
+```python
+format_perception(signals: list[PerceptionSignal]) -> str
+```
+
+Returns a reading as the LLM reads it: `([emotion angry=0.81, neutral=0.12],[sarcasm value=0.04])`.
+
+### merge_perception
+
+```python
+merge_perception(
+    merged: list[PerceptionSignal] | None, reading: list[PerceptionSignal]
+) -> list[PerceptionSignal]
+```
+
+Merges a reading into the readings of the same turn so far, keeping the higher of each signal. A signal read as a value keeps its highest value. A signal read as labels keeps every label either reading has, each with its highest confidence, likeliest first. A signal only one reading has is kept as it is, and signals stay in the order they were first read. Pass `None` as `merged` before the first reading.
+
+The user aggregator uses it to merge all the final readings of a user turn, so a reading from earlier in the turn still reaches the LLM.
+
+## Frames
+
+| Frame                                                                        | Field        | Contents                                                                                                                                                                                                |
+| ---------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TTSMetadataFrame`                                                           | `expression` | What the TTS service performs, an [`ExpressionCapabilities`](/api-reference/server/expressive/tts-services#expressioncapabilities), or `None`. Broadcast at start and when a settings change alters it. |
+| `PerceptionMetadataFrame`                                                    | `perception` | The `PerceptionCapabilities` of a perception producer, broadcast at start.                                                                                                                              |
+| `PerceptionFrame`                                                            | `perception` | `list[PerceptionSignal]`: a reading of how the user spoke, broadcast by a perception producer as soon as it's made, before a transcription carries it. A `SystemFrame`.                                 |
+| `ExpressionMetadataFrame`                                                    |              | Broadcast at start by a processor that writes the tags after the LLM, such as `PipecatToneTagger`, so the LLM is taught none.                                                                           |
+| `TranscriptionFrame`, `InterimTranscriptionFrame`, `EagerTranscriptionFrame` | `perception` | `list[PerceptionSignal] \| None`: how the user said the words, when a perception producer read them.                                                                                                    |
+| `TTSTextFrame`                                                               | `delivery`   | `list[str] \| None`: the delivery of the word just spoken, by its universal names, such as `["warm", "emphasis"]`. Empty for the voice's baseline.                                                      |
+| `LLMContextAssistantTurnFrame`                                               | `text`       | The reply's words alone, without tags.                                                                                                                                                                  |
+
+## Events
+
+The user aggregator's [`on_user_turn_stopped`](/api-reference/server/utilities/turn-management/turn-events) message carries `perception`, the turn's final readings merged with `merge_perception()`, or `None` without a perception producer.
+
+## Notes
+
+- **Context keeps the tags**: the reply is stored in the context as the LLM wrote it, so the LLM sees the tags it used. With `PipecatToneTagger`, the context keeps the reply plain.
+- **Tags never reach text**: transcripts, `LLMContextAssistantTurnFrame` and RTVI `bot-output` text carry the words alone.
+- **Tags the TTS service can't perform**: they are left out of the speech and kept in the context.
+- **Unfinished tags**: a tag cut off at the end of a reply or by an interruption is removed.
+- **A TTS service after the LLM**: the LLM is taught the tags of the TTS service that speaks its replies. When a settings change, such as a new model or voice, changes what it performs, the LLM is taught the new tags.

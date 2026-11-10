@@ -1,0 +1,130 @@
+---
+title: "Alkove Turn"
+description: "Local, audio-only end-of-turn detection with Alkove's Cue model, and an interruption strategy that lets backchannels through"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="edbrdi"
+  maintainerUrl="https://github.com/edbrdi"
+  repo="https://github.com/alkove-ai/alkove/tree/main/integrations/pipecat"
+/>
+
+## Overview
+
+`AlkoveTurnAnalyzer` is a turn analyzer that decides when the user has finished
+speaking. It reads the end of turn head of Cue, the speech detection model of
+[Alkove](https://alkove.ai), an open-source (Apache-2.0) voice SDK. It needs no
+transcript, no API key and no GPU: Focus then Cue run locally on the CPU with
+Alkove's own inference engine, and the head is read every 0.1 s of each pause,
+as the audio comes.
+
+The same package gives `turn.interruption_strategy()`, a user turn start
+strategy: while the bot speaks, the user's turn starts only once their speech
+spans `min_duration` seconds, so a "mm" or a "yeah" lets the bot go on.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/alkove-ai/alkove/tree/main/integrations/pipecat"
+  >
+    Code, example and README of the Pipecat plugin
+  </Card>
+  <Card
+    title="Model Card"
+    icon="cube"
+    href="https://huggingface.co/alkove-ai/alkove-cue-1-preview"
+  >
+    Cue's weights (Apache-2.0), its end of turn evaluation and limits
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-alkove
+```
+
+## Prerequisites
+
+No account or API key. The models (Focus 1.1 MB, Cue 1.2 MB) download once into
+the cache and are checked by their sha256, when the analyzer is created.
+
+- **A VAD analyzer in the pipeline**, for example
+  [`AlkoveVADAnalyzer`](/api-reference/server/services/vad/alkove-vad)
+- **Languages**: evaluated in English, French, Spanish, Italian, Portuguese,
+  German and Dutch
+
+## Configuration
+
+`AlkoveTurnAnalyzer(params=AlkoveTurnParams(...), min_duration=0.7)`
+
+| Parameter   | Default | Description                                                                                                     |
+| ----------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `threshold` | `0.6`   | End of turn probability over which the turn is complete. Lower answers sooner and cuts the user off more often. |
+| `min_pause` | `0.3`   | Seconds of pause before any read can complete the turn.                                                         |
+| `max_pause` | `1.5`   | Seconds of pause after which the turn is complete, whatever the head says.                                      |
+
+<ParamField path="min_duration" type="float" default="0.7">
+  Seconds the user's speech must span, short gaps included, to start their turn
+  while the bot speaks. Used by `interruption_strategy()`.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None" default="None">
+  Input sample rate. `None` takes the transport's.
+</ParamField>
+
+<ParamField path="models" type="alkove.Models | None" default="None">
+  Models to use. `None` loads Focus and Cue once per process, shared by every
+  session.
+</ParamField>
+
+## Usage
+
+```python
+from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat_alkove import AlkoveTurnAnalyzer, AlkoveVADAnalyzer
+
+turn = AlkoveTurnAnalyzer()
+user_turn_strategies = UserTurnStrategies(
+    start=[turn.interruption_strategy(), TranscriptionUserTurnStartStrategy()],
+    stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn)],
+)
+user_params = LLMUserAggregatorParams(
+    user_turn_strategies=user_turn_strategies,
+    vad_analyzer=AlkoveVADAnalyzer(),
+)
+```
+
+## How It Works
+
+- The turn is complete on the first read of the head over `threshold` once the
+  pause reaches `min_pause`, or at `max_pause`. The head starts over at each
+  turn's end.
+- The analyzer runs Focus then Cue itself, on the audio the user aggregator
+  gets: behind [`AlkoveFilter`](/api-reference/server/services/audio-filters/alkove),
+  Focus runs twice.
+- `interruption_strategy()` shares them. While the bot speaks, a shorter "mm"
+  or "yeah" starts no turn, and its transcript does not either. With the bot
+  quiet, or once it stops while the user goes on, the turn starts with the VAD,
+  as Pipecat's default.
+
+## Compatibility
+
+Tested with Pipecat 1.15.0. See the
+[changelog](https://github.com/alkove-ai/alkove/blob/main/CHANGELOG.md) for the
+latest version.
+
+## Notes
+
+- The head hears the voice, not the words: it does not know that "my number
+  is" asks for more.
+- Evaluated on LiveKit's eot-bench, real user turns to voice agents; the results
+  are on the [model card](https://huggingface.co/alkove-ai/alkove-cue-1-preview).

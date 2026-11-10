@@ -3,7 +3,7 @@ title: "Eval Suites"
 description: "Spawn agents and run many scripted and simulated scenarios concurrently from a single manifest with pipecat eval suite."
 ---
 
-`pipecat eval run` tests scenarios against an agent you started yourself. A **suite** goes one step further: you list agents and scenarios in a manifest, and `pipecat eval suite` spawns each agent with its eval transport on its own port, runs its scenarios, tears it down, and aggregates the results, several runs at a time.
+`pipecat eval run` tests scenarios against an agent you started yourself. A **suite** goes one step further: you list agents and scenarios in a manifest, and `pipecat eval suite` spawns each agent on its own port, connects to its `/ws` route, runs its scenarios, stops it as soon as the run ends, and aggregates the results, several runs at a time.
 
 Suites are the right tool when you have more than one agent, more than a handful of scenarios, or want a single command for CI. They are also how a [simulation](/pipecat/evals/simulated-scenarios) runs more than once: each run gets a fresh agent. Pipecat's own release evals are a manifest with 100+ example agents plus this command.
 
@@ -16,7 +16,7 @@ record: false # record conversation audio (audio-mode scenarios)
 scenarios_dir: scenarios # scenario names resolve to <dir>/<name>.yaml
 
 # How to start each agent. {python}, {bot}, and {port} are substituted per run.
-spawn: "{python} {bot} -t eval --port {port}"
+spawn: "{python} {bot} --port {port}"
 
 suite:
   - bot: bots/support-agent.py
@@ -91,7 +91,7 @@ Everything except the `suite:` list can live in the manifest or be passed on the
 
 `concurrency:` is how many runs execute at once, and the suite keeps that many going until none are left. Each time a run finishes, the next one comes from the first entry in manifest order that still has runs, so an entry's scenarios finish together and no slot sits idle while any entry has work, however few entries the manifest has. When runs repeat (`repeat:`, or a simulation's own `runs:`), every entry's first attempt runs before any entry's second.
 
-An entry whose provider rate-limits sets its own `concurrency:`, and never has more than that many runs in flight, across its attempts. When it is full, the next free slot goes to the following entry's run instead. The suite's figure, or `--concurrency`, bounds the whole.
+An entry whose provider rate-limits sets its own `concurrency:`, and never has more than that many runs in flight, across its attempts. The cap applies to that entry alone, even when other entries use the same bot. When it is full, the next free slot goes to the following entry's run instead. The suite's figure, or `--concurrency`, bounds the whole.
 
 ## Run output
 
@@ -104,13 +104,14 @@ eval-runs/20260610_142200/
     bots_support-agent.py__greeting__greeting.log        # the agent process output
     bots_support-agent.py__greeting__greeting.eval.log   # the harness's decision trace
     bots_support-agent.py__greeting__greeting.debug.log  # per-pipeline harness logs (-d only)
+    bots_support-agent.py__greeting__greeting.conversation.json  # a simulation's conversation
   recordings/
     bots_support-agent.py__greeting__greeting.wav        # conversation audio (record: true or -a)
 ```
 
 An artifact's name is the bot path, then the entry's `name:` when it has one, then the scenario's `<file>/<scenario>` name with its slash written as a double underscore, so `bots/turn-agent.py` under the label `openai/gpt-4o-mini` running `turn_completion/short_answer` writes `bots_turn-agent.py__openai_gpt-4o-mini__turn_completion__short_answer.log`.
 
-`results.jsonl` carries one line per run, and every line names its `bot`, its entry's `name`, its `scenario`, its `attempt`, and its `kind`, `script` or `simulation`. A scripted record carries the outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. Each turn lists its `expectations`, one per expectation the turn resolved, with whether it `passed` and what it `matched`: the marker of an `llm_marker`, a function call's signature, a reply's text. What a passed run matched is only recorded here. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, every metric's score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+`results.jsonl` carries one line per run, and every line names its `bot`, its entry's `name`, its `scenario`, its `attempt`, and its `kind`, `script` or `simulation`. A scripted record carries the outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. Each turn lists its `expectations`, one per expectation the turn resolved, with whether it `passed` and what it `matched`: the marker of an `llm_marker`, a function call's signature, a reply's text. What a passed run matched is only recorded here. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, the `success:` wording and the judge's `confidence` and `probabilities` for it, every metric's `criterion`, score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none, each with its `confidence` and `probabilities`), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
 
 Each run executes in its own process, so a harness that loads local audio models does so on its own, and a crash in one run doesn't stop the others.
 
@@ -126,8 +127,8 @@ When a run fails, start with the `.eval.log` decision trace: it's a timestamped 
 If you just want to run a batch of scenarios against an agent you already have running, you don't need a manifest. `pipecat eval run` accepts multiple scenario files and shares the suite's dashboard and tally:
 
 ```bash
-pipecat eval run scenarios/*.yaml --bot-url ws://localhost:7860
-pipecat eval run scenarios/ --bot-url ws://localhost:7860       # the whole directory
+pipecat eval run scenarios/*.yaml --bot-url ws://localhost:7860/ws
+pipecat eval run scenarios/ --bot-url ws://localhost:7860/ws       # the whole directory
 ```
 
 A directory expands to its `.yaml` and `.yml` files in filename order, non-recursively, and files and directories can be mixed in one invocation. A directory holding no scenarios is an error rather than an empty run.

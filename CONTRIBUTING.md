@@ -79,6 +79,9 @@ Our maintainers will review your PR, and once everything looks good, your contri
 
 ## Content Guidelines
 
+See [STYLE.md](STYLE.md) for how pages are written: what to document, page
+templates, code samples, and prose.
+
 ### MDX Frontmatter
 
 Every page needs a `title` (required) and `description` (recommended):
@@ -116,7 +119,7 @@ images/ logo/ videos/   # Static assets
 
 ### Mintlify Components
 
-Use Mintlify's [built-in components](https://mintlify.com/docs/content/components/) for structured content:
+Use Mintlify's [built-in components](https://www.mintlify.com/docs/components) for structured content:
 
 | Component                                | Purpose                            |
 | ---------------------------------------- | ---------------------------------- |

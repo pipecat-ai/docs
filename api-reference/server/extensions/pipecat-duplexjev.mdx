@@ -1,0 +1,123 @@
+---
+title: "DuplexJev Turn Analyzer"
+description: "Audio end-of-turn detection that also returns emotion, non-verbal sounds and barge-in from the same request"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="adventists-ai"
+  maintainerUrl="https://github.com/adventists-ai"
+  repo="https://github.com/adventists-ai/duplexjev/tree/main/integrations/pipecat"
+/>
+
+## Overview
+
+`DuplexJevTurnAnalyzer` is a turn analyzer backed by [DuplexJev](https://github.com/adventists-ai/duplexjev), an
+open-weights speech model that answers multiple-choice questions about raw audio in one forward pass. Instead of a
+yes/no end-of-turn score it reads four turn states from the user's audio -- **finished**, **still talking**,
+**just backchanneling** ("mm-hmm") or **asking to wait** -- so a backchannel or a "hold on" does not trigger a reply.
+
+The same request can also return the user's **emotion**, **non-verbal sounds** (laughter, breathing, coughs, sighs)
+and **barge-in**, or your own multiple-choice questions. No transcript is needed for the decision.
+
+<Note>
+  Not to be confused with the Jev classifier (`pipecat-ai[jev]`) by TypeSafe --
+  DuplexJev is a separate, open-weights speech model by Adventists.ai.
+</Note>
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/adventists-ai/duplexjev/tree/main/integrations/pipecat"
+  >
+    Source code, examples, and issues for the DuplexJev integration
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-duplexjev/"
+  >
+    The `pipecat-duplexjev` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-duplexjev
+```
+
+## Prerequisites
+
+- **Pipecat 1.0 or later** (tested with `pipecat-ai` 1.12.0)
+- **A DuplexJev gateway**: a free, rate-limited trial API is used by default (30 requests per minute). For a live
+  bot, serve the model next to your agent; DuplexJev-4B-Para needs about 10 GB of GPU memory:
+
+```bash
+pip install "vllm[audio]>=0.29" duplexjev-vllm "duplexjev[server]>=0.4.1"
+vllm serve adventists-ai/DuplexJev-4B-Para --max-model-len 4096 --port 8000 &
+duplexjev gateway --vllm http://localhost:8000/v1 --port 8420
+```
+
+The plugin code is BSD-2-Clause; the model weights are CC BY-NC 4.0 (non-commercial use; a commercial licence is
+available from the maintainers).
+
+## Usage
+
+```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat_duplexjev import DuplexJevTurnAnalyzer
+
+turn = DuplexJevTurnAnalyzer(
+    url="http://localhost:8420",          # your own gateway; omit to use the hosted trial API
+    extra_questions=["emotion", "sound"],
+    on_answers=lambda a: print({k: v["answer"] for k, v in a.items()}),
+)
+
+aggregators = LLMContextAggregatorPair(context, user_params=LLMUserAggregatorParams(
+    vad_analyzer=SileroVADAnalyzer(),
+    user_turn_strategies=UserTurnStrategies(stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn)]),
+))
+```
+
+## Configuration
+
+<ParamField path="url" type="str" default="hosted trial API">
+  Base URL of a `duplexjev gateway`.
+</ParamField>
+
+<ParamField path="api_key" type="str" default="None">
+  Bearer key, if your gateway requires one.
+</ParamField>
+
+<ParamField path="lang" type="str" default='"en"'>
+  `"en"` or `"zh"`: wording of the questions (the model hears both languages
+  either way).
+</ParamField>
+
+<ParamField path="threshold" type="float" default="0.5">
+  Probability of "finished" from which the turn is complete.
+</ParamField>
+
+<ParamField path="extra_questions" type="list" default="[]">
+  `"emotion"`, `"sound"`, `"barge_in"`, or dicts `{"id", "text", "options"}`. Answers arrive in `last_answers`
+  and `on_answers`, from the same forward pass as the turn decision.
+</ParamField>
+
+<ParamField path="on_answers" type="Callable" default="None">
+  Callback with every answer dict.
+</ParamField>
+
+<ParamField path="params" type="SmartTurnParams" default="SmartTurnParams()">
+  Pipecat's usual `stop_secs`, `pre_speech_ms` and `max_duration_secs`.
+</ParamField>
+
+If the gateway cannot be reached, the analyzer logs the error and reports "not finished", so Pipecat falls back to
+its silence timeout and the conversation never blocks.

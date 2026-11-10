@@ -8,7 +8,7 @@ description: "Realtime TTS with BlandTTSService (WebSocket streaming) and BlandH
 
 Bland provides two TTS service implementations:
 
-- `BlandTTSService` for real-time synthesis using Bland's WebSocket API at `/v2/tts/ws`. Streams LLM tokens as they arrive and maintains a single connection for the whole conversation, with support for interruptions via Bland's `cancel` message.
+- `BlandTTSService` for real-time synthesis using Bland's WebSocket API at `/v2/tts/ws`. Streams LLM tokens as they arrive and keeps its connection open across turns, with support for interruptions via Bland's `cancel` message.
 - `BlandHttpTTSService` for complete-text synthesis using Bland's HTTP API at `/v2/tts`. Takes the complete text in one request. Voice agents should prefer `BlandTTSService` for streaming.
 
 <CardGroup cols={2}>
@@ -69,7 +69,7 @@ Before using Bland TTS services, you need:
 ### BlandTTSService
 
 <ParamField path="api_key" type="str" required>
-  Bland API key for authentication.
+  Bland API key for authentication. Raises `ValueError` when empty.
 </ParamField>
 
 <ParamField path="url" type="str" default="wss://api.bland.ai/v2/tts/ws">
@@ -102,14 +102,14 @@ Before using Bland TTS services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `BlandTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter         | Type              | Default                                | Description                                                                                                                                                           |
-| ----------------- | ----------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `voice`           | `str`             | `29158307-9893-4149-8a75-bc9ce313d64e` | Voice identifier.                                                                                                                                                     |
-| `expressiveness`  | `float \| None`   | `None`                                 | 0.0-1.0. Higher values produce more varied intonation. `None` leaves Bland at its default.                                                                            |
-| `stability`       | `float \| None`   | `None`                                 | 0.0-1.0. Higher values produce more consistent delivery. `None` leaves Bland at its default.                                                                          |
-| `auto_formatting` | `bool \| None`    | `None`                                 | Rewrite phone numbers and SSNs (spelled out, bare digits, or dashed) into digit groups the voice reads digit by digit. Fixed for the session; changing it reconnects. |
-| `model`           | `str`             | `None`                                 | Model identifier. _(Inherited.)_                                                                                                                                      |
-| `language`        | `Language \| str` | `None`                                 | Language for synthesis. _(Inherited.)_                                                                                                                                |
+| Parameter         | Type              | Default                                | Description                                                                                                            |
+| ----------------- | ----------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `voice`           | `str`             | `29158307-9893-4149-8a75-bc9ce313d64e` | Voice identifier.                                                                                                      |
+| `expressiveness`  | `float \| None`   | `None`                                 | 0.0-1.0. Higher values produce more varied intonation. `None` leaves Bland at its default.                             |
+| `stability`       | `float \| None`   | `None`                                 | 0.0-1.0. Higher values produce more consistent delivery. `None` leaves Bland at its default.                           |
+| `auto_formatting` | `bool \| None`    | `None`                                 | Rewrite phone numbers and SSNs (spelled out, bare digits, or dashed) into digit groups the voice reads digit by digit. |
+| `model`           | `str`             | `None`                                 | Not sent by this service; reported only as the model name in metrics and traces. _(Inherited.)_                        |
+| `language`        | `Language \| str` | `None`                                 | Language used to split text into sentences in `SENTENCE` mode; not sent to Bland. _(Inherited.)_                       |
 
 <Note>
   The voice sets the model; `expressiveness` and `stability` are calibrated for
@@ -119,7 +119,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 ### BlandHttpTTSService
 
 <ParamField path="api_key" type="str" required>
-  Bland API key for authentication.
+  Bland API key for authentication. Raises `ValueError` when empty.
 </ParamField>
 
 <ParamField path="base_url" type="str" default="https://api.bland.ai/v2">
@@ -150,14 +150,16 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `expressiveness`  | `float \| None`   | `None`                                 | 0.0-1.0. Higher values produce more varied intonation.                                                                 |
 | `stability`       | `float \| None`   | `None`                                 | 0.0-1.0. Higher values produce more consistent delivery.                                                               |
 | `auto_formatting` | `bool \| None`    | `None`                                 | Rewrite phone numbers and SSNs (spelled out, bare digits, or dashed) into digit groups the voice reads digit by digit. |
-| `model`           | `str`             | `None`                                 | Model identifier. _(Inherited.)_                                                                                       |
-| `language`        | `Language \| str` | `None`                                 | Language for synthesis. _(Inherited.)_                                                                                 |
+| `model`           | `str`             | `None`                                 | Not sent by this service; reported only as the model name in metrics and traces. _(Inherited.)_                        |
+| `language`        | `Language \| str` | `None`                                 | Language used to split text into sentences; not sent to Bland. _(Inherited.)_                                          |
 
 ## Usage
 
 ### WebSocket Service
 
 ```python
+import os
+
 from pipecat.services.bland.tts import BlandTTSService
 
 tts = BlandTTSService(
@@ -214,10 +216,11 @@ async with aiohttp.ClientSession() as session:
 
 ## Notes
 
-- **Choosing a service**: `BlandTTSService` maintains a single WebSocket connection for the whole conversation and streams LLM tokens as they arrive, making it suitable for interactive voice agents. `BlandHttpTTSService` processes each request as a complete batch.
+- **Choosing a service**: `BlandTTSService` keeps one WebSocket connection open across turns and streams LLM tokens as they arrive, making it suitable for interactive voice agents. Bland closes a session after 60 seconds without a message, and the service reconnects on the next turn. `BlandHttpTTSService` processes each request as a complete batch.
 - **Token Streaming**: By default (`TextAggregationMode.TOKEN`), LLM tokens are sent to Bland immediately. Bland buffers them server-side and chooses its own synthesis boundaries, so no sentence tokenizer or character threshold is needed.
 - **Interruption Handling**: Interruptions send Bland's `cancel` message without closing the connection, so barge-in preserves the session.
-- **Sample Rate**: Bland renders 8000, 16000, 24000, 44100, and 48000 Hz directly. A pipeline running at any other rate is served at 48000 Hz and resampled by the output transport.
+- **Sample Rate**: Bland renders 8000, 16000, 24000, 44100, and 48000 Hz directly. A pipeline running at any other rate is served at 48000 Hz, which `BlandTTSService` passes on for the output transport to resample and `BlandHttpTTSService` resamples to the pipeline rate itself.
+- **Settings updates reconnect**: On `BlandTTSService`, changing `voice`, `expressiveness`, `stability`, or `auto_formatting` closes the session and opens a new one.
 
 ## Event Handlers
 
