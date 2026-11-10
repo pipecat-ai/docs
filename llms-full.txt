@@ -84104,7 +84104,7 @@ results["angry"].probability
 
 ### Reading How the User Sounded
 
-Pass the classifier to a [`PerceptionReader`](/api-reference/server/expressive/overview#perceptionreader), which cuts a clip of the user's speech each time they stop speaking and sets the answers as the transcription's `perception`.
+Give the classifier, with its questions, to a [`PerceptionSource`](/api-reference/server/expressive/overview#perceptionsource) of a [`PerceptionReader`](/api-reference/server/expressive/overview#perceptionreader), which cuts a clip of the user's speech each time they stop speaking and sets the answers as the transcription's `perception`.
 
 ### Sharing a Client
 
@@ -84782,23 +84782,41 @@ A perception producer reads how the user spoke each turn and sets it as the tran
 
 ### PerceptionReader
 
-A perception producer that asks any [classifier](/api-reference/server/classifiers/overview) how the user spoke, and sets the answers as the transcription's `perception`, one signal per question. Goes between the STT service and the user aggregator. Every reading is also broadcast in a `PerceptionFrame` as soon as it's made. A transcription passes unread when its reading is late or the classifier fails. A classifier that can't be set up is reported as an error that leaves the reader unusable.
+A perception producer that asks classifiers how the user spoke, and sets the answers as the transcription's `perception`, one signal per question. Goes between the STT service and the user aggregator. Every classifier's reading is also broadcast in a `PerceptionFrame` as soon as it's made. A reader asks each of its `sources` about the same turn at once, and their signals go in the turn's one reading, in the sources' order. A transcription goes on once every source has read it or run out of time. A source that's late or whose classifier fails leaves only its own signals out, and a transcription none of them read passes unread. A classifier that can't be set up is reported as an error that leaves the reader unusable.
 
-A text classifier reads each final transcription, with the bot's previous reply. A classifier that can hear, as its `supports_audio` says, such as [`HumeAudioClassifier`](/api-reference/server/classifiers/hume-audio), hears the user's audio each time they stop speaking: their speech, plus the audio heard just before it when the speech is shorter than the classifier's `min_audio_secs`. Audio heard while the user is muted counts as silence. The transcriptions of that speech are held until the speech is read and pushed on together, with the reading, and only the last one is finalized. The STT's `ttfs_p99_latency` is raised by `timeout` so the user's turn waits for them. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
+A text classifier reads each final transcription, with the bot's previous reply. A classifier that can hear, as its `supports_audio` says, such as [`HumeAudioClassifier`](/api-reference/server/classifiers/hume-audio), hears the user's audio each time they stop speaking: their speech, plus the audio heard just before it when the speech is shorter than the classifier's `min_audio_secs`. Audio heard while the user is muted counts as silence. The transcriptions of that speech are held until the speech is read and pushed on together, with the reading, and only the last one is finalized. The STT's `ttfs_p99_latency` is raised by the longest source `timeout` so the user's turn waits for them. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
 
 ```python
-from pipecat.expressive.processors.perception_reader import PerceptionQuestion, PerceptionReader
+from pipecat.expressive.processors.perception_reader import (
+    PerceptionQuestion,
+    PerceptionReader,
+    PerceptionSource,
+)
+from pipecat.expressive.processors.tone_reader import PipecatToneSource
 
-reader = PerceptionReader(
-    classifier=JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY")),
+hume = PerceptionSource(
+    classifier=HumeAudioClassifier(api_key=os.getenv("HUME_API_KEY")),
     questions={
-        "frustration": PerceptionQuestion(
-            question=YesNoQuestion(instructions="Is the user frustrated?"),
-            description="The chance the user is frustrated, from 0 to 1.",
+        "hesitation": PerceptionQuestion(
+            question=YesNoQuestion(instructions="Does the speaker sound unsure?"),
+            description="The chance the user sounded unsure, from 0 to 1.",
         ),
     },
 )
+reader = PerceptionReader(sources=[PipecatToneSource(), hume])
 ```
+
+<ParamField path="sources" type="Sequence[PerceptionSource]" required>
+  The classifiers to ask, each with its questions and timeout. Raises
+  `ValueError` when there are no sources, when two sources report a signal of
+  the same name, or when two sources ask the same classifier.
+</ParamField>
+
+A `ChoiceQuestion` is reported as labels, a `YesNoQuestion` as its probability, and a `ScoreQuestion` as its position on the scale.
+
+### PerceptionSource
+
+One classifier a `PerceptionReader` asks, and the questions it's asked. A signal's name belongs to one source, and a classifier goes in one source, with all its questions. A classifier whose questions aren't known until it's set up, such as Pipecat Tone's, gets a subclass: [`PipecatToneSource`](/api-reference/server/expressive/pipecat-tone#pipecattonesource).
 
 <ParamField path="classifier" type="BaseClassifier" required>
   What answers the questions about each turn.
@@ -84810,16 +84828,14 @@ reader = PerceptionReader(
 </ParamField>
 
 <ParamField path="timeout" type="float | None" default="None">
-  Seconds a transcription waits for its reading. By default `0.5` for a text
-  classifier, counted from when the transcription arrives, and `2` for a
-  classifier that hears audio, counted from when the user stops speaking.
+  Seconds a transcription waits for the classifier's answers. By default `0.5`
+  for a text classifier, counted from when the transcription arrives, and `2`
+  for a classifier that hears audio, counted from when the user stops speaking.
 </ParamField>
-
-A `ChoiceQuestion` is reported as labels, a `YesNoQuestion` as its probability, and a `ScoreQuestion` as its position on the scale.
 
 ### PerceptionQuestion
 
-One signal a `PerceptionReader` reports.
+One signal a `PerceptionSource` reports.
 
 | Field         | Type                 | Description                                                                               |
 | ------------- | -------------------- | ----------------------------------------------------------------------------------------- |
@@ -85023,7 +85039,7 @@ Reference for PipecatToneReader, which reads how each user turn was meant, Pipec
 
 Pipecat Tone is two small models for [expressive conversation](/api-reference/server/expressive/overview) that run on the CPU:
 
-- [`PipecatToneReader`](#pipecattonereader) reads how each user turn was meant from its words, a perception producer that tells the LLM how the user sounded. [`PipecatToneClassifier`](#pipecattoneclassifier) puts the same model behind the [classifier](/api-reference/server/classifiers/overview) interface.
+- [`PipecatToneReader`](#pipecattonereader) reads how each user turn was meant from its words, a perception producer that tells the LLM how the user sounded. [`PipecatToneSource`](#pipecattonesource) offers the same reading as a source for a reader with others. [`PipecatToneClassifier`](#pipecattoneclassifier) puts the same model behind the [classifier](/api-reference/server/classifiers/overview) interface.
 - [`PipecatToneTagger`](#pipecattonetagger) writes the expression tags for the LLM's plain replies, a sentence at a time.
 
 For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-conversation).
@@ -85053,7 +85069,7 @@ uv add "pipecat-ai[tone]"
 
 ## PipecatToneReader
 
-Reads each final user transcription, with the bot's reply before it, and sets the reading as the transcription's `perception`. Goes between the STT service and the user aggregator. A read takes a few milliseconds, and the transcription waits for it, up to `timeout` seconds. It is a [`PerceptionReader`](/api-reference/server/expressive/overview#perceptionreader) that asks a `PipecatToneClassifier` its `emotion` and `sarcasm` questions. With metrics enabled, it pushes the classifier's processing metrics.
+Reads each final user transcription, with the bot's reply before it, and sets the reading as the transcription's `perception`. Goes between the STT service and the user aggregator. A read takes a few milliseconds, and the transcription waits for it, up to `timeout` seconds. It is a [`PerceptionReader`](/api-reference/server/expressive/overview#perceptionreader) whose one source is a [`PipecatToneSource`](#pipecattonesource). With metrics enabled, it pushes the classifier's processing metrics.
 
 ```python
 from pipecat.expressive.processors.tone_reader import PipecatToneReader
@@ -85092,6 +85108,18 @@ from pipecat.expressive.processors.tone_reader import PipecatToneReader
 | `sarcasm` | Value   | The chance the turn is sarcastic, from 0 to 1. A sarcastic turn can read as a happy emotion.                         |
 
 The LLM reads them as `([emotion angry=0.81, neutral=0.12],[sarcasm value=0.04])` at the head of the user's message, and is taught what each signal means. The emotion labels are the model's: see its model card.
+
+## PipecatToneSource
+
+Pipecat Tone as one of a `PerceptionReader`'s sources, reporting the same `emotion` and `sarcasm` signals. Give it to a reader beside the sources of other classifiers, such as one that hears the user's audio. Another source's signals need names other than these two.
+
+```python
+from pipecat.expressive.processors.tone_reader import PipecatToneSource
+
+reader = PerceptionReader(sources=[PipecatToneSource(), hume])
+```
+
+Takes the same `revision`, `model_dir`, `precision`, `threads` and `timeout` as [`PipecatToneReader`](#configuration).
 
 ## PipecatToneClassifier
 
