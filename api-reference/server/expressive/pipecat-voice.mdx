@@ -1,0 +1,147 @@
+---
+title: "Pipecat Voice Reader"
+sidebarTitle: "Pipecat Voice"
+description: "Reference for PipecatVoiceReader, PipecatVoiceSource, and PipecatVoiceClassifier, which hear how each user turn sounded on the CPU."
+---
+
+## Overview
+
+Pipecat Voice Reader is a small model for [expressive conversation](/api-reference/server/expressive/overview) that runs on the CPU and hears how a clip of speech sounds: the speaker's tone of voice, sarcasm, sadness, laughter, and how activated and how fast the voice is.
+
+- [`PipecatVoiceReader`](#pipecatvoicereader) hears each user turn, a perception producer that tells the LLM how the user sounded. [`PipecatVoiceSource`](#pipecatvoicesource) offers the same reading as a source for a reader with others. [`PipecatVoiceClassifier`](#pipecatvoiceclassifier) puts the same model behind the [classifier](/api-reference/server/classifiers/overview) interface.
+
+For the reader of the user's words, see [Pipecat Tone](/api-reference/server/expressive/pipecat-tone).
+
+<CardGroup cols={2}>
+  <Card
+    title="Model"
+    icon="cube"
+    href="https://huggingface.co/pipecat-ai/voice-reader"
+  >
+    Pipecat Voice Reader on Hugging Face
+  </Card>
+  <Card
+    title="Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/expressive-conversation/expressive-conversation-voice-reader.py"
+  >
+    A bot with the voice reader beside the tone reader
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[voice-reader]"
+```
+
+## PipecatVoiceReader
+
+Hears the user's speech each time they stop, up to its last 8 seconds, and sets the reading as the `perception` of the turn's transcriptions. Goes between the STT service and the user aggregator, in a pipeline with a VAD. The read runs off the event loop, and the transcriptions wait for it, up to `timeout` seconds. Speech shorter than 0.8 seconds isn't read. It is a [`PerceptionReader`](/api-reference/server/expressive/overview#perceptionreader) whose one source is a [`PipecatVoiceSource`](#pipecatvoicesource).
+
+```python
+from pipecat.expressive.processors.voice_reader import PipecatVoiceReader
+```
+
+### Configuration
+
+<ParamField path="variant" type='Literal["base", "tiny"]' default='"base"'>
+  The model's size. `"base"` reads tone and sadness best, and `"tiny"` costs
+  about half the CPU.
+</ParamField>
+
+<ParamField path="revision" type="str" default='"rc6"'>
+  The model's release on Hugging Face.
+</ParamField>
+
+<ParamField path="model_dir" type="str | Path | None" default="None">
+  A folder to load the model from instead of downloading it, laid out as one of
+  a release's variants. `variant` and `revision` are then unused.
+</ParamField>
+
+<ParamField path="precision" type='Literal["int8", "fp32"]' default='"int8"'>
+  The weights to load.
+</ParamField>
+
+<ParamField path="threads" type="int" default="2">
+  The CPU threads for one read.
+</ParamField>
+
+<ParamField path="sad" type="bool" default="False">
+  Whether to also report the `sad` signal.
+</ParamField>
+
+<ParamField path="timeout" type="float | None" default="None">
+  Seconds a transcription waits for its reading after the user stops speaking,
+  `2` by default. After that it passes unread.
+</ParamField>
+
+### Signals
+
+| Signal          | Read as | Reading                                                                                                                              |
+| --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `tone`          | Labels  | The two likeliest tones of voice, with their confidences: `positive`, `neutral`, `sad` or `frustrated`.                              |
+| `arousal`       | Value   | How activated the voice sounds, from 0 (flat, low energy) to 1 (highly animated).                                                    |
+| `laughter`      | Value   | The chance the turn has laughter in it, from 0 to 1.                                                                                 |
+| `speech_rate`   | Value   | The speaking rate in syllables per second.                                                                                           |
+| `sarcasm_voice` | Value   | The chance the delivery alone sounds sarcastic, from 0 to 1. Weigh it with the `sarcasm` of a source that reads the words.           |
+| `sad`           | Value   | The chance a listener would hear sadness in the turn, from 0 to 1. Reported only with `sad=True`.                                    |
+
+## PipecatVoiceSource
+
+Pipecat Voice Reader as one of a `PerceptionReader`'s sources, reporting the same signals. Give it to a reader beside the sources of other classifiers, such as [`PipecatToneSource`](/api-reference/server/expressive/pipecat-tone#pipecattonesource), which reads the words. Another source's signals need names other than these.
+
+```python
+from pipecat.expressive.processors.tone_reader import PipecatToneSource
+from pipecat.expressive.processors.voice_reader import PipecatVoiceSource
+
+reader = PerceptionReader(sources=[PipecatToneSource(), PipecatVoiceSource()])
+```
+
+Takes the same `variant`, `revision`, `model_dir`, `precision`, `threads`, `sad` and `timeout` as [`PipecatVoiceReader`](#configuration).
+
+## PipecatVoiceClassifier
+
+A [classifier](/api-reference/server/classifiers/overview) backed by the model. It answers only the questions built into the model, listed in `questions`, and any other question raises `ClassifierError`. `setup()` loads the model.
+
+```python
+from pipecat.classifiers.voice.classifier import PipecatVoiceClassifier
+```
+
+### Configuration
+
+Takes the same `variant`, `revision`, `model_dir`, `precision` and `threads` as [`PipecatVoiceReader`](#configuration).
+
+### Questions
+
+| Question      | Kind             | Asks                                                                                              |
+| ------------- | ---------------- | ------------------------------------------------------------------------------------------------- |
+| `tone`        | `ChoiceQuestion` | How the voice sounds: `positive`, `neutral`, `sad` or `frustrated`.                               |
+| `sarcasm`     | `YesNoQuestion`  | Whether a listener would hear the turn as sarcastic.                                              |
+| `laughter`    | `YesNoQuestion`  | Whether there is laughter in the turn.                                                            |
+| `sad`         | `YesNoQuestion`  | Whether a listener would hear sadness in the turn.                                                |
+| `arousal`     | `ScoreQuestion`  | How activated the voice sounds.                                                                   |
+| `upset`       | `ScoreQuestion`  | How clearly the speaker is upset.                                                                 |
+| `speech_rate` | `ScoreQuestion`  | The speaking rate, from 0 to 12 syllables per second.                                             |
+
+Every call takes exactly one `ClassifierAudio` clip in `inputs`, from 0.8 to 8 seconds long, at 16 kHz. Any other number of clips, or a clip outside that length, raises `ClassifierError`. The model hears the audio alone, so the state is ignored.
+
+The model's `sarcasm` rarely passes 0.5, so `is_yes` is seldom true of it. Compare its probability with `sarcasm_threshold`, the probability from which the model's release counts a turn as sarcastic. `sarcasm_threshold` raises `ClassifierError` until `setup()` has loaded the model.
+
+```python
+classifier = PipecatVoiceClassifier()
+await classifier.setup(task_manager)
+
+results = await classifier.ask(
+    {},
+    classifier.questions,
+    inputs=[ClassifierAudio(audio=pcm, sample_rate=16000)],
+)
+tone = results["tone"].choice
+```
+
+## Notes
+
+- **Model download**: the model loads while the pipeline is set up, once a process, shared by every reader of the same variant. The first load downloads it from Hugging Face, which holds the pipeline's start, so download it ahead, such as when you build your image, or pass `model_dir`.
+- **A model that can't load**: it's reported as an error that leaves the reader unusable, and transcriptions pass through unread. The worker's [`processor_unusable_policy`](/api-reference/server/pipeline/pipeline-worker) decides whether the pipeline goes on.
+- **Expressive conversation off**: the reader needs `PipelineParams(enable_expressive_conversation=True)` for the LLM to read readings.
