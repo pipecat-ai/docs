@@ -28,6 +28,10 @@ after the queued audio has played, and delivers the keys the caller presses
 (DTMF) as `InputDTMFFrame`. It is designed to be used with Pipecat's
 `FastAPIWebsocketTransport`.
 
+With the serializer's optional lookahead processor in the pipeline, bot speech
+is sent to FreeSWITCH ahead of the transport's real-time clock, in blocks that
+grow while the bot speaks, so a few playbacks carry a whole utterance.
+
 <CardGroup cols={2}>
   <Card
     title="Source Repository"
@@ -110,7 +114,10 @@ dialplan, the security setup and the example.
   directions, 8000 by default), `freeswitch_in_sample_rate` and
   `freeswitch_out_sample_rate` (per-direction overrides: the rate given to
   `uuid_audio_stream`, and the channel's codec rate: 8000, 16000, 24000, 32000
-  or 48000), `output_gain_db`, `auto_hang_up` and `hang_up_timeout_secs`.
+  or 48000), `output_gain_db`, `auto_hang_up`, `hang_up_timeout_secs` and
+  `lookahead_margin_secs` (with the lookahead processor, how far ahead of the
+  transport's clock the audio already sent must be before the next block is held
+  back; 0.1 by default).
 </ParamField>
 
 <Note>
@@ -154,7 +161,7 @@ async def run_bot(websocket: WebSocket):
             serializer=serializer,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_out_10ms_chunks=20,  # 200 ms blocks keep barge-in working
+            audio_out_10ms_chunks=20,  # 200 ms: the first block of an utterance
             audio_out_end_silence_secs=0,
         ),
     )
@@ -163,6 +170,7 @@ async def run_bot(websocket: WebSocket):
         [
             transport.input(),
             # ... VAD, STT, LLM, TTS, etc.
+            serializer.lookahead(),  # optional: growing blocks (0.3.0 or later)
             transport.output(),
         ]
     )
@@ -180,18 +188,28 @@ async def run_bot(websocket: WebSocket):
 ```
 
 <Tip>
-  Use output blocks of 200 ms or more (`audio_out_10ms_chunks=20`): every
-  playback that FreeSWITCH starts flushes about 30-40 ms of the caller's
-  incoming audio, so smaller blocks keep the bot from hearing barge-ins. Send
-  bot audio at the channel's codec rate to avoid resampling artifacts. See the
-  repository's README for the measurements.
+  Every playback that FreeSWITCH starts flushes about 30-40 ms of the caller's
+  incoming audio, so many short blocks keep the bot from hearing barge-ins.
+  Place `serializer.lookahead()` right before `transport.output()`, after
+  everything that produces bot audio: the speech then reaches FreeSWITCH ahead
+  of time in blocks that grow, and `audio_out_10ms_chunks` only sets the first
+  one. Without it, use output blocks of 200 ms or more
+  (`audio_out_10ms_chunks=20`). Send bot audio at the channel's codec rate to
+  avoid resampling artifacts. See the repository's README for the measurements.
 </Tip>
+
+With the lookahead processor, only audio that passes through it is played:
+the transport's output mixer, its end silence and the tones of
+`OutputDTMFFrame` are not.
 
 ## Compatibility
 
 Tested with Pipecat v1.14.0, FreeSWITCH 1.11.3, `mod_audio_stream` commit
 `da8b068` (community edition) and Python 3.12 and 3.13, with PCMU and Opus
-calls.
+calls. The unit and integration tests also pass on Pipecat v1.16.0, which
+requires version 0.3.0 or later.
+
+Growing blocks (`serializer.lookahead()`) require version 0.3.0 or later.
 
 DTMF requires version 0.2.0 or later: the keys 0-9, `*` and `#` become
 `InputDTMFFrame` when the phone sends them as RFC 2833 telephone events or SIP
