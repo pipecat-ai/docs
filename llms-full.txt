@@ -44035,6 +44035,10 @@ after the queued audio has played, and delivers the keys the caller presses
 (DTMF) as `InputDTMFFrame`. It is designed to be used with Pipecat's
 `FastAPIWebsocketTransport`.
 
+With the serializer's optional lookahead processor in the pipeline, bot speech
+is sent to FreeSWITCH ahead of the transport's real-time clock, in blocks that
+grow while the bot speaks, so a few playbacks carry a whole utterance.
+
 <CardGroup cols={2}>
   <Card
     title="Source Repository"
@@ -44117,7 +44121,10 @@ dialplan, the security setup and the example.
   directions, 8000 by default), `freeswitch_in_sample_rate` and
   `freeswitch_out_sample_rate` (per-direction overrides: the rate given to
   `uuid_audio_stream`, and the channel's codec rate: 8000, 16000, 24000, 32000
-  or 48000), `output_gain_db`, `auto_hang_up` and `hang_up_timeout_secs`.
+  or 48000), `output_gain_db`, `auto_hang_up`, `hang_up_timeout_secs` and
+  `lookahead_margin_secs` (with the lookahead processor, how far ahead of the
+  transport's clock the audio already sent must be before the next block is held
+  back; 0.1 by default).
 </ParamField>
 
 <Note>
@@ -44161,7 +44168,7 @@ async def run_bot(websocket: WebSocket):
             serializer=serializer,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_out_10ms_chunks=20,  # 200 ms blocks keep barge-in working
+            audio_out_10ms_chunks=20,  # 200 ms: the first block of an utterance
             audio_out_end_silence_secs=0,
         ),
     )
@@ -44170,6 +44177,7 @@ async def run_bot(websocket: WebSocket):
         [
             transport.input(),
             # ... VAD, STT, LLM, TTS, etc.
+            serializer.lookahead(),  # optional: growing blocks (0.3.0 or later)
             transport.output(),
         ]
     )
@@ -44187,18 +44195,28 @@ async def run_bot(websocket: WebSocket):
 ```
 
 <Tip>
-  Use output blocks of 200 ms or more (`audio_out_10ms_chunks=20`): every
-  playback that FreeSWITCH starts flushes about 30-40 ms of the caller's
-  incoming audio, so smaller blocks keep the bot from hearing barge-ins. Send
-  bot audio at the channel's codec rate to avoid resampling artifacts. See the
-  repository's README for the measurements.
+  Every playback that FreeSWITCH starts flushes about 30-40 ms of the caller's
+  incoming audio, so many short blocks keep the bot from hearing barge-ins.
+  Place `serializer.lookahead()` right before `transport.output()`, after
+  everything that produces bot audio: the speech then reaches FreeSWITCH ahead
+  of time in blocks that grow, and `audio_out_10ms_chunks` only sets the first
+  one. Without it, use output blocks of 200 ms or more
+  (`audio_out_10ms_chunks=20`). Send bot audio at the channel's codec rate to
+  avoid resampling artifacts. See the repository's README for the measurements.
 </Tip>
+
+With the lookahead processor, only audio that passes through it is played:
+the transport's output mixer, its end silence and the tones of
+`OutputDTMFFrame` are not.
 
 ## Compatibility
 
 Tested with Pipecat v1.14.0, FreeSWITCH 1.11.3, `mod_audio_stream` commit
 `da8b068` (community edition) and Python 3.12 and 3.13, with PCMU and Opus
-calls.
+calls. The unit and integration tests also pass on Pipecat v1.16.0, which
+requires version 0.3.0 or later.
+
+Growing blocks (`serializer.lookahead()`) require version 0.3.0 or later.
 
 DTMF requires version 0.2.0 or later: the keys 0-9, `*` and `#` become
 `InputDTMFFrame` when the phone sends them as RFC 2833 telephone events or SIP
@@ -85980,6 +85998,14 @@ For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-co
   >
     The reader that hears how each user turn sounded
   </Card>
+  <Card
+    title="Behavioral Signals"
+    icon="waveform-lines"
+    href="/api-reference/server/expressive/behavioralsignals"
+  >
+    A community perception producer that adds emotion and behavior sensing with
+    the Behavioral Signals API
+  </Card>
 </CardGroup>
 
 ```python
@@ -86677,6 +86703,108 @@ tone = results["tone"].choice
 - **Model download**: the model loads while the pipeline is set up, once a process, shared by every reader of the same variant. The first load downloads it from Hugging Face, which holds the pipeline's start, so download it ahead, such as when you build your image, or pass `model_dir`.
 - **A model that can't load**: it's reported as an error that leaves the reader unusable, and transcriptions pass through unread. The worker's [`processor_unusable_policy`](/api-reference/server/pipeline/pipeline-worker) decides whether the pipeline goes on.
 - **Expressive conversation off**: the reader needs `PipelineParams(enable_expressive_conversation=True)` for the LLM to read readings.
+
+# Behavioral Signals
+Source: https://docs.pipecat.ai/api-reference/server/expressive/behavioralsignals.md
+
+A perception producer that adds emotion and behavior sensing from the Behavioral Signals API, and tells the LLM how each user turn sounded.
+
+## Overview
+
+`BehavioralSignalsPerceptionService` is a perception producer for [expressive conversation](/api-reference/server/expressive/overview). It streams the user's voice to the [Behavioral Signals](https://behavioralsignals.com/) API and adds per-utterance estimates of expressed emotion, strength, positivity, hesitation, engagement and speaking rate, each with a probability for every class, to the `perception` of each user turn's transcriptions. The LLM reads it with the user's words. Outputs are probabilistic estimates of signals expressed in speech, not determinations of what a person feels, intends or believes.
+
+It can run with [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader), which reads the words: the service adds its reading to the one a transcription already carries.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/BehavioralSignalTechnologies/pipecat-behavioralsignals"
+  >
+    Code, an example voice agent, and the changelog
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="box"
+    href="https://pypi.org/project/pipecat-behavioralsignals/"
+  >
+    The `pipecat-behavioralsignals` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-behavioralsignals
+```
+
+Requires Python 3.12 or later and Pipecat 1.16.
+
+## Prerequisites
+
+- A Behavioral Signals account, with a client ID (CID) and an API key from the [Behavioral Signals portal](https://portal.behavioralsignals.com/).
+- Set them as environment variables, or pass them to the service:
+
+```bash
+export BEHAVIORALSIGNALS_CID=...
+export BEHAVIORALSIGNALS_API_KEY=...
+```
+
+The service streams all of the user's input audio for the whole call, and streaming is billed by the minute. Behavioral Signals saves a stream's results, which can be fetched later: tell your users, and check that this fits your privacy terms (see [Your users' audio](https://github.com/BehavioralSignalTechnologies/pipecat-behavioralsignals#your-users-audio)).
+
+## Configuration
+
+<ParamField path="cid" type="str | None" default="None">
+  Your Behavioral Signals client ID. `None` uses the `BEHAVIORALSIGNALS_CID`
+  environment variable.
+</ParamField>
+
+<ParamField path="api_key" type="str | None" default="None">
+  Your Behavioral Signals API key. `None` uses the `BEHAVIORALSIGNALS_API_KEY`
+  environment variable.
+</ParamField>
+
+## Usage
+
+Put the service right after your STT service, and turn on expressive conversation:
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+
+from pipecat_behavioralsignals import BehavioralSignalsPerceptionService
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    BehavioralSignalsPerceptionService(),
+    user_aggregator,
+    llm,
+    tts,
+    transport.output(),
+    assistant_aggregator,
+])
+
+worker = PipelineWorker(pipeline, params=PipelineParams(enable_expressive_conversation=True))
+```
+
+The service reads the audio the STT service passes on, so keep the STT service's default `audio_passthrough=True`. It reads mono audio, which Pipecat transports give by default; on audio with more channels it reports an error and stops reading.
+
+Each user message then starts with the reading:
+
+```
+([voice_emotion angry=0.71, neutral=0.20, sad=0.06, happy=0.03],[positivity negative=0.72, neutral=0.20, positive=0.08],[strength strong=0.64, neutral=0.30, weak=0.06],[speaking_rate fast=0.50, normal=0.40, slow=0.10],[hesitation no=0.80, yes=0.20],[engagement engaged=0.55, neutral=0.35, withdrawn=0.10],[intensity value=0.61]) I already told you, I was charged twice.
+```
+
+A reading covers a recent part of the turn, often not its last words, and a very short turn may have none.
+
+The signals are `voice_emotion`, `strength`, `positivity`, `speaking_rate`, `hesitation`, `engagement` and `intensity`. See the [repository](https://github.com/BehavioralSignalTechnologies/pipecat-behavioralsignals#what-the-llm-sees) for what each reads and how a reading is matched to a turn.
+
+## Compatibility
+
+Version 0.2.0 requires Pipecat 1.16 (`pipecat-ai>=1.16.0,<1.17`) and is tested with 1.16.0. On Pipecat 1.15, use 0.1.0. See the [changelog](https://github.com/BehavioralSignalTechnologies/pipecat-behavioralsignals/blob/main/CHANGELOG.md) for the versions each release requires.
 
 # IVRNavigator
 Source: https://docs.pipecat.ai/api-reference/server/extensions/ivr.md
