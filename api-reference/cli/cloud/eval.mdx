@@ -16,7 +16,7 @@ Every command takes `--organization` / `-o`, the organization to use, which defa
 
 ## Availability
 
-`eval run` reads the organization's [eval capabilities](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-capabilities-get) first. Where they list `suites`, it runs the file's scenarios as one suite run; otherwise each scenario runs on its own, side by side. The `suite` and `bundle` commands send their requests as they are. Where the organization doesn't have suite runs, they print `Suite runs aren't available for this organization yet.`, or the same for eval bundles, and exit `3`.
+`eval run` reads the organization's [eval capabilities](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-capabilities-get) first. Where they list both `suites` and `bundles`, and you give no `--param`, it runs the file's scenarios as one suite run; otherwise each scenario runs on its own, side by side. The `suite` and `bundle` commands send their requests as they are. Where the organization doesn't have suite runs, they print `Suite runs aren't available for this organization yet.`, or the same for eval bundles, and exit `3`.
 
 Creating a run for an agent in a region without hosted evals is refused by the API. When the API answers that evals are not available, a command fails with `Evals aren't available yet.`
 
@@ -34,7 +34,7 @@ When a command waits, its exit code says how the runs came out:
 
 When side-by-side runs end differently, the priority is `3`, then `1`, then `2`, then `0`. Usage errors exit `3`, not the `2` that shells usually use, so that `2` always means a run with no verdict. Without waiting (`--no-wait`, or `status` without `--wait`), a command exits `0` once the API accepts its request.
 
-A suite run's creation and a bundle publication carry a request ID. A request that got no answer, or a `429` or `503` with a `Retry-After`, is sent again unchanged, and the API answers with what the first request made. No other request is retried, and the CLI never cancels runs it started. After Ctrl-C, use [`list`](#list), [`status`](#status) or [`suite status`](#suite-status) to find what is running, and [`cancel`](#cancel) or [`suite cancel`](#suite-cancel) to stop it.
+A suite run's creation and a bundle publication carry a request ID. A request that got no answer or a gateway error (`502`, `504`), or a `429` or `503` with a `Retry-After`, is sent again unchanged, and the API answers with what the first request made. No other request is retried, and the CLI never cancels runs it started. After Ctrl-C, use [`list`](#list), [`status`](#status) or [`suite status`](#suite-status) to find what is running, and [`cancel`](#cancel) or [`suite cancel`](#suite-cancel) to stop it.
 
 ## run
 
@@ -60,7 +60,9 @@ pipecat cloud eval run AGENT SCENARIO_FILE [OPTIONS]
 
 <ParamField path="--scenario" type="string">
   Name of a scenario in the file. Repeat to select several, in the order named.
-  Each name runs once. When omitted, runs every scenario in file order.
+  Each name runs once. When omitted, runs every script and simulation in file
+  order, and leaves out entries with criteria alone, which are for
+  [`judge`](#judge). A file of criteria alone exits `3`.
 </ParamField>
 
 <ParamField path="--repeat" type="integer">
@@ -111,9 +113,9 @@ pipecat cloud eval run AGENT SCENARIO_FILE [OPTIONS]
 pipecat cloud eval run my-agent scenarios/greeting.yaml --scenario capital_question
 ```
 
-**As a suite run.** Where the organization has suite runs and you give no `--param`, the selected scenarios run as one [suite run](/pipecat-cloud/guides/evals#run-a-suite), under the service's limits. While it waits, the command shows one line of counts as the runs move: pending, live, passed, failed, skipped, and without a verdict. Afterwards it explains each run that failed or ended without a verdict, or shows a measurement's pass rates. `--json` prints the suite run.
+**As a suite run.** Where the organization's capabilities list both `suites` and `bundles`, and you give no `--param`, the selected scenarios run as one [suite run](/pipecat-cloud/guides/evals#run-a-suite), under the service's limits. While it waits, the command shows one line of counts as the runs move: pending, live, passed, failed, skipped, and without a verdict. Afterwards it explains each run that failed or ended without a verdict, or shows a measurement's pass rates. `--json` prints the suite run. If the API refuses the scenarios or the suite run's plan, the command lists why and exits `3`.
 
-**Side by side.** Otherwise each selected scenario is a run of its own, and `--repeat` and `--concurrency` are refused with exit `3`. Runs are submitted separately: an accepted run continues even if another request fails.
+**Side by side.** Otherwise each selected scenario is a run of its own, and `--repeat` and `--concurrency` are refused with exit `3`. If the API answers that suite runs aren't available for the agent, the scenarios run side by side too, unless you gave `--repeat` or `--concurrency`, which exit `3`. Runs are submitted separately: an accepted run continues even if another request fails.
 
 ### JSON Output
 
@@ -312,8 +314,8 @@ pipecat cloud eval suite run AGENT --suite PATH (--bundle NAME[@N] | --revision 
 </ParamField>
 
 <ParamField path="--repeat" type="integer">
-  Runs every member this many times, replacing the suite's `repeat:`. Above 1,
-  the suite run is a
+  Runs every selected scenario this many times, replacing the suite's `repeat:`.
+  Above 1, the suite run is a
   [measurement](/pipecat-cloud/guides/evals#repeat-and-measurements).
 </ParamField>
 
@@ -389,8 +391,8 @@ pipecat cloud eval suite list [AGENT] [OPTIONS]
 
 **Options:**
 
-<ParamField path="--limit" type="integer">
-  How many suite runs to show.
+<ParamField path="--limit / -n" type="integer" default="10">
+  How many suite runs to show, from 1 to 200.
 </ParamField>
 
 <ParamField path="--offset" type="integer" default="0">
@@ -451,10 +453,11 @@ pipecat cloud eval bundle push NAME [DIR] [OPTIONS]
 </ParamField>
 
 - **What's sent:** every `.yaml`, `.yml` and `.json` file under the directory, as UTF-8 text, up to 256 KiB in all.
-- **What's left out, and listed:** hidden files and folders, files named like secrets, and linked folders.
+- **What's left out, and listed:** hidden files and folders, linked folders, folders that can't be read, files and folders named like credentials (such as `credentials.json`, `client_secret*.json`, `*secret*.yaml` or `kubeconfig*`), and files that hold a private key or a Kubernetes Secret. To publish a file left out for its name, rename it.
 - **What stops it:** a symlink that leaves the directory, or a file that isn't UTF-8.
 - **Confirming:** the command shows the files and asks you to confirm before it sends them.
 - **Refused files:** when the API refuses the files, the command lists each problem and exits `3`. Nothing is stored.
+- **Ctrl-C** at the prompt or while publishing exits `130`. While publishing, the command says where to check whether a revision was published.
 - **Output:** the revision's number and what it holds. `--json` prints the revision.
 
 ```shell
@@ -473,8 +476,8 @@ pipecat cloud eval bundle list [OPTIONS]
 
 **Options:**
 
-<ParamField path="--limit" type="integer">
-  How many bundles to show.
+<ParamField path="--limit / -n" type="integer" default="10">
+  How many bundles to show, from 1 to 200.
 </ParamField>
 
 <ParamField path="--offset" type="integer" default="0">

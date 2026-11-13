@@ -529,6 +529,18 @@ const suiteCases = [
     null,
   ],
   [
+    "completed suite run without a verdict",
+    suiteRow({ status: "completed", ...ended, fingerprint: FINGERPRINT }),
+    { ...NONE, admitted: 4, passed: 3 },
+    null,
+  ],
+  [
+    "skipped suite run",
+    suiteRow({ status: "completed", ...ended, fingerprint: FINGERPRINT }),
+    { ...NONE, admitted: 4, skipped: 4 },
+    null,
+  ],
+  [
     "measurement",
     suiteRow({
       ...measured,
@@ -636,6 +648,11 @@ for (const [name, source, tally, passRates] of suiteCases) {
   // The guide's verdict table.
   if (name === "passed suite run") assert.equal(view.verdict, "passed");
   if (name.startsWith("failed suite run")) assert.equal(view.verdict, "failed");
+  if (name === "completed suite run without a verdict") {
+    assert.equal(view.counts.withoutVerdict, 1, name);
+    assert.equal(view.verdict, null, name);
+  }
+  if (name === "skipped suite run") assert.equal(view.verdict, "skipped");
   if (name === "mixed measurement") {
     assert.equal(view.mixed, true);
     assert.ok(view.passRates.every((r) => r.fingerprint !== null));
