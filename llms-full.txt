@@ -38187,6 +38187,7 @@ Speech-to-Text services receive and audio input and output transcriptions.
 | [NVIDIA](/api-reference/server/services/stt/nvidia)             | `uv add "pipecat-ai[nvidia]"`                                                 | Pipecat    |
 | [OpenAI](/api-reference/server/services/stt/openai)             | `uv add "pipecat-ai[openai]"`                                                 | Pipecat    |
 | [Oruk](/api-reference/server/services/stt/oruk)                 | `uv add "pipecat-oruk==0.1.0rc1"`                                             | Community  |
+| [PyAI Hear](/api-reference/server/services/stt/pyai)            | `uv add pipecat-pyai==0.1.4`                                                  | Community  |
 | [Quickdial](/api-reference/server/services/stt/quickdial)       | `uv add pipecat-quickdial`                                                    | Community  |
 | [Rime](/api-reference/server/services/stt/rime)                 | `uv add "pipecat-ai[rime]"`                                                   | Pipecat    |
 | [Ringg AI](/api-reference/server/services/stt/ringg)            | `uv pip install git+https://github.com/Stonkr/pipecat-ringg.git`              | Community  |
@@ -38251,6 +38252,7 @@ Text-to-Speech services receive text input and output audio streams or chunks.
 | [ReadAloud](/api-reference/server/services/tts/readaloud)         | `uv add pipecat-readaloud`                                                                      | Community  |
 | [ResembleAI](/api-reference/server/services/tts/resembleai)       | `uv add "pipecat-ai[resembleai]"`                                                               | Pipecat    |
 | [Respeecher](/api-reference/server/services/tts/respeecher)       | `uv add pipecat-respeecher`                                                                     | Community  |
+| [PyAI Speak](/api-reference/server/services/tts/pyai)             | `uv add pipecat-pyai==0.1.4`                                                                    | Community  |
 | [Quickdial](/api-reference/server/services/tts/quickdial)         | `uv add pipecat-quickdial`                                                                      | Community  |
 | [Rime](/api-reference/server/services/tts/rime)                   | `uv add "pipecat-ai[rime]"`                                                                     | Pipecat    |
 | [Rumik AI](/api-reference/server/services/tts/rumik)              | `uv add pipecat-rumik`                                                                          | Community  |
@@ -44035,6 +44037,10 @@ after the queued audio has played, and delivers the keys the caller presses
 (DTMF) as `InputDTMFFrame`. It is designed to be used with Pipecat's
 `FastAPIWebsocketTransport`.
 
+With the serializer's optional lookahead processor in the pipeline, bot speech
+is sent to FreeSWITCH ahead of the transport's real-time clock, in blocks that
+grow while the bot speaks, so a few playbacks carry a whole utterance.
+
 <CardGroup cols={2}>
   <Card
     title="Source Repository"
@@ -44117,7 +44123,10 @@ dialplan, the security setup and the example.
   directions, 8000 by default), `freeswitch_in_sample_rate` and
   `freeswitch_out_sample_rate` (per-direction overrides: the rate given to
   `uuid_audio_stream`, and the channel's codec rate: 8000, 16000, 24000, 32000
-  or 48000), `output_gain_db`, `auto_hang_up` and `hang_up_timeout_secs`.
+  or 48000), `output_gain_db`, `auto_hang_up`, `hang_up_timeout_secs` and
+  `lookahead_margin_secs` (with the lookahead processor, how far ahead of the
+  transport's clock the audio already sent must be before the next block is held
+  back; 0.1 by default).
 </ParamField>
 
 <Note>
@@ -44161,7 +44170,7 @@ async def run_bot(websocket: WebSocket):
             serializer=serializer,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_out_10ms_chunks=20,  # 200 ms blocks keep barge-in working
+            audio_out_10ms_chunks=20,  # 200 ms: the first block of an utterance
             audio_out_end_silence_secs=0,
         ),
     )
@@ -44170,6 +44179,7 @@ async def run_bot(websocket: WebSocket):
         [
             transport.input(),
             # ... VAD, STT, LLM, TTS, etc.
+            serializer.lookahead(),  # optional: growing blocks (0.3.0 or later)
             transport.output(),
         ]
     )
@@ -44187,18 +44197,28 @@ async def run_bot(websocket: WebSocket):
 ```
 
 <Tip>
-  Use output blocks of 200 ms or more (`audio_out_10ms_chunks=20`): every
-  playback that FreeSWITCH starts flushes about 30-40 ms of the caller's
-  incoming audio, so smaller blocks keep the bot from hearing barge-ins. Send
-  bot audio at the channel's codec rate to avoid resampling artifacts. See the
-  repository's README for the measurements.
+  Every playback that FreeSWITCH starts flushes about 30-40 ms of the caller's
+  incoming audio, so many short blocks keep the bot from hearing barge-ins.
+  Place `serializer.lookahead()` right before `transport.output()`, after
+  everything that produces bot audio: the speech then reaches FreeSWITCH ahead
+  of time in blocks that grow, and `audio_out_10ms_chunks` only sets the first
+  one. Without it, use output blocks of 200 ms or more
+  (`audio_out_10ms_chunks=20`). Send bot audio at the channel's codec rate to
+  avoid resampling artifacts. See the repository's README for the measurements.
 </Tip>
+
+With the lookahead processor, only audio that passes through it is played:
+the transport's output mixer, its end silence and the tones of
+`OutputDTMFFrame` are not.
 
 ## Compatibility
 
 Tested with Pipecat v1.14.0, FreeSWITCH 1.11.3, `mod_audio_stream` commit
 `da8b068` (community edition) and Python 3.12 and 3.13, with PCMU and Opus
-calls.
+calls. The unit and integration tests also pass on Pipecat v1.16.0, which
+requires version 0.3.0 or later.
+
+Growing blocks (`serializer.lookahead()`) require version 0.3.0 or later.
 
 DTMF requires version 0.2.0 or later: the keys 0-9, `*` and `#` become
 `InputDTMFFrame` when the phone sends them as RFC 2833 telephone events or SIP
@@ -52059,6 +52079,113 @@ stt = QuickdialSTTService(
 
 - [pipecat-quickdial on GitHub](https://github.com/samay-ai/pipecat-quickdial) — source, example, and issues
 - [Quickdial API docs](https://quickdial.ai/docs)
+
+# PyAI Hear Speech-to-Text
+Source: https://docs.pipecat.ai/api-reference/server/services/stt/pyai.md
+
+PyAISTTService streams audio to PyAI Hear for STT and returns interim and final transcripts in a Pipecat pipeline.
+
+## Overview
+
+`PyAISTTService` provides streaming speech recognition through PyAI Hear in a Pipecat pipeline.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source and examples"
+    icon="github"
+    href="https://github.com/atomsai/pyai-speech-integrations/tree/main/pipecat-pyai"
+  >
+    PyAI-maintained source, Apache-2.0 license, and examples.
+  </Card>
+  <Card
+    title="PyAI integration guide"
+    icon="book"
+    href="https://docs.pyai.com/guides/pipecat"
+  >
+    Framework setup and provider configuration.
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add pipecat-pyai==0.1.4
+```
+
+Python 3.11 or newer is required. The package declares Pipecat `>=1.3.0,<2.0`.
+A two-turn audio flow was exercised with Pipecat 1.8.1; this is not qualification
+of every version in that range. Version 0.1.4's STT startup-settings correction
+was checked separately from that earlier audio run.
+
+## Prerequisites
+
+Create a PyAI account and a server-side key with the `hear:stream` scope.
+Before running audio, verify the selected project, billing environment, and
+limits with `GET https://api.pyai.com/v1/me`. Usage is charged or limited according
+to that key; Pipecat hosting, transport, and LLM costs are separate.
+
+### Required Environment Variables
+
+- `PYAI_API_KEY`: the server-side PyAI key. Keep it out of browser code and source control.
+
+## Configuration
+
+```python
+from pipecat_pyai import PyAISTTService
+```
+
+### PyAISTTService
+
+<ParamField path="api_key" type="str | None">
+  Default: `None`. Server-side PyAI key. When omitted, reads `PYAI_API_KEY`.
+  Raises `ValueError` if neither is supplied.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.pyai.com">
+  PyAI API base URL.
+</ParamField>
+
+<ParamField path="model" type="str" default="pyai-hear">
+  PyAI model identifier.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None">
+  Default: `None`. Audio sample rate in Hz. When omitted, uses the pipeline
+  audio rate.
+</ParamField>
+
+<ParamField path="language" type="str">
+  Default: empty string (`""`). An empty string enables automatic detection. See
+  [supported languages](https://docs.pyai.com/reference/language-support) for
+  explicit codes.
+</ParamField>
+
+Additional keyword arguments are forwarded to Pipecat's base service.
+
+### Settings
+
+Configure provider options in the constructor. The adapter initializes Pipecat
+settings metadata, but does not implement runtime provider-setting updates.
+Create a new service to change model or language; do not pass a second `settings=` argument.
+
+## Usage
+
+The following function builds the input part of a pipeline from existing components.
+See the [complete WebRTC demo](https://github.com/atomsai/pyai-speech-integrations/blob/main/demos/pipecat_bot.py)
+for transport, VAD, LLM, worker, and disconnect handling.
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_pyai import PyAISTTService
+
+
+def speech_input(transport, user_aggregator, llm):
+    return Pipeline([transport.input(), PyAISTTService(), user_aggregator, llm])
+```
+
+## Frames
+
+Interim results use `InterimTranscriptionFrame`; corrected final text uses `TranscriptionFrame`. Configure a VAD in the user aggregator to finalize spoken turns.
 
 # Rime Speech-to-Text
 Source: https://docs.pipecat.ai/api-reference/server/services/stt/rime.md
@@ -68979,6 +69106,117 @@ tts = QuickdialTTSService(
 
 - [pipecat-quickdial on GitHub](https://github.com/samay-ai/pipecat-quickdial) — source, example, and issues
 - [Quickdial API docs](https://quickdial.ai/docs)
+
+# PyAI Speak Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/pyai.md
+
+PyAITTSService streams PCM audio from PyAI Speak for TTS, using a server-side key and a voice selected from the PyAI catalog.
+
+## Overview
+
+`PyAITTSService` provides streamed PCM speech synthesis through PyAI Speak in a Pipecat pipeline.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source and examples"
+    icon="github"
+    href="https://github.com/atomsai/pyai-speech-integrations/tree/main/pipecat-pyai"
+  >
+    PyAI-maintained source, Apache-2.0 license, and examples.
+  </Card>
+  <Card
+    title="PyAI integration guide"
+    icon="book"
+    href="https://docs.pyai.com/guides/pipecat"
+  >
+    Framework setup and provider configuration.
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add pipecat-pyai==0.1.4
+```
+
+Python 3.11 or newer is required. The package declares Pipecat `>=1.3.0,<2.0`.
+A two-turn audio flow was exercised with Pipecat 1.8.1; this is not qualification
+of every version in that range. Version 0.1.4's STT startup-settings correction
+was checked separately from that earlier audio run.
+
+## Prerequisites
+
+Create a PyAI account and a server-side key with the `speak:synthesize` scope.
+Before running audio, verify the selected project, billing environment, and
+limits with `GET https://api.pyai.com/v1/me`. Usage is charged or limited according
+to that key; Pipecat hosting, transport, and LLM costs are separate.
+
+### Required Environment Variables
+
+- `PYAI_API_KEY`: the server-side PyAI key. Keep it out of browser code and source control.
+
+## Configuration
+
+```python
+from pipecat_pyai import PyAITTSService
+```
+
+### PyAITTSService
+
+<ParamField path="voice" type="str" required>
+  Required streaming-capable voice ID from `GET https://api.pyai.com/v1/voices`.
+</ParamField>
+
+<ParamField path="api_key" type="str | None">
+  Default: `None`. Server-side PyAI key. When omitted, reads `PYAI_API_KEY`.
+  Raises `ValueError` if neither is supplied.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.pyai.com">
+  PyAI API base URL.
+</ParamField>
+
+<ParamField path="model" type="str" default="pyai-speak">
+  PyAI model identifier.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None">
+  Default: `None`. Audio sample rate in Hz. When omitted, uses the pipeline
+  audio rate.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession | None">
+  Default: `None`. Optional HTTP session owned by the caller. When omitted, the
+  service creates and closes its own session.
+</ParamField>
+
+Additional keyword arguments are forwarded to Pipecat's base service.
+
+### Settings
+
+Configure provider options in the constructor. The adapter initializes Pipecat
+settings metadata, but does not implement runtime provider-setting updates.
+Create a new service to change model or voice; do not pass a second `settings=` argument.
+
+## Usage
+
+The following function builds the output part of a pipeline from existing components.
+See the [complete WebRTC demo](https://github.com/atomsai/pyai-speech-integrations/blob/main/demos/pipecat_bot.py)
+for transport, VAD, LLM, worker, and disconnect handling.
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_pyai import PyAITTSService
+
+
+def speech_output(llm, transport, assistant_aggregator):
+    tts = PyAITTSService(voice="stock_emma_en_gb")
+    return Pipeline([llm, tts, transport.output(), assistant_aggregator])
+```
+
+## Frames
+
+Generated PCM is delivered in `TTSAudioRawFrame` objects. The Pipecat base TTS service handles text and utterance framing.
 
 # Rime Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/rime.md
