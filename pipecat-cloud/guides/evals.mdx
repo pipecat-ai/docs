@@ -1,33 +1,33 @@
 ---
 title: "Pipecat Cloud Evals"
 sidebarTitle: "Evals"
-description: "Run Pipecat scenario evals against a deployed Pipecat Cloud agent, or judge a finished session, with the CLI or the REST API."
+description: "Run Pipecat scenario evals and suites against a deployed Pipecat Cloud agent, or judge a finished session, with the CLI or the REST API."
 ---
 
-An eval run checks a deployed agent against a [Pipecat eval scenario](/pipecat/evals/overview) without you hosting the harness. You send a scenario, Pipecat Cloud runs it, and you read back a verdict, the reasons for it, the metrics, and the conversation.
+An eval run checks a deployed agent against a [Pipecat eval scenario](/pipecat/evals/overview) without you hosting the harness. You send a scenario, Pipecat Cloud runs it, and you read back a verdict, the reasons for it, the metrics, and the conversation. A [suite run](#run-a-suite) runs many scenarios, or one scenario many times, and reports on them together.
 
 <Warning>
-  A synthetic eval run starts real sessions of your deployed agent, and the
-  agent calls its real tools: bookings, emails, payments, database writes. Run
-  evals against an agent that uses test credentials or against a staging
-  deployment, never against an agent wired to production systems. A session run
-  starts no session and calls no tools.
+  A synthetic eval run, and every member of a suite run, starts real sessions of
+  your deployed agent, and the agent calls its real tools: bookings, emails,
+  payments, database writes. Run evals against an agent that uses test
+  credentials or against a staging deployment, never against an agent wired to
+  production systems. A session run starts no session and calls no tools.
 </Warning>
 
-## Run kinds
+## Run Kinds
 
 | Kind        | What it does                                                                                                                                                                                     |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `synthetic` | A simulated caller, or the scripted turns of the scenario, holds a conversation with a new session of your deployed agent. The default.                                                          |
 | `session`   | Judges a session of the agent that has already ended, using `success:` and `criterion:` metrics. It starts no session. Needs [conversation publishing](#publish-conversations-for-session-runs). |
 
-Synthetic runs take scenario files in the [`pipecat eval`](/api-reference/cli/eval) format. Session runs take [judging criteria](#session-criteria). Both end with a verdict of `passed`, `failed` or `skipped` when they can reach one. Hosted evals support text scenarios only; audio scenarios are refused.
+Synthetic runs take scenario files in the [`pipecat eval`](/api-reference/cli/eval) format. Session runs take [judging criteria](#session-criteria). Both end with a verdict of `passed`, `failed` or `skipped` when they can reach one. [Audio scenarios](#audio-scenarios) run only where the agent's [capabilities](#check-what-is-available) list `synthetic.audio` as `available`; elsewhere they are refused.
 
-## Write a scenario
+## Write a Scenario
 
 A scenario file is a YAML file in the [format described in the Pipecat evals docs](/pipecat/evals/scenario-configuration). A run sends the scenario file and the files it includes with `!include`, and nothing else.
 
-### A synthetic scenario
+### A Synthetic Scenario
 
 `scenarios/greeting.yaml` is a [scripted scenario](/pipecat/evals/scripted-scenarios) that checks the agent's reply to one question:
 
@@ -45,7 +45,7 @@ scenarios:
 
 A [simulated scenario](/pipecat/evals/simulated-scenarios) works the same way. An LLM plays the caller, and the judge decides `success:` once the call is over.
 
-### Included files
+### Included Files
 
 A scenario can pull in other YAML files with `!include`. On Pipecat Cloud, a nested include resolves relative to the file that names it, and every included file must be inside the root the run is built from.
 
@@ -83,7 +83,13 @@ See [Metrics](/pipecat/evals/simulated-scenarios#metrics) for how a judged metri
 
 The `result.ignored` field of a finished run lists the scenario's keys that had no effect, the first 20 of them. `result.ignoredTotal` counts them all.
 
-## Publish conversations for session runs
+## Audio Scenarios
+
+An [audio scenario](/pipecat/evals/scenario-configuration#text-and-audio-modes) speaks the caller's turns to the agent, judges the agent's spoken audio, or both. Before the conversation starts, an audio run checks the audio settings the agent reports in its `bot-ready` message. When the agent's eval transport has audio turned off in a direction the scenario uses, the run ends `error`, without a verdict or a conversation. Its failure kind is `audio_unsupported`, and `result.reason` names the setting to turn on in the eval transport's params: `audio_in_enabled` for the caller's audio, `audio_out_enabled` for the agent's. Running it again gives the same answer until you change the agent.
+
+An agent on `pipecat-ai` before 1.13 reports no audio settings, so its audio runs go unchecked: if the audio doesn't get through, the run fails or ends without a verdict on its own terms.
+
+## Publish Conversations for Session Runs
 
 A session run needs the session's conversation, and an agent doesn't publish it by default. To publish it, set `PCC_EVAL_CONVERSATIONS=true` in the agent's environment, for example in its [secret set](/pipecat-cloud/fundamentals/secrets):
 
@@ -105,7 +111,7 @@ Then redeploy the agent. Only sessions that start afterwards publish a conversat
 
 Synthetic runs don't need this setting.
 
-## What is sent to OpenAI
+## What Is Sent to OpenAI
 
 Hosted simulated callers and LLM judges use OpenAI models on Daily's account with zero data retention:
 
@@ -119,15 +125,39 @@ Eval runs aren't available to organizations with HIPAA controls. Creating one is
 
 For a session run, enable [conversation publishing](#publish-conversations-for-session-runs) only for agents whose conversations you're willing to send.
 
-## Run an eval with the CLI
+## Check What Is Available
+
+Two read-only routes say what you can run. Both answer even when hosted evals are off, and neither starts a session:
+
+- [Get eval capabilities](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-capabilities-get), for the organization: `enabled`; `creation`, whether the organization may create runs and publish bundles, with a `reason` and `message` when it may not; `bundles`, whether it can [store bundles](#store-files-as-a-bundle); and `suites`, whether it can [run suites](#run-a-suite).
+- [Get an agent's eval capabilities](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-capabilities-agent-get), for one agent: `synthetic`, `synthetic.audio` and `session`, each with a `state` of `available`, `unavailable` or `unknown`, and a `reason` and `message` when it isn't available.
+
+```json eval-capabilities.json
+{
+  "enabled": true,
+  "creation": {
+    "allowed": true,
+    "reason": null,
+    "message": null
+  },
+  "bundles": true,
+  "suites": true
+}
+```
+
+The answers are advisory: a run is still checked when you create it. A suite run of inline files needs both `suites` and `bundles`.
+
+## Run an Eval with the CLI
 
 The commands live under `pipecat cloud eval`. They need an authenticated CLI ([`pipecat cloud auth login`](/api-reference/cli/cloud/auth), or a [personal access token](/pipecat-cloud/guides/personal-access-tokens)). See the [command reference](/api-reference/cli/cloud/eval) for every option.
 
-Run a synthetic scenario and wait for the verdict:
+Run a scenario file and wait for the verdict:
 
 ```shell
 pipecat cloud eval run my-agent scenarios/greeting.yaml --scenario capital_question
 ```
+
+Where the organization has suite runs, `run` runs the selected scenarios as one [suite run](#run-a-suite), with one verdict. Otherwise each scenario is a run of its own, side by side.
 
 Judge a session that has ended:
 
@@ -143,23 +173,13 @@ pipecat cloud eval list my-agent
 pipecat cloud eval cancel RUN_ID --agent my-agent
 ```
 
-When waiting, the exit code combines the selected runs' outcomes, so a script or CI job can gate on them. If several codes apply, the priority is `3`, then `1`, then `2`, then `0`:
-
-| Exit code | Meaning                                                              |
-| --------- | -------------------------------------------------------------------- |
-| `0`       | Every verdict is `passed` or `skipped`.                              |
-| `1`       | At least one verdict is `failed`.                                    |
-| `2`       | At least one run ended without a verdict, including a cancelled run. |
-| `3`       | An API error, a usage error, or files that can't be sent.            |
-| `130`     | You pressed Ctrl-C.                                                  |
-
-With `--no-wait`, `0` means the API accepted every request. Pressing Ctrl-C exits `130` and leaves accepted runs going. The CLI does not retry creation requests or automatically cancel accepted runs. See the reference for [JSON output and interrupted submissions](/api-reference/cli/cloud/eval#json-output).
+When a command waits, its exit code says how the runs came out, so a script or CI job can gate on it: `0` for `passed` or `skipped`, or a finished measurement; `1` for `failed`; `2` for a run or suite run that ended without a verdict; `3` for an API or usage error; and `130` when you press Ctrl-C, which leaves the runs going. See the [exit codes](/api-reference/cli/cloud/eval#exit-codes).
 
 Without `--scenario`, `run` selects every scenario in the file. Repeat `--scenario` to select several. The CLI sends the scenario or criteria file and the files it includes under `--root` (the file's directory by default), and refuses hidden files, key and certificate files, `*.env` files, symlinks that leave the root, and files that aren't UTF-8, before it sends anything. See [the files a run sends](/api-reference/cli/cloud/eval#the-files-a-run-sends).
 
-## Run an eval with the API
+## Run an Eval with the API
 
-The API takes the scenario files in the request body, so you can call it from any language. Authenticate with a [personal access token](/pipecat-cloud/guides/personal-access-tokens) or the CLI's OAuth token as a Bearer token. The routes sit under your organization and agent:
+The API takes the scenario files in the request body, or names a [stored revision](#run-from-a-stored-revision), so you can call it from any language. Authenticate with a [personal access token](/pipecat-cloud/guides/personal-access-tokens) or the CLI's OAuth token as a Bearer token. The routes sit under your organization and agent:
 
 ```text
 https://api.pipecat.daily.co/v1/organizations/{organization}/services/{agent}/eval-runs
@@ -223,21 +243,25 @@ curl -X POST "https://api.pipecat.daily.co/v1/organizations/$ORG/services/my-age
   -H "Authorization: Bearer $PIPECAT_TOKEN"
 ```
 
-### Request fields
+The list takes `kind`, `status`, `verdict` and `suiteRunId` filters.
 
-| Field             | Description                                                                                                                                                                 |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`            | `synthetic` (the default) or `session`.                                                                                                                                     |
-| `files`           | Required. Every file the scenario may include, keyed by path relative to the bundle's root, with UTF-8 text values.                                                         |
-| `scenarioPath`    | Required. The scenario file: one of the keys of `files`.                                                                                                                    |
-| `scenarioName`    | Required. The scenario's name within its file.                                                                                                                              |
-| `sessionId`       | Required for a session run: an ended session of this agent. Not allowed on a synthetic run.                                                                                 |
-| `params`          | Synthetic runs only: `connectTimeoutSeconds` (up to 120), `botReadyTimeoutSeconds` (up to 300), and `defaultTimeoutMs` (up to 600000, how long a turn waits for the agent). |
-| `deadlineSeconds` | How long the run may take from its creation, queueing included. See [Limits](#limits).                                                                                      |
+### Request Fields
+
+| Field              | Description                                                                                                                                                                 |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`             | `synthetic` (the default) or `session`.                                                                                                                                     |
+| `files`            | Every file the scenario may include, keyed by path relative to the bundle's root, with UTF-8 text values. Required unless the run names `bundleRevisionId`.                 |
+| `bundleRevisionId` | A [stored revision](#run-from-a-stored-revision) whose files the run runs, in place of `files`. Needs `requestId`.                                                          |
+| `requestId`        | With `bundleRevisionId`: a UUID you generate, sent again unchanged when you retry the request.                                                                              |
+| `scenarioPath`     | Required. The scenario file: one of the run's files.                                                                                                                        |
+| `scenarioName`     | Required. The scenario's name within its file.                                                                                                                              |
+| `sessionId`        | Required for a session run: an ended session of this agent. Not allowed on a synthetic run.                                                                                 |
+| `params`           | Synthetic runs only: `connectTimeoutSeconds` (up to 120), `botReadyTimeoutSeconds` (up to 300), and `defaultTimeoutMs` (up to 600000, how long a turn waits for the agent). |
+| `deadlineSeconds`  | How long the run may take from its creation, queueing included. See [Limits](#limits).                                                                                      |
 
 The [REST reference](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-run-create) lists every response and error.
 
-### Cancel a run
+### Cancel a Run
 
 Send the POST with no body, or send `{}` with `Content-Type: application/json`. Other body shapes are a `400`. An oversized JSON or form body is a `413`; an unsupported charset or `Content-Encoding` is a `415`. A successful cancel returns `200` with the run's current state: the cancellation request was recorded, or the run was already cancelled. It sends no `Retry-After` or `Location` header.
 
@@ -249,41 +273,308 @@ Send the POST with no body, or send `{}` with `Content-Type: application/json`. 
 
 Stopping an active evaluation is best effort. The `cancelled` status does not confirm that all evaluation activity has stopped. If stopping could not be confirmed, `result.reason` says the evaluation may continue until its deadline. Cancellation does not undo usage already incurred by an agent session. Cancelling works while the organization is suspended.
 
-## Read the result
+## Store Files as a Bundle
+
+A **bundle** is a named set of scenario, suite and included files that your organization keeps. Each time you publish its files, they become a new **revision**: numbered from 1, never changed afterwards, and checked before they are stored. Runs and suite runs name a revision by its ID, so the files a run ran stay readable.
+
+Publish a directory with the CLI. The first push creates the bundle, and each later push publishes its next revision:
+
+```shell
+pipecat cloud eval bundle push support-evals evals/
+```
+
+The CLI shows the files and asks you to confirm, then prints the revision's number and what it holds. With the API, [create the bundle](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-bundle-create) with its first files, then [publish a revision](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-bundle-revision-create) for each change. Both take a `requestId`, a UUID you generate: a retry that sends the same request with the same `requestId` creates nothing more, and answers with what the first one made.
+
+The check classifies every file:
+
+- A `.yaml` or `.yml` mapping with `kind: suite` is a [suite file](#the-suite-file).
+- A file that a suite entry names in `runner_body: {path: ...}` is a body.
+- A `.yaml` or `.yml` mapping with a `name:` is a scenario file. Each of its scenarios is a `script` (it has `turns:`), a `simulation` (it has `persona:`), or a `rubric` (only `success:` and judged metrics, for session runs).
+- Any other file must be included by a scenario file. A file that nothing uses is refused.
+
+A refused bundle stores nothing: the `400` lists each problem with its `file`, the `field` within it, a `code` and a `message`. A stored revision's `catalog` lists what its files hold, and its `coverage` says how far the check went. With `structural` coverage, a scenario that Pipecat's loader would refuse can still be stored, and is refused when a run uses it.
+
+[Get an eval bundle revision](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-bundle-revision-get) reads a revision's files back. [Deleting a bundle](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-bundle-delete) takes it off the list and frees its name. No new run can name its revisions, but the revisions that runs already name stay readable.
+
+### Run from a Stored Revision
+
+An eval run can name a stored revision instead of sending files. Set `bundleRevisionId` and a `requestId` in place of `files`:
+
+```shell
+curl -X POST "https://api.pipecat.daily.co/v1/organizations/$ORG/services/my-agent/eval-runs" \
+  -H "Authorization: Bearer $PIPECAT_TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  -d "$(jq -n --arg revision "$REVISION_ID" --arg request "$(uuidgen)" '{
+    requestId: $request,
+    bundleRevisionId: $revision,
+    scenarioPath: "scenarios/greeting.yaml",
+    scenarioName: "capital_question"
+  }')"
+```
+
+Sending the same request again with the same `requestId` answers `202` with the run it made, as it is now, and the header `Idempotent-Replayed: true`. The same `requestId` with a different request is a `409`, and so is a revision whose bundle has been deleted.
+
+A run of inline `files` keeps them too, as an **anonymous revision** that only that run names. The run's `bundleRevisionId` reads them back; an anonymous revision has no bundle, number or catalog.
+
+## Run a Suite
+
+A **suite run** runs a set of scenarios, its **members**, against one agent, and reports on them together. Each member is an eval run of its own, with its own result. A suite run's plan is fixed when it is accepted: every member, with its entry, scenario and attempt.
+
+### The Suite File
+
+A suite file is a YAML file with `kind: suite`, stored in a bundle beside the scenarios it names. It uses the words of the [`pipecat eval suite` manifest](/pipecat/evals/suites), without those that start agents locally, since the suite run names its agent:
+
+```yaml suite.yaml
+kind: suite
+schemaVersion: 1
+concurrency: 2
+suite:
+  - name: baseline
+    scenarios:
+      - scenarios/greeting.yaml
+      - { path: scenarios/simulated/book_table.yaml, name: available }
+  - name: vip-caller
+    runner_body:
+      data: { tier: vip }
+    scenarios:
+      - { path: scenarios/simulated/book_table.yaml, name: available }
+```
+
+| Key             | Description                                                                                |
+| --------------- | ------------------------------------------------------------------------------------------ |
+| `kind`          | Required: `suite`.                                                                         |
+| `schemaVersion` | Required: `1`.                                                                             |
+| `suite`         | Required: the entries, at least one.                                                       |
+| `concurrency`   | How many members run at once. See [Concurrency and Deadlines](#concurrency-and-deadlines). |
+| `repeat`        | How many times every member runs. See [Repeat and Measurements](#repeat-and-measurements). |
+
+Each entry takes:
+
+| Key           | Description                                                                                                                                                                                                                                                      |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scenarios`   | Required. Each item is a scenario file's path in the bundle, which selects every scenario it holds except rubrics, or `{path, name}`, which selects one scenario.                                                                                                |
+| `name`        | The entry's label, which its members and pass rates carry. Entries without one share the empty label, so they can't select the same scenario.                                                                                                                    |
+| `runner_body` | A session body for the entry's members, as a [`/start` request](/pipecat-cloud/guides/websocket-authentication) would send it: `{path: <file>}`, a YAML or JSON file in the bundle, or `{data: {...}}`. Needs an agent deployed with `websocket_auth = "token"`. |
+| `concurrency` | At most this many of the entry's members at once.                                                                                                                                                                                                                |
+
+Suite files take no `!include`. The manifest's keys for starting agents, such as `bot:`, `spawn:` and `runs_dir:`, are refused.
+
+### Start a Suite Run
+
+With the CLI, run a suite file from a stored bundle's latest revision, or from revision 3 with `--bundle support-evals@3`:
+
+```shell
+pipecat cloud eval suite run my-agent --bundle support-evals --suite suite.yaml
+```
+
+`pipecat cloud eval run` also runs a scenario file from your machine as a suite run, where the organization has suite runs.
+
+With the API, [create a suite run](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-suite-run-create):
+
+```shell
+curl -X POST "https://api.pipecat.daily.co/v1/organizations/$ORG/services/my-agent/eval-suite-runs" \
+  -H "Authorization: Bearer $PIPECAT_TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  -d "$(jq -n --arg revision "$REVISION_ID" --arg request "$(uuidgen)" '{
+    requestId: $request,
+    bundleRevisionId: $revision,
+    suitePath: "suite.yaml"
+  }')"
+```
+
+| Field                         | Description                                                                                                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `requestId`                   | Required. A UUID you generate, sent again unchanged when you retry the request.                                                                                    |
+| `bundleRevisionId` or `files` | Exactly one: a stored revision, or the files inline, which are checked as a bundle and kept as an anonymous revision.                                              |
+| `suitePath` or `scenarioPath` | Exactly one: a suite file, or a scenario file to run as a suite of one entry. With `scenarioPath`, `scenarioNames` runs only the scenarios it lists, in its order. |
+| `filters`                     | Narrows the plan: `kinds` (`script`, `simulation`) and `scenarios` (`{path, name}`), each of which must be in the plan.                                            |
+| `repeat`, `concurrency`       | Replace the suite file's `repeat:` and `concurrency:`.                                                                                                             |
+| `deadlineSeconds`             | From 90 to 43200 (12 hours). 43200 by default.                                                                                                                     |
+
+The API answers `202` with the suite run, its `entries` and `counts.planned`, and a `Location` header. Nothing is recorded unless the answer is `202`, and a retry with the same `requestId` answers with the suite run the first request made. A plan that can't be made is refused with `400` and a `refusal` that names why, such as an unknown suite file or a scenario named twice. While the agent is between deployments, a new suite run is refused with `409` (`EVAL-AGENT-BETWEEN-DEPLOYMENTS`): retry once the deployment has completed.
+
+### Repeat and Measurements
+
+Without `repeat`, every scenario runs once, except a simulation, which runs its own `runs:`, and every run counts toward the verdict. With `repeat`, from the request or the suite file, every member runs that many times instead. Members run attempt by attempt: every scenario's first attempt in entry order, then every second, and so on.
+
+Above 1, the suite run is a **measurement** (`measurement: true`). It has no verdict, and reports a pass rate for each entry and scenario in `passRates`: `passed / (passed + failed + skipped)`. Members that ended without a verdict are counted apart, in `withoutVerdict`, and never in a rate. The threshold is yours to choose.
+
+### Concurrency and Deadlines
+
+`concurrency` caps how many members run at once: the request's, otherwise the suite file's, otherwise a default. An entry's own `concurrency:` caps that entry. The suite run's `concurrency.effective` shows what applies. Members also wait for room on the agent, up to its [maximum agents](/pipecat-cloud/fundamentals/scaling#maximum-agents) less its other sessions, and suite runs on one agent share that room fairly.
+
+A suite run's deadline covers all of it, queueing and every member, from when it is accepted: 12 hours, unless `deadlineSeconds` sets it shorter. Each member also has a single run's own deadline, cut short to the suite run's.
+
+### Read a Suite Run
+
+Poll [Get an eval suite run](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-suite-run-get) until it has ended. While it is live, the `Retry-After` header says when to ask again. With the CLI:
+
+```shell
+pipecat cloud eval suite status SUITE_RUN_ID --wait
+```
+
+| Status      | Meaning                                                                                                 |
+| ----------- | ------------------------------------------------------------------------------------------------------- |
+| `queued`    | Accepted. No member has been admitted yet.                                                              |
+| `running`   | At least one member has been admitted.                                                                  |
+| `completed` | Every member was admitted and has ended.                                                                |
+| `cancelled` | A cancel stopped it.                                                                                    |
+| `expired`   | Its deadline stopped it.                                                                                |
+| `error`     | It couldn't go on as accepted. `error` says why: see [What Stops a Suite Run](#what-stops-a-suite-run). |
+
+A member's own failure stays on the member: it never ends the suite run as `error`.
+
+`counts` places every member. `pending` (not yet admitted), `live` and `terminal` add up to `planned`; `passed`, `failed`, `skipped` and `withoutVerdict` add up to `terminal`. Once a suite run has stopped, members never admitted count as terminal, without a verdict.
+
+A suite run has a verdict only once it has `completed`, and never as a measurement:
+
+| Its members                                              | `verdict` |
+| -------------------------------------------------------- | --------- |
+| Any failed                                               | `failed`  |
+| None failed, and any ended without a verdict             | `null`    |
+| Every one passed or was skipped, and at least one passed | `passed`  |
+| Every one was skipped                                    | `skipped` |
+
+A completed measurement, with `repeat` 40 over one entry that runs the two scenarios of `greet.yaml`:
+
+```json suite-run.json
+{
+  "id": "7c2f9a1e-4b3d-4e8a-9f61-2d5c8b0e3a47",
+  "serviceName": "my-agent",
+  "region": "us-west",
+  "bundleRevisionId": "3b7d9e1f-2a4c-4f6e-8b0d-1c3e5a7f9b20",
+  "status": "completed",
+  "target": { "kind": "suite", "suitePath": "suite.yaml" },
+  "filters": null,
+  "repeat": { "requested": 40, "suite": null, "effective": 40 },
+  "measurement": true,
+  "concurrency": { "requested": null, "suite": 2, "effective": 2 },
+  "deadlineSeconds": 43200,
+  "entries": [
+    { "index": 0, "label": "baseline", "concurrency": null, "body": null }
+  ],
+  "counts": {
+    "planned": 80,
+    "pending": 0,
+    "live": 0,
+    "terminal": 80,
+    "passed": 28,
+    "failed": 52,
+    "skipped": 0,
+    "withoutVerdict": 0
+  },
+  "verdict": null,
+  "passRates": [
+    {
+      "entry": 0,
+      "label": "baseline",
+      "scenarioPath": "greet.yaml",
+      "scenarioName": "hello",
+      "fingerprint": null,
+      "passed": 1,
+      "failed": 39,
+      "skipped": 0,
+      "withoutVerdict": 0,
+      "passRate": 0.025
+    },
+    {
+      "entry": 0,
+      "label": "baseline",
+      "scenarioPath": "greet.yaml",
+      "scenarioName": "goodbye",
+      "fingerprint": null,
+      "passed": 27,
+      "failed": 13,
+      "skipped": 0,
+      "withoutVerdict": 0,
+      "passRate": 0.675
+    }
+  ],
+  "cancelRequestedAt": null,
+  "error": null,
+  "fingerprint": "jfp1:5e0c3f2a9b7d41e86c2a0f5d9e3b7c1a4f8e2d6b0c9a5e1f3d7b2c8a6e4f0d19",
+  "mixed": false,
+  "deadlineAt": "2026-11-14T02:52:36.013Z",
+  "createdAt": "2026-11-13T14:52:36.013Z",
+  "startedAt": "2026-11-13T14:52:36.711Z",
+  "finishedAt": "2026-11-13T14:58:59.961Z"
+}
+```
+
+Each member is an eval run with the suite run's `suiteRunId` and its place in the plan, `suiteMemberOrdinal`. List the members' runs with the `suiteRunId` filter on [the agent's eval runs](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-run-list), or with `pipecat cloud eval list my-agent --suite SUITE_RUN_ID`, and read any one for its result. [List eval suite run members](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-suite-run-items) gives the plan, with each member's `evalRunId` once it has been admitted.
+
+### Cancel a Suite Run
+
+```shell
+pipecat cloud eval suite cancel SUITE_RUN_ID
+```
+
+With the API, POST to [the suite run's `cancel`](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-suite-run-cancel) with no body. Once the request is recorded, no more members are admitted, members not yet admitted never run, and live members are cancelled as a [cancelled run](#cancel-a-run) is. The response can still show `running` while they finish, and results they reach first are kept. The suite run then ends `cancelled`, unless something had already stopped it, such as its deadline. Cancelling again is safe. Cancelling a suite run that already ended another way answers `409`.
+
+### What Stops a Suite Run
+
+| Cause                                                                                                                                                | Ends as                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| A cancel.                                                                                                                                            | `cancelled`                                       |
+| Its deadline passes with members waiting or live, or too little time is left for the next member to start.                                           | `expired`                                         |
+| The agent is redeployed: its active deployment changes, or a member's session runs on a deployment other than the one the suite run was accepted on. | `error`, with `error.code` `deployment_changed`   |
+| Which deployment a member's session ran on can't be confirmed.                                                                                       | `error`, with `error.code` `deployment_unknown`   |
+| Its bundle revision is no longer available.                                                                                                          | `error`, with `error.code` `revision_unavailable` |
+
+The first cause stands, and a later one never replaces it. From then on the suite run admits no members, and it ends once none is live. A suite run's members are held to the deployment the agent was on when it was accepted, so a redeploy ends the suite run rather than mixing versions of your agent, and a suite run [can't start](#start-a-suite-run) while a deployment is in progress. `deployment_changed` names both deployments in `error.expectedDeploymentId` and `error.deploymentId`.
+
+### Judging Versions
+
+Every eval run records its **judging version** in `executor.fingerprint`: an identifier of everything that decides a verdict. A suite run holds its members to one judging version, its own `fingerprint`, taken from the first member to report one.
+
+If the platform's judging changes during a suite run, members keep being judged by the suite run's version where they can. A member that can't be judged by it in time is judged by the newer version, and the suite run is flagged `mixed: true`. A mixed suite run keeps its verdict. A mixed measurement's pass rates are split by version: each `passRates` row then has its `fingerprint`. `pipecat cloud eval suite status` shows the judging version, and warns when a suite run is mixed.
+
+## Read the Result
 
 A run has these fields:
 
-| Field                                                  | Description                                                                       |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| `id`, `kind`, `scenarioPath`, `scenarioName`, `params` | What was requested.                                                               |
-| `status`                                               | Where the run is. See [Statuses](#statuses).                                      |
-| `verdict`                                              | `passed`, `failed`, `skipped`, or `null` when the run ended without one.          |
-| `sessionId`                                            | The associated agent session, if known. For a session run, the session it judges. |
-| `createdAt`, `startedAt`, `finishedAt`, `deadlineAt`   | Timestamps. `startedAt` is when the run first left the queue.                     |
-| `result`                                               | `null` while the run is live. Otherwise the result below.                         |
+| Field                                                  | Description                                                                                                                            |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`, `kind`, `scenarioPath`, `scenarioName`, `params` | What was requested.                                                                                                                    |
+| `serviceName`                                          | The agent. `environmentName` and `parentServiceName` are set when the agent is an environment of another.                              |
+| `status`                                               | Where the run is. See [Statuses](#statuses).                                                                                           |
+| `verdict`                                              | `passed`, `failed`, `skipped`, or `null` when the run ended without one.                                                               |
+| `bundleRevisionId`                                     | The revision whose files the run ran: a [stored one](#run-from-a-stored-revision), or the anonymous one its inline files were kept as. |
+| `suiteRunId`, `suiteMemberOrdinal`                     | The [suite run](#run-a-suite) the run is a member of, and its place in the plan. Both null for a run of its own.                       |
+| `executor`                                             | The [judging version](#judging-versions) (`fingerprint`) and build that ran the run. Null until they are reported.                     |
+| `sessionId`                                            | The associated agent session, if known. For a session run, the session it judges.                                                      |
+| `createdAt`, `startedAt`, `finishedAt`, `deadlineAt`   | Timestamps. `startedAt` is when the run first left the queue.                                                                          |
+| `result`                                               | `null` while the run is live. Otherwise the result below.                                                                              |
 
 `result` holds:
 
 - `reason`: why the run got its verdict, or why it has none. A failed run says what fell short, such as `The agent fell short on the metric 'politeness', scoring 0.50 where it needs 1.00: ...`.
 - `metrics`: each metric's `name`, `score`, `passed` and `reason`.
 - `details`: `kind` (`script` or `simulation`), `turns` with the checks on each, `failures`, and a simulation's `goal` with the judge's verdict on `success:`. `null` when the result was too large to keep.
-- `conversation`: the conversation in Pipecat's format. It is `[]` for a scripted scenario.
+- `conversation`: the conversation in Pipecat's format. A scripted run's can be `[]`.
 - `ignored` and `ignoredTotal`: the scenario's keys that had no effect (the first 20), and how many there were in all.
 - `truncated`: `true` when the result was too large, in which case the conversation, details, and metric reasons are left out.
 
 A finished run of the greeting scenario:
 
-```json
+```json eval-run.json
 {
-  "id": "0b6b3c8e-5f4a-4a58-9a77-52f7c0f2e8d1",
   "serviceName": "my-agent",
   "environmentName": null,
   "parentServiceName": null,
+  "id": "0b6b3c8e-5f4a-4a58-9a77-52f7c0f2e8d1",
   "kind": "synthetic",
   "status": "completed",
   "verdict": "passed",
+  "bundleRevisionId": "9e4f2c7a-1b3d-4a5e-8f60-7d2c9b1e4a38",
   "scenarioPath": "greeting.yaml",
   "scenarioName": "capital_question",
+  "suiteRunId": null,
+  "suiteMemberOrdinal": null,
+  "executor": {
+    "fingerprint": "jfp1:5e0c3f2a9b7d41e86c2a0f5d9e3b7c1a4f8e2d6b0c9a5e1f3d7b2c8a6e4f0d19",
+    "build": "4a1c7e9b2d5f8a3c6e0b9d2f5a8c1e4b7d0a3f6c"
+  },
   "params": {},
   "sessionId": "5d9c2a1e-3f0b-4b6e-8d11-7a4e6c9b0f22",
   "createdAt": "2026-11-07T10:00:00.000Z",
@@ -293,6 +584,7 @@ A finished run of the greeting scenario:
   "result": {
     "reason": "The agent passed the scenario.",
     "metrics": [],
+    "conversation": [],
     "details": {
       "kind": "script",
       "turns": [
@@ -315,7 +607,6 @@ A finished run of the greeting scenario:
       "failures": [],
       "goal": null
     },
-    "conversation": [],
     "ignored": [],
     "ignoredTotal": 0,
     "truncated": false
@@ -346,8 +637,11 @@ Every status except `completed` has a `null` verdict.
 | Limit                  | Value                                                                                                                                          |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | Files in a run         | 256 KiB of UTF-8 in all, and at most 3.5 MiB as JSON with paths counted. The request body is at most 3 MiB. Paths are at most 1024 characters. |
+| Files in a bundle      | 2,000 files and 256 KiB of UTF-8 in all, and at most 3.5 MiB as JSON with paths counted. Paths are at most 1024 characters.                    |
+| Bundle name            | 1 to 128 lowercase letters, digits, dots, dashes and underscores, starting and ending with a letter or a digit.                                |
 | Synthetic run deadline | `deadlineSeconds` from 90 to 7200. 1800 (30 minutes) by default.                                                                               |
 | Session run deadline   | `deadlineSeconds` from 240 to 1800. 600 (10 minutes) by default.                                                                               |
+| Suite run deadline     | `deadlineSeconds` from 90 to 43200. 43200 (12 hours) by default.                                                                               |
 | Eval time limit        | The smaller of one hour and the deadline less 30 seconds. An eval still going then ends as `timed_out`.                                        |
 | Scenario loading       | A scenario's includes load at most 200 files, 256 KiB and 20,000 values in all. An include counts each time it is named.                       |
 | Conversation judged    | 256,000 characters or 2,000 messages. A longer one is `refused`.                                                                               |
@@ -357,7 +651,7 @@ The deadline counts from the run's creation, including time spent waiting for th
 
 Hosted evals are not available in every region. Creating a run for an agent in a region without them is refused with `400`.
 
-## Next steps
+## Next Steps
 
 <CardGroup cols={2}>
   <Card title="Pipecat evals" icon="flask-vial" href="/pipecat/evals/overview">

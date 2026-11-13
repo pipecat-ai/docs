@@ -61,7 +61,7 @@ const CUSTOM_LLMS_WARN = 120_000; // usability ceiling for a custom llms.txt (ch
 // thing being enforced - not the move.
 const ENFORCED = new Set([1, 8, 13, 15, 16, 17, 18, 19]);
 
-const EXPECTED_OPENAPI_PAGES = 28;
+const EXPECTED_OPENAPI_PAGES = 43;
 const EXPECTED_URL_STUBS = {
   "api-reference/server/links/server-reference":
     "https://reference-server.pipecat.ai/",
