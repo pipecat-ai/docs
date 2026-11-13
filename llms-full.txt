@@ -38344,6 +38344,7 @@ Video services enable you to build an avatar where audio and video are synchroni
 
 | Service                                                         | Setup                         | Maintainer |
 | --------------------------------------------------------------- | ----------------------------- | ---------- |
+| [Akapulu Labs](/api-reference/server/services/video/akapulu)    | `uv add pipecat-akapulu`      | Community  |
 | [Anam](/api-reference/server/services/video/anam)               | `uv add pipecat-anam`         | Community  |
 | [bitHuman](/api-reference/server/services/video/bithuman)       | `uv add pipecat-bithuman`     | Community  |
 | [HeyGen](/api-reference/server/services/video/heygen)           | `uv add "pipecat-ai[heygen]"` | Pipecat    |
@@ -77841,6 +77842,266 @@ async with aiohttp.ClientSession() as session:
 Tested with Pipecat v0.0.108. Check the [source
 repository](https://github.com/bnovik0v/pipecat-replicate) for the latest tested
 version and changelog.
+
+# Akapulu Labs Video Avatar
+Source: https://docs.pipecat.ai/api-reference/server/services/video/akapulu.md
+
+AkapuluAvatar generates real-time Akapulu Labs video avatars synchronized with your Pipecat agent's audio.
+
+## Overview
+
+`AkapuluAvatar` is a Pipecat processor that sits after your speech model. It
+sends assistant audio to the [Akapulu Labs](https://akapulu.com) worker. The
+worker joins the Daily room for that call and publishes the avatar video and
+audio. Your voice bot itself does not publish camera or microphone.
+
+On `InterruptionFrame`, the processor tells the worker to cut the in-flight
+reply so the avatar can stop speaking when the caller barges in.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Akapulu/pipecat-akapulu"
+  >
+    Source code, examples, and issues for the Akapulu Labs integration
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-akapulu/"
+  >
+    The `pipecat-akapulu` package on PyPI
+  </Card>
+  <Card
+    title="Akapulu Labs Docs"
+    icon="book"
+    href="https://docs.akapulu.com/guides/calls/your-bot"
+  >
+    Create the Daily room, start a live session, and wire `AkapuluAvatar`
+  </Card>
+  <Card title="Akapulu Labs" icon="key" href="https://akapulu.com">
+    Create an account and get an API key
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-akapulu
+```
+
+You'll also need Pipecat with Daily and the STT, TTS, and LLM extras you use.
+
+## Prerequisites
+
+### Akapulu Labs account setup
+
+Before using the Akapulu Labs video avatar, you need:
+
+1. **Akapulu Labs API key**: Create an account at [Akapulu Labs](https://akapulu.com)
+2. **Avatar ID**: UUID of a public or private avatar. See our
+   [catalog](https://akapulu.com/catalog) for public avatars. Private avatars are
+   available on our enterprise plan.
+3. **Daily API key**: [Daily](https://dashboard.daily.co) is used to create the
+   room when you call `create_akapulu_call`
+
+You'll also need API keys for the STT, TTS, and LLM services used in your
+pipeline.
+
+### Required environment variables
+
+- `AKAPULU_API_KEY`: Your Akapulu Labs API key
+- `DAILY_API_KEY`: Your Daily API key (`create_akapulu_call` reads this)
+
+## Configuration
+
+### `create_akapulu_call`
+
+Run this on your server before the voice bot starts. It creates a private Daily
+room for three participants and mints the browser, voice-bot, and avatar worker
+tokens. It uses your `AKAPULU_API_KEY` to POST `/api/live-sessions/` to
+Akapulu Labs. It returns `room_url`, `bot_token`,
+`browser_token`, and `session_id`. The worker token is sent to Akapulu Labs and
+is not returned.
+
+<ParamField path="avatar_id" type="str" required>
+  UUID of a public or private avatar. See our
+  [catalog](https://akapulu.com/catalog) for public avatars. Private avatars are
+  available on our enterprise plan.
+</ParamField>
+
+<ParamField path="show_ai_label" type="bool" required>
+  Whether a visible "This is AI" label is shown on the live avatar video feed.
+</ParamField>
+
+<ParamField path="session" type="aiohttp.ClientSession" required>
+  HTTP client for creating the Daily room and for the Akapulu Labs live-session
+  request.
+</ParamField>
+
+<ParamField path="room_exp_secs" type="float" default="7200">
+  Daily room lifetime in seconds. Defaults to two hours. Daily removes everyone
+  when the room expires.
+</ParamField>
+
+<Note>
+  `create_akapulu_call` spawns an avatar worker. That worker can take 5 to 10
+  seconds to start up.
+
+While that worker starts up, `AkapuluAvatar` pushes
+[RTVI](/api-reference/server/rtvi/introduction) server messages:
+
+- `type`: `status`
+- `call_is_ready`: true when the first video frame is published
+- `completion_percent`
+- `latest_update_text`
+
+Keep a loading state up until `call_is_ready` is true.
+
+</Note>
+
+If you would like to create the Daily room yourself, skip `create_akapulu_call`.
+We recommend these room settings:
+
+- `privacy`: `private`
+- `max_participants`: `3` (the end user joins as `You`, your voice bot joins as the name you pass to `DailyTransport`, `Assistant` in the example below, and the avatar worker joins as `Avatar`)
+- `enable_chat`: off
+- `enable_prejoin_ui`: off
+- `eject_at_room_exp`: on, so Daily removes everyone when `exp` is reached
+
+Then mint the avatar worker token and POST `/api/live-sessions/` to Akapulu Labs
+with `avatar_id`, `show_ai_label`, `room_url`, and `avatar_token`. The response
+is `session_id`.
+
+<Note>
+  The avatar worker joins the room as `Avatar` and publishes audio and video.
+  Its token needs permission to send audio and video.
+
+Daily shows the end user and the avatar. The voice bot is in the room and
+does not get its own tile.
+
+`create_akapulu_call` already does this.
+
+</Note>
+
+### `AkapuluAvatar`
+
+Constructor parameters for `AkapuluAvatar`:
+
+<ParamField path="session_id" type="str" required>
+  Live session id returned by `create_akapulu_call` or `POST
+  /api/live-sessions/`.
+</ParamField>
+
+<ParamField path="tail_secs" type="float" default="0">
+  Seconds to wait after `TTSStoppedFrame` before the audio counts as stopped, so
+  the avatar can transition from speaking back to idle. We recommend `0`. Custom
+  engineered pipelines with voice bots that trickle in audio more slowly might
+  need different values. See our [enterprise
+  plan](https://akapulu.com/pricing/).
+</ParamField>
+
+<Note>
+  See the [source repository](https://github.com/Akapulu/pipecat-akapulu) for
+  the authoritative, up-to-date list of parameters, loading-status RTVI
+  messages, and the complete example.
+</Note>
+
+## Usage
+
+When you construct your voice bot and create your transport processor, leave
+audio out and video out off. Your voice bot will not publish audio or video
+into the Daily room. The Akapulu Labs avatar worker publishes the audio and
+video. Add `AkapuluAvatar` after your TTS processor so it forwards that audio
+to the avatar worker.
+
+```python
+import aiohttp
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
+from pipecat_akapulu import AkapuluAvatar, create_akapulu_call
+
+async with aiohttp.ClientSession() as http:
+    room_url, bot_token, browser_token, session_id = await create_akapulu_call(
+        avatar_id="your-avatar-uuid",
+        show_ai_label=True,
+        session=http,
+    )
+
+    transport = DailyTransport(
+        room_url=room_url,
+        token=bot_token,
+        bot_name="Assistant",
+        params=DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            video_out_enabled=False,
+        ),
+    )
+    avatar = AkapuluAvatar(session_id=session_id)
+
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        context_aggregator.user(),
+        llm,
+        tts,
+        avatar,  # Forwards assistant audio to the Akapulu Labs worker
+        transport.output(),
+        context_aggregator.assistant(),
+    ])
+```
+
+The browser joins with `browser_token` as `You` and stays subscribed to the
+`Avatar` microphone. That track is the voice the person on the call hears.
+Pipecat subscribes the voice bot to every remote microphone. When `Avatar`
+joins, turn that microphone off so the voice bot only hears the caller. Call
+this once. Do not set subscriptions again on a participant update.
+
+```python
+@transport.event_handler("on_participant_joined")
+async def on_participant_joined(_transport, participant):
+    # Avatar publishes the spoken audio. Turn that microphone off for the voice bot.
+    if participant["info"]["userName"] != "Avatar":
+        return
+    await transport.update_subscriptions(
+        participant_settings={
+            participant["id"]: {"media": {"microphone": "unsubscribed"}},
+        },
+    )
+```
+
+<Note>
+  The avatar worker needs about 800 ms of assistant audio before it starts
+  rendering the video. The render itself, given the audio, only takes around
+  150ms.
+
+You might see added latency in your bot's response even if your TTS
+provider's TTFA is low, due to this buffer accumulation.
+
+A TTS that trickles audio in slowly fills that buffer late, so the response
+is slower and the avatar gestures less.
+
+We recommend a TTS that sends audio in waves.
+
+[Cartesia](/api-reference/server/services/tts/cartesia) has been the best in
+our testing.
+
+</Note>
+
+See the
+[foundational example](https://github.com/Akapulu/pipecat-akapulu/blob/main/examples/foundational.py)
+and [akapulu-examples](https://github.com/Akapulu/akapulu-examples) for a
+complete Daily pipeline.
+
+## Compatibility
+
+Tested with Pipecat v1.14.0, v1.15.0, and v1.16.0 (Python 3.11+). Requires Pipecat 1.12.0 or newer.
+Check the [source repository](https://github.com/Akapulu/pipecat-akapulu) for
+the latest tested version and changelog.
 
 # Anam Video Avatar
 Source: https://docs.pipecat.ai/api-reference/server/services/video/anam.md
