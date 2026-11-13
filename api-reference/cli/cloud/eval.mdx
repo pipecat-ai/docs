@@ -1,0 +1,513 @@
+---
+title: "pipecat cloud eval"
+sidebarTitle: "eval"
+description: "pipecat cloud eval runs Pipecat scenarios and suites against a deployed agent, judges finished sessions, and stores eval bundles."
+---
+
+The `eval` command group runs [Pipecat eval scenarios](/pipecat/evals/overview) against an agent deployed on Pipecat Cloud, runs suites of them, judges the agent's finished sessions, and stores the files as bundles. For concepts, scenario examples, and the equivalent API calls, see the [Evals guide](/pipecat-cloud/guides/evals).
+
+<Warning>
+  A synthetic run, and every member of a suite run, starts real sessions of your
+  agent, and the agent calls its real tools. Use test credentials or a staging
+  deployment.
+</Warning>
+
+Every command takes `--organization` / `-o`, the organization to use, which defaults to the current one in your configuration, and `--json`, which prints one JSON document on stdout, the same as the global [`--output json`](/api-reference/cli/cloud/output). JSON output uses the API's field names.
+
+## Availability
+
+`eval run` reads the organization's [eval capabilities](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-capabilities-get) first. Where they list both `suites` and `bundles`, and you give no `--param`, it runs the file's scenarios as one suite run; otherwise each scenario runs on its own, side by side. The `suite` and `bundle` commands send their requests as they are. Where the organization doesn't have suite runs, they print `Suite runs aren't available for this organization yet.`, or the same for eval bundles, and exit `3`.
+
+Creating a run for an agent in a region without hosted evals is refused by the API. When the API answers that evals are not available, a command fails with `Evals aren't available yet.`
+
+## Exit Codes
+
+When a command waits, its exit code says how the runs came out:
+
+| Code  | Meaning                                                                                                         |
+| ----- | --------------------------------------------------------------------------------------------------------------- |
+| `0`   | Every verdict is `passed` or `skipped`, or a measurement completed.                                             |
+| `1`   | A verdict is `failed`.                                                                                          |
+| `2`   | A run ended without a verdict, or a suite run was cancelled, expired or ended in error, a measurement included. |
+| `3`   | An API error, a usage error, or files that can't be sent.                                                       |
+| `130` | You pressed Ctrl-C. Waiting stops, and the runs keep going.                                                     |
+
+When side-by-side runs end differently, the priority is `3`, then `1`, then `2`, then `0`. Usage errors exit `3`, not the `2` that shells usually use, so that `2` always means a run with no verdict. Without waiting (`--no-wait`, or `status` without `--wait`), a command exits `0` once the API accepts its request.
+
+A suite run's creation and a bundle publication carry a request ID. A request that got no answer or a gateway error (`502`, `504`), or a `429` or `503` with a `Retry-After`, is sent again unchanged, and the API answers with what the first request made. No other request is retried, and the CLI never cancels runs it started. After Ctrl-C, use [`list`](#list), [`status`](#status) or [`suite status`](#suite-status) to find what is running, and [`cancel`](#cancel) or [`suite cancel`](#suite-cancel) to stop it.
+
+## run
+
+Run a scenario file's scenarios against an agent.
+
+**Usage:**
+
+```shell
+pipecat cloud eval run AGENT SCENARIO_FILE [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent" type="string" required>
+  Name of the deployed agent to run against.
+</ParamField>
+
+<ParamField path="scenario_file" type="path" required>
+  The scenario YAML file to run.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--scenario" type="string">
+  Name of a scenario in the file. Repeat to select several, in the order named.
+  Each name is selected once. In a suite run, a simulation runs its `runs:`
+  times unless `--repeat` replaces it. When omitted, runs every script and
+  simulation in file order, and leaves out entries with criteria alone, which
+  are for [`judge`](#judge). A file of criteria alone exits `3`.
+</ParamField>
+
+<ParamField path="--repeat" type="integer">
+  Suite runs only. Runs each selected scenario this many times, replacing a
+  simulation's `runs:`. Above 1, the suite run is a
+  [measurement](/pipecat-cloud/guides/evals#repeat-and-measurements), which
+  reports pass rates instead of a verdict.
+</ParamField>
+
+<ParamField path="--concurrency" type="integer">
+  Suite runs only. Runs at most this many at once. Defaults to 4, as in
+  Pipecat's manifests. The API sets the most.
+</ParamField>
+
+<ParamField path="--param" type="string">
+  A synthetic run's setting as `KEY=VALUE`, where the value is a number. Repeat
+  the option for several. The settings are `connectTimeoutSeconds`,
+  `botReadyTimeoutSeconds` and `defaultTimeoutMs`. A suite run takes no
+  settings, so with `--param` the scenarios run side by side.
+</ParamField>
+
+<ParamField path="--deadline" type="integer">
+  Seconds a suite run may take from its creation, all of it: from 90 to 43200,
+  and 43200 (12 hours) by default. For side-by-side runs, the seconds each run
+  may take. The API sets the bounds: see
+  [Limits](/pipecat-cloud/guides/evals#limits).
+</ParamField>
+
+<ParamField path="--root" type="path">
+  Directory the scenario's included files are read from, and may not leave.
+  Defaults to the scenario file's directory. The scenario file must be inside
+  it. A scenario that includes `../` files needs `--root` set to the directory
+  above, as in the [guide](/pipecat-cloud/guides/evals#included-files).
+</ParamField>
+
+<ParamField path="--wait / --no-wait" type="boolean" default="true">
+  Wait for the runs to end, then print their results and exit with the [exit
+  code](#exit-codes) of how they came out. With `--no-wait`, print what was
+  accepted and return.
+</ParamField>
+
+<ParamField path="--verbose / -v" type="boolean" default="false">
+  Explain every run with its conversation and the checks or judgments that
+  decided it, not only the runs that didn't pass. Has no effect on JSON output.
+</ParamField>
+
+```shell
+pipecat cloud eval run my-agent scenarios/greeting.yaml --scenario capital_question
+```
+
+**As a suite run.** Where the organization's capabilities list both `suites` and `bundles`, and you give no `--param`, the selected scenarios run as one [suite run](/pipecat-cloud/guides/evals#run-a-suite), under the service's limits. While it waits, the command shows one line of counts as the runs move: pending, live, passed, failed, skipped, and without a verdict. Afterwards it explains each run that failed or ended without a verdict, or shows a measurement's pass rates. `--json` prints the suite run. If the API refuses the scenarios or the suite run's plan, the command lists why and exits `3`.
+
+**Side by side.** Otherwise each selected scenario is a run of its own, and `--repeat` and `--concurrency` are refused with exit `3`. If the API answers that suite runs aren't available for the agent, the scenarios run side by side too, unless you gave `--repeat` or `--concurrency`, which exit `3`. Runs are submitted separately: an accepted run continues even if another request fails.
+
+### JSON Output
+
+For side-by-side runs and for `judge`, one selected scenario or session prints the acknowledged run as one object. For several, normal completion, `--no-wait` and Ctrl-C print a list in selection order. Acknowledged runs keep their API fields, including `id`; entries without an acknowledged run use these fields:
+
+| Field                          | Meaning                                                                                                                                                                               |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scenarioPath`, `scenarioName` | The selected scenario.                                                                                                                                                                |
+| `sessionId`                    | The session being judged, on a `judge` submission without an acknowledged run.                                                                                                        |
+| `submissionStatus`             | `error` for a returned creation failure; `unknown` for an interrupted creation request that may have reached the API; `not_submitted` for a scenario whose request was not attempted. |
+| `error`                        | Original error details, when present. Fields such as `error`, `code` or `reason` depend on the API response.                                                                          |
+
+These entries describe submission, not a server run's terminal `status`. An interruption during submission preserves known run IDs, marks the in-flight request `unknown` and leaves the remaining scenarios `not_submitted`. An interruption while waiting preserves the latest known runs and any submission failures. For a single-scenario creation interrupted before acknowledgment, stdout is an error object with code `CLI-INTERRUPTED`; a run may exist. Read stdout even when the command exits nonzero.
+
+An unacknowledged single-session `judge` submission returns one structured entry with `sessionId` and `submissionStatus`. A creation interrupted before acknowledgment is `unknown`; check the agent's eval list before submitting it again.
+
+### The Files a Run Sends
+
+A run sends the scenario file and every file it pulls in with `!include`, keyed by path relative to `--root`. Includes resolve relative to the file that names them, and nothing else in the directory is sent. Before any request, the CLI refuses a bundle that breaks one of these rules, and names the file:
+
+- The files total at most 256 KiB of UTF-8 text.
+- An include stays inside the root. Absolute paths and `..` that leave it are refused, and so is a symlink that points outside the root.
+- Hidden files and folders (any path part starting with `.`) are refused, and so are files named `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `id_rsa*`, `id_dsa*`, `id_ecdsa*` or `id_ed25519*`. A symlink to such a file is refused too.
+- Files must be UTF-8 text with no NUL characters.
+- Includes nest at most 8 deep and don't include themselves. One load of the scenario reads at most 200 files and 256 KiB, and an include counts each time it is named.
+
+The service also limits a load to 20,000 values, and refuses a scenario past that when the run is created. See [Limits](/pipecat-cloud/guides/evals#limits).
+
+## judge
+
+Judge finished sessions against one set of [criteria](/pipecat-cloud/guides/evals#session-criteria). Each session creates a separate eval run. Judging starts no agent session and calls no tools.
+
+**Usage:**
+
+```shell
+pipecat cloud eval judge AGENT SESSION_ID [SESSION_ID...] --criteria FILE [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent" type="string" required>
+  Name of the agent whose sessions to judge.
+</ParamField>
+
+<ParamField path="session_ids" type="list[UUID]" required>
+  One or more ended session IDs. Duplicate IDs are refused before submission.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--criteria" type="path" required>
+  YAML file with exactly one named `scenarios:` entry containing a nonempty
+  `success:` and optional judged `metrics:`. `persona:` and `goal:` are not
+  required. Scripted `turns:`, audio modalities and `measure:` metrics are
+  refused.
+</ParamField>
+
+<ParamField path="--deadline" type="integer">
+  Seconds each judgment may take from creation. The API sets the bounds: see
+  [Limits](/pipecat-cloud/guides/evals#limits).
+</ParamField>
+
+<ParamField path="--root" type="path">
+  Directory the criteria file and its includes may not leave. Defaults to the
+  criteria file's directory. The same [file rules](#the-files-a-run-sends) apply
+  as for `run`.
+</ParamField>
+
+<ParamField path="--wait / --no-wait" type="boolean" default="true">
+  Wait for judgments and exit with the [exit code](#exit-codes) of how they came
+  out. With `--no-wait`, print the accepted runs and return.
+</ParamField>
+
+<ParamField path="--verbose / -v" type="boolean" default="false">
+  Print each session's conversation and the judgments that decided its result.
+  Has no effect on JSON output.
+</ParamField>
+
+Judgments are submitted separately, and print [JSON output](#json-output) as side-by-side runs do: one object for a single session, or a list in input order for several. Accepted runs continue if another submission fails, and Ctrl-C leaves accepted runs going.
+
+## status
+
+Show a run. With `--wait`, wait for it to end.
+
+**Usage:**
+
+```shell
+pipecat cloud eval status RUN_ID --agent AGENT [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="run_id" type="string" required>
+  ID of the run.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--agent / -a" type="string" required>
+  Name of the agent the run is on.
+</ParamField>
+
+<ParamField path="--wait" type="boolean" default="false">
+  Wait for the run to end, then print the result and exit with the verdict's
+  code. See [exit codes](#exit-codes).
+</ParamField>
+
+<ParamField path="--verbose / -v" type="boolean" default="false">
+  Print the run's conversation and the checks or judgments that decided it after
+  it ends. Has no effect on JSON output.
+</ParamField>
+
+A finished run prints its verdict, reason, failures with their turns, and metrics.
+
+## list
+
+List an agent's eval runs, newest first.
+
+**Usage:**
+
+```shell
+pipecat cloud eval list AGENT [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent" type="string" required>
+  Name of the agent.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--suite" type="string">
+  ID of a suite run. Lists only that suite run's member runs.
+</ParamField>
+
+<ParamField path="--limit / -n" type="integer" default="10">
+  How many runs to show, from 1 to 200.
+</ParamField>
+
+<ParamField path="--offset" type="integer" default="0">
+  How many of the newest runs to skip. When more runs remain, the command prints
+  the `--offset` for the next page.
+</ParamField>
+
+## cancel
+
+Request cancellation of a run. The command succeeds when the request is recorded or the run is already cancelled; it may still be `starting` or `running`. No further cancel request is needed. You can optionally use [`status`](#status) to check the outcome. Stopping is best effort; the result reason describes any unconfirmed stop. Cancellation does not undo usage already incurred by an agent session. A run that finished another way is an error.
+
+**Usage:**
+
+```shell
+pipecat cloud eval cancel RUN_ID --agent AGENT [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="run_id" type="string" required>
+  ID of the run.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--agent / -a" type="string" required>
+  Name of the agent the run is on.
+</ParamField>
+
+## suite run
+
+Run a suite file from a stored [bundle](#bundle-push) against an agent.
+
+**Usage:**
+
+```shell
+pipecat cloud eval suite run AGENT --suite PATH (--bundle NAME[@N] | --revision ID) [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent" type="string" required>
+  Name of the deployed agent to run against.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--suite" type="string" required>
+  Path of the [suite file](/pipecat-cloud/guides/evals#the-suite-file) in the
+  bundle.
+</ParamField>
+
+<ParamField path="--bundle" type="string">
+  The bundle, as `NAME` for its latest revision or `NAME@N` for revision `N`.
+  One of `--bundle` and `--revision` is required.
+</ParamField>
+
+<ParamField path="--revision" type="string">
+  A revision by its ID, in place of `--bundle`.
+</ParamField>
+
+<ParamField path="--repeat" type="integer">
+  Runs every selected scenario this many times, replacing the suite's `repeat:`
+  and each simulation's `runs:`. Above 1, the suite run is a
+  [measurement](/pipecat-cloud/guides/evals#repeat-and-measurements).
+</ParamField>
+
+<ParamField path="--concurrency" type="integer">
+  Runs at most this many members at once, replacing the suite's `concurrency:`.
+  Without either, 4, as in Pipecat's manifests. The API sets the most.
+</ParamField>
+
+<ParamField path="--deadline" type="integer">
+  Seconds the whole suite run may take: from 90 to 43200, and 43200 (12 hours)
+  by default.
+</ParamField>
+
+<ParamField path="--wait / --no-wait" type="boolean" default="true">
+  Wait for the suite run to end, then print its results and exit with its [exit
+  code](#exit-codes). With `--no-wait`, print the accepted suite run and return.
+</ParamField>
+
+<ParamField path="--verbose / -v" type="boolean" default="false">
+  Explain every member with its conversation, not only those that didn't pass.
+  Has no effect on JSON output.
+</ParamField>
+
+```shell
+pipecat cloud eval suite run my-agent --bundle support-evals@3 --suite suite.yaml --repeat 10
+```
+
+While it waits, the command shows the same counts and explanations as [`run`](#run) does for a suite run.
+
+## suite status
+
+Show a suite run. With `--wait`, follow it to its end.
+
+**Usage:**
+
+```shell
+pipecat cloud eval suite status SUITE_RUN_ID [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="suite_run_id" type="string" required>
+  ID of the suite run.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--wait" type="boolean" default="false">
+  Follow the suite run to its end, then exit with its [exit code](#exit-codes).
+</ParamField>
+
+<ParamField path="--verbose / -v" type="boolean" default="false">
+  Explain every member with its conversation, not only those that didn't pass.
+  Has no effect on JSON output.
+</ParamField>
+
+The command shows the suite run's status, verdict, counts and settings, why it ended if it ended in error, and its [judging version](/pipecat-cloud/guides/evals#judging-versions), the API's `fingerprint`, on a line such as `Judging version  jfp1:…`. When its results were judged by more than one version, it warns: `Mixed judging versions: these results were judged by more than one version (a deploy changed how runs are judged mid-suite)`. A measurement's pass rates are then split by version. To list the members' runs, use [`list`](#list) with `--suite`.
+
+## suite list
+
+List suite runs, newest first: the organization's, or one agent's.
+
+**Usage:**
+
+```shell
+pipecat cloud eval suite list [AGENT] [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="agent" type="string">
+  Name of an agent, to list only its suite runs.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--limit / -n" type="integer" default="10">
+  How many suite runs to show, from 1 to 200.
+</ParamField>
+
+<ParamField path="--offset" type="integer" default="0">
+  How many of the newest suite runs to skip. When more remain, the command
+  prints the `--offset` for the next page.
+</ParamField>
+
+The table has a row for each suite run. `Done` counts its finished members of those planned, and a measurement shows `measurement` as its verdict:
+
+```text
+ID                                    Agent     Status     Verdict      Done  Passed  Failed  Created
+5f0e2c1a-8b7d-4e3a-9c6f-1d2b3a4e5f60  my-agent  completed  failed       2/2   1       1       2026-11-13 15:30:24
+9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d  my-agent  completed  measurement  2/2   0       2       2026-11-13 15:31:00
+Showing 1 to 2 of 17. For the next page use --offset 2.
+```
+
+## suite cancel
+
+Ask for a suite run to be cancelled. Members not yet started never run, and running ones are asked to stop, as [`cancel`](#cancel) asks a run. The command exits `0` once the cancellation is recorded, or if it already was. A suite run that already ended some other way prints how it ended, such as `Suite run 5f0e2c1a… already ended: completed, verdict passed.`, and exits `3`.
+
+**Usage:**
+
+```shell
+pipecat cloud eval suite cancel SUITE_RUN_ID [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="suite_run_id" type="string" required>
+  ID of the suite run.
+</ParamField>
+
+## bundle push
+
+Publish a directory as the next revision of a bundle, creating the bundle if it is new.
+
+**Usage:**
+
+```shell
+pipecat cloud eval bundle push NAME [DIR] [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="name" type="string" required>
+  The bundle's name: 1 to 128 lowercase letters, digits, dots, dashes or
+  underscores, starting and ending with a letter or a digit.
+</ParamField>
+
+<ParamField path="dir" type="path" default=".">
+  The directory to publish. Defaults to the current directory.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--yes / -y" type="boolean" default="false">
+  Publish without asking to confirm. Required off a terminal, and with `--json`.
+</ParamField>
+
+- **What's sent:** every `.yaml`, `.yml` and `.json` file under the directory, as UTF-8 text, up to 256 KiB in all.
+- **What's left out, and listed:** hidden files and folders, linked folders, folders that can't be read, files and folders named like credentials (such as `credentials.json`, `client_secret*.json`, `*secret*.yaml` or `kubeconfig*`), and files that hold a private key or a Kubernetes Secret. To publish a file left out for its name, rename it.
+- **What stops it:** more than 2,000 files to send, a path over 1,024 characters, a symlink that leaves the directory, a file that isn't UTF-8 or holds a NUL character, more than 256 KiB in all, or every file left out.
+- **Confirming:** the command shows the files and asks you to confirm before it sends them.
+- **Refused files:** when the API refuses the files, the command lists each problem and exits `3`. Nothing is stored.
+- **Ctrl-C** at the prompt or while publishing exits `130`. While publishing, the command says where to check whether a revision was published.
+- **Output:** the revision's number and what it holds. `--json` prints the revision.
+
+```shell
+pipecat cloud eval bundle push support-evals evals/
+```
+
+## bundle list
+
+List the organization's bundles, each with its latest revision.
+
+**Usage:**
+
+```shell
+pipecat cloud eval bundle list [OPTIONS]
+```
+
+**Options:**
+
+<ParamField path="--limit / -n" type="integer" default="10">
+  How many bundles to show, from 1 to 200.
+</ParamField>
+
+<ParamField path="--offset" type="integer" default="0">
+  How many bundles to skip.
+</ParamField>
+
+## bundle show
+
+Show a bundle's revision: its suites, scenario files, bodies and fragments, any keys a hosted run would ignore, and its files.
+
+**Usage:**
+
+```shell
+pipecat cloud eval bundle show NAME[@N] [OPTIONS]
+```
+
+**Arguments:**
+
+<ParamField path="name" type="string" required>
+  The bundle, as `NAME` for its latest revision or `NAME@N` for revision `N`.
+</ParamField>
+
+**Options:**
+
+<ParamField path="--files" type="boolean" default="false">
+  Also print the files' contents.
+</ParamField>
+
+`--json` prints the revision with its files.
