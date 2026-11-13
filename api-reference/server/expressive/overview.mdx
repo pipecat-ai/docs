@@ -32,6 +32,21 @@ For a walkthrough, see [Expressive Conversation](/pipecat/features/expressive-co
     The reader, which hears how the user sounded, and the tagger, which writes
     tags for the LLM
   </Card>
+  <Card
+    title="Pipecat Voice Reader"
+    icon="waveform-lines"
+    href="/api-reference/server/expressive/pipecat-voice"
+  >
+    The reader that hears how each user turn sounded
+  </Card>
+  <Card
+    title="Behavioral Signals"
+    icon="waveform-lines"
+    href="/api-reference/server/expressive/behavioral-signals"
+  >
+    A community perception producer that adds emotion and behavior sensing with
+    the Behavioral Signals API
+  </Card>
 </CardGroup>
 
 ```python
@@ -128,27 +143,51 @@ A breath is offered only with `ExpressionGuidance.BREATHE`.
 
 ## Perception
 
-A perception producer reads how the user spoke each turn and sets it as the transcription's `perception`. The LLM reads it at the head of the user's message, formatted by `format_perception()`.
+A perception producer reads how the user spoke each turn and sets it as the transcription's `perception`. A producer after another adds its reading to the one the transcription carries. The LLM reads it at the head of the user's message, formatted by `format_perception()`.
 
 ### PerceptionReader
 
-A perception producer that asks any [classifier](/api-reference/server/classifiers/overview) how the user spoke, and sets the answers as the transcription's `perception`, one signal per question. Goes between the STT service and the user aggregator. Every reading is also broadcast in a `PerceptionFrame` as soon as it's made. A transcription passes unread when its reading is late or the classifier fails. A classifier that can't be set up is reported as an error that leaves the reader unusable.
+A perception producer that asks classifiers how the user spoke, and adds the answers to the transcription's `perception`, one signal per question, after any signals the STT service read. Goes between the STT service and the user aggregator. Every classifier's reading is also broadcast in a `PerceptionFrame` as soon as it's made. A reader asks each of its `sources` about the same turn at once, and their signals go in the turn's one reading, in the sources' order. A signal both the transcription and the reader report keeps the higher of each label, as `merge_perception()` does. The reader declares the signals declared before it together with its own in a `PerceptionMetadataFrame`, so the latest declaration names every signal a transcription can carry. A transcription goes on once every source has read it or run out of time. A source that's late or whose classifier fails leaves only its own signals out, and a transcription none of them read passes unread. A classifier that can't be set up is reported as an error that leaves the reader unusable.
 
-A text classifier reads each final transcription, with the bot's previous reply. A classifier that can hear, as its `supports_audio` says, such as [`HumeAudioClassifier`](/api-reference/server/classifiers/hume-audio), hears the user's audio each time they stop speaking: their speech, plus the audio heard just before it when the speech is shorter than the classifier's `min_audio_secs`. Audio heard while the user is muted counts as silence. The transcriptions of that speech are held until the speech is read and pushed on together, with the reading, and only the last one is finalized. The STT's `ttfs_p99_latency` is raised by `timeout` so the user's turn waits for them. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
+A text classifier reads each final transcription, with the bot's previous reply. A classifier that can hear, as its `supports_audio` says, such as [`HumeAudioClassifier`](/api-reference/server/classifiers/hume-audio) or [`PipecatVoiceClassifier`](/api-reference/server/expressive/pipecat-voice#pipecatvoiceclassifier), hears the user's speech each time they stop: the latest, topped up with the end of what they said before it since the bot last spoke when that's shorter than the classifier's `preferred_audio_secs`. Speech from before a mute or before the bot stopped speaking is never joined to later speech, and audio heard while the user is muted isn't kept. A classifier hears one clip at a time, and of the clips that come while it's busy, only the newest. The transcriptions of that speech are held until the speech is read and pushed on together, with the reading, and only the last one is finalized. The STT's `ttfs_p99_latency` is raised by the longest source `timeout` so the user's turn waits for them. [`PipecatToneReader`](/api-reference/server/expressive/pipecat-tone#pipecattonereader) is a `PerceptionReader`.
 
 ```python
-from pipecat.expressive.processors.perception_reader import PerceptionQuestion, PerceptionReader
+from pipecat.expressive.processors.perception_reader import (
+    PerceptionQuestion,
+    PerceptionReader,
+    PerceptionSource,
+)
+from pipecat.expressive.processors.tone_reader import PipecatToneSource
 
-reader = PerceptionReader(
-    classifier=JevClassifier(api_key=os.getenv("TYPESAFE_API_KEY")),
+hume = PerceptionSource(
+    classifier=HumeAudioClassifier(api_key=os.getenv("HUME_API_KEY")),
     questions={
-        "frustration": PerceptionQuestion(
-            question=YesNoQuestion(instructions="Is the user frustrated?"),
-            description="The chance the user is frustrated, from 0 to 1.",
+        "hesitation": PerceptionQuestion(
+            question=YesNoQuestion(instructions="Does the speaker sound unsure?"),
+            description="The chance the user sounded unsure, from 0 to 1.",
         ),
     },
 )
+reader = PerceptionReader(sources=[PipecatToneSource(), hume])
 ```
+
+<ParamField path="sources" type="Sequence[PerceptionSource]" required>
+  The classifiers to ask, each with its questions and timeout. Raises
+  `ValueError` when there are no sources, when two sources report a signal of
+  the same name, or when two sources ask the same classifier.
+</ParamField>
+
+<ParamField path="replace_perception" type="bool" default="False">
+  Whether the reader's reading replaces the one a transcription carries, such as
+  the STT service's, instead of being added to it. A transcription the reader
+  doesn't read keeps the reading it carries.
+</ParamField>
+
+A `ChoiceQuestion` is reported as labels, a `YesNoQuestion` as its probability, and a `ScoreQuestion` as its position on the scale.
+
+### PerceptionSource
+
+One classifier a `PerceptionReader` asks, and the questions it's asked. A signal's name belongs to one source, and a classifier goes in one source, with all its questions. A classifier whose questions aren't known until it's set up, such as Pipecat Tone's, gets a subclass: [`PipecatToneSource`](/api-reference/server/expressive/pipecat-tone#pipecattonesource).
 
 <ParamField path="classifier" type="BaseClassifier" required>
   What answers the questions about each turn.
@@ -160,16 +199,14 @@ reader = PerceptionReader(
 </ParamField>
 
 <ParamField path="timeout" type="float | None" default="None">
-  Seconds a transcription waits for its reading. By default `0.5` for a text
-  classifier, counted from when the transcription arrives, and `2` for a
-  classifier that hears audio, counted from when the user stops speaking.
+  Seconds a transcription waits for the classifier's answers. By default `0.5`
+  for a text classifier, counted from when the transcription arrives, and `2`
+  for a classifier that hears audio, counted from when the user stops speaking.
 </ParamField>
-
-A `ChoiceQuestion` is reported as labels, a `YesNoQuestion` as its probability, and a `ScoreQuestion` as its position on the scale.
 
 ### PerceptionQuestion
 
-One signal a `PerceptionReader` reports.
+One signal a `PerceptionSource` reports.
 
 | Field         | Type                 | Description                                                                               |
 | ------------- | -------------------- | ----------------------------------------------------------------------------------------- |
@@ -202,6 +239,8 @@ One signal a perception producer reports, as it declares it at start.
 | Field     | Type                   | Description                          |
 | --------- | ---------------------- | ------------------------------------ |
 | `signals` | `list[PerceptionTerm]` | Each signal the producer can report. |
+
+`merge(other)` returns the signals of both, these first. A signal both report keeps every label either can report and the first non-empty description.
 
 ### format_perception
 
