@@ -1,0 +1,135 @@
+---
+title: "Turn Blend"
+description: "Local end-of-turn detection that blends Smart Turn v3.2 and turn-1-mini scores in one CPU-only ONNX model, with no API key"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="adhiraj4802"
+  maintainerUrl="https://github.com/adhiraj4802"
+  repo="https://github.com/adhiraj4802/pipecat-turn-blend"
+/>
+
+## Overview
+
+`TurnBlendAnalyzer` is a turn analyzer backed by `turn-blend.onnx`, a single 56 MB model file that contains
+Silero VAD v6.2, [Smart Turn v3.2](https://github.com/pipecat-ai/smart-turn), p99lab's
+[turn-1-mini](https://huggingface.co/p99lab/turn-1-mini) and a logistic blend of the two end-of-turn scores
+with the elapsed silence. It runs locally on the CPU, needs no API key or GPU, and decides from audio alone.
+
+On LiveKit's [eot-bench](https://github.com/livekit/eot-bench) (English, 400 turns, cross-validated) the blend
+makes fewer false cut-offs than either model inside it: 20.1% at a 300 ms latency budget, against 22.6% for
+turn-1-mini and 35.2% for Smart Turn v3.2. It is behind the best hosted models. The blend's weights were fitted
+on that same dataset, so expect a smaller gain on other audio; the
+[benchmark page](https://github.com/adhiraj4802/pipecat-turn-blend/blob/main/benchmark/README.md) has the full
+tables, the latency measurements and the limits.
+
+<Note>
+  English only, because turn-1-mini is English only. For other languages use
+  Pipecat's built-in Smart Turn.
+</Note>
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/adhiraj4802/pipecat-turn-blend"
+  >
+    Source code, example bot, and issues for the Turn Blend integration
+  </Card>
+  <Card
+    title="Benchmarks"
+    icon="chart-line"
+    href="https://github.com/adhiraj4802/pipecat-turn-blend/blob/main/benchmark/README.md"
+  >
+    eot-bench results and CPU latency measurements
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv pip install git+https://github.com/adhiraj4802/pipecat-turn-blend.git
+```
+
+## Prerequisites
+
+- **Pipecat 1.0 or later** (tested with `pipecat-ai` 1.16.0)
+- **16 kHz input audio**: set `PipelineParams(audio_in_sample_rate=16000)`
+- **2 or more CPU threads** for the model to keep up in real time
+
+No account, API key or environment variable is required. The model is downloaded from the repository's releases
+on first use, checked against its SHA-256 and cached in `~/.cache/turn-blend`.
+
+The plugin code and blend are Apache-2.0. The model file also contains the unmodified weights of Silero VAD
+(MIT), Smart Turn v3.2 (BSD 2-Clause) and turn-1-mini (Apache-2.0); all of those licences apply to it.
+
+## Usage
+
+```python
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat_turn_blend import TurnBlendAnalyzer
+
+turn = TurnBlendAnalyzer(
+    blend_threshold=0.85,                 # any model setting can be passed as a keyword
+    on_end_of_turn=lambda r: print(r),    # {"reason": "commit", "silence_ms": 384, "detect_ms": 416, ...}
+)
+
+aggregators = LLMContextAggregatorPair(context, user_params=LLMUserAggregatorParams(
+    vad_analyzer=SileroVADAnalyzer(),
+    user_turn_strategies=UserTurnStrategies(stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn)]),
+))
+
+worker = PipelineWorker(pipeline, params=PipelineParams(audio_in_sample_rate=16000))
+```
+
+Pipecat's VAD still opens the user turn and handles interruptions. The analyzer ends the turn when the blend
+commits, or when the silence timeout runs out.
+
+## Configuration
+
+<ParamField path="model_path" type="str" default="None">
+  Path to `turn-blend.onnx`. If omitted, the model is downloaded on first use.
+</ParamField>
+
+<ParamField path="threads" type="int" default="4">
+  CPU threads for the model.
+</ParamField>
+
+<ParamField path="on_end_of_turn" type="Callable" default="None">
+  Callback with the result of each ended turn: the reason (`commit` or
+  `timeout`), the silence waited, the detection delay and the three scores. The
+  same dict is kept in `last_result`.
+</ParamField>
+
+<ParamField path="blend_threshold" type="float" default="0.85">
+  The turn ends when the blended probability is above this.
+</ParamField>
+
+<ParamField path="blend_min_silence_ms" type="float" default="320">
+  Silence required before the blend may end the turn.
+</ParamField>
+
+<ParamField path="blend_confirm_scores" type="float" default="2">
+  Number of consecutive scores above the threshold required.
+</ParamField>
+
+<ParamField path="timeout_secs" type="float" default="3.0">
+  Silence that ends the turn even if the blend never commits.
+</ParamField>
+
+The model has 16 settings in all, including its VAD thresholds and the blend weights. Each can be passed as a
+keyword argument, changed later with `turn.detector.configure(...)`, or read from a JSON file and
+`TURN_BLEND_<SETTING>` environment variables with `load_settings()`. The
+[README](https://github.com/adhiraj4802/pipecat-turn-blend#settings) lists them.
+
+## Compatibility
+
+Last tested with Pipecat v1.16.0.
