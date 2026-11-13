@@ -13849,6 +13849,8 @@ The judge handles interim replies gracefully: if the agent says "Let me check on
 
 A `no` on a complete reply fails the turn with the kind `judge_no` (a `no` on a reply still arriving is judged again as more comes), and its reason is the [explainer's](/pipecat/evals/scenario-configuration#reasons-from-the-explainer) followed by the classifier's probabilities.
 
+A judge call that fails twice, such as a provider out of credits, fails the turn with the kind `judge_no_verdict` instead, so it doesn't read as the bot getting it wrong. The reason carries the provider's own error text, with credentials masked.
+
 `eval:` only makes sense on the agent's text output (`response`, `llm_response`, `tts_response`) and on the `expression` its TTS performed.
 
 ### Substring checks with `text_contains:`
@@ -13938,6 +13940,8 @@ Because every deadline is measured from the send, time spent matching earlier ex
 If the bot ends the call before an expectation is met, for example because its LLM rejected the API key, the turn doesn't wait out the budget. It fails at once with the kind `bot_ended`, after anything the bot said last has been transcribed.
 
 If one of the harness's own services fails during the run, such as the TTS that voices the user or the STT that transcribes the bot, the turn fails at once with the kind `error` and the service's error as the reason, rather than blaming the bot with a `timeout` or a missing function call.
+
+A harness service that fails after the last turn, such as the caller's voice on a turn that expects nothing, fails the run as `error` rather than letting it pass.
 
 ### Function calls
 
@@ -15229,7 +15233,7 @@ scored = [t for t in result.turns if t.status != "not_run"]
 print(f"{sum(1 for t in scored if t.status == 'passed')}/{len(scored)} turns")
 ```
 
-`failures` carry a `kind` alongside the reason (`timeout`, `judge_no`, `text_mismatch`, `missing_function_call`, `connect_failed` for a refused connection, `closed_before_ready` for a bot that closes the connection before `bot-ready`, `bot_ended` for a bot that ends the call before a turn's expectation is met, `error` for a failure in one of the harness's own services, and so on), which is the stable key to group by when scoring a sweep rather than reading one run.
+`failures` carry a `kind` alongside the reason (`timeout`, `judge_no`, `judge_no_verdict` for a judge call that failed, `text_mismatch`, `missing_function_call`, `connect_failed` for a refused connection, `closed_before_ready` for a bot that closes the connection before `bot-ready`, `bot_ended` for a bot that ends the call before a turn's expectation is met, `error` for a failure in one of the harness's own services, and so on), which is the stable key to group by when scoring a sweep rather than reading one run.
 
 This maps cleanly onto a pytest test:
 
@@ -97304,10 +97308,11 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 Realtime (speech-to-speech) LLM services (OpenAI Realtime, Azure Realtime, Grok/xAI Realtime, Inworld, Gemini Live, AWS Nova Sonic, and Ultravox) consume user audio directly and manage their own conversation flow. `LLMContextAggregatorPair` switches to realtime mode on its own when one of these services starts, so it needs no configuration. Its `realtime_service_mode` argument overrides that: `False` keeps the cascade behavior, and `True` turns realtime mode on for a third-party realtime service that doesn't announce itself.
 
-Realtime mode adapts the pair's behavior in two ways:
+Realtime mode adapts the pair's behavior in three ways:
 
 1. **Context writes are decoupled from `UserStoppedSpeakingFrame`.** Instead, the assistant response start triggers the user message write. This keeps the context correct even when the realtime service provides no turn frames and local turn detection (VAD) is disabled.
 2. **`UserStoppedSpeakingFrame` can fire without waiting for transcripts.** When local turn detection drives the conversation, this frame triggers the assistant response — letting it fire earlier reduces latency. The pair flips `wait_for_transcript=False` on the [stop strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#stop-strategies) that support it.
+3. **Appended messages go straight to the realtime service.** An `LLMMessagesAppendFrame` queued ahead of the user aggregator, such as an RTVI `send-text` message, passes through it to the realtime service. Services that support it take the messages into their session as the frame passes, so the model has them straight away. The assistant aggregator then adds them to the context and decides when the model answers them, waiting for the bot and the user to stop talking.
 
 Separately from realtime mode, services that propose turn boundaries from server-side VAD (OpenAI Realtime, Azure Realtime, Grok, Inworld) replace the default turn strategies with `ExternalUserTurnStrategies`, which resolve those proposals into `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and drive `on_user_turn_started` / `on_user_turn_stopped`. Services that propose nothing, either because they never do (Gemini Live, Nova Sonic, Ultravox) or because server-side turn detection was disabled at runtime (e.g. OpenAI Realtime with `turn_detection=False`), keep the defaults so locally-driven turn detection (e.g. local VAD) can fire the events. Passing custom `user_turn_strategies` opts out of this swap, unless `UserTurnStrategiesParams` extends a list.
 
