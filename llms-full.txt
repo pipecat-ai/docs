@@ -31663,7 +31663,7 @@ The check classifies every file:
 - A `.yaml` or `.yml` mapping with a `name:` is a scenario file. Each of its scenarios is a `script` (it has `turns:`), a `simulation` (it has `persona:`), or a `rubric` (only `success:` and judged metrics, for session runs).
 - Any other file must be included by a scenario file. A file that nothing uses is refused.
 
-A refused bundle stores nothing: the `400` lists each problem with its `file`, the `field` within it, a `code` and a `message`. A stored revision's `catalog` lists what its files hold, and its `coverage` says how far the check went. With `structural` coverage, a scenario that Pipecat's loader would refuse can still be stored, and is refused when a run uses it.
+A refused bundle stores nothing: the `400` lists the first 50 problems in `problems`, each with its `file`, the `scenario` and `field` within it where it has them, a `code` and a `message`, and `total` counts them all. A stored revision's `catalog` lists what its files hold, and its `coverage` says how far the check went. With `structural` coverage, a scenario that Pipecat's loader would refuse can still be stored, and is refused when a run uses it.
 
 [Get an eval bundle revision](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-bundle-revision-get) reads a revision's files back. [Deleting a bundle](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-bundle-delete) takes it off the list and frees its name. No new run can name its revisions, but the revisions that runs already name stay readable.
 
@@ -31762,17 +31762,17 @@ curl -X POST "https://api.pipecat.daily.co/v1/organizations/$ORG/services/my-age
 | `repeat`, `concurrency`       | Replace the suite file's `repeat:` and `concurrency:`.                                                                                                                                                       |
 | `deadlineSeconds`             | From 90 to 43200 (12 hours). 43200 by default.                                                                                                                                                               |
 
-The API answers `202` with the suite run, its `entries` and `counts.planned`, and a `Location` header. Nothing is recorded unless the answer is `202`, and a retry with the same `requestId` answers with the suite run the first request made. A plan that can't be made is refused with `400` and a `refusal` that names why, such as an unknown suite file or a scenario named twice. While the agent is between deployments, a new suite run is refused with `409` (`EVAL-AGENT-BETWEEN-DEPLOYMENTS`): retry once the deployment has completed.
+The API answers `202` with the suite run, its `entries` and `counts.planned`, and a `Location` header. Its `target` says what it runs: `{"kind": "suite", "suitePath": ...}` for a suite file, or `{"kind": "scenarios", "scenarioPath": ..., "scenarioNames": [...]}` for a scenario file, such as the one `eval run` sends, with `scenarioNames` only when the request listed them. Nothing is recorded unless the answer is `202`, and a retry with the same `requestId` answers with the suite run the first request made. A plan that can't be made is refused with `400` and a `refusal` that names why, such as an unknown suite file or a scenario named twice. While the agent is between deployments, a new suite run is refused with `409` (`EVAL-AGENT-BETWEEN-DEPLOYMENTS`): retry once the deployment has completed.
 
 ### Repeat and Measurements
 
-Without `repeat`, every scenario runs once, except a simulation, which runs its own `runs:`, and every run counts toward the verdict. With `repeat`, from the request or the suite file, every selected scenario runs that many times instead. Members run attempt by attempt: every scenario's first attempt in entry order, then every second, and so on.
+Without `repeat`, every scenario runs once, except a simulation, which runs its own `runs:`, and every run counts toward the verdict. With `repeat`, from the request or the suite file, every selected scenario runs that many times instead, replacing a simulation's `runs:`. Members run attempt by attempt: every scenario's first attempt in entry order, then every second, and so on.
 
 Above 1, the suite run is a **measurement** (`measurement: true`). It has no verdict, and reports a pass rate for each entry and scenario in `passRates`: `passed / (passed + failed + skipped)`, or null until one of its members has passed, failed or been skipped. Members that ended without a verdict are counted apart, in `withoutVerdict`, and never in a rate. Pass rates are only on [Get an eval suite run](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-suite-run-get); lists show `passRates: null`. The threshold is yours to choose.
 
 ### Concurrency and Deadlines
 
-`concurrency` caps how many members run at once: the request's, otherwise the suite file's, otherwise a default. An entry's own `concurrency:` caps that entry. The suite run's `concurrency.effective` shows what applies. Members also wait for room on the agent, up to its [maximum agents](/pipecat-cloud/fundamentals/scaling#maximum-agents) less its other sessions, and suite runs on one agent share that room fairly.
+`concurrency` caps how many members run at once: the request's, otherwise the suite file's, otherwise 4, as in Pipecat's manifests. The API sets the most. An entry's own `concurrency:` caps that entry. The suite run's `concurrency.effective` shows what applies. Members also wait for room on the agent, up to its [maximum agents](/pipecat-cloud/fundamentals/scaling#maximum-agents) less its other sessions, and suite runs on one agent share that room fairly.
 
 A suite run's deadline covers all of it, queueing and every member, from when it is accepted: 12 hours, unless `deadlineSeconds` sets it shorter. Each member also has a single run's own deadline, cut short to the suite run's.
 
@@ -118107,21 +118107,22 @@ pipecat cloud eval run AGENT SCENARIO_FILE [OPTIONS]
 
 <ParamField path="--scenario" type="string">
   Name of a scenario in the file. Repeat to select several, in the order named.
-  Each name runs once. When omitted, runs every script and simulation in file
-  order, and leaves out entries with criteria alone, which are for
-  [`judge`](#judge). A file of criteria alone exits `3`.
+  Each name is selected once. In a suite run, a simulation runs its `runs:`
+  times unless `--repeat` replaces it. When omitted, runs every script and
+  simulation in file order, and leaves out entries with criteria alone, which
+  are for [`judge`](#judge). A file of criteria alone exits `3`.
 </ParamField>
 
 <ParamField path="--repeat" type="integer">
-  Suite runs only. Runs each selected scenario this many times. Above 1, the
-  suite run is a
+  Suite runs only. Runs each selected scenario this many times, replacing a
+  simulation's `runs:`. Above 1, the suite run is a
   [measurement](/pipecat-cloud/guides/evals#repeat-and-measurements), which
   reports pass rates instead of a verdict.
 </ParamField>
 
 <ParamField path="--concurrency" type="integer">
-  Suite runs only. Runs at most this many scenarios at once. Defaults to the
-  service's own limit.
+  Suite runs only. Runs at most this many at once. Defaults to 4, as in
+  Pipecat's manifests. The API sets the most.
 </ParamField>
 
 <ParamField path="--param" type="string">
@@ -118187,7 +118188,9 @@ A run sends the scenario file and every file it pulls in with `!include`, keyed 
 - An include stays inside the root. Absolute paths and `..` that leave it are refused, and so is a symlink that points outside the root.
 - Hidden files and folders (any path part starting with `.`) are refused, and so are files named `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `id_rsa*`, `id_dsa*`, `id_ecdsa*` or `id_ed25519*`. A symlink to such a file is refused too.
 - Files must be UTF-8 text with no NUL characters.
-- Includes nest at most 8 deep and don't include themselves. One load of the scenario reads at most 200 files, 256 KiB and 20,000 values, and an include counts each time it is named.
+- Includes nest at most 8 deep and don't include themselves. One load of the scenario reads at most 200 files and 256 KiB, and an include counts each time it is named.
+
+The service also limits a load to 20,000 values, and refuses a scenario past that when the run is created. See [Limits](/pipecat-cloud/guides/evals#limits).
 
 ## judge
 
@@ -118361,13 +118364,14 @@ pipecat cloud eval suite run AGENT --suite PATH (--bundle NAME[@N] | --revision 
 </ParamField>
 
 <ParamField path="--repeat" type="integer">
-  Runs every selected scenario this many times, replacing the suite's `repeat:`.
-  Above 1, the suite run is a
+  Runs every selected scenario this many times, replacing the suite's `repeat:`
+  and each simulation's `runs:`. Above 1, the suite run is a
   [measurement](/pipecat-cloud/guides/evals#repeat-and-measurements).
 </ParamField>
 
 <ParamField path="--concurrency" type="integer">
   Runs at most this many members at once, replacing the suite's `concurrency:`.
+  Without either, 4, as in Pipecat's manifests. The API sets the most.
 </ParamField>
 
 <ParamField path="--deadline" type="integer">
@@ -118501,7 +118505,7 @@ pipecat cloud eval bundle push NAME [DIR] [OPTIONS]
 
 - **What's sent:** every `.yaml`, `.yml` and `.json` file under the directory, as UTF-8 text, up to 256 KiB in all.
 - **What's left out, and listed:** hidden files and folders, linked folders, folders that can't be read, files and folders named like credentials (such as `credentials.json`, `client_secret*.json`, `*secret*.yaml` or `kubeconfig*`), and files that hold a private key or a Kubernetes Secret. To publish a file left out for its name, rename it.
-- **What stops it:** a symlink that leaves the directory, or a file that isn't UTF-8.
+- **What stops it:** more than 2,000 files to send, a path over 1,024 characters, a symlink that leaves the directory, a file that isn't UTF-8 or holds a NUL character, more than 256 KiB in all, or every file left out.
 - **Confirming:** the command shows the files and asks you to confirm before it sends them.
 - **Refused files:** when the API refuses the files, the command lists each problem and exits `3`. Nothing is stored.
 - **Ctrl-C** at the prompt or while publishing exits `130`. While publishing, the command says where to check whether a revision was published.
