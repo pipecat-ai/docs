@@ -14284,7 +14284,7 @@ judge:
     model: small-streaming
 
 metrics:
-  - measure: latency # from the persona stopping to the agent's first spoken sentence
+  - measure: latency # from the persona stopping to the agent starting to speak
     max_value: 5
 ```
 
@@ -14358,15 +14358,15 @@ metrics:
 
 The built-in measures:
 
-| Measure          | What it measures                                                                                                                                                                                                  | Unit    |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `turns`          | The persona's turns in the conversation. A reply that only calls `end_call` is not a turn.                                                                                                                        | count   |
-| `duration`       | The conversation's length, from its first line to the hang-up.                                                                                                                                                    | seconds |
-| `words`          | The longest agent reply. Bounds every reply.                                                                                                                                                                      | words   |
-| `latency`        | The slowest agent reply. In text mode, from the persona's send to the reply's first LLM token; in audio mode, from the agent noticing the persona stop speaking to its first spoken sentence. Bounds every reply. | seconds |
-| `function_calls` | The function calls the agent made, checked against a `calls:` list instead of a range. See [below](#checking-tool-calls-with-function_calls).                                                                     | calls   |
+| Measure          | What it measures                                                                                                                                                                                                                                                                                  | Unit    |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `turns`          | The persona's turns in the conversation. A reply that only calls `end_call` is not a turn.                                                                                                                                                                                                        | count   |
+| `duration`       | The conversation's length, from its first line to the hang-up.                                                                                                                                                                                                                                    | seconds |
+| `words`          | The longest agent reply. Bounds every reply.                                                                                                                                                                                                                                                      | words   |
+| `latency`        | The slowest agent reply, in seconds. It starts at the persona's send for a text caller, or when the agent notices the persona stop speaking for a spoken one, and ends at the reply's first LLM token for a text judge, or when the agent starts speaking for an audio judge. Bounds every reply. | seconds |
+| `function_calls` | The function calls the agent made, checked against a `calls:` list instead of a range. See [below](#checking-tool-calls-with-function_calls).                                                                                                                                                     | calls   |
 
-The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode there is no speech, so `latency` times the agent's own work before it starts answering: any tool call, then the LLM's first token. It is a budget on the LLM, not on what a caller would hear. Only in audio mode does it measure what a caller experiences. The two are not comparable, so a failed `latency` metric says what it timed, "to the first token" or "from the persona stopping to the first spoken sentence". A measure outside its range fails with the `failure_kind` `out_of_range`; a `function_calls` list that did not match, with `function_calls`; a bounded measure with no value, such as `words` or `latency` when the agent never replied, with `error`.
+The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode there is no speech, so `latency` times the agent's own work before it starts answering: any tool call, then the LLM's first token. It is a budget on the LLM, not on what a caller would hear. Only in audio mode does it measure what a caller experiences. The two are not comparable, so a failed `latency` metric says what it timed, "to the first token" or "to the agent starting to speak". A reply that opens with a function call is timed to its first text token. A turn still unanswered when the run ends by silence or its time limit counts with its wait up to the end. For a spoken persona, `latency` leaves out the agent's end-of-turn wait, so it is not voice-to-voice latency. A measure outside its range fails with the `failure_kind` `out_of_range`; a `function_calls` list that did not match, with `function_calls`; a bounded measure with no value, such as `words` or `latency` when the agent never replied, with `error`.
 
 There is deliberately no interruptions measure. The persona causes interruptions; the agent cannot.
 
@@ -97304,10 +97304,11 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 Realtime (speech-to-speech) LLM services (OpenAI Realtime, Azure Realtime, Grok/xAI Realtime, Inworld, Gemini Live, AWS Nova Sonic, and Ultravox) consume user audio directly and manage their own conversation flow. `LLMContextAggregatorPair` switches to realtime mode on its own when one of these services starts, so it needs no configuration. Its `realtime_service_mode` argument overrides that: `False` keeps the cascade behavior, and `True` turns realtime mode on for a third-party realtime service that doesn't announce itself.
 
-Realtime mode adapts the pair's behavior in two ways:
+Realtime mode adapts the pair's behavior in three ways:
 
 1. **Context writes are decoupled from `UserStoppedSpeakingFrame`.** Instead, the assistant response start triggers the user message write. This keeps the context correct even when the realtime service provides no turn frames and local turn detection (VAD) is disabled.
 2. **`UserStoppedSpeakingFrame` can fire without waiting for transcripts.** When local turn detection drives the conversation, this frame triggers the assistant response — letting it fire earlier reduces latency. The pair flips `wait_for_transcript=False` on the [stop strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#stop-strategies) that support it.
+3. **Appended messages go straight to the realtime service.** An `LLMMessagesAppendFrame` queued ahead of the user aggregator, such as an RTVI `send-text` message, passes through it to the realtime service. Services that support it take the messages into their session as the frame passes, so the model has them straight away. The assistant aggregator then adds them to the context and decides when the model answers them, waiting for the bot and the user to stop talking.
 
 Separately from realtime mode, services that propose turn boundaries from server-side VAD (OpenAI Realtime, Azure Realtime, Grok, Inworld) replace the default turn strategies with `ExternalUserTurnStrategies`, which resolve those proposals into `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and drive `on_user_turn_started` / `on_user_turn_stopped`. Services that propose nothing, either because they never do (Gemini Live, Nova Sonic, Ultravox) or because server-side turn detection was disabled at runtime (e.g. OpenAI Realtime with `turn_detection=False`), keep the defaults so locally-driven turn detection (e.g. local VAD) can fire the events. Passing custom `user_turn_strategies` opts out of this swap, unless `UserTurnStrategiesParams` extends a list.
 
