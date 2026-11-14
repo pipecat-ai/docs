@@ -38321,6 +38321,7 @@ Transports exchange audio and video streams between the user and bot.
 | [LemonSlice](/api-reference/server/services/transport/lemonslice)               | `uv add "pipecat-ai[lemonslice]"`             | Pipecat    |
 | [LiveKit](/api-reference/server/services/transport/livekit)                     | `uv add "pipecat-ai[livekit]"`                | Pipecat    |
 | [MCP](/api-reference/server/services/transport/mcp)                             | `uv add pipecat-mcp-transport`                | Community  |
+| [SIP](/api-reference/server/services/transport/sip)                             | `uv add "pipecat-ai[sip]"`                    | Pipecat    |
 | [SmallWebRTC](/api-reference/server/services/transport/small-webrtc)            | `uv add "pipecat-ai[webrtc]"`                 | Pipecat    |
 | [Tavus](/api-reference/server/services/transport/tavus)                         | `uv add "pipecat-ai[tavus]"`                  | Pipecat    |
 | [Vonage Video Connector](/api-reference/server/services/transport/vonage)       | `uv add "pipecat-ai[vonage-video-connector]"` | Pipecat    |
@@ -41226,6 +41227,393 @@ The `/start` response carries a `moq` block — `relayUrl`, `certHash`, `serve`,
 - **RTVI over MoQ**: the `transcript_track` is a lossless, ordered JSON stream carrying RTVI messages in both directions, so MoQ is a full RTVI transport on par with Daily or WebSocket rather than an audio-only path.
 - **Audio**: a single Opus track each way. The library resamples to the nearest Opus-supported rate before encoding, so `audio_out_sample_rate` doesn't have to be one of them.
 - **Latency**: `audio_in_max_latency_ms` trades interactivity against resilience — lower waits less for a late frame, at the cost of more drops on a poor network.
+
+# SIP Transport
+Source: https://docs.pipecat.ai/api-reference/server/services/transport/sip.md
+
+Native SIP calling with SIPTransport, SIPConnection, and SIPParams: dial-in, dial-out, DTMF, transfers, and video.
+
+## Overview
+
+`SIPTransport` makes a pipeline a SIP endpoint. The bot registers a SIP account (or dials through a registration-less trunk), answers inbound calls, places outbound calls, and exchanges audio, video, and DTMF with the pipeline. Its events and call-control methods use the same names as the dial-in and dial-out surface of [`DailyTransport`](/api-reference/server/services/transport/daily), so a bot can switch between the two by changing the constructor and params.
+
+Each `SIPTransport` handles one call. Create several instances, each with its own `SIPConnection`, to hold several conversations on one account.
+
+<CardGroup cols={2}>
+  <Card
+    title="baresip-python"
+    icon="book"
+    href="https://pypi.org/project/baresip-python/"
+  >
+    The SIP stack the transport is built on
+  </Card>
+  <Card
+    title="Development Runner"
+    icon="play"
+    href="/api-reference/server/utilities/runner/guide#sip-transport-sip"
+  >
+    Run a SIP bot locally with `-t sip`
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[sip]"
+```
+
+## Prerequisites
+
+A SIP account to register with, or a Daily domain to provision one on. With the [development runner](/api-reference/server/utilities/runner/guide#sip-transport-sip), a bot with no configured account gets a temporary Daily SIP client (`DAILY_API_KEY`). See [`DailyRESTHelper`](/api-reference/server/utilities/daily/rest-helper) to create SIP clients yourself.
+
+## Configuration
+
+```python
+from pipecat.transports.sip.connection import SIPConnection
+from pipecat.transports.sip.transport import SIPParams, SIPTransport
+```
+
+### SIPTransport
+
+<ParamField path="connection" type="SIPConnection" required>
+  The SIP account and stack settings the call runs over. A connection belongs to
+  one transport instance.
+</ParamField>
+
+<ParamField path="params" type="SIPParams | None" default="None">
+  Transport configuration. Defaults to `SIPParams()`.
+</ParamField>
+
+<ParamField path="input_name" type="str | None" default="None">
+  Optional name for the input processor.
+</ParamField>
+
+<ParamField path="output_name" type="str | None" default="None">
+  Optional name for the output processor.
+</ParamField>
+
+### SIPParams
+
+`SIPParams` extends `TransportParams`; the fields below are the ones it adds or overrides.
+
+| Parameter               | Type          | Default | Description                                                                                                                                                                                 |
+| ----------------------- | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto_answer`           | `bool`        | `True`  | Answer inbound calls as they arrive, accepting video when a video direction is enabled. When `False`, the call keeps ringing until you call `connection.answer()` or `connection.reject()`. |
+| `trunk`                 | `str \| None` | `None`  | Domain (or `host:port`) that turns a `phoneNumber` dial-out into `sip:+E164@trunk`. Without it, dial-out requires a full `sipUri`.                                                          |
+| `audio_out_10ms_chunks` | `int`         | `2`     | Number of 10 ms chunks per outbound audio buffer. The default sends 20 ms buffers, matching typical RTP packet time.                                                                        |
+
+### SIPConnection
+
+All parameters are keyword-only. Parameters marked runtime-wide are shared by every `SIPConnection` in the process, and a connection that disagrees with the running settings raises `ValueError`. Connections that share a `user` and `domain` must agree on `transport`, `registrar`, `password`, `auth_user`, `audio_codecs`, `dtmf_mode`, and `extra_params`.
+
+<ParamField path="user" type="str" required>
+  The user part of `sip:user@domain`.
+</ParamField>
+
+<ParamField path="domain" type="str" required>
+  Registration domain. May carry a port.
+</ParamField>
+
+<ParamField path="password" type="str" default='""'>
+  Authentication password. May be empty.
+</ParamField>
+
+<ParamField path="auth_user" type="str | None" default="None">
+  Digest username, when the credential store keys it differently from `user`
+  (credential-list trunks).
+</ParamField>
+
+<ParamField path="transport" type="str" default='"udp"'>
+  SIP transport: `"udp"`, `"tcp"`, or `"tls"`.
+</ParamField>
+
+<ParamField path="registrar" type="str | None" default="None">
+  Outbound proxy to register through, when it is not the domain itself.
+</ParamField>
+
+<ParamField path="reg_interval" type="int" default="600">
+  Seconds between registration refreshes. `0` disables registration (trunk
+  mode): the connection never sends REGISTER and dials targets directly. Without
+  a registration, a SIP server cannot route inbound calls to the bot, so dial-in
+  works only when the peer reaches the bot's listening socket directly, and
+  `on_dialin_ready` never fires.
+</ParamField>
+
+<ParamField path="audio_codecs" type="tuple | None" default="None">
+  Codec preference order by stack name, for example `("opus/48000/2",
+  "PCMU/8000/1")`. `None` uses the stack default.
+</ParamField>
+
+<ParamField path="dtmf_mode" type="str" default='"rtpevent"'>
+  How DTMF is sent: `"rtpevent"`, `"info"`, or `"auto"`.
+</ParamField>
+
+<ParamField path="extra_params" type="tuple | None" default="None">
+  Raw baresip account parameters, each a `"key=value"` string appended verbatim
+  to the SIP address-of-record, for account directives Pipecat does not model.
+  For media-NAT traversal, `("medianat=stun", "stunserver=stun:HOST:PORT")`
+  advertises the address a STUN server reports, which reaches the bot through an
+  endpoint-independent NAT. Behind a symmetric NAT (such as an AWS NAT Gateway)
+  that address is unreachable: the call needs a peer that latches onto the bot's
+  RTP source address, or `medianat=turn` with a TURN server.
+</ParamField>
+
+<ParamField path="jitter_buffer_mode" type="str | None" default="None">
+  Receive jitter buffer: `"off"`, `"fixed"`, or `"adaptive"`. With no mode and
+  no `jitter_buffer_ms`, the buffer is fixed at 40-60 ms. The buffer holds media
+  before the transport reads it, so its size adds to turn latency. A fixed
+  buffer costs its minimum on every packet; an adaptive buffer widens under
+  jitter and does not narrow again for the rest of the call. A packet arriving
+  later than the minimum plus one packet time is discarded. Runtime-wide.
+</ParamField>
+
+<ParamField path="jitter_buffer_ms" type="tuple | None" default="None">
+  `(min, max)` in milliseconds for a fixed or adaptive buffer. Given alone, it
+  selects `"fixed"`. Not accepted with `"off"`. Runtime-wide.
+</ParamField>
+
+<ParamField path="net_interface" type="str | None" default="None">
+  Restrict the stack to one local interface, by name or address, for example
+  `"127.0.0.1"` for a registrar on loopback or one address of a multi-homed
+  host. `None` lets the OS pick the source address per destination.
+  Runtime-wide.
+</ParamField>
+
+<ParamField path="expose_headers" type="tuple" default="()">
+  SIP header names whose values are included in call events. Runtime-wide.
+</ParamField>
+
+<ParamField path="max_concurrent_calls" type="int | None" default="2">
+  Simultaneous-call cap for the process; further inbound INVITEs are refused
+  with 486. `None` means unlimited. Runtime-wide.
+</ParamField>
+
+<ParamField path="rtp_timeout" type="int" default="0">
+  Seconds without received RTP after which a call is closed with reason `"rtp
+  stream error"`. Held and send-only streams are not checked. `0` disables
+  detection. Runtime-wide.
+</ParamField>
+
+<ParamField path="instance_id" type="str | None" default="None">
+  A canonical lowercase UUID identifying this endpoint across restarts (RFC 5626
+  `+sip.instance`), so a supporting registrar replaces a restarted bot's stale
+  registration. `None` sends no instance parameter. Runtime-wide.
+</ParamField>
+
+<ParamField path="video_size" type="tuple" default="(640, 480)">
+  Video width and height for both directions. Runtime-wide.
+</ParamField>
+
+<ParamField path="video_fps" type="float" default="30.0">
+  Transmit frame rate. Runtime-wide.
+</ParamField>
+
+<ParamField path="video_bitrate" type="int" default="1000000">
+  VP8 encoder target in bits per second. Runtime-wide.
+</ParamField>
+
+<ParamField path="native_log_level" type="str" default='"warning"'>
+  Lowest severity captured from the native SIP stack's logging: `"debug"`,
+  `"info"`, `"warning"`, or `"error"`. Records appear in Pipecat's log output.
+  Runtime-wide.
+</ParamField>
+
+<ParamField path="sip_trace" type="bool" default="False">
+  Log every SIP message sent and received, verbatim. The trace contains call
+  metadata and digest authentication material, so leave it off in production.
+  Runtime-wide.
+</ParamField>
+
+<ParamField path="route_inbound" type="bool" default="True">
+  Whether inbound calls on the account are routed to this connection. Set it to
+  `False` for a connection that only places calls.
+</ParamField>
+
+## Usage
+
+### Dial-in
+
+```python
+connection = SIPConnection(user="1001", domain="sip.example.com", password="...")
+transport = SIPTransport(
+    connection,
+    SIPParams(audio_in_enabled=True, audio_out_enabled=True),
+)
+
+@transport.event_handler("on_dialin_ready")
+async def on_dialin_ready(transport, aor):
+    print(f"Registered as {aor}")
+
+@transport.event_handler("on_client_connected")
+async def on_client_connected(transport, participant):
+    ...
+```
+
+### Dial-out
+
+```python
+@transport.event_handler("on_connected")
+async def on_connected(transport, data=None):
+    session_id, error = await transport.start_dialout({"sipUri": "sip:1002@sip.example.com"})
+    if error:
+        print(error)
+```
+
+### Creating the transport with the runner
+
+Under the development runner, or on Pipecat Cloud, `create_transport()` builds the connection from the runner arguments, so the bot code is the same everywhere:
+
+```python
+from pipecat.runner.utils import create_transport
+
+transport_params = {
+    "sip": lambda: SIPParams(audio_in_enabled=True, audio_out_enabled=True),
+}
+
+async def bot(runner_args):
+    transport = await create_transport(runner_args, transport_params)
+```
+
+### Video
+
+Calls made or answered with a video direction enabled carry VP8 video. Video crosses the pipeline as RGB `InputImageRawFrame` and `OutputImageRawFrame`. With `video_out_enabled`, the transport sets the call's video size and frame rate from `video_out_width`, `video_out_height`, and `video_out_framerate`. A peer that declines video leaves a working audio call.
+
+## Methods
+
+All call-control methods return an error description as a `str`, or `None` on success. They do not raise.
+
+### start_dialout
+
+```python
+await transport.start_dialout(settings=None) -> tuple[str, str | None]
+```
+
+Places a call and returns `(session_id, error)`. `settings` takes:
+
+| Key           | Description                                                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `sipUri`      | Direct SIP target.                                                                                                                   |
+| `phoneNumber` | Phone number, used with `SIPParams.trunk`.                                                                                           |
+| `video`       | `True` offers send and receive video. A direction string offers that direction; `"inactive"` negotiates video without activating it. |
+| `headers`     | Dict of extra INVITE headers.                                                                                                        |
+
+Returns an error when the transport already has an active call.
+
+### stop_dialout
+
+```python
+await transport.stop_dialout(participant_id) -> str | None
+```
+
+Hangs up the dial-out call whose session id is `participant_id`.
+
+### send_dtmf
+
+```python
+await transport.send_dtmf(settings) -> str | None
+```
+
+Sends DTMF tones on the active call. `settings` takes `tones` (the digits), and optionally `sessionId` and `method` (`"telephone-event"` or `"sip-info"`). The wire method is set by the connection's `dtmf_mode`; a `method` that does not match it returns an error.
+
+### sip_refer
+
+```python
+await transport.sip_refer(settings) -> str | None
+```
+
+Sends a SIP REFER that asks the caller to call `settings["toEndPoint"]` (blind transfer). On success the call closes. Takes an optional `sessionId`.
+
+### sip_attended_transfer
+
+```python
+await transport.sip_attended_transfer(settings) -> str | None
+```
+
+Dials `settings["toEndPoint"]` on a consult leg, waits for it to answer, then sends a REFER with a Replaces header so the two peers connect directly. Both of the bot's legs close, and the active call's close is reported with reason `"transferred"`. If the transfer fails, the original call resumes. Takes an optional `sessionId`.
+
+`sip_refer()` and `sip_attended_transfer()` need a peer that processes REFER, such as a SIP PBX or registrar (FreeSWITCH, Asterisk, Kamailio), not a carrier PSTN trunk.
+
+### sip_call_transfer
+
+```python
+await transport.sip_call_transfer(settings) -> str | None
+```
+
+Always returns an error; Daily's cloud-mediated transfer has no SIP equivalent. Use `sip_refer()` or `sip_attended_transfer()`.
+
+### Video control
+
+```python
+await transport.set_video_direction(direction) -> str | None
+await transport.add_video() -> str | None
+await transport.remove_video() -> str | None
+await transport.request_keyframe() -> None
+```
+
+`set_video_direction()` renegotiates the call's video with `"sendrecv"`, `"sendonly"`, `"recvonly"`, or `"inactive"`; the call must already carry a video stream. `add_video()` and `remove_video()` set `"sendrecv"` and `"inactive"`. `request_keyframe()` asks the far end for a video keyframe.
+
+## Notes
+
+- **Transfers**: A transfer that succeeds closes the bot's side of the call. `sip_call_transfer` is not supported.
+- **Trunk mode**: `reg_interval=0` is independent of `SIPParams.trunk`, which only builds `sip:+E164@trunk` URIs from `phoneNumber`. PSTN trunking typically uses both. Treat `on_connected` as the ready signal, since `on_dialin_ready` does not fire.
+- **DTMF**: Received digits that are not keypad entries (`A`-`D`) fire `on_dtmf_event` but produce no `InputDTMFFrame`.
+- **Differences from DailyTransport**: `on_connected` carries no payload, so cross-transport handlers should accept `data=None`. Dial-out has no per-call `callerId`, `codecs`, or `videoSettings`; use the connection's `user`, `audio_codecs`, and `video_size`. Rooms, `on_app_message`, transcription, and recording events do not exist on this transport.
+
+## Event Handlers
+
+| Event                         | Arguments                        | Description                                                                  |
+| ----------------------------- | -------------------------------- | ---------------------------------------------------------------------------- |
+| `on_connected`                | `transport`                      | The connection is up.                                                        |
+| `on_left`                     | `transport`                      | The connection closed.                                                       |
+| `on_before_leave`             | `transport`                      | About to leave. Synchronous.                                                 |
+| `on_error`                    | `transport, error`               | A transport error occurred.                                                  |
+| `on_call_state_updated`       | `transport, state`               | The call state changed: `"ringing"`, `"established"`, or `"closed"`.         |
+| `on_dialin_ready`             | `transport, aor`                 | The account registered; `aor` is the registered address-of-record.           |
+| `on_dialin_connected`         | `transport, data`                | An inbound call was established.                                             |
+| `on_dialin_stopped`           | `transport, data`                | An inbound call ended. `data["reason"]` is `"transferred"` after a transfer. |
+| `on_dialin_error`             | `transport, data`                | An inbound call could not be answered.                                       |
+| `on_dialin_warning`           | `transport, data`                | An audio warning on an inbound call.                                         |
+| `on_dialout_connected`        | `transport, data`                | An outbound call is ringing at the far end.                                  |
+| `on_dialout_answered`         | `transport, data`                | An outbound call was answered.                                               |
+| `on_dialout_stopped`          | `transport, data`                | An outbound call ended, including one that closed before it connected.       |
+| `on_dialout_error`            | `transport, data`                | An outbound call failed.                                                     |
+| `on_dialout_warning`          | `transport, data`                | An audio warning on an outbound call.                                        |
+| `on_dtmf_event`               | `transport, data`                | A DTMF digit was received. `data["tone"]` is the digit.                      |
+| `on_first_participant_joined` | `transport, participant`         | The first call of this transport was established.                            |
+| `on_participant_joined`       | `transport, participant`         | A call was established.                                                      |
+| `on_client_connected`         | `transport, participant`         | A call was established; a `ClientConnectedFrame` is pushed downstream.       |
+| `on_participant_left`         | `transport, participant, reason` | A call ended; `reason` is `"leftCall"`.                                      |
+| `on_client_disconnected`      | `transport, participant`         | An established call ended.                                                   |
+| `on_participant_updated`      | `transport, participant`         | The peer put the call on hold or resumed it, or video was renegotiated.      |
+| `on_call_quality_stats`       | `transport, stats`               | Final call quality statistics, fired when a call closes.                     |
+
+Dial event `data` dicts carry `sessionId` and `sipCallId`. Dial-in data adds `sipFrom`, `sipTo`, and `sipHeaders`; dial-out data adds `origin` and `destination`; error and warning data carries `errorMsg`.
+
+```python
+@transport.event_handler("on_dialout_stopped")
+async def on_dialout_stopped(transport, data):
+    print(f"Call {data['sessionId']} ended: {data['reason']}")
+```
+
+### SIPConnection Events
+
+`SIPConnection` has its own event handlers, registered with `connection.add_event_handler(name, handler)`. Most bots use the transport's events above; the connection's `incoming` event is how a bot with `auto_answer=False` answers or declines a call.
+
+| Event              | Arguments                                    | Description                                                      |
+| ------------------ | -------------------------------------------- | ---------------------------------------------------------------- |
+| `connected`        | `connection`                                 | The connection is up.                                            |
+| `disconnected`     | `connection`                                 | The connection closed.                                           |
+| `registered`       | `connection, aor`                            | The account registered.                                          |
+| `incoming`         | `connection, data`                           | An inbound call arrived and is ringing.                          |
+| `call_progress`    | `connection, data`                           | A call is ringing.                                               |
+| `call_established` | `connection, data`                           | A call was established.                                          |
+| `call_closed`      | `connection, data`                           | A call closed.                                                   |
+| `call_failed`      | `connection, data`                           | An outbound call failed.                                         |
+| `dtmf`             | `connection, digit_event, session_id`        | A DTMF digit was received.                                       |
+| `remote_hold`      | `connection, data`                           | The peer put the call on hold or resumed it.                     |
+| `renegotiated`     | `connection, data`                           | Media was renegotiated mid-call (video added, removed, changed). |
+| `audio_warning`    | `connection, warning, direction, session_id` | An audio warning on a call.                                      |
+| `media_restarted`  | `connection, kind`                           | A media stream restarted.                                        |
 
 # Small WebRTC Transport
 Source: https://docs.pipecat.ai/api-reference/server/services/transport/small-webrtc.md
@@ -91956,12 +92344,13 @@ A bot runner typically creates transport sessions (like Daily WebRTC rooms), gen
 
 ## How the Development Runner Works
 
-The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. By default it starts a **single server that supports all transports simultaneously** — WebRTC, Daily, LiveKit, telephony (Twilio, Telnyx, Plivo, Exotel), and plain WebSocket. Clients choose which transport they want per-request by sending a `"transport"` field in the `POST /start` body; you no longer restart the server to switch transports.
+The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. By default it starts a **single server that supports all transports simultaneously** — WebRTC, Daily, LiveKit, SIP, telephony (Twilio, Telnyx, Plivo, Exotel), and plain WebSocket. Clients choose which transport they want per-request by sending a `"transport"` field in the `POST /start` body; you no longer restart the server to switch transports.
 
 - **WebRTC connections**: It serves a built-in web interface where users can connect directly as well as an endpoint to create new WebRTC sessions
 - **Daily integration**: It provides endpoints that create new rooms and tokens and redirect users to join them
 - **LiveKit integration**: It mints room tokens and spawns bots as participants in LiveKit rooms
 - **Telephony providers**: For Twilio, Telnyx, and Plivo, it sets up webhook endpoints that handle incoming calls and establish WebSocket connections for audio streaming
+- **SIP**: It starts bots that register a SIP account, and serves a webhook for Daily SIP-trunk notifications
 - **Plain WebSocket**: It exposes a `/ws-client` endpoint for non-telephony WebSocket clients (e.g. browser apps using protobuf framing)
 
 The runner registers the infrastructure for every transport and dispatches each connection to the right handler. It then discovers your bot function and spawns new instances whenever users connect. This means you can focus on writing your bot logic while the runner handles all the server infrastructure, connection management, and transport-specific details.
@@ -92108,6 +92497,7 @@ Runner arguments are how the runner communicates transport-specific information 
 - **`DailyRunnerArguments`**: Contains `room_url`, `token` (Optional), `body` (Optional) for joining Daily rooms
 - **`LiveKitRunnerArguments`**: Contains `room_name`, `url`, `token`, `body` (Optional), `session_id` for joining LiveKit rooms
 - **`SmallWebRTCRunnerArguments`**: Contains `webrtc_connection` for local WebRTC sessions, `body` (Optional) for WhatsApp call metadata
+- **`SIPRunnerArguments`**: Contains the SIP account (`user`, `domain`, `password`, `transport`) and the connection settings read from the environment, for registering with a SIP server
 - **`WebSocketRunnerArguments`**: Contains `websocket` for both telephony and plain WebSocket connections. The `transport_type` field distinguishes them: `"websocket"` for plain (non-telephony) clients connecting via `/ws-client`, or `None` for connections via `/ws` until `create_transport()` sets it to the detected telephony provider.
 
 All runner arguments also include:
@@ -92179,7 +92569,7 @@ This allows you to easily customize behavior between development and production 
 
 ## All Supported Transports
 
-The development runner supports nine transport types, each designed for different use cases. By default all are available from one server; the client selects one per session via the `"transport"` field in the `/start` request. The `-t <transport>` form below is the optional way to **restrict** the server to a single transport.
+The development runner supports ten transport types, each designed for different use cases. By default all are available from one server; the client selects one per session via the `"transport"` field in the `/start` request. The `-t <transport>` form below is the optional way to **restrict** the server to a single transport.
 
 ### WebRTC (`"transport": "webrtc"`)
 
@@ -92297,6 +92687,52 @@ Environment variables are optional, but when provided will attempt to hang up th
 
 Your bot receives the accepted FastAPI WebSocket. [`create_transport()`](#simplifying-with-the-transport-utility) detects the telephony provider from its first messages and configures the matching serializer; when you build the transport yourself, call `parse_telephony_websocket()` to detect the provider and set the serializer in `FastAPIWebsocketParams`.
 
+### SIP (`"transport": "sip"`)
+
+Native SIP calling through [`SIPTransport`](/api-reference/server/services/transport/sip). Requires `pipecat-ai[sip]`.
+
+```bash
+# Server: POST /start and the Daily SIP-trunk webhook
+python bot.py -t sip
+
+# Direct: run one bot immediately with no server
+python bot.py -t sip -d
+```
+
+The runner resolves the SIP account in this order:
+
+1. `body.sip_client` from the `/start` request, or from the `--runner-body` file in direct mode. This is what a Daily SIP trunk sends for each call.
+2. The `SIP_USER`, `SIP_PASS`, and `SIP_DOMAIN` environment variables.
+3. A temporary SIP client provisioned on your Daily domain with `DAILY_API_KEY`. The runner prints its dialable URI and deletes it when the bot exits.
+
+The bot registers at once and waits for its call. With `-t sip`, the runner exposes:
+
+- `POST /start` with `"transport": "sip"`, with the account in `body.sip_client`
+- `POST /daily-sip-trunk-webhook`, which starts a bot on the per-call SIP client that each Daily SIP-trunk notification carries. A notification without a usable `sip_client` is rejected with HTTP 400, and the whole notification reaches the bot as `runner_args.body`. Point the trunk's `webhook_url` at it through a tunnel.
+
+**Environment Variables**:
+
+- `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`: An existing SIP account. Without `SIP_USER` and `SIP_DOMAIN` (and no `sip_client` in the body), a temporary Daily SIP client is provisioned.
+- `DAILY_API_KEY`: Required when the runner has to provision a SIP client. `DAILY_API_URL` (Optional) overrides the API URL.
+- `SIP_TRANSPORT` (Optional): `udp`, `tcp`, or `tls`. Defaults to `udp` for an account from the environment and `tls` for a provisioned client or an account from the body. A `transport` in the body wins.
+- `SIP_AUDIO_CODECS` (Optional): Comma-separated codec preference list, for example `opus/48000/2,PCMU/8000/1`.
+- `SIP_AUTH_USER` (Optional): Digest username, when it differs from `SIP_USER`.
+- `SIP_REG_INTERVAL` (Optional): Seconds between registration refreshes. Defaults to 600; `0` disables registration (trunk mode).
+- `SIP_RTP_TIMEOUT` (Optional): Seconds without received RTP before a call is closed. Defaults to 0 (off).
+- `SIP_INSTANCE_ID` (Optional): A stable UUID identifying the endpoint across restarts.
+- `SIP_NET_INTERFACE` (Optional): Restrict the stack to one local interface, such as `127.0.0.1`.
+- `SIP_JITTER_BUFFER` (Optional): `off`, `fixed:MIN-MAX`, or `adaptive:MIN-MAX` (milliseconds). Defaults to a fixed 40-60 ms buffer.
+- `SIP_STUN_SERVER` (Optional): STUN server for media-NAT traversal. The runner enables `medianat=stun` by default using `stun.l.google.com`; set `off` to disable.
+- `SIP_EXTRA_PARAMS` (Optional): Comma-separated raw baresip account parameters (`key=value`). Replaces the default STUN setting.
+- `SIP_NATIVE_LOG_LEVEL` (Optional): Lowest severity captured from the native SIP stack's logs (`debug`, `info`, `warning`, or `error`). Defaults to `warning`.
+- `SIP_TRACE` (Optional): Set to `1` to log every SIP message verbatim. Contains authentication material, so leave it off in production.
+
+**Runner Arguments**: `SIPRunnerArguments`
+
+[`create_transport()`](#simplifying-with-the-transport-utility) builds the `SIPTransport` from the runner arguments, so bots need a `"sip"` key in `transport_params` and nothing else. It also builds it from plain `RunnerArguments`, as on Pipecat Cloud, when the body carries `sip_client` or the environment holds `SIP_USER` and `SIP_DOMAIN`. It never provisions a Daily SIP client on its own.
+
+To work with the account yourself, `pipecat.runner.sip` provides `configure()` (resolves the account), `sip_runner_arguments()` (converts it into `SIPRunnerArguments`), and `cleanup()` (deletes a client that `configure()` provisioned).
+
 ### WebSocket (`"transport": "websocket"`)
 
 Plain (non-telephony) WebSocket connections, for clients such as browser apps that speak protobuf framing directly. Selecting this transport on `/start` returns a `wsUrl` pointing at the `/ws-client` endpoint, which the client then connects to.
@@ -92325,7 +92761,7 @@ Options:
   --port INTEGER             Server port (default: 7860)
   -t, --transport            Restrict to a single transport and set it as the default
                              for /start: daily, livekit, webrtc, twilio, telnyx, plivo,
-                             exotel, websocket, moq.
+                             exotel, websocket, moq, sip.
                              Omit to support all transports simultaneously (default).
   -x, --proxy TEXT           Public proxy hostname for telephony webhooks (required for telephony)
   --allowed-origins [ORIGIN] Allowed origins for HTTP and WebSocket connections,
@@ -92347,7 +92783,8 @@ Options:
   --uploads-folder-max-files INTEGER
                              Max files kept in the uploads folder; oldest removed (default: 10)
   --esp32                    Enable SDP munging for ESP32 WebRTC compatibility
-  -d, --direct               Connect directly to Daily room for testing (automatically sets transport to daily)
+  -d, --direct               Run the bot immediately with no server: join the Daily room
+                             (the default) or register the SIP account (-t sip)
   --dialin / --no-dialin     Mount the Daily PSTN dial-in webhook (default: on)
   --whatsapp                 Mount the WhatsApp webhook routes (requires the WhatsApp
                              environment variables)
@@ -92363,11 +92800,12 @@ Options:
 - `livekit`: LiveKit integration with room management
 - `twilio`, `telnyx`, `plivo`, `exotel`: Telephony provider integration
 - `websocket`: Plain WebSocket server
+- `sip`: [SIP](/api-reference/server/services/transport/sip) calling, registering a SIP account
 - `moq`: [Media over QUIC](/api-reference/server/services/transport/moq), serving its own socket or dialing a relay
 
 **`--proxy` / `-x`**: Required for most telephony transports (Twilio, Telnyx, Plivo). This should be a publicly accessible hostname (like `yourbot.ngrok.io`) that can receive webhooks from telephony providers. The runner automatically strips protocol prefixes (http://, https://) if provided. Not required for Exotel, which uses direct WebSocket connections.
 
-**`--direct` / `-d`**: Special mode for Daily that bypasses the web server and connects your bot directly to a Daily room. Useful for quick testing but not recommended for production use.
+**`--direct` / `-d`**: Bypasses the web server and runs your bot immediately: it joins a Daily room, or with `-t sip` registers the SIP account. Useful for quick testing but not recommended for production use.
 
 **`--dialin` / `--no-dialin`**: The `/daily-dialin-webhook` endpoint for handling Daily PSTN dial-in calls is mounted by default; pass `--no-dialin` to leave it out. This endpoint receives webhook data from Daily when a phone call dials into your configured phone number, creates a SIP-enabled room, and spawns your bot. It doesn't require `-t daily`.
 
@@ -92414,6 +92852,11 @@ Different transports require different environment variables:
 - `TWILIO_REGION`, `TWILIO_EDGE` (Optional): Twilio region and edge for non-US1 regions (set both)
 - `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`: Plivo credentials
 - `TELNYX_API_KEY`: Telnyx API key
+
+**SIP**: See [SIP](#sip-transport-sip) for the full list.
+
+- `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`: Existing SIP account
+- `DAILY_API_KEY`: Provisions a temporary SIP client when no account is given
 
 **Security**:
 
@@ -92554,6 +92997,10 @@ For `"transport": "twilio" | "telnyx" | "plivo" | "exotel"` or `"transport": "we
 Telephony connections use `/ws`; plain WebSocket clients use `/ws-client` (and also receive a `sessionId`). The bot starts when the connection is established. When the runner uses [`--ws-auth token`](#key-arguments), the response also carries a one-time `token` the client must present when it connects.
 
 When file uploads are enabled, the `/start` response also includes `fileUploadUrl`, the route to POST uploads to, relative to the `/start` endpoint's origin. It is the session-scoped `/sessions/{session_id}/files` route when the session is registered, or the flat `/files` route otherwise. Files uploaded through a session-scoped route are deleted when the session ends. The field is omitted when uploads are disabled.
+
+**Request Format (`"transport": "sip"`):**
+
+The bot registers its SIP account immediately and `/start` returns its `sessionId`. The account comes from `body.sip_client`, else the environment, else a provisioned Daily SIP client (see [SIP](#sip-transport-sip)). An unusable account returns HTTP 400.
 
 ### The `/status` Endpoint
 
@@ -92739,20 +93186,22 @@ This automatic logging applies to all runner endpoints and helps identify issues
 
 All transports are available from `python bot.py`; the `-t` form below restricts the server to one. Access columns assume the default `localhost:7860`.
 
-| Transport     | Command                                     | Access                          | Environment Variables                                                 |
-| ------------- | ------------------------------------------- | ------------------------------- | --------------------------------------------------------------------- |
-| All (default) | `python bot.py`                             | http://localhost:7860/client    | Per transport (see below)                                             |
-| WebRTC        | `python bot.py -t webrtc`                   | http://localhost:7860/client    | None                                                                  |
-| Daily         | `python bot.py -t daily`                    | `GET /daily`, `POST /start`     | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
-| Daily Direct  | `python bot.py -d`                          | Direct connection               | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
-| Daily Dial-In | `python bot.py`                             | Phone calls via Daily PSTN      | `DAILY_API_KEY` (Required)                                            |
-| LiveKit       | `python bot.py -t livekit`                  | `POST /start`                   | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (All required) |
-| Twilio        | `python bot.py -t twilio -x proxy.ngrok.io` | Phone calls                     | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`                             |
-| Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io` | Phone calls                     | `TELNYX_API_KEY`                                                      |
-| Plivo         | `python bot.py -t plivo -x proxy.ngrok.io`  | Phone calls                     | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                                   |
-| Exotel        | `python bot.py -t exotel`                   | Phone calls                     | None                                                                  |
-| WebSocket     | `python bot.py`                             | `ws://localhost:7860/ws-client` | None                                                                  |
-| ESP32 WebRTC  | `python bot.py --esp32 --host <ESP32_IP>`   | ESP32 WebRTC connection         | None                                                                  |
+| Transport     | Command                                     | Access                                         | Environment Variables                                                 |
+| ------------- | ------------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------------- |
+| All (default) | `python bot.py`                             | http://localhost:7860/client                   | Per transport (see below)                                             |
+| WebRTC        | `python bot.py -t webrtc`                   | http://localhost:7860/client                   | None                                                                  |
+| Daily         | `python bot.py -t daily`                    | `GET /daily`, `POST /start`                    | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
+| Daily Direct  | `python bot.py -d`                          | Direct connection                              | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
+| Daily Dial-In | `python bot.py`                             | Phone calls via Daily PSTN                     | `DAILY_API_KEY` (Required)                                            |
+| LiveKit       | `python bot.py -t livekit`                  | `POST /start`                                  | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (All required) |
+| SIP           | `python bot.py -t sip`                      | `POST /start`, `POST /daily-sip-trunk-webhook` | `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`, or `DAILY_API_KEY`              |
+| SIP Direct    | `python bot.py -t sip -d`                   | Direct registration                            | `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`, or `DAILY_API_KEY`              |
+| Twilio        | `python bot.py -t twilio -x proxy.ngrok.io` | Phone calls                                    | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`                             |
+| Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io` | Phone calls                                    | `TELNYX_API_KEY`                                                      |
+| Plivo         | `python bot.py -t plivo -x proxy.ngrok.io`  | Phone calls                                    | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                                   |
+| Exotel        | `python bot.py -t exotel`                   | Phone calls                                    | None                                                                  |
+| WebSocket     | `python bot.py`                             | `ws://localhost:7860/ws-client`                | None                                                                  |
+| ESP32 WebRTC  | `python bot.py --esp32 --host <ESP32_IP>`   | ESP32 WebRTC connection                        | None                                                                  |
 
 ## Examples
 
@@ -93375,6 +93824,61 @@ token_params = DailyMeetingTokenParams(
   `cloud-audio-only` will produce files with a `.m4a` extension.
 </Warning>
 
+### DailySIPClientParams
+
+Parameters for creating a SIP client: plain SIP credentials on your Daily domain that any SIP user agent, such as a [SIP transport](/api-reference/server/services/transport/sip) bot, can register with to receive and place calls. This is distinct from `DailyRoomSipParams`, which configures a room's SIP interconnect.
+
+<ResponseField name="username" type="string" required>
+  SIP username. Follows the room naming rules, with an optional `.<n>` suffix
+  (for example `"support.1"`). At most 64 characters.
+</ResponseField>
+<ResponseField name="password" type="string | None" default="None">
+  Password, 12-64 characters with at least one letter and one digit.
+  Auto-generated when omitted.
+</ResponseField>
+<ResponseField name="expires_in_seconds" type="int | None" default="None">
+  Time to live in seconds (60-2592000). The client is deleted automatically when
+  it expires. Never expires when omitted.
+</ResponseField>
+
+### DailySIPClientObject
+
+A SIP client returned by the API.
+
+<ResponseField name="username" type="string">
+  SIP username
+</ResponseField>
+<ResponseField name="domain" type="string">
+  SIP domain to register with (for example `"mydomain.sip-us.daily.co"`)
+</ResponseField>
+<ResponseField name="sip_uri" type="string">
+  The client's dialable SIP URI
+</ResponseField>
+<ResponseField name="password" type="string | None">
+  SIP password. Only present in create and rotate responses; it cannot be
+  retrieved later, only rotated.
+</ResponseField>
+<ResponseField name="expires_at" type="string | None">
+  Expiration timestamp in ISO 8601 format, or `None` if the client never expires
+</ResponseField>
+
+### DailySIPClientPage
+
+A page of SIP clients returned by `list_sip_clients()`.
+
+<ResponseField name="sip_clients" type="list[DailySIPClientObject]">
+  The clients in this page (passwords never included)
+</ResponseField>
+<ResponseField name="total" type="int">
+  Total number of SIP clients on the domain
+</ResponseField>
+<ResponseField name="limit" type="int">
+  Page size used for this response
+</ResponseField>
+<ResponseField name="offset" type="int">
+  Offset used for this response
+</ResponseField>
+
 ## Initialize DailyRESTHelper
 
 Create a new instance of the Daily REST helper.
@@ -93531,6 +94035,80 @@ Extracts the room name from a Daily room URL.
 ```python
 room_name = helper.get_name_from_url("https://your-domain.daily.co/my-room")
 print(f"Room name: {room_name}")  # Outputs: "my-room"
+```
+
+## Create SIP Client
+
+Creates a SIP client on the Daily domain and returns a `DailySIPClientObject` that includes the password. The response is the only place the password is returned. Raises an exception when the domain's SIP client limit is reached (403) or the username already exists (409).
+
+<ParamField path="params" type="DailySIPClientParams" required>
+  SIP client configuration
+</ParamField>
+
+```python
+client = await helper.create_sip_client(DailySIPClientParams(username="bot"))
+print(client.sip_uri)
+```
+
+## List SIP Clients
+
+Returns a `DailySIPClientPage` of the domain's SIP clients.
+
+<ParamField path="limit" type="int | None" default="None">
+  Maximum clients per page (1-100). The Daily API default of 50 applies when
+  unset.
+</ParamField>
+
+<ParamField path="offset" type="int | None" default="None">
+  Number of clients to skip. The Daily API default of 0 applies when unset.
+</ParamField>
+
+```python
+page = await helper.list_sip_clients(limit=20)
+for client in page.sip_clients:
+    print(client.username, client.sip_uri)
+```
+
+## Get SIP Client
+
+Returns the `DailySIPClientObject` for a username, without its password. Raises an exception when the client does not exist.
+
+<ParamField path="username" type="string" required>
+  SIP username
+</ParamField>
+
+```python
+client = await helper.get_sip_client("bot")
+```
+
+## Delete SIP Client
+
+Deletes a SIP client and returns `True`. Deleting a client that does not exist also returns `True`.
+
+<ParamField path="username" type="string" required>
+  SIP username
+</ParamField>
+
+```python
+await helper.delete_sip_client("bot")
+```
+
+## Rotate SIP Client Password
+
+Sets a new password and returns the `DailySIPClientObject` with it. The client's URI and expiration are unchanged. Raises an exception when the client does not exist.
+
+<ParamField path="username" type="string" required>
+  SIP username
+</ParamField>
+
+<ParamField path="password" type="string | None" default="None">
+  New password, 12-64 characters with at least one letter and one digit.
+  Auto-generated when omitted.
+</ParamField>
+
+```python
+client = await helper.rotate_sip_client_password("bot")
+print(client.password)
 ```
 
 # Smart Turn Overview
