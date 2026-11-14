@@ -14761,7 +14761,10 @@ judge:
 
 <Note>
   The built-in transcribers are `moonshine` and `whisper`, both local models.
-  When `transcription.service:` is omitted, it defaults to `moonshine`.
+  When `transcription.service:` is omitted, it defaults to `moonshine`. The
+  transcriber must be a `SegmentedSTTService`, such as `moonshine`, `whisper`,
+  or `DeepgramSegmentedSTTService`. Any other STT fails the run with a
+  `ValueError` before it connects.
 </Note>
 
 In either modality, the `judge.eval:` block sets what decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics. Every verdict comes from a [classifier](/pipecat/learn/classifiers), which picks one of the possible answers and gives a probability for each. By default that is an `LLMClassifier` over Ollama (`gemma4:12b`, with an optional `endpoint:` for a remote Ollama), so the default judge needs no API key. A [`factory:`](#custom-services-with-factory) can return any other LLM to classify with, or a classifier of its own, such as [Jev](#judging-with-a-classifier). `service: openai` is deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0.
@@ -14894,7 +14897,7 @@ The pipeline sets each service's sample rate, so a factory doesn't. What a facto
 - `judge.eval.explainer:`: an LLM service that supports `run_inference()`.
 - `simulator:`: an OpenAI-compatible LLM service that supports function calling.
 - `user.speech:`: a local or HTTP TTS. The cache around it drives synthesis directly, so a WebSocket-streaming TTS yields nothing there.
-- `judge.transcription:`: any pipeline STT.
+- `judge.transcription:`: any `SegmentedSTTService`.
 
 `pipecat eval` loads the nearest `.env` before it runs, so a factory can read its API key from the environment the way your agent does.
 
@@ -15499,7 +15502,7 @@ To judge a saved conversation again from Python, pass its messages to `EvalSimul
 
 ### Custom audio services
 
-`from_scenario()` also takes `user_tts=` for the user's synthesized voice and `bot_stt=` for transcribing the agent's spoken audio, for either kind. `bot_stt` is any Pipecat `STTService`. `user_tts` is a `CachingTTSService`, which wraps a `TTSService` and caches its audio on disk so repeated turns don't re-synthesize; give it a `cache_key` that identifies the voice configuration:
+`from_scenario()` also takes `user_tts=` for the user's synthesized voice and `bot_stt=` for transcribing the agent's spoken audio, for either kind. `bot_stt` must be a `SegmentedSTTService`; any other STT raises a `ValueError` before the session connects. `user_tts` is a `CachingTTSService`, which wraps a `TTSService` and caches its audio on disk so repeated turns don't re-synthesize; give it a `cache_key` that identifies the voice configuration:
 
 ```python
 import os
@@ -97304,10 +97307,11 @@ user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
 
 Realtime (speech-to-speech) LLM services (OpenAI Realtime, Azure Realtime, Grok/xAI Realtime, Inworld, Gemini Live, AWS Nova Sonic, and Ultravox) consume user audio directly and manage their own conversation flow. `LLMContextAggregatorPair` switches to realtime mode on its own when one of these services starts, so it needs no configuration. Its `realtime_service_mode` argument overrides that: `False` keeps the cascade behavior, and `True` turns realtime mode on for a third-party realtime service that doesn't announce itself.
 
-Realtime mode adapts the pair's behavior in two ways:
+Realtime mode adapts the pair's behavior in three ways:
 
 1. **Context writes are decoupled from `UserStoppedSpeakingFrame`.** Instead, the assistant response start triggers the user message write. This keeps the context correct even when the realtime service provides no turn frames and local turn detection (VAD) is disabled.
 2. **`UserStoppedSpeakingFrame` can fire without waiting for transcripts.** When local turn detection drives the conversation, this frame triggers the assistant response — letting it fire earlier reduces latency. The pair flips `wait_for_transcript=False` on the [stop strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#stop-strategies) that support it.
+3. **Appended messages go straight to the realtime service.** An `LLMMessagesAppendFrame` queued ahead of the user aggregator, such as an RTVI `send-text` message, passes through it to the realtime service. Services that support it take the messages into their session as the frame passes, so the model has them straight away. The assistant aggregator then adds them to the context and decides when the model answers them, waiting for the bot and the user to stop talking.
 
 Separately from realtime mode, services that propose turn boundaries from server-side VAD (OpenAI Realtime, Azure Realtime, Grok, Inworld) replace the default turn strategies with `ExternalUserTurnStrategies`, which resolve those proposals into `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` and drive `on_user_turn_started` / `on_user_turn_stopped`. Services that propose nothing, either because they never do (Gemini Live, Nova Sonic, Ultravox) or because server-side turn detection was disabled at runtime (e.g. OpenAI Realtime with `turn_detection=False`), keep the defaults so locally-driven turn detection (e.g. local VAD) can fire the events. Passing custom `user_turn_strategies` opts out of this swap, unless `UserTurnStrategiesParams` extends a list.
 
