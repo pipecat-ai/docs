@@ -122,16 +122,34 @@ class Reference:
         listed = ", ".join(f"`{json.dumps(value)}`" for value in values)
         return f"Always {listed}." if len(values) == 1 else f"One of {listed}."
 
-    def object_fields(self, schema: dict) -> tuple[dict, str | None]:
-        """The object a schema describes, through ``$ref``, ``anyOf`` and arrays."""
+    def object_variants(self, schema: dict) -> list[tuple[dict, str | None]]:
+        """The objects a schema can be, through ``$ref``, ``anyOf`` and arrays."""
         options, _ = self.variants(schema)
+        objects = []
         for option in options:
             resolved, ref_name = self.resolve(option)
             if resolved.get("type") == "array" and resolved.get("items"):
-                return self.object_fields(resolved["items"])
-            if resolved.get("properties"):
-                return resolved, ref_name
-        return {}, None
+                objects += self.object_variants(resolved["items"])
+            elif resolved.get("properties"):
+                objects.append((resolved, ref_name))
+        return objects
+
+    @staticmethod
+    def variant_title(variant: dict, ref_name: str | None, variants: list) -> str:
+        """A title for one of several objects: the field that tells them apart, or its name.
+
+        That field is in every object and has a fixed value in some; an object
+        without a fixed value for it takes any other value.
+        """
+        for name in variant.get("properties", {}):
+            fields = [other.get("properties", {}).get(name) for other, _ in variants]
+            if all(fields) and any("const" in field for field in fields):
+                field = variant["properties"][name]
+                if "const" not in field:
+                    return f"{name}: any other"
+                const = field["const"]
+                return f"{name}: {const if isinstance(const, str) else json.dumps(const)}"
+        return ref_name or "object"
 
     def param_fields(
         self, schema: dict, path: str, indent: str, depth: int, seen: tuple[str, ...]
@@ -161,12 +179,35 @@ class Reference:
             default = field["default"]
             text = default if isinstance(default, str) else json.dumps(default)
             attrs.append(f"default={mdx_attr(text)}")
-        body = [part for part in (field.get("description", ""), self.allowed(field)) if part]
+        description = field.get("description", "")
+        allowed = self.allowed(field)
+        # A description that already gives the allowed values needn't repeat them.
+        if allowed and all(f"`{value}`" in description for value in re.findall(r"`([^`]*)`", allowed)):
+            allowed = ""
+        body = [part for part in (description, allowed) if part]
         lines = [f"{indent}<ParamField {' '.join(attrs)}>"]
         if body:
             lines.append(f"{indent}  {mdx_text(' '.join(body))}")
-        nested, ref_name = self.object_fields(field)
-        if nested:
+        variants = self.object_variants(field)
+        if len(variants) > 1:
+            # One of several objects: each in its own expandable, by what tells them apart.
+            for variant, ref_name in variants:
+                title = self.variant_title(variant, ref_name, variants)
+                lines.append("")
+                lines.append(f"{indent}  <Expandable title={mdx_attr(title)}>")
+                if variant.get("description"):
+                    lines.append(f"{indent}    {mdx_text(variant['description'])}")
+                    lines.append("")
+                lines += self.param_fields(
+                    variant,
+                    "",
+                    indent + "    ",
+                    depth + 1,
+                    seen + ((ref_name,) if ref_name else ()),
+                )
+                lines.append(f"{indent}  </Expandable>")
+        elif variants:
+            nested, ref_name = variants[0]
             if ref_name and ref_name in seen:
                 lines.append(f"{indent}  Same fields as `{ref_name}`, above.")
             elif depth >= MAX_DEPTH:
@@ -207,9 +248,9 @@ class Reference:
             lines += [f'<ParamField path="id" type="string" required>', f"  {about_id}", "</ParamField>"]
         if "data" in properties:
             data = properties["data"]
-            fields, _ = self.object_fields(data)
-            if fields:
-                lines += self.param_fields(fields, "data.", "", 1, ())
+            variants = self.object_variants(data)
+            if len(variants) == 1:
+                lines += self.param_fields(variants[0][0], "data.", "", 1, ())
             else:
                 lines += self.param_field(data, "data", "data" in required, "", 1, ())
         if "id" in properties or "data" in properties:
