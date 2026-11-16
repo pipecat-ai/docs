@@ -1,0 +1,226 @@
+---
+title: "Synthesia Video Avatar"
+sidebarTitle: "Synthesia"
+description: "SynthesiaVideoService renders a real-time Synthesia Interactive Avatar, lip-synced to your Pipecat agent's TTS audio."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Synthesia"
+  maintainerUrl="https://github.com/synthesia-ai"
+  repo="https://github.com/synthesia-ai/pipecat-synthesia"
+/>
+
+## Overview
+
+`SynthesiaVideoService` gives your Pipecat agent a photoreal, lip-synced
+[Synthesia](https://www.synthesia.io) Interactive Avatar. Place it straight
+after your TTS (or speech-to-speech model): it consumes the TTS audio, and a
+Synthesia-hosted avatar worker renders the avatar speaking it. No GPU runs in
+your process. `BotStartedSpeakingFrame` and `BotStoppedSpeakingFrame` come from
+the avatar's actual playout, so interruptions line up with what the user sees.
+
+The avatar runs in a LiveKit room, reached one of two ways:
+
+- **Direct join** (`LiveKitTransportRoom`), for users on LiveKit: the avatar
+  joins your bot's room and publishes its video and audio there.
+- **Relayed join** (`PrivateLiveKitRoom`), for users on Daily or SmallWebRTC:
+  the avatar joins a private LiveKit room the plugin creates, and its video and
+  audio come back into your pipeline as `OutputImageRawFrame`s and audio frames.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/synthesia-ai/pipecat-synthesia"
+  >
+    Source code, examples and the full guide for the Synthesia integration
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-synthesia/"
+  >
+    The `pipecat-synthesia` package on PyPI
+  </Card>
+  <Card
+    title="Plugin Reference"
+    icon="book"
+    href="https://developers.synthesia.io/docs/ia-pipecat-plugin-reference"
+  >
+    Synthesia's reference for the plugin
+  </Card>
+  <Card
+    title="Avatar IDs"
+    icon="user"
+    href="https://developers.synthesia.io/docs/ia-concepts#finding-your-avatar-id"
+  >
+    Find the Interactive Avatar ID to use
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`.
+It requires `pipecat-ai` 1.14 or later, below 2.0. Its `[livekit]` extra is
+required for both join modes:
+
+```bash
+uv add "pipecat-synthesia[livekit]"
+```
+
+You'll also need Pipecat with the services you use (STT, TTS, LLM, transport).
+
+## Prerequisites
+
+### Synthesia and LiveKit setup
+
+1. **Synthesia API key** with Interactive Avatar access.
+2. **Interactive Avatar ID**: see
+   [Finding your avatar ID](https://developers.synthesia.io/docs/ia-concepts#finding-your-avatar-id).
+   A Synthesia Studio avatar ID is not an Interactive Avatar ID.
+3. **A LiveKit project**, for both join modes. LiveKit Cloud's free tier is
+   fine. On a direct join, use the project your users' room is in.
+
+You'll also need API keys for the STT, TTS and LLM services in your pipeline.
+
+### Required environment variables
+
+- `SYNTHESIA_API_KEY`: your Synthesia API key
+- `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`: your LiveKit project
+- `LIVEKIT_URL`: your LiveKit project URL, for a relayed join (a direct join
+  uses your `LiveKitTransport`'s URL)
+
+## Configuration
+
+Constructor parameters for `SynthesiaVideoService`:
+
+<ParamField path="avatar_ids" type="Sequence[str]" required>
+  One to five Interactive Avatar IDs. The session always starts on the first, so
+  list the one you want first; the others can be switched to mid-call.
+</ParamField>
+
+<ParamField path="room" type="room adapter" required>
+  `LiveKitTransportRoom(transport)` for a direct join, or `PrivateLiveKitRoom()`
+  for a relayed join. Both are in `pipecat_synthesia.livekit`.
+</ParamField>
+
+<ParamField path="api_key" type="str" default="None">
+  Synthesia API key. Falls back to `SYNTHESIA_API_KEY`.
+</ParamField>
+
+<ParamField path="launch_timeout" type="float" default="90.0">
+  Seconds for the whole launch: connecting, creating the session and the avatar
+  joining.
+</ParamField>
+
+<ParamField path="required" type="bool" default="True">
+  `True` ends the call if the avatar can't start, and none of the bot's speech
+  plays from then on. `False` carries on voice-only.
+</ParamField>
+
+<ParamField path="settings" type="SynthesiaVideoSettings" default="None">
+  Initial runtime settings. `SynthesiaVideoSettings` has one setting of its own,
+  `avatar_id`: one of `avatar_ids`, or `"default"` for the first. Push a
+  `SynthesiaVideoUpdateSettingsFrame(delta=SynthesiaVideoSettings(avatar_id=...))`
+  to switch avatars mid-call. Both import from `pipecat_synthesia`. Switching
+  avatars hasn't yet been tested against the live Synthesia API.
+</ParamField>
+
+<Note>
+  See the [source repository](https://github.com/synthesia-ai/pipecat-synthesia)
+  for the authoritative list of parameters, events and errors.
+</Note>
+
+## Usage
+
+### Relayed join (Daily, SmallWebRTC)
+
+Tell the transport the avatar's video size, 512×512 at 25 fps (for Daily, set
+the same `video_out_*` values on `DailyParams`), and put the avatar straight
+after the TTS. Keep voice activity detection on `LLMUserAggregatorParams`: the
+transport params silently ignore a `vad_analyzer`.
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.transports.base_transport import TransportParams
+from pipecat_synthesia import SynthesiaVideoService
+from pipecat_synthesia.livekit import PrivateLiveKitRoom
+
+transport_params = TransportParams(
+    audio_in_enabled=True,
+    audio_out_enabled=True,
+    video_out_enabled=True,
+    video_out_is_live=True,
+    video_out_width=512,
+    video_out_height=512,
+    video_out_framerate=25,
+)
+
+avatar = SynthesiaVideoService(
+    avatar_ids=["your-avatar-id"],
+    room=PrivateLiveKitRoom(),  # reads LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    avatar,  # Video avatar (consumes the TTS audio)
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+### Direct join (LiveKit)
+
+```python
+from pipecat_synthesia.livekit import LiveKitTransportRoom
+
+room = LiveKitTransportRoom(transport)  # your LiveKitTransport
+avatar = SynthesiaVideoService(avatar_ids=["your-avatar-id"], room=room)
+
+pipeline = Pipeline([
+    transport.input(),
+    room.input_filter(),  # keeps the avatar's voice off the bot's input
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    avatar,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+<Warning>
+  A direct join needs a bot token with the top-level `kind="agent"` claim
+  (`AccessToken(...).with_kind("agent")`), and refuses one without it. The
+  development runner's `-t livekit` token lacks it, so mint your own. A relayed
+  join over the LiveKit transport is untested and not supported.
+</Warning>
+
+The avatar is a room participant too, and usually the first to arrive, so
+`on_first_participant_joined` fires for it. Greet the first participant whose
+identity isn't `avatar.avatar_identity` instead.
+
+See [`bot_relayed_join.py`](https://github.com/synthesia-ai/pipecat-synthesia/blob/main/examples/bot_relayed_join.py)
+and [`bot_direct_join.py`](https://github.com/synthesia-ai/pipecat-synthesia/blob/main/examples/bot_direct_join.py)
+in the source repository for complete working bots.
+
+## Compatibility
+
+Tested with Pipecat v1.14, v1.15 and v1.16 (Python 3.11+). Any later
+1.x is allowed, and logs one warning at startup if it's a newer minor than
+these. Check the
+[source repository](https://github.com/synthesia-ai/pipecat-synthesia) for the
+latest tested version and changelog.
+
+## Support
+
+GitHub issues are turned off for this repository. Email
+[support@synthesia.io](mailto:support@synthesia.io) and say it's about
+`pipecat-synthesia`; the repository's `SUPPORT.md` lists what to include.
