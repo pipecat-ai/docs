@@ -12,8 +12,11 @@ The pages are generated, never edited by hand. Run, from the docs root::
 
     python3 scripts/gen-rtvi-reference.py --pipecat ../pipecat
 
-``--check`` writes nothing and fails when a page is missing or out of date, as
-CI runs it. Uses only the Python standard library.
+It also lists every version's page, newest first, in the RTVI group of
+``docs.json`` and in the standard page's Protocol Reference list, and fails when
+the standard page's Protocol Versions table, written by hand, has no row for a
+version. ``--check`` writes nothing and fails when any of these is missing or
+out of date, as CI runs it. Uses only the Python standard library.
 """
 
 from __future__ import annotations
@@ -29,6 +32,9 @@ PAGES_DIR = DOCS_ROOT / "api-reference" / "standards" / "rtvi"
 SPEC_DIR = Path("src/pipecat/processors/frameworks/rtvi/spec")
 SPEC_URL = "https://github.com/pipecat-ai/pipecat/blob/main/" + SPEC_DIR.as_posix()
 STANDARD_PAGE = "/api-reference/standards/rtvi-standard"
+DOCS_JSON = DOCS_ROOT / "docs.json"
+# Prettier's line width, which docs.json is formatted to.
+PRINT_WIDTH = 80
 
 # How deep nested objects are expanded; deeper ones are named, not expanded.
 MAX_DEPTH = 4
@@ -328,6 +334,45 @@ def documents(pipecat: Path) -> dict[str, Path]:
     return dict(sorted(found.items(), key=lambda item: _version_key(item[0])))
 
 
+def sidebar(docs_json: str, versions: list[str]) -> str | None:
+    """``docs.json`` with the RTVI group listing every version's page, newest first.
+
+    Edits the text in place, laid out as Prettier lays it out, so the rest of the
+    file keeps its formatting. None when the file has no RTVI group.
+    """
+    group = re.search(
+        r'"root": "' + re.escape(STANDARD_PAGE.lstrip("/")) + r'",\n( *)"pages": \[[^\]]*\]',
+        docs_json,
+    )
+    if group is None:
+        return None
+    indent = group.group(1)
+    pages = [json.dumps(_page(version)) for version in reversed(versions)]
+    inline = f'"pages": [{", ".join(pages)}]'
+    if len(indent) + len(inline) > PRINT_WIDTH:
+        inline = '"pages": [\n' + ",\n".join(f"{indent}  {page}" for page in pages) + f"\n{indent}]"
+    start = group.end() - len(group.group(0)) + group.group(0).index('"pages"')
+    return docs_json[:start] + inline + docs_json[group.end() :]
+
+
+def reference_list(standard: str, versions: list[str]) -> str | None:
+    """The standard page with its Protocol Reference list naming every version, newest first.
+
+    None when the page has no such list.
+    """
+    entry = r"- \[RTVI [0-9.]+\]\(/" + re.escape(_page("")) + r"[0-9.]+\)(?: \(current\))?\n"
+    block = re.search(f"(?:{entry})+", standard)
+    if block is None:
+        return None
+    lines = [f"- [RTVI {version}](/{_page(version)})" for version in reversed(versions)]
+    lines[0] += " (current)"
+    return standard[: block.start()] + "\n".join(lines) + "\n" + standard[block.end() :]
+
+
+def _page(version: str) -> str:
+    return f"{PAGES_DIR.relative_to(DOCS_ROOT).as_posix()}/{version}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pipecat", default="../pipecat", help="a pipecat checkout")
@@ -338,24 +383,48 @@ def main() -> int:
     if not found:
         print(f"no RTVI specification in {Path(args.pipecat) / SPEC_DIR}", file=sys.stderr)
         return 2
-    stale = []
-    for version, path in found.items():
-        page = PAGES_DIR / f"{version}.mdx"
-        text = Reference(json.loads(path.read_text(encoding="utf-8")), version).render()
-        current = page.read_text(encoding="utf-8") if page.exists() else None
+    versions = list(found)
+    outputs = {
+        PAGES_DIR / f"{version}.mdx": Reference(
+            json.loads(path.read_text(encoding="utf-8")), version
+        ).render()
+        for version, path in found.items()
+    }
+    problems = []
+    standard_path = DOCS_ROOT / f"{STANDARD_PAGE.lstrip('/')}.mdx"
+    standard = standard_path.read_text(encoding="utf-8")
+    for path, text in (
+        (DOCS_JSON, sidebar(DOCS_JSON.read_text(encoding="utf-8"), versions)),
+        (standard_path, reference_list(standard, versions)),
+    ):
+        if text is None:
+            problems.append(f"no RTVI version list to update in {path.relative_to(DOCS_ROOT)}")
+        else:
+            outputs[path] = text
+    # The versions table names the Pipecat and client releases and what changed,
+    # which the specification doesn't say, so it's written by hand.
+    for version in versions:
+        if not re.search(rf"^\| \[{re.escape(version)}\]\(/{re.escape(_page(version))}\) ", standard, re.M):
+            problems.append(
+                f"the Protocol Versions table of {standard_path.relative_to(DOCS_ROOT)} "
+                f"has no row linking to /{_page(version)}"
+            )
+
+    for path, text in outputs.items():
+        current = path.read_text(encoding="utf-8") if path.exists() else None
         if current == text:
             continue
         if args.check:
-            stale.append(page.relative_to(DOCS_ROOT))
+            problems.append(
+                f"{path.relative_to(DOCS_ROOT)} is out of date; run python3 scripts/gen-rtvi-reference.py"
+            )
         else:
-            PAGES_DIR.mkdir(parents=True, exist_ok=True)
-            page.write_text(text, encoding="utf-8")
-            print(f"wrote {page.relative_to(DOCS_ROOT)}")
-    if stale:
-        for page in stale:
-            print(f"{page} is out of date; run python3 scripts/gen-rtvi-reference.py", file=sys.stderr)
-        return 1
-    return 0
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            print(f"wrote {path.relative_to(DOCS_ROOT)}")
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":
