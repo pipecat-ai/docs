@@ -1,0 +1,267 @@
+---
+title: "Rime Prism"
+description: "Speech-to-speech conversation with RimeRealtimeLLMService on Rime Prism, with tools, async tool results, and interruption rules."
+---
+
+## Overview
+
+`RimeRealtimeLLMService` runs a conversation with [Prism](https://docs.rime.ai/docs/prism/overview), Rime's speech-to-speech model. Prism detects the user's turns, calls tools, and speaks its replies, so the service replaces STT, the LLM, and TTS in a pipeline. It works with the standard `LLMContextAggregatorPair` and transports, like [OpenAI Realtime](/api-reference/server/services/s2s/openai).
+
+<CardGroup cols={2}>
+  <Card
+    title="Rime Prism API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.rime.realtime.llm.html"
+  >
+    Pipecat's API methods for Rime Prism integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/realtime/realtime-rime.py"
+  >
+    Complete Rime Prism conversation example
+  </Card>
+  <Card
+    title="Prism Documentation"
+    icon="book"
+    href="https://docs.rime.ai/docs/prism/overview"
+  >
+    Official Rime Prism documentation
+  </Card>
+  <Card title="Rime Dashboard" icon="microphone" href="https://app.rime.ai/">
+    Create an API key and manage your Rime account
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[rime-realtime]"
+```
+
+## Prerequisites
+
+### Rime Account Setup
+
+1. **Rime account**: Sign up at [Rime](https://app.rime.ai/).
+2. **API key**: Create an API key in the Rime dashboard.
+
+### Required Environment Variables
+
+- `RIME_API_KEY`: Your Rime API key. The service's own client reads it.
+
+## Configuration
+
+```python
+from pipecat.services.rime.realtime.llm import RimeRealtimeLLMService
+```
+
+### RimeRealtimeLLMService
+
+<ParamField path="client" type="rimelabs_sdk.Rime | None" default="None">
+  Rime SDK client. `None` creates one that reads `RIME_API_KEY`. A client you
+  pass stays yours to close.
+</ParamField>
+
+<ParamField path="endpoint" type="str | None" default="None">
+  Prism WebSocket URL. `None` uses the SDK's default.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="RimeRealtimeLLMService.Settings"
+  default="None"
+>
+  Runtime-configurable settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField
+  path="turn_detection"
+  type="rimelabs_sdk.realtime.TurnDetection | None"
+  default="None"
+>
+  Prism's turn timing, such as `eagerness` and `end_of_turn_min_silence_ms`,
+  fixed when the conversation opens. `None` uses Prism's defaults. Its
+  interruption rules can be given here or in `settings`; raises `ValueError`
+  when the same rule is set in both.
+</ParamField>
+
+<ParamField
+  path="timeouts"
+  type="rimelabs_sdk.realtime.RealtimeTimeouts | None"
+  default="None"
+>
+  SDK limits for connecting, readiness, and acknowledgments. `None` uses the
+  SDK's defaults.
+</ParamField>
+
+<ParamField path="request_id" type="str | None" default="None">
+  Correlation ID to request for the Prism session.
+</ParamField>
+
+<ParamField path="startup" type="RimeStartupParams | None" default="None">
+  Retry limits for opening the conversation. See
+  [RimeStartupParams](#rimestartupparams).
+</ParamField>
+
+<ParamField
+  path="playback"
+  type='Literal["estimated", "discard"]'
+  default='"estimated"'
+>
+  `"estimated"` plays Prism's audio and reports estimated playback positions on
+  interruption. `"discard"` pushes no audio and reports every reply as unplayed.
+</ParamField>
+
+<ParamField path="max_pending_operations" type="int" default="256">
+  Maximum queued operations, such as history writes, settings updates, and reply
+  requests. Must be at least 1. Exceeding it ends the service with a permanent
+  error.
+</ParamField>
+
+<ParamField path="max_input_audio_bytes" type="int" default="1920000">
+  Maximum microphone audio buffered before Prism takes it. Must be at least
+  192000. Exceeding it ends the service with a permanent error.
+</ParamField>
+
+<ParamField path="shutdown_timeout" type="float" default="5.0">
+  Maximum seconds to finish queued requests when the pipeline ends.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `RimeRealtimeLLMService.Settings(...)`. They can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details. Any other base setting, such as `temperature`, raises `ValueError`.
+
+| Parameter                | Type                                           | Default   | Description                                                                                                                                                   |
+| ------------------------ | ---------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                  | `str`                                          | `"prism"` | Model identifier. Only `"prism"` is accepted. _(Inherited from base settings.)_                                                                               |
+| `system_instruction`     | `str \| None`                                  | `None`    | System instruction/prompt. _(Inherited from base settings.)_                                                                                                  |
+| `tools`                  | `ToolsSchema \| None`                          | `None`    | Tools Prism can call. An empty list removes all tools.                                                                                                        |
+| `voice`                  | `str \| None`                                  | `None`    | Prism voice. `None` uses Prism's default voice.                                                                                                               |
+| `interrupt_on_speech`    | `bool`                                         | `True`    | Whether Prism stops a reply when the user talks over it.                                                                                                      |
+| `tool_fillers`           | `dict[str, rimelabs_sdk.realtime.PrismFiller]` | `{}`      | What Prism says while a tool runs, keyed by tool name. See [What the caller hears while a tool runs](https://docs.rime.ai/docs/prism/tools).                  |
+| `truncation`             | `rimelabs_sdk.realtime.Truncation \| None`     | `None`    | How Prism shortens history that outgrows the model's context. `None` uses Prism's default. See [Handle long calls](https://docs.rime.ai/docs/prism/sessions). |
+| `response_metadata`      | `dict[str, str] \| None`                       | `None`    | Labels Prism attaches to each later reply. They appear in `LLMFullResponseStartFrame.metadata["rime"]["response_metadata"]`.                                  |
+| `speed`                  | `float \| None`                                | `None`    | Speech speed, from 0.85 to 1.3. `None` uses Prism's default.                                                                                                  |
+| `interrupt_min_words`    | `int \| None`                                  | `None`    | Words, from 1 to 10, the user says over a reply before Prism stops it. `None` uses Prism's default.                                                           |
+| `interrupt_phrases`      | `list[str] \| None`                            | `None`    | Phrases that stop a reply regardless of `interrupt_min_words`. An empty list clears them.                                                                     |
+| `acknowledgment_phrases` | `list[str] \| None`                            | `None`    | Phrases, such as `"uh huh"`, that don't stop a reply. An empty list clears them.                                                                              |
+
+An update can't set a setting back to `None`; it raises `ValueError`.
+
+### RimeStartupParams
+
+```python
+from pipecat.services.rime.realtime.llm import RimeStartupParams
+```
+
+| Parameter         | Type    | Default | Description                                                           |
+| ----------------- | ------- | ------- | --------------------------------------------------------------------- |
+| `max_retries`     | `int`   | `3`     | Additional attempts after a refused connection, from 0 to 10.         |
+| `retry_interval`  | `float` | `2`     | Minimum seconds between attempts.                                     |
+| `attempt_timeout` | `float` | `30`    | Maximum seconds for one attempt to connect and open the conversation. |
+| `total_timeout`   | `float` | `60`    | Maximum seconds for all attempts and the waits between them.          |
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.services.rime.realtime.llm import RimeRealtimeLLMService
+
+llm = RimeRealtimeLLMService(
+    settings=RimeRealtimeLLMService.Settings(
+        system_instruction="You are a helpful assistant.",
+    ),
+)
+
+context = LLMContext([{"role": "developer", "content": "Say hello!"}])
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        user_aggregator,
+        llm,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+Register tools on the `LLMContext`, as for other LLM services. See [Function Calling](/pipecat/learn/function-calling).
+
+### Asking for a Reply Mid-Conversation
+
+After the opening reply, add messages and ask for a reply with `LLMMessagesAppendFrame`:
+
+```python
+from pipecat.frames.frames import LLMMessagesAppendFrame
+
+await worker.queue_frame(
+    LLMMessagesAppendFrame(
+        messages=[{"role": "developer", "content": "Ask whether there is anything else."}],
+        run_llm=True,
+    )
+)
+```
+
+### Updating Settings Mid-Conversation
+
+Send an `LLMUpdateSettingsFrame` to hand the conversation to another role, with new instructions and tools:
+
+```python
+from pipecat.frames.frames import LLMUpdateSettingsFrame
+
+await worker.queue_frame(
+    LLMUpdateSettingsFrame(
+        delta=RimeRealtimeLLMService.Settings(
+            system_instruction="You are a billing specialist.",
+            tools=billing_tools,
+        )
+    )
+)
+```
+
+### Setting Interruption Rules
+
+```python
+llm = RimeRealtimeLLMService(
+    settings=RimeRealtimeLLMService.Settings(
+        interrupt_min_words=3,
+        interrupt_phrases=["stop", "wait"],
+        acknowledgment_phrases=["uh huh", "okay"],
+    ),
+)
+```
+
+## Notes
+
+- **No local VAD**: Prism detects the user's turns itself, so the pipeline needs no VAD analyzer.
+- **Append-only history**: The first `LLMContextFrame` opens the conversation with the context's messages and starts a reply. After that, Prism history only grows. `LLMMessagesUpdateFrame` and `LLMMessagesTransformFrame` don't change it, and `LLMRunFrame` starts no reply; use `LLMMessagesAppendFrame(run_llm=True)`. A write Prism rejects doesn't roll back the local context.
+- **Tools**: Tool selection is `"auto"` or `"none"`. Intermediate function call results reach Prism while the call stays open. A result from an async tool (`cancel_on_interruption=False`) that arrives after a later reply has started, or after Prism's 90-second result deadline, gets a reply of its own.
+- **Audio**: Input at 8, 16, 24, or 48 kHz goes to Prism as is; other rates are resampled to 16 kHz.
+- **Playback positions**: Standard transports don't report what the caller heard, so on an interruption the service estimates the playback position from elapsed time.
+- **Transcripts**: The user's speech is pushed upstream and downstream as `InterimTranscriptionFrame`s and `TranscriptionFrame`s, and Prism's reply downstream as `LLMTextFrame`s and `TTSTextFrame`s.
+- **No reconnect**: The service doesn't reconnect or replay history. When the connection fails, it pushes a permanent error and becomes unusable; start a new service for a new conversation. Use one instance per conversation.
+
+## Event Handlers
+
+| Event                | Description                                                                                                |
+| -------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `on_session_updated` | Called with the session's `rimelabs_sdk.realtime.SessionInfo` when it opens and after each settings update |
+| `on_rime_event`      | Called with each `rimelabs_sdk.realtime.SessionEvent` Prism sends, including its diagnostics               |
+
+```python
+@llm.event_handler("on_session_updated")
+async def on_session_updated(service, info):
+    print(f"Prism session {info.session_id}, voice {info.voice}")
+
+@llm.event_handler("on_rime_event")
+async def on_rime_event(service, event):
+    print(f"Prism event: {type(event.payload).__name__}")
+```
