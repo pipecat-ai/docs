@@ -13,10 +13,14 @@ The pages are generated, never edited by hand. Run, from the docs root::
     python3 scripts/gen-rtvi-reference.py --pipecat ../pipecat
 
 It also lists every version's page, newest first, in the RTVI group of
-``docs.json`` and in the standard page's Protocol Reference list, and fails when
-the standard page's Protocol Versions table, written by hand, has no row for a
-version. ``--check`` writes nothing and fails when any of these is missing or
-out of date, as CI runs it. Uses only the Python standard library.
+``docs.json`` and in the standard page's Protocol Reference list, and points the
+``/api-reference/standards/rtvi/latest`` redirect at the newest version, so
+other pages link to ``latest`` and follow new versions on their own. It fails
+when the standard page's Protocol Versions table, written by hand, has no row
+for a version, and when a page links to an anchor a version's page doesn't
+have, which Mintlify's link check doesn't follow through the redirect.
+``--check`` writes nothing and fails when any of these is missing or out of
+date, as CI runs it. Uses only the Python standard library.
 """
 
 from __future__ import annotations
@@ -373,6 +377,65 @@ def _page(version: str) -> str:
     return f"{PAGES_DIR.relative_to(DOCS_ROOT).as_posix()}/{version}"
 
 
+def latest_redirect(docs_json: str, newest: str) -> str | None:
+    """``docs.json`` with the ``latest`` redirect pointing at the newest version's page.
+
+    Adds the redirect first in ``redirects`` when there is none. None when the
+    file has no ``redirects``.
+    """
+    source = json.dumps(f"/{_page('latest')}")
+    destination = json.dumps(f"/{_page(newest)}")
+    redirect = re.search(
+        re.escape(f'"source": {source},') + r'\n( *)"destination": "[^"]*"', docs_json
+    )
+    if redirect is not None:
+        indent = redirect.group(1)
+        new = f'"source": {source},\n{indent}"destination": {destination}'
+        return docs_json[: redirect.start()] + new + docs_json[redirect.end() :]
+    redirects = re.search(r'( *)"redirects": \[\n', docs_json)
+    if redirects is None:
+        return None
+    indent = redirects.group(1) + "  "
+    entry = (
+        f'{indent}{{\n{indent}  "source": {source},\n'
+        f'{indent}  "destination": {destination}\n{indent}}},\n'
+    )
+    return docs_json[: redirects.end()] + entry + docs_json[redirects.end() :]
+
+
+_LINK = re.compile(r"/" + re.escape(_page("")) + r"(latest|[0-9]+\.[0-9]+\.[0-9]+)#([A-Za-z0-9_-]+)")
+_HEADING = re.compile(r"^#{1,6} (.+)$", re.M)
+
+
+def _anchor(heading: str) -> str:
+    """The anchor Mintlify gives a heading."""
+    return re.sub(r"[^a-z0-9 -]", "", heading.lower()).strip().replace(" ", "-")
+
+
+def broken_anchors(pages: dict[str, str], newest: str) -> list[str]:
+    """Each link in the docs to an anchor that a version's page doesn't have.
+
+    Args:
+        pages: Each version's generated page.
+        newest: The version ``latest`` points at.
+    """
+    anchors = {
+        version: {_anchor(heading) for heading in _HEADING.findall(text)}
+        for version, text in pages.items()
+    }
+    problems = []
+    for path in sorted(DOCS_ROOT.rglob("*.mdx")):
+        relative = path.relative_to(DOCS_ROOT)
+        if any(part.startswith((".", "_")) or part == "node_modules" for part in relative.parts):
+            continue
+        for match in _LINK.finditer(path.read_text(encoding="utf-8")):
+            version, anchor = match.groups()
+            target = newest if version == "latest" else version
+            if anchor not in anchors.get(target, set()):
+                problems.append(f"{relative} links to {match.group(0)}, which RTVI {target} doesn't have")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pipecat", default="../pipecat", help="a pipecat checkout")
@@ -384,23 +447,25 @@ def main() -> int:
         print(f"no RTVI specification in {Path(args.pipecat) / SPEC_DIR}", file=sys.stderr)
         return 2
     versions = list(found)
-    outputs = {
-        PAGES_DIR / f"{version}.mdx": Reference(
-            json.loads(path.read_text(encoding="utf-8")), version
-        ).render()
+    pages = {
+        version: Reference(json.loads(path.read_text(encoding="utf-8")), version).render()
         for version, path in found.items()
     }
-    problems = []
+    outputs = {PAGES_DIR / f"{version}.mdx": text for version, text in pages.items()}
+    problems = broken_anchors(pages, versions[-1])
     standard_path = DOCS_ROOT / f"{STANDARD_PAGE.lstrip('/')}.mdx"
     standard = standard_path.read_text(encoding="utf-8")
-    for path, text in (
-        (DOCS_JSON, sidebar(DOCS_JSON.read_text(encoding="utf-8"), versions)),
-        (standard_path, reference_list(standard, versions)),
-    ):
-        if text is None:
-            problems.append(f"no RTVI version list to update in {path.relative_to(DOCS_ROOT)}")
-        else:
-            outputs[path] = text
+    docs_json = sidebar(DOCS_JSON.read_text(encoding="utf-8"), versions)
+    if docs_json is None:
+        problems.append("docs.json has no RTVI group to list the versions in")
+    elif (docs_json := latest_redirect(docs_json, versions[-1])) is None:
+        problems.append("docs.json has no redirects to add the latest RTVI version to")
+    else:
+        outputs[DOCS_JSON] = docs_json
+    if (text := reference_list(standard, versions)) is None:
+        problems.append(f"no RTVI version list to update in {standard_path.relative_to(DOCS_ROOT)}")
+    else:
+        outputs[standard_path] = text
     # The versions table names the Pipecat and client releases and what changed,
     # which the specification doesn't say, so it's written by hand.
     for version in versions:
