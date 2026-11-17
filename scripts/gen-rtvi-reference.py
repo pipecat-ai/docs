@@ -81,7 +81,12 @@ class Reference:
     # -- Schemas ------------------------------------------------------------
 
     def resolve(self, schema: dict) -> tuple[dict, str | None]:
-        """A schema with its ``$ref`` followed, and the name it was referred to by."""
+        """A schema with its ``$ref`` followed, and the name it was referred to by.
+
+        A field with a description of its own wraps its ``$ref`` in an ``allOf``.
+        """
+        if len(schema.get("allOf", [])) == 1:
+            schema = schema["allOf"][0]
         ref = schema.get("$ref", "")
         if ref.startswith("#/components/schemas/"):
             name = ref.rsplit("/", 1)[1]
