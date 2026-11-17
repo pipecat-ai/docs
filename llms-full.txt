@@ -13683,7 +13683,7 @@ turns:
       - "Spain with my family."
 ```
 
-Each `pause_ms:` is a positive integer number of milliseconds, and the list needs at least one text. The judge and `text_contains` see the text alone, joined in order. A pausing turn requires `user.modality: audio` and can't also name an `audio:` file.
+Each `pause_ms:` is a positive integer number of milliseconds, and the list needs at least one text. The judge and `text_contains` see the text alone, joined in order. A pausing turn requires `user.modality: audio` and can't also name an `audio:` file. A turn's pauses can total at most 60 seconds; a scenario file with a turn that pauses longer fails to load with an error naming the turn and its total.
 
 ### Playing audio files with `audio:`
 
@@ -15094,7 +15094,7 @@ eval-runs/20260610_142200/
 
 An artifact's name is the bot path, then the entry's `name:` when it has one, then the scenario's `<file>/<scenario>` name with its slash written as a double underscore, so `bots/turn-agent.py` under the label `openai/gpt-4o-mini` running `turn_completion/short_answer` writes `bots_turn-agent.py__openai_gpt-4o-mini__turn_completion__short_answer.log`.
 
-`results.jsonl` carries one line per run, and every line names its `bot`, its entry's `name`, its `scenario`, its `attempt`, and its `kind`, `script` or `simulation`. A scripted record carries the outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. Each turn lists its `expectations`, one per expectation the turn resolved, with whether it `passed` and what it `matched`: the marker of an `llm_marker`, a function call's signature, a reply's text. What a passed run matched is only recorded here. A simulation record carries the outcome (`passed`, `succeeded`, `error`), how the run ended (`ended_by`), the persona's turn count, the `success:` wording and the judge's `confidence` and `probabilities` for it, every metric's `criterion`, score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none, each with its `confidence` and `probabilities`), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+`results.jsonl` carries one line per run, and every line names its `bot`, its entry's `name`, its `scenario`, its `attempt`, and its `kind`, `script` or `simulation`. A scripted record carries the outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. Each turn lists its `expectations`, one per expectation the turn resolved, with whether it `passed` and what it `matched`: the marker of an `llm_marker`, a function call's signature, a reply's text. What a passed run matched is only recorded here. A simulation record carries the outcome (`passed`, `succeeded`, `error`, and for a run that did not complete its `failure_kind`), how the run ended (`ended_by`), the persona's turn count, the `success:` wording and the judge's `confidence` and `probabilities` for it, every metric's `criterion`, score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none, each with its `confidence` and `probabilities`), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
 
 Each run executes in its own process, so a harness that loads local audio models does so on its own, and a crash in one run doesn't stop the others.
 
@@ -15233,7 +15233,7 @@ scored = [t for t in result.turns if t.status != "not_run"]
 print(f"{sum(1 for t in scored if t.status == 'passed')}/{len(scored)} turns")
 ```
 
-`failures` carry a `kind` alongside the reason (`timeout`, `judge_no`, `judge_no_verdict` for a judge call that failed, `text_mismatch`, `missing_function_call`, `connect_failed` for a refused connection, `closed_before_ready` for a bot that closes the connection before `bot-ready`, `bot_ended` for a bot that ends the call before a turn's expectation is met, `error` for a failure in one of the harness's own services, and so on), which is the stable key to group by when scoring a sweep rather than reading one run.
+`failures` carry a `kind` alongside the reason (`timeout`, `judge_no`, `judge_no_verdict` for a judge call that failed, `text_mismatch`, `missing_function_call`, `connect_failed` for a refused connection, `closed_before_ready` for a bot that closes the connection before `bot-ready`, `audio_unsupported` for a bot whose `bot-ready` reports its transport is off for audio the run uses (see `audio_support_check`), `bot_ended` for a bot that ends the call before a turn's expectation is met, `error` for a failure in one of the harness's own services, and so on), which is the stable key to group by when scoring a sweep rather than reading one run.
 
 This maps cleanly onto a pytest test:
 
@@ -15286,26 +15286,27 @@ A session runs the simulation once. The `runs:` field is honored by the [suite](
 
 `run()` returns an `EvalSimulationResult`:
 
-| Field             | Description                                                                                                                                                                  |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `simulation_name` | Name of the simulation that ran.                                                                                                                                             |
-| `passed`          | Whether the run completed, the judge said `success:` was met, and no metric with a threshold fell short.                                                                     |
-| `succeeded`       | The judge's verdict on `success:` alone.                                                                                                                                     |
-| `reason`          | The judge's reason for its verdict, or the error.                                                                                                                            |
-| `failure`         | Why the run did not pass, or `None`: the error, then `goal not met: ...`, then the first failed metric.                                                                      |
-| `error`           | Set when the run did not complete (a failed connect, a harness error). Such a run is neither a goal success nor a goal failure.                                              |
-| `metrics`         | One `EvalSimulationMetricScore` per metric, in the order the file lists them. See below.                                                                                     |
-| `messages`        | The conversation, the persona's turns as `user` messages and the agent's as `assistant`. The `assistant` messages are the turns the metrics scored.                          |
-| `conversation`    | The conversation as a conversation file holds it: `messages` with the agent's function calls in place. A suite or `pipecat eval run` saves it as `<stem>.conversation.json`. |
-| `success`         | The `success:` wording the conversation was judged on.                                                                                                                       |
-| `confidence`      | How sure the judge is of its verdict on `success:`, from 0 to 1; `None` when it gave none.                                                                                   |
-| `probabilities`   | The probability of each answer to the goal question; empty when the judge gave none.                                                                                         |
-| `turns`           | The persona's turn count.                                                                                                                                                    |
-| `ended_by`        | How the run ended: `end_call`, `bot`, `max_turns`, `max_duration`, `silence`, or `error`.                                                                                    |
-| `end_call`        | The persona's own `end_call` claim (`success`, `reason`) when it made one. Advisory: the judge decides `succeeded`.                                                          |
-| `duration_ms`     | Wall-clock time the run took.                                                                                                                                                |
-| `events_seen`     | Every semantic event observed, for diagnostics.                                                                                                                              |
-| `debug_log`       | The harness's timestamped decision trace.                                                                                                                                    |
+| Field             | Description                                                                                                                                                                                                |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `simulation_name` | Name of the simulation that ran.                                                                                                                                                                           |
+| `passed`          | Whether the run completed, the judge said `success:` was met, and no metric with a threshold fell short.                                                                                                   |
+| `succeeded`       | The judge's verdict on `success:` alone.                                                                                                                                                                   |
+| `reason`          | The judge's reason for its verdict, or the error.                                                                                                                                                          |
+| `failure`         | Why the run did not pass, or `None`: the error, then `goal not met: ...`, then the first failed metric.                                                                                                    |
+| `error`           | Set when the run did not complete (a failed connect, a harness error). Such a run is neither a goal success nor a goal failure.                                                                            |
+| `failure_kind`    | What ended a run that did not complete: `connect_failed` for a bot that could not be reached, `error` for a failed harness service, `audio_unsupported`, and so on. `None` when the run reached a verdict. |
+| `metrics`         | One `EvalSimulationMetricScore` per metric, in the order the file lists them. See below.                                                                                                                   |
+| `messages`        | The conversation, the persona's turns as `user` messages and the agent's as `assistant`. The `assistant` messages are the turns the metrics scored.                                                        |
+| `conversation`    | The conversation as a conversation file holds it: `messages` with the agent's function calls in place. A suite or `pipecat eval run` saves it as `<stem>.conversation.json`.                               |
+| `success`         | The `success:` wording the conversation was judged on.                                                                                                                                                     |
+| `confidence`      | How sure the judge is of its verdict on `success:`, from 0 to 1; `None` when it gave none.                                                                                                                 |
+| `probabilities`   | The probability of each answer to the goal question; empty when the judge gave none.                                                                                                                       |
+| `turns`           | The persona's turn count.                                                                                                                                                                                  |
+| `ended_by`        | How the run ended: `end_call`, `bot`, `max_turns`, `max_duration`, `silence`, or `error`.                                                                                                                  |
+| `end_call`        | The persona's own `end_call` claim (`success`, `reason`) when it made one. Advisory: the judge decides `succeeded`.                                                                                        |
+| `duration_ms`     | Wall-clock time the run took.                                                                                                                                                                              |
+| `events_seen`     | Every semantic event observed, for diagnostics.                                                                                                                                                            |
+| `debug_log`       | The harness's timestamped decision trace.                                                                                                                                                                  |
 
 Each `EvalSimulationMetricScore` carries the metric's `name`, its `score` (the share of turns the judge said yes to for a judged metric, `1.0` or `0.0` for a measured one, `None` when there was nothing to judge or measure), whether it `passed`, its `reason`, its `min_score`, the `criterion` a judged metric scored each turn on, its measured `value` (the seconds, words, turns, or number of calls), and a `failure_kind` (`judge_no`, `judge_no_verdict`, `out_of_range`, `function_calls`, or `error`; `None` when it passed). A judged metric also carries one `EvalSimulationTurnVerdict` per agent turn with the 1-based `turn`, whether it `passed`, the judge's `verdict` (`yes`, `no`, or `none` when the judge gave none, which counts as a no), its `reason`, and its `confidence` and `probabilities`:
 
@@ -15364,16 +15365,17 @@ params = EvalSessionParams(
 result = await EvalSession.from_scenario(scenario, "ws://localhost:7860/ws", params=params).run()
 ```
 
-| Field                 | Default | Description                                                                                                            |
-| --------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `connect_timeout_s`   | `5.0`   | How long to wait for the bot to accept the WebSocket connection.                                                       |
-| `default_timeout_ms`  | `60000` | Scripted scenarios only: the latency budget for expectations without their own `within_ms`.                            |
-| `record_path`         | `None`  | Where to save the conversation audio. Only an audio-mode run records.                                                  |
-| `cache_dir`           | `None`  | Directory for cached synthesized user audio; `None` for the default under the user cache directory.                    |
-| `use_cache`           | `True`  | When `False`, ignore cached user audio and synthesize every turn, with no cache reads or writes.                       |
-| `bot_ready_timeout_s` | `60.0`  | How long to wait, once connected, for the bot's RTVI `bot-ready`, which covers the bot's startup.                      |
-| `stop_bot`            | `False` | Deprecated, no effect: the harness always ends the bot's session after a run.                                          |
-| `trigger_disconnect`  | `False` | Deprecated: only affects a bot serving the server `EvalTransport`, which fires `on_client_disconnected` only when set. |
+| Field                 | Default | Description                                                                                                                                                                                                                                                                 |
+| --------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `connect_timeout_s`   | `5.0`   | How long to wait for the bot to accept the WebSocket connection.                                                                                                                                                                                                            |
+| `default_timeout_ms`  | `60000` | Scripted scenarios only: the latency budget for expectations without their own `within_ms`.                                                                                                                                                                                 |
+| `record_path`         | `None`  | Where to save the conversation audio. Only an audio-mode run records.                                                                                                                                                                                                       |
+| `cache_dir`           | `None`  | Directory for cached synthesized user audio; `None` for the default under the user cache directory.                                                                                                                                                                         |
+| `use_cache`           | `True`  | When `False`, ignore cached user audio and synthesize every turn, with no cache reads or writes.                                                                                                                                                                            |
+| `bot_ready_timeout_s` | `60.0`  | How long to wait, once connected, for the bot's RTVI `bot-ready`, which covers the bot's startup.                                                                                                                                                                           |
+| `audio_support_check` | `"off"` | `"when_advertised"` refuses an audio run as `audio_unsupported` when the bot's `bot-ready` reports its transport is off for audio the run uses (`audio_in_enabled` or `audio_out_enabled`). A bot that reports nothing, such as one on Pipecat before 1.13, runs unchecked. |
+| `stop_bot`            | `False` | Deprecated, no effect: the harness always ends the bot's session after a run.                                                                                                                                                                                               |
+| `trigger_disconnect`  | `False` | Deprecated: only affects a bot serving the server `EvalTransport`, which fires `on_client_disconnected` only when set.                                                                                                                                                      |
 
 <Warning>
   Passing these as individual keyword arguments to `from_scenario()`
@@ -28757,7 +28759,7 @@ See [Scaling](./scaling) for more on how the pool grows, and [Capacity Planning]
   [Discord](https://discord.gg/dailyco).
 </Warning>
 
-Developers are responsible for handling capacity errors when starting sessions. When your instance pool is at capacity, the start request will fail with a `429` status and code.
+Developers are responsible for handling capacity errors when starting sessions. When your instance pool is at capacity, the start request will fail with a `429` status and the code [`PCC-AGENT-AT-CAPACITY`](./error-codes#pcc-agent-at-capacity). Sessions on the generic WebSocket endpoint are closed with code `1011` instead (see [Generic WebSocket](../guides/generic-websocket#when-a-session-cannot-start)).
 
 Here is a simple example of how to handle a capacity error:
 
@@ -28770,9 +28772,8 @@ curl --location --request POST 'https://api.pipecat.daily.co/v1/public/{agent_na
 --data-raw '{}'
 
 >> {
->>	"status": 429,
->>	"code": "429",
->>	"message": "Rate limit exceeded. Please try again later"
+>>	"error": "Service maximum instances reached",
+>>	"code": "PCC-AGENT-AT-CAPACITY"
 >> }
 ```
 
@@ -28797,6 +28798,8 @@ except Exception as e:
 ```
 
 </CodeGroup>
+
+A `429` with the message `Rate limit exceeded. Please try again later.` is a different error. It means you sent too many requests to the Pipecat Cloud API in a short time, not that your instance pool is full. Wait a moment and try again.
 
 ## Logging and monitoring
 
@@ -29793,7 +29796,7 @@ Indicates an error in your image that prevent your agent from starting. Typicall
 
 ### PCC-AGENT-AT-CAPACITY
 
-> Service maximum agent instances reached
+> Service maximum instances reached
 
 This error indicates that the maximum active sessions for your deployment have been reached. You can either increase the maximum active sessions for your deployment (`max-agents`), or place the end-user in a queue until a session becomes available.
 
@@ -33487,6 +33490,12 @@ Including a `body` on a `/start` call against a service that has `websocket_auth
 
 </Note>
 
+## When a session cannot start
+
+If your agent's instance pool is full, the WebSocket connection is closed with code `1011` and the reason `Concurrency limit reached`. This matches the `429` [`PCC-AGENT-AT-CAPACITY`](/pipecat-cloud/fundamentals/error-codes#pcc-agent-at-capacity) error from `/start`. A new connection works once a session ends or you raise your capacity.
+
+If Pipecat Cloud can't accept the session for a short time, the connection is closed with code `1013` and the reason `Service temporarily unavailable`. Your client can retry the connection.
+
 # Pipecat Cloud WebSocket Authentication
 Source: https://docs.pipecat.ai/pipecat-cloud/guides/websocket-authentication.md
 
@@ -36123,7 +36132,7 @@ Your deployed code remains private and protected through multiple layers:
 
 Pipecat Cloud supports HMAC token authentication for WebSocket connections. When enabled, clients must obtain a short-lived, one-time-use token via the `/start` endpoint before connecting. Tokens are validated before the WebSocket connection is accepted — unauthorized requests never allocate bot resources.
 
-New agents default to requiring token authentication. For telephony providers that connect directly (Twilio, Plivo, etc.), you can set `websocket_auth = "none"` in your deployment config.
+New agents default to `websocket_auth = "none"` (no authentication). To require tokens, set `websocket_auth = "token"` in your deployment config. Keep `"none"` for telephony providers that connect directly (Twilio, Plivo, etc.).
 
 See the [WebSocket Authentication guide](/pipecat-cloud/guides/websocket-authentication) for setup instructions and details.
 
@@ -38214,6 +38223,7 @@ Speech-to-Text services receive and audio input and output transcriptions.
 | [NVIDIA](/api-reference/server/services/stt/nvidia)             | `uv add "pipecat-ai[nvidia]"`                                                 | Pipecat    |
 | [OpenAI](/api-reference/server/services/stt/openai)             | `uv add "pipecat-ai[openai]"`                                                 | Pipecat    |
 | [Oruk](/api-reference/server/services/stt/oruk)                 | `uv add "pipecat-oruk==0.1.0rc1"`                                             | Community  |
+| [PyAI Hear](/api-reference/server/services/stt/pyai)            | `uv add pipecat-pyai==0.1.5`                                                  | Community  |
 | [Quickdial](/api-reference/server/services/stt/quickdial)       | `uv add pipecat-quickdial`                                                    | Community  |
 | [Rime](/api-reference/server/services/stt/rime)                 | `uv add "pipecat-ai[rime]"`                                                   | Pipecat    |
 | [Ringg AI](/api-reference/server/services/stt/ringg)            | `uv pip install git+https://github.com/Stonkr/pipecat-ringg.git`              | Community  |
@@ -38280,6 +38290,7 @@ For the services and models that perform expression tags, such as laughter or a 
 | [ReadAloud](/api-reference/server/services/tts/readaloud)         | `uv add pipecat-readaloud`                                                                      | Community  |
 | [ResembleAI](/api-reference/server/services/tts/resembleai)       | `uv add "pipecat-ai[resembleai]"`                                                               | Pipecat    |
 | [Respeecher](/api-reference/server/services/tts/respeecher)       | `uv add pipecat-respeecher`                                                                     | Community  |
+| [PyAI Speak](/api-reference/server/services/tts/pyai)             | `uv add pipecat-pyai==0.1.5`                                                                    | Community  |
 | [Quickdial](/api-reference/server/services/tts/quickdial)         | `uv add pipecat-quickdial`                                                                      | Community  |
 | [Rime](/api-reference/server/services/tts/rime)                   | `uv add "pipecat-ai[rime]"`                                                                     | Pipecat    |
 | [Rumik AI](/api-reference/server/services/tts/rumik)              | `uv add pipecat-rumik`                                                                          | Community  |
@@ -41110,13 +41121,13 @@ Extends [`TransportParams`](/api-reference/server/services/transport/transport-p
 
 **Audio**
 
-| Parameter                 | Type  | Default | Description                                                            |
-| ------------------------- | ----- | ------- | ---------------------------------------------------------------------- |
-| `audio_out_sample_rate`   | `int` | `24000` | Rate the bot publishes at; audio is resampled to the nearest Opus rate |
-| `audio_in_sample_rate`    | `int` | `16000` | Rate decoded audio is resampled to before going downstream             |
-| `audio_in_max_latency_ms` | `int` | `500`   | How long to wait for a late frame before skipping ahead                |
-| `audio_out_frame_ms`      | `int` | `20`    | Outgoing frame duration. One of 2, 5, 10, 20, 40, 60                   |
-| `audio_out_max_buffer_ms` | `int` | `25000` | Maximum outgoing buffer                                                |
+| Parameter                 | Type  | Default | Description                                                                                             |
+| ------------------------- | ----- | ------- | ------------------------------------------------------------------------------------------------------- |
+| `audio_out_sample_rate`   | `int` | `24000` | Rate the bot publishes at; audio is resampled to the nearest Opus rate                                  |
+| `audio_in_sample_rate`    | `int` | `16000` | Rate decoded audio is resampled to before going downstream                                              |
+| `audio_in_max_latency_ms` | `int` | `500`   | How long to wait for a late frame before skipping ahead                                                 |
+| `audio_out_frame_ms`      | `int` | `20`    | Outgoing frame duration. One of 2, 5, 10, 20, 40, 60                                                    |
+| `audio_out_max_buffer_ms` | `int` | `2000`  | Maximum outgoing buffer. Also bounds how long a cancelled utterance keeps playing after an interruption |
 
 <Warning>
   `serve_bind` is deprecated since v1.8.0 and will be removed in 2.0.0. Use
@@ -41169,11 +41180,11 @@ transport = MOQTransport(
 )
 
 @transport.event_handler("on_client_connected")
-async def on_client_connected(transport):
+async def on_client_connected(transport, client):
     await worker.queue_frames([LLMRunFrame()])
 
 @transport.event_handler("on_client_disconnected")
-async def on_client_disconnected(transport):
+async def on_client_disconnected(transport, client):
     # In client mode the transport redials, so end the call here
     await runner.cancel()
 ```
@@ -41220,10 +41231,16 @@ The `/start` response carries a `moq` block — `relayUrl`, `certHash`, `serve`,
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `on_connected`           | A session with the relay is established, the first and every redialed one, or the serve-mode bind is up                                                |
 | `on_disconnected`        | A session ended, or the transport stopped without ever having one. Client mode redials after it, so end the call from `on_client_disconnected` instead |
-| `on_client_connected`    | The peer's broadcast was announced                                                                                                                     |
-| `on_client_disconnected` | The peer is gone: it said goodbye, or it stayed missing for `connection_timeout`                                                                       |
+| `on_client_connected`    | The peer's broadcast was announced. Receives the client, `{"id": peer_id}`                                                                             |
+| `on_client_disconnected` | The peer is gone: it said goodbye, or it stayed missing for `connection_timeout`. Receives the client, `{"id": peer_id}`                               |
 | `on_track_subscribed`    | A remote track subscription succeeded                                                                                                                  |
 | `on_error`               | An error in the underlying transport. Receives the message and the exception; the pipeline also gets an `ErrorFrame`                                   |
+
+<Warning>
+  A `on_client_connected` or `on_client_disconnected` handler that takes only
+  `transport` still fires but is deprecated since v1.8.0 and will be removed in
+  2.0.0. Add the `client` argument.
+</Warning>
 
 ## Notes
 
@@ -45872,34 +45889,34 @@ Before using AssemblyAI STT services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `AssemblyAISTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter                          | Type                                                 | Default               | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ---------------------------------- | ---------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                            | `str`                                                | `"universal-3-6-pro"` | STT model identifier. Set to `"universal-3-6-pro"` or `"universal-3-5-pro"` (Universal-3 Pro models). Both share the full U3 Pro feature set; `universal-3-6-pro` covers 32 declared languages against `universal-3-5-pro`'s 19. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `language`                         | `Language \| str`                                    | `Language.EN`         | Not sent to AssemblyAI, so it doesn't affect transcription; use `language_codes` instead. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `formatted_finals`                 | `bool`                                               | `True`                | Whether to enable transcript formatting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `format_turns`                     | `bool`                                               | `True`                | Whether to format turn transcripts. When `True`, a turn is final only once its formatted transcript arrives. Applies to the `universal-streaming-english` and `universal-streaming-multilingual` models; U3 Pro models format automatically.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `word_finalization_max_wait_time`  | `int`                                                | `None`                | Maximum time to wait for word finalization in milliseconds.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `end_of_turn_confidence_threshold` | `float`                                              | `None`                | Confidence threshold for end-of-turn detection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `min_turn_silence`                 | `int`                                                | `None`                | Silence duration (ms) before a speculative end-of-turn check. If terminal punctuation is found, the turn ends; otherwise a partial is emitted and the turn continues. Clamped to 50–10000 ms. Server default is mode-dependent (set by the `mode` preset). In Pipecat mode (`vad_force_turn_endpoint=True`), Pipecat sends `100` on U3 Pro models when unset, and always `160` on other models.                                                                                                                                                                                                                                                                                                                                              |
-| `max_turn_silence`                 | `int`                                                | `None`                | Maximum silence (ms) before the turn is forced to end, regardless of punctuation. In Pipecat mode on U3 Pro models, any value is replaced with `min_turn_silence`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `keyterms_prompt`                  | `List[str]`                                          | `None`                | A list of words and phrases to improve recognition accuracy for. Maximum 100 terms. May be combined with `prompt` on U3 Pro models.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `prompt`                           | `str`                                                | `None`                | A contextual prompt describing what the audio is about (its domain, scenario, or conversation details) so the model better recognizes likely vocabulary. Carries context about your audio, not transcription instructions; formatting or behavioral commands are not supported. Maximum ~1500 characters. U3 Pro models only: setting it with another model raises `ValueError` at construction. May be combined with `keyterms_prompt`.                                                                                                                                                                                                                                                                                                     |
-| `language_code`                    | `str`                                                | `None`                | Older single-language form of `language_codes`: one ISO code, such as `"es"`. Prefer `language_codes`. If both are set, `language_codes` is used and this setting is ignored.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `language_codes`                   | `List[Language]`                                     | `None`                | Languages to steer transcription toward, on Universal-3 Pro models only. `universal-3-6-pro` supports 32 languages and `universal-3-5-pro` supports 19 ([full list](https://www.assemblyai.com/docs/streaming/multilingual-transcription#supported-languages)). Pass one language (e.g. `[Language.ES]`) to pin the session to it, or several (e.g. `[Language.EN, Language.ES]`) to limit code-switching to that set. Order matters. You can declare up to 10 distinct languages on every Universal-3 Pro model, including `universal-3-6-pro`; regional variants such as `Language.ES_MX` count as their base language. This setting can be changed mid-session without reconnecting; pass `[]` to clear it. It's ignored on other models. |
-| `language_detection`               | `bool \| None`                                       | `None`                | Whether to detect the spoken language and report it on each turn, on `universal-streaming-multilingual` only. `None` is not sent. Independent of `language_codes`, which steers transcription instead.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `speaker_labels`                   | `bool`                                               | `None`                | Whether to enable streaming speaker diarization. When enabled, each turn includes a `speaker_label` and each final word includes a `speaker` field for word-level attribution.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `max_speakers`                     | `int`                                                | `None`                | Maximum number of speaker labels, from 1 to 10. Once the cap is reached, additional speakers are merged into the closest existing label. Set it a little above the expected number of speakers, since a cap that is too high can split one speaker into several. Only used when `speaker_labels` is enabled.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `speaker_format`                   | `str \| None`                                        | `None`                | Format string for diarized transcripts. Use `{speaker}` for the speaker label, `{speaker_number}` for the speaker's order of first appearance (`1`, `2`, ...), and `{text}` for the transcript text, e.g. `"{speaker}: {text}"`. If `None`, the text is not modified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `filter_profanity`                 | `bool`                                               | `None`                | Whether to replace profanity in transcribed text with asterisks. When not set, text is left unfiltered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `vad_threshold`                    | `float`                                              | `None`                | Confidence threshold (0.0–1.0) for classifying audio frames as silence. Frames with VAD confidence below this value are considered silent; increase for noisy environments to reduce false speech detection. Server default is mode-dependent (set by the `mode` preset).                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `domain`                           | `str`                                                | `None`                | Enable a domain-specific model for specialized terminology. Set to `"medical-v1"` for Medical Mode (improved accuracy on medications, procedures, conditions, and dosages). Supported languages: `en`, `es`, `de`, `fr`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `continuous_partials`              | `bool`                                               | `True`                | Whether to emit additional partial transcripts during long turns at a steady ~3 second cadence. When enabled, partials covering the full turn transcript are emitted about every 3 seconds while speech continues; when disabled, only one early partial is emitted near turn start. The first partial (at 750 ms) is unaffected.                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `interruption_delay`               | `int`                                                | `None`                | How soon the first partial is emitted, in milliseconds (0–1000). Useful for tuning barge-in responsiveness or emitting earlier partials for LLM inference; larger values are more confident on interruptions, smaller values give faster time to first partial. The server adds a fixed 256 ms, so `0` yields an effective 256 ms and `500` yields 756 ms. Server default is mode-dependent (set by the `mode` preset).                                                                                                                                                                                                                                                                                                                      |
-| `agent_context`                    | `str`                                                | `None`                | Your voice agent's spoken text (TTS reply), used as context for the next user turn — improves accuracy on short or ambiguous replies and spelled-out entities like emails or IDs. Set at connection to seed the agent's greeting and/or update after each reply; each update replaces the previous value. Maximum ~1500 characters.                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `previous_context_n_turns`         | `int`                                                | `None`                | Advanced. Maximum number of prior conversation entries (user transcripts and any `agent_context` values) carried forward as context. Range 0–100; set to `0` to disable automatic carryover. Most integrations should leave this unset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `voice_focus`                      | `Literal["near-field", "far-field"]`                 | `None`                | Enable Voice Focus to isolate the primary voice and suppress background noise before transcription. Set to `"near-field"` for close-talking mics (headsets, phones) or `"far-field"` for distant mics (conference rooms). Off when unset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `voice_focus_threshold`            | `float`                                              | `None`                | Controls how aggressively Voice Focus suppresses background audio, from `0.0` (least) to `1.0` (most). Requires `voice_focus` to be set, otherwise a validation error is returned.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `mode`                             | `Literal["min_latency", "balanced", "max_accuracy"]` | `None`                | Latency and accuracy preset controlling turn-detection and partial-emission defaults. `max_accuracy` favors quality, `min_latency` favors speed, and `balanced` trades off between them. When omitted, the server applies its own preset, which sets the defaults for mode-dependent fields such as `interruption_delay`, `min_turn_silence`, `vad_threshold`, `previous_context_n_turns`, and `continuous_partials`.                                                                                                                                                                                                                                                                                                                        |
+| Parameter                          | Type                                                 | Default               | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ---------------------------------- | ---------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                            | `str`                                                | `"universal-3-6-pro"` | STT model identifier. Set to `"universal-3-6-pro"`, `"universal-3-5-pro"`, or `"assemblyai-stt-3-7-realtime-agent"` (Universal-3 Pro models). All share the full U3 Pro feature set; `universal-3-6-pro` and `assemblyai-stt-3-7-realtime-agent` cover 32 declared languages against `universal-3-5-pro`'s 19. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `language`                         | `Language \| str`                                    | `Language.EN`         | Not sent to AssemblyAI, so it doesn't affect transcription; use `language_codes` instead. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `formatted_finals`                 | `bool`                                               | `True`                | Whether to enable transcript formatting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `format_turns`                     | `bool`                                               | `True`                | Whether to format turn transcripts. When `True`, a turn is final only once its formatted transcript arrives. Applies to the `universal-streaming-english` and `universal-streaming-multilingual` models; U3 Pro models format automatically.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `word_finalization_max_wait_time`  | `int`                                                | `None`                | Maximum time to wait for word finalization in milliseconds.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `end_of_turn_confidence_threshold` | `float`                                              | `None`                | Confidence threshold for end-of-turn detection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `min_turn_silence`                 | `int`                                                | `None`                | Silence duration (ms) before a speculative end-of-turn check. If terminal punctuation is found, the turn ends; otherwise a partial is emitted and the turn continues. Clamped to 50–10000 ms. Server default is mode-dependent (set by the `mode` preset). In Pipecat mode (`vad_force_turn_endpoint=True`), Pipecat sends `100` on U3 Pro models when unset, and always `160` on other models.                                                                                                                                                                                                                                                                                                                                                                                     |
+| `max_turn_silence`                 | `int`                                                | `None`                | Maximum silence (ms) before the turn is forced to end, regardless of punctuation. In Pipecat mode on U3 Pro models, any value is replaced with `min_turn_silence`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `keyterms_prompt`                  | `List[str]`                                          | `None`                | A list of words and phrases to improve recognition accuracy for. Maximum 100 terms. May be combined with `prompt` on U3 Pro models.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `prompt`                           | `str`                                                | `None`                | A contextual prompt describing what the audio is about (its domain, scenario, or conversation details) so the model better recognizes likely vocabulary. Carries context about your audio, not transcription instructions; formatting or behavioral commands are not supported. Maximum ~1500 characters. U3 Pro models only: setting it with another model raises `ValueError` at construction. May be combined with `keyterms_prompt`.                                                                                                                                                                                                                                                                                                                                            |
+| `language_code`                    | `str`                                                | `None`                | Older single-language form of `language_codes`: one ISO code, such as `"es"`. Prefer `language_codes`. If both are set, `language_codes` is used and this setting is ignored.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `language_codes`                   | `List[Language]`                                     | `None`                | Languages to steer transcription toward, on Universal-3 Pro models only. `universal-3-6-pro` and `assemblyai-stt-3-7-realtime-agent` support 32 languages and `universal-3-5-pro` supports 19 ([full list](https://www.assemblyai.com/docs/streaming/multilingual-transcription#supported-languages)). Pass one language (e.g. `[Language.ES]`) to pin the session to it, or several (e.g. `[Language.EN, Language.ES]`) to limit code-switching to that set. Order matters. You can declare up to 10 distinct languages on every Universal-3 Pro model, including `universal-3-6-pro`; regional variants such as `Language.ES_MX` count as their base language. This setting can be changed mid-session without reconnecting; pass `[]` to clear it. It's ignored on other models. |
+| `language_detection`               | `bool \| None`                                       | `None`                | Whether to detect the spoken language and report it on each turn, on `universal-streaming-multilingual` only. `None` is not sent. Independent of `language_codes`, which steers transcription instead.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `speaker_labels`                   | `bool`                                               | `None`                | Whether to enable streaming speaker diarization. When enabled, each turn includes a `speaker_label` and each final word includes a `speaker` field for word-level attribution.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `max_speakers`                     | `int`                                                | `None`                | Maximum number of speaker labels, from 1 to 10. Once the cap is reached, additional speakers are merged into the closest existing label. Set it a little above the expected number of speakers, since a cap that is too high can split one speaker into several. Only used when `speaker_labels` is enabled.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `speaker_format`                   | `str \| None`                                        | `None`                | Format string for diarized transcripts. Use `{speaker}` for the speaker label, `{speaker_number}` for the speaker's order of first appearance (`1`, `2`, ...), and `{text}` for the transcript text, e.g. `"{speaker}: {text}"`. If `None`, the text is not modified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `filter_profanity`                 | `bool`                                               | `None`                | Whether to replace profanity in transcribed text with asterisks. When not set, text is left unfiltered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `vad_threshold`                    | `float`                                              | `None`                | Confidence threshold (0.0–1.0) for classifying audio frames as silence. Frames with VAD confidence below this value are considered silent; increase for noisy environments to reduce false speech detection. Server default is mode-dependent (set by the `mode` preset).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `domain`                           | `str`                                                | `None`                | Enable a domain-specific model for specialized terminology. Set to `"medical-v1"` for Medical Mode (improved accuracy on medications, procedures, conditions, and dosages). Supported languages: `en`, `es`, `de`, `fr`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `continuous_partials`              | `bool`                                               | `True`                | Whether to emit additional partial transcripts during long turns at a steady ~3 second cadence. When enabled, partials covering the full turn transcript are emitted about every 3 seconds while speech continues; when disabled, only one early partial is emitted near turn start. The first partial (at 750 ms) is unaffected.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `interruption_delay`               | `int`                                                | `None`                | How soon the first partial is emitted, in milliseconds (0–1000). Useful for tuning barge-in responsiveness or emitting earlier partials for LLM inference; larger values are more confident on interruptions, smaller values give faster time to first partial. The server adds a fixed 256 ms, so `0` yields an effective 256 ms and `500` yields 756 ms. Server default is mode-dependent (set by the `mode` preset).                                                                                                                                                                                                                                                                                                                                                             |
+| `agent_context`                    | `str`                                                | `None`                | Your voice agent's spoken text (TTS reply), used as context for the next user turn — improves accuracy on short or ambiguous replies and spelled-out entities like emails or IDs. Set at connection to seed the agent's greeting and/or update after each reply; each update replaces the previous value. Maximum ~1500 characters.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `previous_context_n_turns`         | `int`                                                | `None`                | Advanced. Maximum number of prior conversation entries (user transcripts and any `agent_context` values) carried forward as context. Range 0–100; set to `0` to disable automatic carryover. Most integrations should leave this unset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `voice_focus`                      | `Literal["near-field", "far-field"]`                 | `None`                | Enable Voice Focus to isolate the primary voice and suppress background noise before transcription. Set to `"near-field"` for close-talking mics (headsets, phones) or `"far-field"` for distant mics (conference rooms). Off when unset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `voice_focus_threshold`            | `float`                                              | `None`                | Controls how aggressively Voice Focus suppresses background audio, from `0.0` (least) to `1.0` (most). Requires `voice_focus` to be set, otherwise a validation error is returned.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `mode`                             | `Literal["min_latency", "balanced", "max_accuracy"]` | `None`                | Latency and accuracy preset controlling turn-detection and partial-emission defaults. `max_accuracy` favors quality, `min_latency` favors speed, and `balanced` trades off between them. When omitted, the server applies its own preset, which sets the defaults for mode-dependent fields such as `interruption_delay`, `min_turn_silence`, `vad_threshold`, `previous_context_n_turns`, and `continuous_partials`.                                                                                                                                                                                                                                                                                                                                                               |
 
 ### Sync Settings
 
@@ -45907,7 +45924,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 
 | Parameter              | Type                       | Default               | Description                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ---------------------- | -------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                | `str`                      | `"universal-3-6-pro"` | STT model identifier sent to the Sync API. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                               |
+| `model`                | `str`                      | `"universal-3-6-pro"` | STT model identifier sent to the Sync API, for example `"universal-3-6-pro"` or `"assemblyai-stt-3-7"`. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                  |
 | `language`             | `Language \| str`          | `Language.EN`         | Language for speech recognition. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                         |
 | `prompt`               | `str \| None`              | `None`                | A natural-language description of what the audio is about: the domain, the scenario, or details of the conversation. Prepended to the model's system prompt to guide transcription.                                                                                                                                                                                                                            |
 | `keyterms_prompt`      | `List[str]`                | `None`                | Key terms or phrases to bias the decoder toward.                                                                                                                                                                                                                                                                                                                                                               |
@@ -45949,7 +45966,7 @@ stt = AssemblyAISTTService(
 
 ### With AssemblyAI Built-in Turn Detection
 
-AssemblyAI's Universal-3 Pro models (`universal-3-5-pro` and `universal-3-6-pro`) support built-in turn detection for more natural conversation flow. When `vad_force_turn_endpoint=False`, the service automatically requests `ExternalUserTurnStrategies`, so you don't need to configure turn strategies manually:
+AssemblyAI's Universal-3 Pro models (`universal-3-5-pro`, `universal-3-6-pro`, and `assemblyai-stt-3-7-realtime-agent`) support built-in turn detection for more natural conversation flow. When `vad_force_turn_endpoint=False`, the service automatically requests `ExternalUserTurnStrategies`, so you don't need to configure turn strategies manually:
 
 ```python
 from pipecat.services.assemblyai.stt import AssemblyAISTTService
@@ -46047,7 +46064,7 @@ stt = AssemblyAISTTService(
 )
 ```
 
-Language steering applies to Universal-3 Pro models only: `universal-3-6-pro` supports 32 languages and `universal-3-5-pro` supports 19. You can declare up to 10 distinct languages on every Universal-3 Pro model; regional variants such as `Language.ES_MX` count as their base language. `language_codes` can be changed mid-session without reconnecting using `STTUpdateSettingsFrame`.
+Language steering applies to Universal-3 Pro models only: `universal-3-6-pro` and `assemblyai-stt-3-7-realtime-agent` support 32 languages and `universal-3-5-pro` supports 19. You can declare up to 10 distinct languages on every Universal-3 Pro model; regional variants such as `Language.ES_MX` count as their base language. `language_codes` can be changed mid-session without reconnecting using `STTUpdateSettingsFrame`.
 
 ### AssemblyAISyncSTTService Usage
 
@@ -46333,13 +46350,16 @@ Before using AWS Transcribe STT services, you need:
 
 Runtime-configurable settings passed via the `settings` constructor argument using `AWSTranscribeSTTService.Settings(...)`. These can be updated mid-conversation with `STTUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
 
-| Parameter                   | Type                          | Default       | Description                                                                                                                                                                                                                                                                                                                                                      |
-| --------------------------- | ----------------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                     | `str \| None`                 | `None`        | Not sent by this service; reported only as the model name in metrics and traces. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                           |
-| `language`                  | `Language \| str`             | `Language.EN` | Language for transcription. See [AWS Transcribe supported languages](https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html). _(Inherited from base STT settings.)_                                                                                                                                                                           |
-| `partial_results_stability` | `"high" \| "medium" \| "low"` | `"high"`      | How stable interim results should be, trading accuracy against latency: `"low"` is the most accurate, `"high"` the fastest. AWS binds this to a connection, so updating it at runtime triggers a reconnect. See [AWS partial result stabilization docs](https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html#streaming-partial-result-stabilization). |
-| `show_speaker_label`        | `bool`                        | `False`       | Enable speaker diarization. Each contiguous speaker run of a final result is pushed as its own frame, with AWS's speaker label (`"0"`, `"1"`, ...) in `speaker.label`. Interim results have no `speaker`. Updating it at runtime triggers a reconnect.                                                                                                           |
-| `speaker_format`            | `str \| None`                 | `None`        | Format string for diarized speaker runs. Use `{speaker}` for the speaker label, `{speaker_number}` for the speaker's order of first appearance (`1`, `2`, ...), and `{text}` for the transcript text, e.g. `"{speaker}: {text}"`. If `None`, the text is not modified. Updating it at runtime does not reconnect.                                                |
+| Parameter                     | Type                          | Default       | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------- | ----------------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                       | `str \| None`                 | `None`        | Not sent by this service; reported only as the model name in metrics and traces. _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                                                                                             |
+| `language`                    | `Language \| str`             | `Language.EN` | Language for transcription. See [AWS Transcribe supported languages](https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html). _(Inherited from base STT settings.)_                                                                                                                                                                                                                                                                                             |
+| `partial_results_stability`   | `"high" \| "medium" \| "low"` | `"high"`      | How stable interim results should be, trading accuracy against latency: `"low"` is the most accurate, `"high"` the fastest. AWS binds this to a connection, so updating it at runtime triggers a reconnect. See [AWS partial result stabilization docs](https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html#streaming-partial-result-stabilization).                                                                                                                   |
+| `show_speaker_label`          | `bool`                        | `False`       | Enable speaker diarization. Each contiguous speaker run of a final result is pushed as its own frame, with AWS's speaker label (`"0"`, `"1"`, ...) in `speaker.label`. Interim results have no `speaker`. Updating it at runtime triggers a reconnect.                                                                                                                                                                                                                             |
+| `speaker_format`              | `str \| None`                 | `None`        | Format string for diarized speaker runs. Use `{speaker}` for the speaker label, `{speaker_number}` for the speaker's order of first appearance (`1`, `2`, ...), and `{text}` for the transcript text, e.g. `"{speaker}: {text}"`. If `None`, the text is not modified. Updating it at runtime does not reconnect.                                                                                                                                                                  |
+| `language_options`            | `list[Language] \| None`      | `None`        | Languages AWS chooses among to identify the spoken language: at least two, one locale per language (`Language.EN_US` and `Language.EN_GB` can't both be listed), and AWS recommends no more than five. When set, any configured `language` is ignored and each transcription frame carries the language AWS identified. Updating it at runtime triggers a reconnect. See [AWS language identification docs](https://docs.aws.amazon.com/transcribe/latest/dg/lang-id-stream.html). |
+| `identify_multiple_languages` | `bool`                        | `False`       | Identify the language of each segment, for speakers who switch languages mid-conversation. Requires `language_options`. Updating it at runtime triggers a reconnect.                                                                                                                                                                                                                                                                                                               |
+| `preferred_language`          | `Language \| None`            | `None`        | The most likely of `language_options`, which helps AWS identify the language sooner. Requires `language_options`. Updating it at runtime triggers a reconnect.                                                                                                                                                                                                                                                                                                                     |
 
 ## Usage
 
@@ -46374,9 +46394,23 @@ stt = AWSTranscribeSTTService(
 )
 ```
 
+### With Language Identification
+
+```python
+stt = AWSTranscribeSTTService(
+    api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    settings=AWSTranscribeSTTService.Settings(
+        language_options=[Language.EN_US, Language.ES_US],
+        preferred_language=Language.EN_US,
+    ),
+)
+```
+
 ## Notes
 
 - **Pre-signed URL authentication**: The service uses pre-signed URLs for WebSocket authentication rather than passing credentials directly, following AWS best practices.
+- **Invalid language identification settings**: `identify_multiple_languages` and `preferred_language` require `language_options`, and `language_options` needs at least two languages, and `preferred_language` must be one of them. The constructor raises `ValueError` on a conflict; a conflicting runtime update is rejected whole with a non-fatal error.
 
 ## Event Handlers
 
@@ -52107,6 +52141,115 @@ stt = QuickdialSTTService(
 
 - [pipecat-quickdial on GitHub](https://github.com/samay-ai/pipecat-quickdial) — source, example, and issues
 - [Quickdial API docs](https://quickdial.ai/docs)
+
+# PyAI Hear Speech-to-Text
+Source: https://docs.pipecat.ai/api-reference/server/services/stt/pyai.md
+
+PyAISTTService streams audio to PyAI Hear for STT and returns interim and final transcripts in a Pipecat pipeline.
+
+## Overview
+
+`PyAISTTService` provides streaming speech recognition through PyAI Hear in a Pipecat pipeline.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source and examples"
+    icon="github"
+    href="https://github.com/atomsai/pyai-speech-integrations/tree/main/pipecat-pyai"
+  >
+    PyAI-maintained source, Apache-2.0 license, and examples.
+  </Card>
+  <Card
+    title="PyAI integration guide"
+    icon="book"
+    href="https://docs.pyai.com/guides/pipecat"
+  >
+    Framework setup and provider configuration.
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add pipecat-pyai==0.1.5
+```
+
+Python 3.11 or newer is required. The package declares Pipecat `>=1.3.0,<2.0`.
+A two-turn audio flow was exercised with Pipecat 1.8.1; this is not qualification
+of every version in that range. Version 0.1.4's STT startup-settings correction
+was checked separately from that earlier audio run. Version 0.1.5 adds the
+standalone WebRTC example, public source/documentation links, and TTS session
+cleanup. Its package and framework compatibility checks generate no audio.
+
+## Prerequisites
+
+Create a PyAI account and a server-side key with the `hear:stream` scope.
+Before running audio, verify the selected project, billing environment, and
+limits with `GET https://api.pyai.com/v1/me`. Usage is charged or limited according
+to that key; Pipecat hosting, transport, and LLM costs are separate.
+
+### Required Environment Variables
+
+- `PYAI_API_KEY`: the server-side PyAI key. Keep it out of browser code and source control.
+
+## Configuration
+
+```python
+from pipecat_pyai import PyAISTTService
+```
+
+### PyAISTTService
+
+<ParamField path="api_key" type="str | None">
+  Default: `None`. Server-side PyAI key. When omitted, reads `PYAI_API_KEY`.
+  Raises `ValueError` if neither is supplied.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.pyai.com">
+  PyAI API base URL.
+</ParamField>
+
+<ParamField path="model" type="str" default="pyai-hear">
+  PyAI model identifier.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None">
+  Default: `None`. Audio sample rate in Hz. When omitted, uses the pipeline
+  audio rate.
+</ParamField>
+
+<ParamField path="language" type="str">
+  Default: empty string (`""`). An empty string enables automatic detection. See
+  [supported languages](https://docs.pyai.com/reference/language-support) for
+  explicit codes.
+</ParamField>
+
+Additional keyword arguments are forwarded to Pipecat's base service.
+
+### Settings
+
+Configure provider options in the constructor. The adapter initializes Pipecat
+settings metadata, but does not implement runtime provider-setting updates.
+Create a new service to change model or language; do not pass a second `settings=` argument.
+
+## Usage
+
+The following function builds the input part of a pipeline from existing components.
+See the [complete WebRTC demo](https://github.com/atomsai/pyai-speech-integrations/blob/main/demos/pipecat_bot.py)
+for transport, VAD, LLM, worker, and disconnect handling.
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_pyai import PyAISTTService
+
+
+def speech_input(transport, user_aggregator, llm):
+    return Pipeline([transport.input(), PyAISTTService(), user_aggregator, llm])
+```
+
+## Frames
+
+Interim results use `InterimTranscriptionFrame`; corrected final text uses `TranscriptionFrame`. Configure a VAD in the user aggregator to finalize spoken turns.
 
 # Rime Speech-to-Text
 Source: https://docs.pipecat.ai/api-reference/server/services/stt/rime.md
@@ -69028,6 +69171,119 @@ tts = QuickdialTTSService(
 - [pipecat-quickdial on GitHub](https://github.com/samay-ai/pipecat-quickdial) — source, example, and issues
 - [Quickdial API docs](https://quickdial.ai/docs)
 
+# PyAI Speak Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/pyai.md
+
+PyAITTSService streams PCM audio from PyAI Speak for TTS, using a server-side key and a voice selected from the PyAI catalog.
+
+## Overview
+
+`PyAITTSService` provides streamed PCM speech synthesis through PyAI Speak in a Pipecat pipeline.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source and examples"
+    icon="github"
+    href="https://github.com/atomsai/pyai-speech-integrations/tree/main/pipecat-pyai"
+  >
+    PyAI-maintained source, Apache-2.0 license, and examples.
+  </Card>
+  <Card
+    title="PyAI integration guide"
+    icon="book"
+    href="https://docs.pyai.com/guides/pipecat"
+  >
+    Framework setup and provider configuration.
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add pipecat-pyai==0.1.5
+```
+
+Python 3.11 or newer is required. The package declares Pipecat `>=1.3.0,<2.0`.
+A two-turn audio flow was exercised with Pipecat 1.8.1; this is not qualification
+of every version in that range. Version 0.1.4's STT startup-settings correction
+was checked separately from that earlier audio run. Version 0.1.5 adds the
+standalone WebRTC example, public source/documentation links, and TTS session
+cleanup. Its package and framework compatibility checks generate no audio.
+
+## Prerequisites
+
+Create a PyAI account and a server-side key with the `speak:synthesize` scope.
+Before running audio, verify the selected project, billing environment, and
+limits with `GET https://api.pyai.com/v1/me`. Usage is charged or limited according
+to that key; Pipecat hosting, transport, and LLM costs are separate.
+
+### Required Environment Variables
+
+- `PYAI_API_KEY`: the server-side PyAI key. Keep it out of browser code and source control.
+
+## Configuration
+
+```python
+from pipecat_pyai import PyAITTSService
+```
+
+### PyAITTSService
+
+<ParamField path="voice" type="str" required>
+  Required streaming-capable voice ID from `GET https://api.pyai.com/v1/voices`.
+</ParamField>
+
+<ParamField path="api_key" type="str | None">
+  Default: `None`. Server-side PyAI key. When omitted, reads `PYAI_API_KEY`.
+  Raises `ValueError` if neither is supplied.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.pyai.com">
+  PyAI API base URL.
+</ParamField>
+
+<ParamField path="model" type="str" default="pyai-speak">
+  PyAI model identifier.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | None">
+  Default: `None`. Audio sample rate in Hz. When omitted, uses the pipeline
+  audio rate.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession | None">
+  Default: `None`. Optional HTTP session owned by the caller. When omitted, the
+  service creates and closes its own session.
+</ParamField>
+
+Additional keyword arguments are forwarded to Pipecat's base service.
+
+### Settings
+
+Configure provider options in the constructor. The adapter initializes Pipecat
+settings metadata, but does not implement runtime provider-setting updates.
+Create a new service to change model or voice; do not pass a second `settings=` argument.
+
+## Usage
+
+The following function builds the output part of a pipeline from existing components.
+See the [complete WebRTC demo](https://github.com/atomsai/pyai-speech-integrations/blob/main/demos/pipecat_bot.py)
+for transport, VAD, LLM, worker, and disconnect handling.
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_pyai import PyAITTSService
+
+
+def speech_output(llm, transport, assistant_aggregator):
+    tts = PyAITTSService(voice="stock_emma_en_gb")
+    return Pipeline([llm, tts, transport.output(), assistant_aggregator])
+```
+
+## Frames
+
+Generated PCM is delivered in `TTSAudioRawFrame` objects. The Pipecat base TTS service handles text and utterance framing.
+
 # Rime Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/rime.md
 
@@ -74487,6 +74743,7 @@ context = LLMContext(
 - **Tool calls in conversation history**: When seeding a session with conversation history that contains tool calls (e.g., after a multi-worker handoff or reconnect), the service automatically converts function calls and their results to text summaries. This is required because Gemini Live's API only accepts text and media content. The conversion happens transparently and preserves the context for the model.
 - **System instruction precedence**: The `system_instruction` from service settings takes precedence over an initial system message in the LLM context. A warning is logged when both are set.
 - **VAD modes**: By default, Gemini Live uses server-side VAD for detecting when the user starts and stops speaking. To use local VAD (e.g., Silero), set `vad=GeminiVADParams(disabled=True)` and configure an external VAD analyzer in your `LLMUserAggregatorParams`. The service will automatically send activity signals to the Gemini API when local VAD detects speech. With server-side VAD, the service emits no `UserStartedSpeakingFrame` or `UserStoppedSpeakingFrame`, so processors that depend on them (RTVI user speaking events, user idle and mute handling, turn recording) do nothing unless `LLMUserAggregatorParams` has a `vad_analyzer`.
+- **Starting a conversation**: Start a session by pushing an `LLMContextFrame` (the aggregators do this for you). An `LLMMessagesAppendFrame` alone doesn't start a conversation when the pipeline has no context aggregators. Once the session has its first context, an appended message goes into the session as it passes; before that, the service doesn't send it, and the assistant aggregator adds it to the context the session starts from.
 - **Tools precedence**: Similarly, tools provided in the context override tools provided at init time. Tools can't change mid-session: the service drops `LLMSetToolsFrame`.
 - **Seed parameter**: Gemini treats the `seed` parameter as best effort. Identical seeds usually but not always produce identical responses.
 - **Transcription aggregation**: Gemini Live sends user transcriptions in small chunks. The service aggregates them into complete sentences using end-of-sentence detection with a 0.5-second timeout fallback.
@@ -76317,6 +76574,7 @@ Returns the server's copy of a conversation item, such as one reported to `on_co
 - **G.711 formats**: The service passes audio through without converting it, and pipeline audio frames are 16-bit PCM, so use `PCMAudioFormat` rather than `PCMUAudioFormat` or `PCMAAudioFormat`; for telephony, the transport's serializer converts to and from G.711.
 - **Video support**: Video frames can be sent to the model for multimodal input, at most one per second; frames in between are dropped. Control the detail level with `video_frame_detail` and pause/resume with `set_video_input_paused()`.
 - **Transcription frames**: User speech transcription frames are always emitted upstream when input audio transcription is configured.
+- **Appended messages**: A message appended with `LLMMessagesAppendFrame` goes into the session with its own role: `user` and `assistant` messages keep theirs, and any other role is sent as a system message.
 - **System instruction precedence**: The `system_instruction` from service settings takes precedence over an initial system message in the LLM context. A warning is logged when both are set.
 - **Reasoning support**: The `reasoning` configuration is only supported by reasoning-capable models such as `gpt-realtime-2`. When used with non-supporting models, the reasoning configuration is automatically filtered out to prevent session errors, and a warning is logged.
 
@@ -87616,19 +87874,20 @@ its silence timeout and the conversation never blocks.
 # Turn Blend
 Source: https://docs.pipecat.ai/api-reference/server/extensions/pipecat-turn-blend.md
 
-Local end-of-turn detection that blends Smart Turn v3.2 and turn-1-mini scores in one CPU-only ONNX model, with no API key
+Local end-of-turn detection that blends a distilled Whisper Base student and turn-1-mini scores in one CPU-only ONNX model, with no API key
 
 ## Overview
 
-`TurnBlendAnalyzer` is a turn analyzer backed by `turn-blend.onnx`, a single 56 MB model file that contains
-Silero VAD v6.2, [Smart Turn v3.2](https://github.com/pipecat-ai/smart-turn), p99lab's
+`TurnBlendAnalyzer` is a turn analyzer backed by `turn-blend.onnx`, a single 105 MB model file that contains
+Silero VAD v6.2, a student model (a Whisper Base encoder trained to reproduce the end-of-turn scores of
+p99lab's [turn-1](https://huggingface.co/p99lab/turn-1)), p99lab's
 [turn-1-mini](https://huggingface.co/p99lab/turn-1-mini) and a logistic blend of the two end-of-turn scores
 with the elapsed silence. It runs locally on the CPU, needs no API key or GPU, and decides from audio alone.
 
-On LiveKit's [eot-bench](https://github.com/livekit/eot-bench) (English, 400 turns, cross-validated) the blend
-makes fewer false cut-offs than either model inside it: 20.1% at a 300 ms latency budget, against 22.6% for
-turn-1-mini and 35.2% for Smart Turn v3.2. It is behind the best hosted models. The blend's weights were fitted
-on that same dataset, so expect a smaller gain on other audio; the
+On LiveKit's [eot-bench](https://github.com/livekit/eot-bench) v1.1 (English, 2,288 turns) version 0.2.0 makes
+23.5% false cut-offs at a 300 ms latency budget, against 32.5% for version 0.1.0, which used Smart Turn v3.2
+in place of the student. It is behind the best hosted models and weakest on short turns. The blend's weights
+were fitted on held-out audio, not on the benchmark; the
 [benchmark page](https://github.com/adhiraj4802/pipecat-turn-blend/blob/main/benchmark/README.md) has the full
 tables, the latency measurements and the limits.
 
@@ -87666,13 +87925,14 @@ uv pip install git+https://github.com/adhiraj4802/pipecat-turn-blend.git
 
 - **Pipecat 1.0 or later** (tested with `pipecat-ai` 1.16.0)
 - **16 kHz input audio**: set `PipelineParams(audio_in_sample_rate=16000)`
-- **2 or more CPU threads** for the model to keep up in real time
+- **2 or more CPU threads**; the analyzer scores less often on machines that cannot keep up in real time
 
 No account, API key or environment variable is required. The model is downloaded from the repository's releases
 on first use, checked against its SHA-256 and cached in `~/.cache/turn-blend`.
 
-The plugin code and blend are Apache-2.0. The model file also contains the unmodified weights of Silero VAD
-(MIT), Smart Turn v3.2 (BSD 2-Clause) and turn-1-mini (Apache-2.0); all of those licences apply to it.
+The plugin code, the student model and the blend are Apache-2.0. The model file also contains the unmodified
+weights of Silero VAD (MIT) and turn-1-mini (Apache-2.0), and the student was initialised from OpenAI's Whisper
+Base (MIT) and trained on scores from turn-1 (Apache-2.0); all of those licences apply to it.
 
 ## Usage
 
@@ -87685,7 +87945,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat_turn_blend import TurnBlendAnalyzer
 
 turn = TurnBlendAnalyzer(
-    blend_threshold=0.85,                 # any model setting can be passed as a keyword
+    blend_threshold=0.75,                 # any model setting can be passed as a keyword
     on_end_of_turn=lambda r: print(r),    # {"reason": "commit", "silence_ms": 384, "detect_ms": 416, ...}
 )
 
@@ -87716,11 +87976,11 @@ commits, or when the silence timeout runs out.
   same dict is kept in `last_result`.
 </ParamField>
 
-<ParamField path="blend_threshold" type="float" default="0.85">
+<ParamField path="blend_threshold" type="float" default="0.75">
   The turn ends when the blended probability is above this.
 </ParamField>
 
-<ParamField path="blend_min_silence_ms" type="float" default="320">
+<ParamField path="blend_min_silence_ms" type="float" default="160">
   Silence required before the blend may end the turn.
 </ParamField>
 
@@ -107885,7 +108145,7 @@ export type SmallWebRTCTransportConnectionOptions = {
 };
 ```
 
-On `connect()`, the `SmallWebRTCTransport` optionally takes a set of connection parameters. This can be provided directly to the `PipecatClient`'s `connect()` method or via a starting endpoint passed to the `PipecatClient`'s `startBotAndConnect()` method. If using an endpoint, your endpoint should return a JSON object matching the `SmallWebRTCTransportConnectionOptions` type. Snake_case keys are converted to camelCase, and unrecognized keys are ignored with a warning. If the response has a `sessionId` (or `session_id`) and no offer endpoint, the transport builds the offer URL from the start endpoint, or from `offerUrlTemplate`.
+On `connect()`, the `SmallWebRTCTransport` optionally takes a set of connection parameters. This can be provided directly to the `PipecatClient`'s `connect()` method or via a starting endpoint passed to the `PipecatClient`'s `startBotAndConnect()` method. If using an endpoint, your endpoint should return a JSON object matching the `SmallWebRTCTransportConnectionOptions` type. Snake_case keys are converted to camelCase, and unrecognized keys are ignored and logged at info level. If the response has a `sessionId` (or `session_id`) and no offer endpoint, the transport builds the offer URL from the start endpoint, or from `offerUrlTemplate`.
 
 Use `webrtcRequestParams` to give the offer endpoint as an [`APIRequest`](/api-reference/client/js/client-methods#startbot), which allows headers and request data alongside the URL. `iceConfig` supplies ICE servers for this connection, overriding the constructor's `iceServers`. It is read only from `connect()`, so an `iceConfig` passed to the constructor is ignored.
 
@@ -108118,7 +108378,7 @@ interface WebSocketSerializer {
 
 ### TransportConnectionParams
 
-`connect()` accepts `WebSocketTransportOptions`: `wsUrl` (or the deprecated `ws_url`) and `token`. `wsUrl` overrides the value set in the constructor. `token` is appended to the URL as a URL-encoded `token` query parameter; it is read only from `connect()`, so a `token` passed to the constructor is ignored. Any other key raises an `RTVIError`, so the serializer, media manager and sample rates are constructor-only.
+`connect()` accepts `WebSocketTransportOptions`: `wsUrl` (or the deprecated `ws_url`) and `token`. `wsUrl` overrides the value set in the constructor. `token` is appended to the URL as a URL-encoded `token` query parameter; it is read only from `connect()`, so a `token` passed to the constructor is ignored. A `null` `token` is treated as unset, and `sessionId` is ignored. Any other key is ignored and logged at info level, so the serializer, media manager and sample rates are constructor-only.
 
 <CodeGroup>
 ```typescript client
