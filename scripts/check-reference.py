@@ -848,6 +848,13 @@ def parse_page(path):
             )
         )
 
+    def section_at(line_no):
+        """The enclosing heading that is a bare class name, or None."""
+        _, _, chain = heading_at(line_no)
+        return next((h.strip("` ") for h in chain if re.fullmatch(r"[A-Z]\w+", h.strip("` "))), None)
+
+    events = set()
+    event_sections = defaultdict(set)
     i = 0
     while i < len(lines):
         if in_code[i] or not lines[i].lstrip().startswith("|"):
@@ -867,7 +874,17 @@ def parse_page(path):
         tcol = next((col[h] for h in col if h.startswith("type")), None)
         dcol = next((col[h] for h in col if h.startswith("default")), None)
         if tcol is None and dcol is None:
-            continue  # not a field table (e.g. an events or comparison table)
+            # An events table names events the prose scan below misses: names
+            # without the `on_` prefix (SIPConnection's).
+            if header[0].startswith("event"):
+                section = section_at(start + 1)
+                for _, row in rows[2:]:
+                    cells = split_row(row)
+                    m = NAME_CELL_RE.match(cells[0]) if cells else None
+                    if m:
+                        events.add(m.group(1))
+                        event_sections[m.group(1)].add(section)
+            continue  # not a field table (e.g. a comparison table)
         entries = []
         for line_no, row in rows[2:]:
             cells = split_row(row)
@@ -890,15 +907,12 @@ def parse_page(path):
             hl, ht, chain = heading_at(start + 1)
             groups[("table", start)] = Group("table", ht, hl, entries, chain)
 
-    events = set()
-    event_sections = defaultdict(set)
     for i, ln in enumerate(lines):
         found = EVENT_RE.findall(ln)
         if not found:
             continue
         events.update(found)
-        _, _, chain = heading_at(i + 1)
-        section = next((h.strip("` ") for h in chain if re.fullmatch(r"[A-Z]\w+", h.strip("` "))), None)
+        section = section_at(i + 1)
         for ev in found:
             event_sections[ev].add(section)
     community = "CommunityMaintained" in text

@@ -41,6 +41,7 @@ _spec.loader.exec_module(cr)
 
 TTS = "api-reference/server/services/tts/acme.mdx"
 STT = "api-reference/server/services/stt/acme.mdx"
+CONN = "api-reference/server/services/transport/acme-connection.mdx"
 COMMUNITY = "api-reference/server/services/community/community-tts.mdx"
 EVAL = "api-reference/cli/eval.mdx"
 INIT = "api-reference/cli/init.mdx"
@@ -63,6 +64,8 @@ EXPECTED = {
     (TTS, "missing-event", "on_acme_ready"),
     (TTS, "unfired-event", "on_acme_never"),
     (TTS, "unfired-event", "on_acme_http_only"),
+    (CONN, "missing-event", "dropped"),
+    (CONN, "unfired-event", "idle"),
     (TTS, "missing-deprecated", "model_name"),
     (TTS, "type-mismatch", "container"),
     (GUIDE, "sample-unknown-arg", "bogus_flag"),
@@ -259,6 +262,17 @@ class TestEvents(Case):
     def test_unfired_event_skips_fired(self):
         self.not_flagged(TTS, "unfired-event", "on_acme_connected")  # private method, called
         self.not_flagged(TTS, "unfired-event", "on_acme_shared")  # one of the page's classes fires it
+
+    def test_missing_event_without_on_prefix(self):
+        # AcmeConnection's events have no `on_` prefix; the prose scan can't
+        # see them, so only an events table row counts as naming one.
+        self.flagged(CONN, "missing-event", "dropped")  # fired, prose-only mention
+
+    def test_event_table_names_events_without_on_prefix(self):
+        self.not_flagged(CONN, "missing-event", "connected")  # named in the events table
+
+    def test_unfired_event_from_event_table(self):
+        self.flagged(CONN, "unfired-event", "idle")  # table names it, nothing fires it
 
 
 class TestSamples(Case):
