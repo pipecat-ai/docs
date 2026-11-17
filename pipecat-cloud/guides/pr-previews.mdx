@@ -1,0 +1,162 @@
+---
+title: "Pull Request Previews"
+sidebarTitle: "PR previews"
+description: "Give every pull request its own Pipecat Cloud environment: turn previews on with a secret set, see what a preview runs, and when it is deleted."
+---
+
+Turn on PR previews and every pull request into the branch your project deploys from gets an environment of its own, built from the pull request's head. Reviewers can talk to the change before it merges, and the preview is deleted when the pull request closes.
+
+<Note>
+  Previews are a project setting, so they need [a GitHub repository connected to
+  the project](/pipecat-cloud/guides/deploy-from-github). An environment of
+  another project cannot have previews of its own. See [Projects and
+  environments](/pipecat-cloud/fundamentals/projects-and-environments).
+</Note>
+
+## Prerequisites
+
+- A project [deploying from a GitHub repository](/pipecat-cloud/guides/deploy-from-github)
+- A [secret set](/pipecat-cloud/fundamentals/secrets) for previews to mount, in the project's region
+
+## Choose a secret set for previews
+
+A preview never mounts your project's own secret sets. It mounts the set you choose here, so turning previews on cannot put production keys in front of a pull request. Choosing that set is what turns previews on.
+
+Create a set with the keys your agent reads, pointing at whatever you are happy for a pull request to use: test credentials, a sandbox project, or lower provider quotas.
+
+<Tabs>
+  <Tab title="Dashboard">
+    Open the project's **Settings → GitHub**, find **PR previews**, and pick the
+    secret set previews should mount.
+  </Tab>
+  <Tab title="CLI">
+    ```shell
+    pipecat cloud project previews enable my-bot --secret-set preview-secrets
+    ```
+
+    Check the setting and the previews that are open:
+
+    ```shell
+    pipecat cloud project previews status my-bot
+    ```
+
+  </Tab>
+</Tabs>
+
+The set has to exist, be a secret set rather than an image pull secret, be in the project's region, and be ready to mount. If it isn't, the request is refused and says which of those is wrong.
+
+## Which pull requests get a preview
+
+A pull request gets a preview when all of this holds:
+
+- It comes **from a branch in the same repository**. Pull requests from forks never get previews, so a fork's code cannot run with your organization's secrets.
+- It **targets the branch the project deploys from**. A pull request into any other branch is ignored.
+- It **touches the project's [watch paths](/pipecat-cloud/guides/deploy-from-github#watch-paths)**, if the project has any.
+- It was **opened by a person**, or by a bot while bot pull requests are turned on.
+
+Draft pull requests get previews.
+
+### Pull requests opened by bots
+
+Dependabot, Renovate and GitHub Apps open pull requests that run code nobody on your team wrote, so they are left out by default. Turn them on when you want dependency bumps previewed too.
+
+<Tabs>
+  <Tab title="Dashboard">
+    Tick **Preview bot pull requests** under **PR previews**.
+  </Tab>
+  <Tab title="CLI">
+    ```shell
+    pipecat cloud project previews enable my-bot --secret-set preview-secrets --bot-pull-requests
+    ```
+
+    Pass `--no-bot-pull-requests` to leave them out again.
+
+  </Tab>
+</Tabs>
+
+## What a preview runs
+
+A preview is an environment of the project named `pr-<number>`, so pull request 7 becomes the `pr-7` environment. Its agent is named after the project and the pull request, as in `my-bot-pr-7`, which is the name you use to start sessions against it.
+
+It copies the project's live configuration, with two differences:
+
+- **Secrets** come from the set you chose for previews, not from the project's own sets.
+- **Scaling** is at most one instance, with none kept warm. A preview that nobody is using costs nothing, and the first session after a quiet spell is a cold start.
+
+Its repository binding follows the pull request's head branch, so each push to the pull request builds and deploys that commit onto the preview. The build shows on the commit as a `Pipecat Cloud Deploy (my-bot-pr-7)` check, alongside your other checks.
+
+A project that has never deployed has no live configuration to copy, so its first preview uses the configuration its repository connection was created with.
+
+## Talk to a preview
+
+A preview is an environment, so every project command reaches it with `--env pr-<number>`, or by its agent name:
+
+```shell
+pipecat cloud project status my-bot --env pr-7
+pipecat cloud project logs my-bot --env pr-7
+pipecat cloud project start my-bot-pr-7
+```
+
+Its agent name is what you pass to the [session
+API](/pipecat-cloud/guides/session-api) and to a client, since those address an
+agent rather than a project.
+
+In the dashboard, open the project and switch to the preview from the header's environment menu.
+
+## When a preview is deleted
+
+- **The pull request closes**, merged or not. Its previews go with it.
+- **You turn previews off.** The previews that exist are deleted within a few minutes.
+- **The pull request is retargeted** at a branch the project doesn't deploy, or the repository is disconnected.
+
+A sweep runs regularly and catches anything a missed GitHub delivery left behind, so a preview whose pull request closed while Pipecat Cloud was unreachable is still cleaned up.
+
+<Tabs>
+  <Tab title="Dashboard">
+    Clear the secret set under **PR previews** on the project's **Settings →
+    GitHub**.
+  </Tab>
+  <Tab title="CLI">
+    ```shell
+    pipecat cloud project previews disable my-bot
+    ```
+
+  </Tab>
+</Tabs>
+
+## Things to know
+
+- **A preview is managed by its pull request.** It cannot be renamed, moved to another project, or unlinked by hand, and its repository binding is not yours to change.
+- **`pr-` is reserved.** No environment you create by hand can take a preview's name.
+- **A project with previews on cannot become an environment** of another project. Turn previews off first.
+- **Previews count towards your usage.** Each one is an agent, billed for the sessions it runs.
+- **Turning previews on needs an active organization.** A suspended organization can turn them off but not on.
+- **A very long project name can crowd out a preview.** The agent name is cut to fit the agent-name limit, and if that lands on a name already taken by an agent that isn't this preview, the preview is skipped.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="No preview appeared for my pull request">
+    Check each condition in [Which pull requests get a
+    preview](#which-pull-requests-get-a-preview): the branch it targets has to
+    be the one the project deploys from, the pull request has to come from the
+    same repository, and it has to touch the project's watch paths. `pipecat
+    cloud project previews status my-bot` shows whether previews are on, the
+    secret set they mount, whether bot pull requests are included, and the
+    project's watch paths.
+  </Accordion>
+  <Accordion title="A dependency bot's pull request has no preview">
+    Bot pull requests are left out until you turn them on. See [Pull requests
+    opened by bots](#pull-requests-opened-by-bots).
+  </Accordion>
+  <Accordion title="The preview is missing a secret my agent needs">
+    A preview mounts only the set chosen for previews, so every key your agent
+    reads has to be in that set. Add it there rather than to the project's own
+    sets.
+  </Accordion>
+  <Accordion title="Turning previews on was refused">
+    The message names the reason. The most common are a secret set that doesn't
+    exist or sits in another region, a project with no repository connected, and
+    an agent that is itself an environment of another project.
+  </Accordion>
+</AccordionGroup>
