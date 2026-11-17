@@ -13814,6 +13814,8 @@ Scenarios assert on a small set of semantic events, mapped from the RTVI message
 | `function_call`             | The LLM called a function. A call made outside the agent's pipeline and reported into it, such as a backend's, counts the same.                                                                                                                                                                                                                   |
 | `function_call_stopped`     | A function call ended. Its `args` carry `tool_call_id` and `cancelled`, so a scenario can tell work that was stopped from work that finished on its own.                                                                                                                                                                                          |
 | `image`                     | An image the bot output (such as a generated one), carrying its `width`, `height`, and `format`. Only sent when a scenario expects it.                                                                                                                                                                                                            |
+| `metrics`                   | A report of what the agent's processors measured, such as a service's TTFB, processing time, or usage. Sent when the agent's pipeline has `enable_metrics` on. See [Metrics and server messages](#metrics-and-server-messages).                                                                                                                   |
+| `server_message`            | A message of the agent's own making: the data it pushed in an `RTVIServerMessageFrame`. Its text is the data as JSON. See [Metrics and server messages](#metrics-and-server-messages).                                                                                                                                                            |
 | `user_transcription`        | The agent's STT finalized a transcription of the user. Audio mode only, except on [DTMF turns](#dtmf-keypresses-with-dtmf), where the aggregated keys become a transcription in either mode.                                                                                                                                                      |
 | `bot_backchannel`           | A short acknowledgment the agent said while the user talked, such as "Mm-hmm.", once it has been spoken to the end.                                                                                                                                                                                                                               |
 | `user_backchannel`          | A short acknowledgment the user said while the agent talked, which neither interrupted the agent nor reached its LLM.                                                                                                                                                                                                                             |
@@ -13987,6 +13989,31 @@ A `function_call_stopped` carries no arguments, only how the call ended, so it t
       calls:
         - name: write_report
           args: { cancelled: true }
+```
+
+### Metrics and server messages
+
+A `metrics` expectation matches a report of what the agent's processors measured. `metric:` names the kind the report must hold (`ttfb`, `processing`, `tokens`, and so on) and `processor:` is text the measuring processor's name must contain. A bare `metrics` takes any report. The zero a pipeline reports for every processor as it starts is not a measurement and never matches. A report that arrived while an earlier expectation was waiting for its own event is behind this one, so look back for it with [`check_from:`](#looking-back-in-the-turn-with-check_from):
+
+```yaml
+- user: "What is the capital of Germany?"
+  expect:
+    - event: user_transcription
+    - event: metrics
+      metric: ttfb
+      processor: STT
+      check_from: turn_start
+```
+
+Every report of a run is kept with its result, expected or not, so an expectation is only needed to hold a turn open until one arrives.
+
+A `server_message` expectation matches the data the agent pushed in an `RTVIServerMessageFrame`. It lets an agent built for an eval report what only it can know, such as a result it computed. The event's text is the data as JSON (or the data itself when it is a string), so `text_contains:` and the other content checks read it, and a matched expectation records it in the run's result:
+
+```yaml
+- user: "What is the capital of Germany?"
+  expect:
+    - event: server_message
+      text_contains: '"done": true'
 ```
 
 ### Turn-completion markers with `llm_marker`
@@ -15097,7 +15124,7 @@ eval-runs/20260610_142200/
 
 An artifact's name is the bot path, then the entry's `name:` when it has one, then the scenario's `<file>/<scenario>` name with its slash written as a double underscore, so `bots/turn-agent.py` under the label `openai/gpt-4o-mini` running `turn_completion/short_answer` writes `bots_turn-agent.py__openai_gpt-4o-mini__turn_completion__short_answer.log`.
 
-`results.jsonl` carries one line per run, and every line names its `bot`, its entry's `name`, its `scenario`, its `attempt`, and its `kind`, `script` or `simulation`. A scripted record carries the outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. Each turn lists its `expectations`, one per expectation the turn resolved, with whether it `passed` and what it `matched`: the marker of an `llm_marker`, a function call's signature, a reply's text. What a passed run matched is only recorded here. A simulation record carries the outcome (`passed`, `succeeded`, `error`, and for a run that did not complete its `failure_kind`), how the run ended (`ended_by`), the persona's turn count, the `success:` wording and the judge's `confidence` and `probabilities` for it, every metric's `criterion`, score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none, each with its `confidence` and `probabilities`), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Runs that didn't pass also carry `events_seen`.
+`results.jsonl` carries one line per run, and every line names its `bot`, its entry's `name`, its `scenario`, its `attempt`, and its `kind`, `script` or `simulation`. A scripted record carries the outcome, duration, failures (each with a `kind`), per-turn results, and paths to its artifacts. Each turn lists its `expectations`, one per expectation the turn resolved, with whether it `passed` and what it `matched`: the marker of an `llm_marker`, a function call's signature, a reply's text. What a passed run matched is only recorded here. A simulation record carries the outcome (`passed`, `succeeded`, `error`, and for a run that did not complete its `failure_kind`), how the run ended (`ended_by`), the persona's turn count, the `success:` wording and the judge's `confidence` and `probabilities` for it, every metric's `criterion`, score, value, `failure_kind`, and per-turn verdicts (`yes`, `no`, or `none` when the judge gave none, each with its `confidence` and `probabilities`), the judge's reason, the persona's own `end_call` claim, and the whole conversation as `messages`. Lines are appended as each run finishes, so an interrupted sweep keeps everything already done. Every record, passed or failed, carries `bot_metrics`: each metrics report the agent sent during the run, with its time (`at`) and `data`. Runs that didn't pass also carry `events_seen`.
 
 Each run executes in its own process, so a harness that loads local audio models does so on its own, and a crash in one run doesn't stop the others.
 
@@ -15220,6 +15247,7 @@ The agent must already be running with the dev runner (`python bot.py`), just as
 | `turns`         | One `EvalScriptTurnResult` per scenario turn, in order. See below.                                  |
 | `duration_ms`   | Wall-clock time the run took.                                                                       |
 | `events_seen`   | Every semantic event observed, for diagnostics.                                                     |
+| `bot_metrics`   | Every metrics report the agent sent during the run, each a dict with its time (`at`) and `data`.    |
 | `debug_log`     | The harness's timestamped decision trace (what the CLI writes to `<scenario>.eval.log`).            |
 | `skipped`       | Set (with a reason) when the scenario was not run; such a result is neither pass nor fail.          |
 
@@ -15309,6 +15337,7 @@ A session runs the simulation once. The `runs:` field is honored by the [suite](
 | `end_call`        | The persona's own `end_call` claim (`success`, `reason`) when it made one. Advisory: the judge decides `succeeded`.                                                                                        |
 | `duration_ms`     | Wall-clock time the run took.                                                                                                                                                                              |
 | `events_seen`     | Every semantic event observed, for diagnostics.                                                                                                                                                            |
+| `bot_metrics`     | Every metrics report the agent sent during the run, each a dict with its time (`at`) and `data`.                                                                                                           |
 | `debug_log`       | The harness's timestamped decision trace.                                                                                                                                                                  |
 
 Each `EvalSimulationMetricScore` carries the metric's `name`, its `score` (the share of turns the judge said yes to for a judged metric, `1.0` or `0.0` for a measured one, `None` when there was nothing to judge or measure), whether it `passed`, its `reason`, its `min_score`, the `criterion` a judged metric scored each turn on, its measured `value` (the seconds, words, turns, or number of calls), and a `failure_kind` (`judge_no`, `judge_no_verdict`, `out_of_range`, `function_calls`, or `error`; `None` when it passed). A judged metric also carries one `EvalSimulationTurnVerdict` per agent turn with the 1-based `turn`, whether it `passed`, the judge's `verdict` (`yes`, `no`, or `none` when the judge gave none, which counts as a no), its `reason`, and its `confidence` and `probabilities`:
