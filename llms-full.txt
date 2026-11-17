@@ -47146,13 +47146,14 @@ for updates.
 # Deepgram Speech-to-Text
 Source: https://docs.pipecat.ai/api-reference/server/services/stt/deepgram.md
 
-Streaming STT with DeepgramSTTService and DeepgramFluxSTTService: Nova models, Flux turn detection, and SageMaker variants.
+STT with DeepgramSTTService, DeepgramSegmentedSTTService, and DeepgramFluxSTTService: Nova streaming and pre-recorded transcription, Flux turn detection, and SageMaker variants.
 
 ## Overview
 
-Deepgram provides four STT service implementations:
+Deepgram provides five STT service implementations:
 
 - `DeepgramSTTService` for real-time speech recognition using Deepgram's standard WebSocket API with support for interim results, language detection, and voice activity detection (VAD)
+- `DeepgramSegmentedSTTService` for transcribing each speech segment with one request to Deepgram's pre-recorded API, using VAD to find segment boundaries; transcripts are final only, with no interim results
 - `DeepgramFluxSTTService` for advanced conversational AI with Flux capabilities including intelligent turn detection, eager end-of-turn events, multilingual support (with `flux-general-multi` model), and enhanced speech processing for improved response timing
 - `DeepgramSageMakerSTTService` for real-time speech recognition using Deepgram Nova models deployed on AWS SageMaker endpoints via HTTP/2 bidirectional streaming
 - `DeepgramFluxSageMakerSTTService` for advanced conversational AI using Deepgram Flux models deployed on AWS SageMaker endpoints with native turn detection and low-latency streaming
@@ -47178,6 +47179,13 @@ Deepgram provides four STT service implementations:
     href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-deepgram.py"
   >
     Complete example with standard Deepgram STT
+  </Card>
+  <Card
+    title="Segmented STT Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-deepgram-http.py"
+  >
+    Complete example with Deepgram's pre-recorded API
   </Card>
   <Card
     title="Flux STT Example"
@@ -47384,6 +47392,98 @@ stt = DeepgramSTTService(
 
 Fires the [`on_connection_error`](/api-reference/server/events/service-events#on_connection_error) service event when a reconnect after a settings update fails.
 
+## DeepgramSegmentedSTTService
+
+Transcribes each speech segment with one request to Deepgram's pre-recorded API (`POST /v1/listen`) instead of streaming over a WebSocket. It inherits from `SegmentedSTTService`, so it relies on VAD to buffer each utterance. Transcripts are final only; there are no interim results.
+
+<ParamField path="api_key" type="str" required>
+  Deepgram API key for authentication.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession" required>
+  aiohttp session used for HTTP requests.
+</ParamField>
+
+<ParamField path="base_url" type="str" default='"https://api.deepgram.com"'>
+  Base URL for the Deepgram API. Override for a regional endpoint (e.g.
+  `https://api.eu.deepgram.com`) or a self-hosted deployment.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the pipeline's configured sample
+  rate.
+</ParamField>
+
+<ParamField path="tag" type="str | list[str]" default="None">
+  Custom billing tag.
+</ParamField>
+
+<ParamField path="mip_opt_out" type="bool" default="None">
+  Opt out of the Deepgram Model Improvement Program.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="DeepgramSegmentedSTTService.Settings"
+  default="None"
+>
+  Runtime-configurable settings. See [Settings](#settings-2) below.
+</ParamField>
+
+<ParamField
+  path="ttfs_p99_latency"
+  type="float"
+  default="DEEPGRAM_SEGMENTED_TTFS_P99"
+>
+  P99 latency from speech end to final transcript in seconds. Override for your
+  deployment.
+</ParamField>
+
+### Settings
+
+Passed via the `settings` constructor argument using `DeepgramSegmentedSTTService.Settings(...)`. Settings are read for every request, so an update made with `STTUpdateSettingsFrame` applies from the next segment without reconnecting. Each setting is sent as the Deepgram query parameter of the same name, except `diarize` and `speaker_format`; `None` leaves a parameter out. Any other pre-recorded query parameter can be passed through `extra`.
+
+| Parameter          | Type              | Default            | Description                                                                                                                                                  |
+| ------------------ | ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`            | `str`             | `"nova-3-general"` | Deepgram model to use. _(Inherited from base STT settings.)_                                                                                                 |
+| `language`         | `Language \| str` | `Language.EN`      | Recognition language. _(Inherited from base STT settings.)_                                                                                                  |
+| `detect_entities`  | `bool`            | `False`            | Enable named entity detection.                                                                                                                               |
+| `detect_language`  | `bool`            | `False`            | Detect the spoken language and transcribe in it, overriding `language`. The detected language is reported on the transcript.                                 |
+| `diarize`          | `bool`            | `False`            | Enable speaker diarization. Each contiguous speaker run is pushed as its own frame, with Deepgram's speaker number (`"0"`, `"1"`, ...) in `speaker.label`.   |
+| `diarize_model`    | `str`             | `"latest"`         | Diarization model that `diarize` turns on: `"latest"` or a version such as `"v2"`. Sent only when `diarize` is `True`.                                       |
+| `dictation`        | `bool`            | `False`            | Enable dictation mode (converts commands to punctuation).                                                                                                    |
+| `filler_words`     | `bool`            | `False`            | Include filler words such as "uh" and "um".                                                                                                                  |
+| `keyterm`          | `str \| list`     | `None`             | Keyterms to boost recognition accuracy.                                                                                                                      |
+| `keywords`         | `str \| list`     | `None`             | Keywords to boost.                                                                                                                                           |
+| `language_hint`    | `str \| list`     | `None`             | BCP-47 language tag, or list of tags, biasing language detection on Nova-3 multilingual. Deepgram ignores it unless `model="nova-3"` and `language="multi"`. |
+| `numerals`         | `bool`            | `False`            | Convert spoken numbers to numerals.                                                                                                                          |
+| `profanity_filter` | `bool \| None`    | `None`             | Filter profanity from transcripts.                                                                                                                           |
+| `punctuate`        | `bool`            | `True`             | Add punctuation to transcripts.                                                                                                                              |
+| `redact`           | `str \| list`     | `None`             | Redact sensitive information.                                                                                                                                |
+| `replace`          | `str \| list`     | `None`             | Word replacement rules.                                                                                                                                      |
+| `search`           | `str \| list`     | `None`             | Search terms to highlight.                                                                                                                                   |
+| `smart_format`     | `bool`            | `False`            | Apply smart formatting to transcripts.                                                                                                                       |
+| `speaker_format`   | `str \| None`     | `None`             | Format string for diarized speaker runs. Use `{speaker}`, `{speaker_number}`, and `{text}`, e.g. `"{speaker}: {text}"`. If `None`, the text is not modified. |
+| `version`          | `str`             | `None`             | Model version to transcribe with. `None` leaves Deepgram on `"latest"`.                                                                                      |
+
+### Usage
+
+```python
+import aiohttp
+
+from pipecat.services.deepgram.stt import DeepgramSegmentedSTTService
+
+async with aiohttp.ClientSession() as session:
+    stt = DeepgramSegmentedSTTService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        aiohttp_session=session,
+        settings=DeepgramSegmentedSTTService.Settings(
+            model="nova-3-general",
+            smart_format=True,
+        ),
+    )
+```
+
 ## DeepgramFluxSTTService
 
 <Note>
@@ -47436,14 +47536,23 @@ Fires the [`on_connection_error`](/api-reference/server/events/service-events#on
   type="DeepgramFluxSTTService.Settings"
   default="None"
 >
-  Configuration settings for the Flux API. See [Settings](#settings-2) below.
+  Configuration settings for the Flux API. See [Settings](#settings-3) below.
 </ParamField>
 
 <ParamField path="should_interrupt" type="bool" default="True">
   Whether the bot should be interrupted when Flux detects user speech. See [User
   Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstrategies)
-  if you pass your own `user_turn_strategies`.
+  if you pass your own `user_turn_strategies`. Ignored with
+  `vad_force_turn_endpoint=True`.
+</ParamField>
+
+<ParamField path="vad_force_turn_endpoint" type="bool" default="False">
+  Whether the pipeline's user turn strategies decide when user turns end,
+  instead of Flux. Each `VADUserStoppedSpeakingFrame` then asks Flux to finalize
+  the audio sent so far, so a VAD analyzer is required. The service recommends
+  no turn strategies in this mode. Can't be combined with
+  `enable_eager_end_of_turn`; setting both raises `ValueError`.
 </ParamField>
 
 <ParamField path="watchdog_min_timeout" type="float" default="0.5">
@@ -47577,6 +47686,7 @@ This sends a `Configure` message to Deepgram over the existing WebSocket connect
 ### Notes
 
 - **Turn management**: Flux provides its own turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on) to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
+- **Pipeline turn detection**: With `vad_force_turn_endpoint=True`, Flux keeps transcribing but your `user_turn_strategies` (by default, VAD to start the turn and a local smart-turn analyzer to end it) decide when the user's turn ends. Each VAD stop sends Flux a `ForceEndTurn`, so several finalized transcripts can arrive in one user turn; the user aggregator joins them until the turn ends, and `on_end_of_turn` fires for each one. Set `eot_threshold=1.0` to stop Flux finalizing on its own confidence too. Call `force_end_turn()` to finalize on another signal, such as a push-to-talk release.
 - **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`, set with `LLMUserAggregatorParams(vad_analyzer=...)`) is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
 - **Reconnection**: When the connection drops, or the first connection fails, the service reconnects in the background; audio that arrives meanwhile isn't transcribed. A user turn in progress when the connection drops ends with the transcript received so far, and speech after the reconnect starts a new turn. After three consecutive attempts fail to produce a connection that stays up, the service reports itself unable to do its job, so a [`ServiceSwitcher`](/api-reference/server/composite-services/service-switcher) using `ServiceSwitcherStrategyFailover` moves to its next service.
 - **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers Flux's predicted end of turn (`EagerEndOfTurn` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`TurnResumed` event) or the committed transcript differs from the eager one. Each Flux `Update` event pushes an `InterimTranscriptionFrame` holding the transcript of the turn so far, and also fires the `on_update` event.
@@ -47651,7 +47761,7 @@ Turn events receive `(service, transcript)` where `transcript` is the current tr
   type="DeepgramSageMakerSTTService.Settings"
   default="None"
 >
-  Runtime-configurable settings for the STT service. See [Settings](#settings-3)
+  Runtime-configurable settings for the STT service. See [Settings](#settings-4)
   below.
 </ParamField>
 
@@ -47739,7 +47849,16 @@ Supports the standard [service connection events](/api-reference/server/events/s
 <ParamField path="should_interrupt" type="bool" default="True">
   Whether to interrupt the bot when Flux detects user speech. See [User Turn
   Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies#externaluserturnstrategies)
-  if you pass your own `user_turn_strategies`.
+  if you pass your own `user_turn_strategies`. Ignored with
+  `vad_force_turn_endpoint=True`.
+</ParamField>
+
+<ParamField path="vad_force_turn_endpoint" type="bool" default="False">
+  Whether the pipeline's user turn strategies decide when user turns end,
+  instead of Flux. Each `VADUserStoppedSpeakingFrame` then asks Flux to finalize
+  the audio sent so far, so a VAD analyzer is required. The service recommends
+  no turn strategies in this mode. Can't be combined with
+  `enable_eager_end_of_turn`; setting both raises `ValueError`.
 </ParamField>
 
 <ParamField path="watchdog_min_timeout" type="float" default="0.5">
@@ -47776,7 +47895,7 @@ Supports the standard [service connection events](/api-reference/server/events/s
   type="DeepgramFluxSageMakerSTTService.Settings"
   default="None"
 >
-  Runtime-configurable settings. See [Settings](#settings-4) below.
+  Runtime-configurable settings. See [Settings](#settings-5) below.
 </ParamField>
 
 ### Settings
@@ -47859,6 +47978,7 @@ await worker.queue_frame(
 ### Notes
 
 - **Turn management**: Flux provides native turn detection via `StartOfTurn`/`EndOfTurn` events. It proposes each turn boundary instead of pushing the turn frames itself, and automatically requests `ExternalUserTurnStrategies` at start (or `EagerUserTurnStrategies` when `enable_eager_end_of_turn` is on) to avoid conflicting VAD-based turn management. Those strategies resolve the proposals and own the interruption; see [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) for the controls.
+- **Pipeline turn detection**: With `vad_force_turn_endpoint=True`, Flux keeps transcribing but your `user_turn_strategies` (by default, VAD to start the turn and a local smart-turn analyzer to end it) decide when the user's turn ends. Each VAD stop sends Flux a `ForceEndTurn`, so several finalized transcripts can arrive in one user turn; the user aggregator joins them until the turn ends, and `on_end_of_turn` fires for each one. Set `eot_threshold=1.0` to stop Flux finalizing on its own confidence too. Call `force_end_turn()` to finalize on another signal, such as a push-to-talk release.
 - **VAD is optional**: When Flux drives turn detection, a VAD (such as `SileroVADAnalyzer`, set with `LLMUserAggregatorParams(vad_analyzer=...)`) is not required for core functionality. Include one if you want useful STT metrics; omit it otherwise.
 - **Connection error handling**: When a SageMaker session or Flux connection cannot be established (for example, if the endpoint rejects a setting), the service fails with an error instead of hanging indefinitely. Session establishment and connection confirmation are each bounded by a 10-second timeout.
 - **Eager end of turn**: With `enable_eager_end_of_turn=True`, the service answers Flux's predicted end of turn (`EagerEndOfTurn` event) ahead of the committed one, pushing an `EagerTranscriptionFrame` that triggers a speculative inference. The response is held until the turn is confirmed, and discarded if the user resumes speaking (`TurnResumed` event) or the committed transcript differs from the eager one. Each Flux `Update` event pushes an `InterimTranscriptionFrame` holding the transcript of the turn so far, and also fires the `on_update` event.
