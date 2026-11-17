@@ -1,0 +1,200 @@
+---
+title: "Pipecat Guardrails"
+description: "Output guardrail that checks each sentence the bot is about to say and stops it before the TTS speaks it"
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Apoorv012"
+  maintainerUrl="https://github.com/Apoorv012"
+  repo="https://github.com/Apoorv012/pipecat-guardrails"
+/>
+
+## Overview
+
+`OutputGuardProcessor` sits between the LLM and the TTS and checks what the bot
+is about to say. Each sentence is checked before the TTS gets it, so nothing
+unchecked is spoken. A sentence can be allowed, redacted (for example a phone
+number becomes `[phone number]`), or blocked: on a block, the rest of the reply
+is dropped and a fallback line is spoken instead.
+
+Blocked text never reaches the TTS, so it never enters the conversation history
+either. User interruptions, function calls, and lines your own code speaks
+(`TTSSpeakFrame`) pass through in order.
+
+A `Guard` decides what is allowed, in up to three layers, stopping at the first
+one that is sure:
+
+1. **Rules**: banned terms, regular expressions, and personal data (email,
+   phone, card numbers, plus an India pack for Aadhaar, PAN, and Hinglish word
+   lists). Local and instant.
+2. **Classifier** (optional): any [Pipecat classifier](/pipecat/learn/classifiers),
+   such as [Jev](/api-reference/server/classifiers/jev), answers yes/no
+   policies about the reply in one call.
+3. **Judge** (optional): an LLM, through Pipecat's
+   [LLM classifier](/api-reference/server/classifiers/llm), decides the
+   policies the classifier was unsure about.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Apoorv012/pipecat-guardrails"
+  >
+    Source code, examples, and issues for Pipecat Guardrails
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-guardrails/"
+  >
+    The `pipecat-guardrails` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-guardrails
+```
+
+To use the Jev classifier for policies:
+
+```bash
+uv add "pipecat-guardrails[jev]"
+```
+
+## Prerequisites
+
+- **Pipecat 1.12.0 or later**: `pipecat-ai>=1.12,<2`
+- **Python 3.11 or later**
+- **No API key for rules.** Rules run locally.
+- **For policies**, the keys of the classifier or judge you choose, for example
+  `TYPESAFE_API_KEY` for Jev, or your LLM provider's key for a judge.
+
+## Configuration
+
+### OutputGuardProcessor
+
+<ParamField path="guard" type="Guard" required>
+  The guard that checks each sentence (or the whole reply).
+</ParamField>
+
+<ParamField path="strategy" type="str" default="sentence">
+  `"sentence"` checks each sentence before it is spoken. `"full_reply"` holds
+  the whole reply, checks it once, then speaks it: safer for rules that need the
+  full reply, at the cost of latency.
+</ParamField>
+
+<ParamField path="max_parallel_checks" type="int" default="5">
+  With the `"sentence"` strategy, how many sentences are checked at once.
+  Sentences are always released in order, so usually only the first sentence of
+  a reply waits for a classifier or judge round trip.
+</ParamField>
+
+Events: `on_violation(processor, verdict)` when a rule or policy fires, and
+`on_check(processor, verdict)` for every check.
+
+### Guard
+
+<ParamField path="rules" type="Iterable[Rule]" default="()">
+  Layer 1: `BannedTerms`, `Regex`, `PII`, or any function decorated with
+  `@rule`. Each rule can `block`, `redact`, or `flag`.
+</ParamField>
+
+<ParamField path="policies" type="Mapping[str, str | Policy]" default="None">
+  Yes/no questions about the reply, by id, where "yes" means it breaks the
+  policy. Needs a `classifier`, a `judge`, or both.
+</ParamField>
+
+<ParamField path="classifier" type="BaseClassifier" default="None">
+  Layer 2: a Pipecat classifier that answers every policy in one call.
+</ParamField>
+
+<ParamField path="judge" type="BaseClassifier" default="None">
+  Layer 3: usually `LLMClassifier`, for the policies the classifier was unsure
+  about.
+</ParamField>
+
+<ParamField path="fallback" type="str | Callable" default="None">
+  What to say instead of blocked text, or a function of the verdict. `None`
+  says nothing.
+</ParamField>
+
+<ParamField path="mode" type="str" default="enforce">
+  `"shadow"` reports what the guard would do without changing anything, so new
+  rules can be tried on live traffic.
+</ParamField>
+
+<ParamField path="on_error" type="str" default="block">
+  What a failed or timed-out check does: `"block"` (fail closed) or `"allow"`
+  (fail open).
+</ParamField>
+
+See the [source repository](https://github.com/Apoorv012/pipecat-guardrails)
+for the full list of options, policies, and the `pipecat-guardrails eval`
+command for measuring a guard on your own data.
+
+## Usage
+
+Put `OutputGuardProcessor` between the LLM and the TTS:
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat_guardrails import Guard
+from pipecat_guardrails.pipecat import OutputGuardProcessor, guarded_rtvi_observer_params
+from pipecat_guardrails.rules import PII, BannedTerms, pii
+
+guard = Guard(
+    rules=[
+        BannedTerms(["acme corp"], id="no-competitors"),
+        PII(pii.email(), pii.phone(), id="pii"),  # redacts
+    ],
+    fallback="Sorry, I can only help with our own products.",
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    OutputGuardProcessor(guard),  # checks each sentence before it is spoken
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+
+# RTVI sends raw LLM text to the client before the guard sees it; turn that off.
+worker = PipelineWorker(pipeline, rtvi_observer_params=guarded_rtvi_observer_params())
+```
+
+Add policies for what word lists miss, such as paraphrases:
+
+```python
+import os
+
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+from pipecat_guardrails import Guard, Policy
+
+guard = Guard(
+    rules=[...],
+    policies={
+        "no-med-advice": Policy(
+            "Does this reply tell the user to stop, skip or change a medication?",
+            no="Telling them to ask their doctor first.",
+        ),
+    },
+    classifier=JevClassifier(api_key=os.environ["TYPESAFE_API_KEY"]),
+    fallback="That's a question for your doctor.",
+)
+```
+
+## Compatibility
+
+Tested with Pipecat v1.16.0. Check the [source
+repository](https://github.com/Apoorv012/pipecat-guardrails) for the latest
+tested version and changelog.
