@@ -31382,7 +31382,9 @@ An eval run checks a deployed agent against a [Pipecat eval scenario](/pipecat/e
   your deployed agent, and the agent calls its real tools: bookings, emails,
   payments, database writes. Run evals against an agent that uses test
   credentials or against a staging deployment, never against an agent wired to
-  production systems. A session run starts no session and calls no tools.
+  production systems. If a synthetic run is interrupted on Pipecat Cloud's side,
+  it starts again with a new session of your agent, so one run can start up to
+  three sessions. A session run starts no session and calls no tools.
 </Warning>
 
 ## Run Kinds
@@ -31637,12 +31639,12 @@ The [REST reference](/api-reference/pipecat-cloud/rest-reference/endpoint/eval-r
 Send the POST with no body, or send `{}` with `Content-Type: application/json`. Other body shapes are a `400`. An oversized JSON or form body is a `413`; an unsupported charset or `Content-Encoding` is a `415`. A successful cancel returns `200` with the run's current state: the cancellation request was recorded, or the run was already cancelled. It sends no `Retry-After` or `Location` header.
 
 - A `queued` run ends at once as `cancelled`.
-- An active run may still be `starting` or `running` in the response. No further cancel request is needed. You can optionally GET the run to check its eventual outcome.
+- An active run may still be `starting` or `running` in the response, and usually reaches `cancelled` within a few seconds. No further cancel request is needed. You can optionally GET the run to check its eventual outcome.
 - A run that reaches its own end before the cancel does keeps that end.
 - Cancelling a run that is already `cancelled` is safe.
 - Cancelling a run that ended any other way answers `409`: `The run has already finished.`
 
-Stopping an active evaluation is best effort. The `cancelled` status does not confirm that all evaluation activity has stopped. If stopping could not be confirmed, `result.reason` says the evaluation may continue until its deadline. Cancellation does not undo usage already incurred by an agent session. Cancelling works while the organization is suspended.
+A run ends `cancelled` once its evaluation has stopped. If the stop couldn't be confirmed, `result.reason` says so, and that the evaluation may continue until its deadline. Cancellation does not undo usage already incurred by an agent session. Cancelling works while the organization is suspended.
 
 ## Store Files as a Bundle
 
@@ -31772,7 +31774,7 @@ Above 1, the suite run is a **measurement** (`measurement: true`). It has no ver
 
 ### Concurrency and Deadlines
 
-`concurrency` caps how many members run at once: the request's, otherwise the suite file's, otherwise 4, as in Pipecat's manifests. The API sets the most. An entry's own `concurrency:` caps that entry. The suite run's `concurrency.effective` shows what applies. Members also wait for room on the agent, up to its [maximum agents](/pipecat-cloud/fundamentals/scaling#maximum-agents) less its other sessions, and suite runs on one agent share that room fairly.
+`concurrency` caps how many members run at once: the request's, otherwise the suite file's, otherwise 4, as in Pipecat's manifests, and at most 20. An entry's own `concurrency:` caps that entry. The suite run's `concurrency.effective` shows what applies. Members also wait for room on the agent, up to its [maximum agents](/pipecat-cloud/fundamentals/scaling#maximum-agents) less its other sessions, and suite runs on one agent share that room fairly.
 
 A suite run's deadline covers all of it, queueing and every member, from when it is accepted: 12 hours, unless `deadlineSeconds` sets it shorter. Each member also has a single run's own deadline, cut short to the suite run's.
 
@@ -31898,7 +31900,7 @@ The first cause stands, and a later one never replaces it. From then on the suit
 
 Every eval run records its **judging version** in `executor.fingerprint`: an identifier of everything that decides a verdict. A suite run holds its members to one judging version, its own `fingerprint`. Until a member has a verdict, it can name a version that hasn't judged any.
 
-If the platform's judging changes during a suite run, members keep being judged by the suite run's version where they can. A member that can't be judged by it in time is judged by the newer version, and the suite run is flagged `mixed: true`. A mixed suite run keeps its verdict. A mixed measurement's pass rates are split by version: each `passRates` row then has its `fingerprint`. `pipecat cloud eval suite status` shows the judging version, and warns when a suite run is mixed.
+If the platform's judging changes during a suite run, members keep being judged by the suite run's version where they can. A member waits a short time for room on the suite run's version, and is judged by the newer version once that version has no room or is no longer available. The suite run is then flagged `mixed: true`. A mixed suite run keeps its verdict. A mixed measurement's pass rates are split by version: each `passRates` row then has its `fingerprint`. `pipecat cloud eval suite status` shows the judging version, and warns when a suite run is mixed.
 
 ## Read the Result
 
@@ -31913,7 +31915,7 @@ A run has these fields:
 | `bundleRevisionId`                                     | The revision whose files the run ran: a [stored one](#run-from-a-stored-revision), or the anonymous one its inline files were kept as. |
 | `suiteRunId`, `suiteMemberOrdinal`                     | The [suite run](#run-a-suite) the run is a member of, and its place in the plan. Both null for a run of its own.                       |
 | `executor`                                             | The [judging version](#judging-versions) (`fingerprint`) and build that ran the run. Null until they are reported.                     |
-| `sessionId`                                            | The associated agent session, if known. For a session run, the session it judges.                                                      |
+| `sessionId`                                            | The associated agent session, if known: the latest one if the run was started again. For a session run, the session it judges.         |
 | `createdAt`, `startedAt`, `finishedAt`, `deadlineAt`   | Timestamps. `startedAt` is when the run first left the queue.                                                                          |
 | `result`                                               | `null` while the run is live. Otherwise the result below.                                                                              |
 
@@ -31923,6 +31925,7 @@ A run has these fields:
 - `metrics`: each metric's `name`, `score`, `passed` and `reason`.
 - `details`: `kind` (`script` or `simulation`), `turns` with the checks on each, `failures`, and a simulation's `goal` with the judge's verdict on `success:`. `null` when the result was too large to keep.
 - `conversation`: the conversation in Pipecat's format. A scripted run's can be `[]`.
+- `conversationUnavailable`: `true` when a session run's conversation couldn't be read back, so `conversation` is empty. The verdict, reason and metrics still stand. Reading the run again may show it.
 - `ignored` and `ignoredTotal`: the scenario's keys that had no effect (the first 20), and how many there were in all.
 - `truncated`: `true` when the result was too large, in which case the conversation, details, and metric reasons are left out.
 
@@ -31956,6 +31959,7 @@ A finished run of the greeting scenario:
     "reason": "The agent passed the scenario.",
     "metrics": [],
     "conversation": [],
+    "conversationUnavailable": false,
     "details": {
       "kind": "script",
       "turns": [
@@ -31987,21 +31991,23 @@ A finished run of the greeting scenario:
 
 ### Statuses
 
-A run is live while it is `queued`, `starting`, or `running`. It ends in one of:
+A run is live while it is `queued` (waiting for room on the agent), `starting` (being started, or started again after an interruption) or `running` (the conversation or the judging is under way). It ends in one of:
 
-| Status               | Meaning                                                                                                                         |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `completed`          | The run reached a verdict, `passed`, `failed` or `skipped`.                                                                     |
-| `refused`            | The scenario can't run, or a session run's conversation is too long to judge. `result.reason` says why.                         |
-| `target_unavailable` | The agent never connected.                                                                                                      |
-| `not_started`        | The run could not start or continue. `result.reason` says why, such as HIPAA controls or a missing conversation.                |
-| `spend_limited`      | The organization's [spend limit](/api-reference/cli/cloud/spend-limit) was reached, preventing further session or judge starts. |
-| `expired`            | The run's deadline passed before it finished.                                                                                   |
-| `cancelled`          | The run was cancelled. `result.reason` explains what may have started and any unconfirmed stop.                                 |
-| `timed_out`          | The eval itself ran past its [time limit](#limits).                                                                             |
-| `error`, `abandoned` | The run failed without a verdict. `abandoned` is a run that failed on every attempt.                                            |
+| Status               | Meaning                                                                                                                                 |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `completed`          | The run reached a verdict, `passed`, `failed` or `skipped`.                                                                             |
+| `refused`            | The scenario can't run, or a session run's conversation is too long to judge. `result.reason` says why.                                 |
+| `target_unavailable` | The agent never connected.                                                                                                              |
+| `not_started`        | The run could not start or continue. `result.reason` says why, such as HIPAA controls or a missing conversation.                        |
+| `spend_limited`      | The organization's [spend limit](/api-reference/cli/cloud/spend-limit) was reached, preventing further session or judge starts.         |
+| `expired`            | The run's deadline passed before it finished.                                                                                           |
+| `cancelled`          | The run was cancelled. `result.reason` explains what may have started and any unconfirmed stop.                                         |
+| `timed_out`          | The eval itself ran past its [time limit](#limits).                                                                                     |
+| `error`, `abandoned` | The run failed without a verdict. `abandoned` is a run whose evaluation stopped before a result, and was started again, too many times. |
 
 Every status except `completed` has a `null` verdict.
+
+A run interrupted on Pipecat Cloud's side starts again from the beginning, and shows `starting` until it's running again. A synthetic run starts at most three sessions of the agent, and a session run restarts at most three times. A run that can't finish within them ends `abandoned`.
 
 ## Limits
 
@@ -32013,6 +32019,7 @@ Every status except `completed` has a `null` verdict.
 | Synthetic run deadline | `deadlineSeconds` from 90 to 7200. 1800 (30 minutes) by default.                                                                               |
 | Session run deadline   | `deadlineSeconds` from 240 to 1800. 600 (10 minutes) by default.                                                                               |
 | Suite run deadline     | `deadlineSeconds` from 90 to 43200. 43200 (12 hours) by default.                                                                               |
+| Suite concurrency      | At most 20 members at once.                                                                                                                    |
 | Eval time limit        | The smaller of one hour and the deadline less 30 seconds. An eval still going then ends as `timed_out`.                                        |
 | Scenario loading       | A scenario's includes load at most 200 files, 256 KiB and 20,000 values in all. An include counts each time it is named.                       |
 | Conversation judged    | 256,000 characters or 2,000 messages. A longer one is `refused`.                                                                               |
@@ -118122,7 +118129,7 @@ pipecat cloud eval run AGENT SCENARIO_FILE [OPTIONS]
 
 <ParamField path="--concurrency" type="integer">
   Suite runs only. Runs at most this many at once. Defaults to 4, as in
-  Pipecat's manifests. The API sets the most.
+  Pipecat's manifests, and can be at most 20.
 </ParamField>
 
 <ParamField path="--param" type="string">
@@ -118311,7 +118318,7 @@ pipecat cloud eval list AGENT [OPTIONS]
 
 ## cancel
 
-Request cancellation of a run. The command succeeds when the request is recorded or the run is already cancelled; it may still be `starting` or `running`. No further cancel request is needed. You can optionally use [`status`](#status) to check the outcome. Stopping is best effort; the result reason describes any unconfirmed stop. Cancellation does not undo usage already incurred by an agent session. A run that finished another way is an error.
+Request cancellation of a run. The command succeeds when the request is recorded or the run is already cancelled; it may still be `starting` or `running`. No further cancel request is needed. You can optionally use [`status`](#status) to check the outcome. A run usually ends `cancelled` within a few seconds, once its evaluation has stopped; if the stop couldn't be confirmed, the result reason says so. Cancellation does not undo usage already incurred by an agent session. A run that finished another way is an error.
 
 **Usage:**
 
@@ -118371,7 +118378,7 @@ pipecat cloud eval suite run AGENT --suite PATH (--bundle NAME[@N] | --revision 
 
 <ParamField path="--concurrency" type="integer">
   Runs at most this many members at once, replacing the suite's `concurrency:`.
-  Without either, 4, as in Pipecat's manifests. The API sets the most.
+  Without either, 4, as in Pipecat's manifests. At most 20.
 </ParamField>
 
 <ParamField path="--deadline" type="integer">
