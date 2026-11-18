@@ -21,12 +21,13 @@ A bot runner typically creates transport sessions (like Daily WebRTC rooms), gen
 
 ## How the Development Runner Works
 
-The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. By default it starts a **single server that supports all transports simultaneously** — WebRTC, Daily, LiveKit, telephony (Twilio, Telnyx, Plivo, Exotel), and plain WebSocket. Clients choose which transport they want per-request by sending a `"transport"` field in the `POST /start` body; you no longer restart the server to switch transports.
+The development runner operates as a FastAPI web server that automatically discovers and executes your bot code. By default it starts a **single server that supports all transports simultaneously** — WebRTC, Daily, LiveKit, SIP, telephony (Twilio, Telnyx, Plivo, Exotel), and plain WebSocket. Clients choose which transport they want per-request by sending a `"transport"` field in the `POST /start` body; you no longer restart the server to switch transports.
 
 - **WebRTC connections**: It serves a built-in web interface where users can connect directly as well as an endpoint to create new WebRTC sessions
 - **Daily integration**: It provides endpoints that create new rooms and tokens and redirect users to join them
 - **LiveKit integration**: It mints room tokens and spawns bots as participants in LiveKit rooms
 - **Telephony providers**: For Twilio, Telnyx, and Plivo, it sets up webhook endpoints that handle incoming calls and establish WebSocket connections for audio streaming
+- **SIP**: It starts bots that register a SIP account, and serves a webhook for Daily SIP-trunk notifications
 - **Plain WebSocket**: It exposes a `/ws-client` endpoint for non-telephony WebSocket clients (e.g. browser apps using protobuf framing)
 
 The runner registers the infrastructure for every transport and dispatches each connection to the right handler. It then discovers your bot function and spawns new instances whenever users connect. This means you can focus on writing your bot logic while the runner handles all the server infrastructure, connection management, and transport-specific details.
@@ -173,6 +174,7 @@ Runner arguments are how the runner communicates transport-specific information 
 - **`DailyRunnerArguments`**: Contains `room_url`, `token` (Optional), `body` (Optional) for joining Daily rooms
 - **`LiveKitRunnerArguments`**: Contains `room_name`, `url`, `token`, `body` (Optional), `session_id` for joining LiveKit rooms
 - **`SmallWebRTCRunnerArguments`**: Contains `webrtc_connection` for local WebRTC sessions, `body` (Optional) for WhatsApp call metadata
+- **`SIPRunnerArguments`**: Contains the SIP account (`user`, `domain`, `password`, `transport`) and the connection settings read from the environment, for registering with a SIP server
 - **`WebSocketRunnerArguments`**: Contains `websocket` for both telephony and plain WebSocket connections. The `transport_type` field distinguishes them: `"websocket"` for plain (non-telephony) clients connecting via `/ws-client`, or `None` for connections via `/ws` until `create_transport()` sets it to the detected telephony provider.
 
 All runner arguments also include:
@@ -244,7 +246,7 @@ This allows you to easily customize behavior between development and production 
 
 ## All Supported Transports
 
-The development runner supports nine transport types, each designed for different use cases. By default all are available from one server; the client selects one per session via the `"transport"` field in the `/start` request. The `-t <transport>` form below is the optional way to **restrict** the server to a single transport.
+The development runner supports ten transport types, each designed for different use cases. By default all are available from one server; the client selects one per session via the `"transport"` field in the `/start` request. The `-t <transport>` form below is the optional way to **restrict** the server to a single transport.
 
 ### WebRTC (`"transport": "webrtc"`)
 
@@ -362,6 +364,117 @@ Environment variables are optional, but when provided will attempt to hang up th
 
 Your bot receives the accepted FastAPI WebSocket. [`create_transport()`](#simplifying-with-the-transport-utility) detects the telephony provider from its first messages and configures the matching serializer; when you build the transport yourself, call `parse_telephony_websocket()` to detect the provider and set the serializer in `FastAPIWebsocketParams`.
 
+### SIP (`"transport": "sip"`)
+
+Native SIP calling through [`SIPTransport`](/api-reference/server/services/transport/sip). Requires `pipecat-ai[sip]` (Linux or macOS; Windows through WSL2).
+
+```bash
+# Server: POST /start and the Daily SIP-trunk webhook
+python bot.py -t sip
+
+# Direct: run one bot immediately with no server
+python bot.py -t sip -d
+```
+
+#### Quick start
+
+The runner can run a SIP bot with no SIP account at all. With `DAILY_API_KEY` set, plus whatever keys the bot's own services need:
+
+```bash
+python bot.py -t sip -d
+```
+
+The runner provisions a temporary SIP client on your Daily domain, logs `Created Daily SIP client: sip:pipecat-<id>@<domain>.sip-us.daily.co`, and the bot registers and waits. Dial that URI from any SIP softphone (Linphone, Zoiper, Telephone.app on macOS) and the bot answers. The client expires on its own after two hours and is deleted when the bot exits. Nothing else is needed to hear the transport work; the rest of this section is for a real account and for phone calls.
+
+#### Where the account comes from
+
+The runner resolves the account from three sources, in this order; the first that applies wins.
+
+**1. The request body (`body.sip_client`).** A `/start` request, or the `--runner-body` file in direct mode, names the account:
+
+```json
+{
+  "transport": "sip",
+  "body": {
+    "sip_client": {
+      "username": "1001",
+      "password": "secret",
+      "domain": "sip.example.com",
+      "transport": "tls"
+    }
+  }
+}
+```
+
+`username`, `password`, and `domain` are required. `transport` is optional and wins over `SIP_TRANSPORT`; it is `tls` when neither is given. `sip_uri` is optional and informational. This is the shape a Daily SIP trunk sends for each call, so one bot serves `/start` and the trunk webhook below without a code change. The whole `body` reaches the bot as `runner_args.body`.
+
+**2. The environment (`SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`).** A fixed account on any registrar: a PBX such as FreeSWITCH or Asterisk, a Kamailio deployment, a carrier's registration trunk, or a persistent Daily SIP client. The bot registers it at start and stays registered between calls. For a carrier trunk that authenticates each call instead of a registration (a credential list), set `SIP_REG_INTERVAL=0` and, when the digest username differs from the address, `SIP_AUTH_USER`.
+
+**3. A provisioned Daily SIP client (`DAILY_API_KEY`).** When neither of the above is set, the runner creates a temporary client, as in the quick start. Only the runner's own `/start` and direct modes provision; Pipecat Cloud and `create_transport()` on plain runner arguments never do.
+
+#### The Daily SIP-trunk webhook
+
+With `-t sip`, the runner also serves `POST /daily-sip-trunk-webhook`, a local stand-in for Pipecat Cloud's handler of Daily SIP-trunk notifications. A `sip_client` trunk on Daily provisions a SIP client for each inbound call and POSTs a [`sip_trunk.incoming` notification](https://docs.daily.co/reference/rest-api/sip-trunk/notification) to the trunk's `webhook_url`. The route starts a bot on that per-call account and answers at once, while Daily holds the caller until the bot's REGISTER lands. The config-time `sip_trunk.test` probe is acknowledged without starting anything, and a notification without a usable `sip_client` is refused with HTTP 400. The whole notification reaches the bot as `runner_args.body`.
+
+<Warning>
+  The runner's route does not verify the notification's `X-Siptrunk-Signature`;
+  it is a development tool meant to sit behind a tunnel. Pipecat Cloud's handler
+  verifies every notification with the trunk's secret, and a self-hosted handler
+  must do the same. The signature recipe is in Daily's notification reference.
+</Warning>
+
+To use it: run `python bot.py -t sip`, expose the port (`ngrok http 7860`), create the trunk through the [Daily SIP trunk API](https://docs.daily.co/reference/rest-api/sip-trunk) with `notification.webhook_url` set to `https://<host>/daily-sip-trunk-webhook`, and point your carrier at the trunk's `sip_uri`.
+
+#### Environment variables
+
+Grouped by what they are for; only the account group is ever required.
+
+**The account**
+
+- `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`: An existing SIP account; set these to run against your own registrar. Without `SIP_USER` and `SIP_DOMAIN`, and no `sip_client` in the body, a temporary Daily SIP client is provisioned.
+- `DAILY_API_KEY`: Needed only when the runner provisions that client. `DAILY_API_URL` (Optional) overrides the API URL.
+- `SIP_TRANSPORT` (Optional): `udp`, `tcp`, or `tls`. Defaults to `udp` for an account from the environment and `tls` for a provisioned client or a body account; a `transport` in the body wins. Use `tls` whenever the registrar offers it.
+- `SIP_AUTH_USER` (Optional): The digest username when it differs from `SIP_USER`; carrier credential lists are the usual case.
+- `SIP_REG_INTERVAL` (Optional): Seconds between registration refreshes; default 600. Lower it (240 or less) behind a NAT that drops idle connections, as cloud NAT gateways do. `0` disables registration: trunk mode, for a carrier that authenticates each INVITE instead.
+
+**Media and NAT**
+
+- `SIP_STUN_SERVER` (Optional): The runner enables `medianat=stun` by default with `stun.l.google.com`, so the bot advertises its public address in the SDP. Set `off` to disable it, for a registrar on the same network or on loopback. STUN alone does not work behind a symmetric NAT (Pipecat Cloud, AWS NAT Gateway); the remedies are under `extra_params` in the [SIPConnection reference](/api-reference/server/services/transport/sip#sipconnection).
+- `SIP_EXTRA_PARAMS` (Optional): Comma-separated raw baresip account parameters (`key=value`), for anything the typed settings do not cover, `medianat=turn,stunserver=turn:HOST:3478,stunuser=USER,stunpass=PASS` for instance. It replaces the default STUN setting, so repeat `medianat=stun,stunserver=...` if you still want that.
+- `SIP_AUDIO_CODECS` (Optional): Comma-separated codec preference list by stack name, for example `opus/48000/2,PCMU/8000/1`. Set it to match what the far end offers; PSTN trunks are `PCMU` and `PCMA`.
+- `SIP_JITTER_BUFFER` (Optional): `off`, `fixed:MIN-MAX`, or `adaptive:MIN-MAX` in milliseconds; default a fixed 40-60 ms. Raise the minimum on a jittery path (choppy audio, `on_dialin_warning` reports); lower it on a clean one to shave latency.
+- `SIP_RTP_TIMEOUT` (Optional): Seconds without received RTP before the call is closed as dead; default 0 (off). Set it (30, say) for peers that can vanish without a BYE.
+
+**Deployment**
+
+- `SIP_INSTANCE_ID` (Optional): A stable UUID identifying this endpoint across restarts (RFC 5626 `+sip.instance`). Set it so a restarted bot replaces its own registration instead of leaving a stale one that still receives calls.
+- `SIP_NET_INTERFACE` (Optional): Restrict the stack to one local interface, by name or address: `127.0.0.1` for a registrar on loopback, or one address of a multi-homed host.
+
+**Debugging**
+
+- `SIP_NATIVE_LOG_LEVEL` (Optional): Lowest severity captured from the native SIP stack (`debug`, `info`, `warning`, or `error`); default `warning`.
+- `SIP_TRACE` (Optional): `1` or `true` logs every SIP message verbatim, SDP included. The trace carries authentication material: never enable it in production or paste it into an issue.
+
+#### Debugging a SIP bot
+
+The events tell most of the story; the trace tells the rest.
+
+| Symptom                                                         | Where to look                                                                                                                                                                                                                                                                 |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `on_dialin_ready` never fires and `on_error` reports 401 or 403 | Credentials: `SIP_USER` and `SIP_PASS`, and `SIP_AUTH_USER` when the digest user differs.                                                                                                                                                                                     |
+| `on_error` reports a timeout or an unreachable registrar        | `SIP_DOMAIN` and `SIP_TRANSPORT` (TLS is usually port 5061, UDP 5060), and whether outbound SIP is firewalled.                                                                                                                                                                |
+| The call connects but audio flows one way                       | NAT. STUN advertises an address a symmetric NAT does not honour: have the peer latch onto the bot's RTP source address (carriers call it Symmetric RTP), or use TURN through `SIP_EXTRA_PARAMS`. `on_call_quality_stats` at close shows `rx_packets=0` on the dead direction. |
+| A trunk call rings, then fails after about 12 seconds           | Daily got no 2xx from the webhook in time: the tunnel, the `webhook_url` path, or a bot that failed to start. The runner log shows the notification, or nothing arrived.                                                                                                      |
+| Two bots answer, or calls ring a bot that is gone               | Two registrations on one account. Set `SIP_INSTANCE_ID`, or stop the other process.                                                                                                                                                                                           |
+
+When the table does not settle it, `SIP_TRACE=1 SIP_NATIVE_LOG_LEVEL=debug` shows the signaling and the stack's view of it.
+
+**Runner Arguments**: `SIPRunnerArguments`
+
+[`create_transport()`](#simplifying-with-the-transport-utility) builds the `SIPTransport` from the runner arguments, so bots need a `"sip"` key in `transport_params` and nothing else. It also builds it from plain `RunnerArguments`, as on Pipecat Cloud, when the body carries `sip_client` or the environment holds `SIP_USER` and `SIP_DOMAIN`. It never provisions a Daily SIP client on its own.
+
+To work with the account yourself, `pipecat.runner.sip` provides `configure()` (resolves the account), `sip_runner_arguments()` (converts it into `SIPRunnerArguments`), and `cleanup()` (deletes a client that `configure()` provisioned).
+
 ### WebSocket (`"transport": "websocket"`)
 
 Plain (non-telephony) WebSocket connections, for clients such as browser apps that speak protobuf framing directly. Selecting this transport on `/start` returns a `wsUrl` pointing at the `/ws-client` endpoint, which the client then connects to.
@@ -390,7 +503,7 @@ Options:
   --port INTEGER             Server port (default: 7860)
   -t, --transport            Restrict to a single transport and set it as the default
                              for /start: daily, livekit, webrtc, twilio, telnyx, plivo,
-                             exotel, websocket, moq.
+                             exotel, websocket, moq, sip.
                              Omit to support all transports simultaneously (default).
   -x, --proxy TEXT           Public proxy hostname for telephony webhooks (required for telephony)
   --allowed-origins [ORIGIN] Allowed origins for HTTP and WebSocket connections,
@@ -412,7 +525,8 @@ Options:
   --uploads-folder-max-files INTEGER
                              Max files kept in the uploads folder; oldest removed (default: 10)
   --esp32                    Enable SDP munging for ESP32 WebRTC compatibility
-  -d, --direct               Connect directly to Daily room for testing (automatically sets transport to daily)
+  -d, --direct               Run the bot immediately with no server: join the Daily room
+                             (the default) or register the SIP account (-t sip)
   --dialin / --no-dialin     Mount the Daily PSTN dial-in webhook (default: on)
   --whatsapp                 Mount the WhatsApp webhook routes (requires the WhatsApp
                              environment variables)
@@ -428,11 +542,12 @@ Options:
 - `livekit`: LiveKit integration with room management
 - `twilio`, `telnyx`, `plivo`, `exotel`: Telephony provider integration
 - `websocket`: Plain WebSocket server
+- `sip`: [SIP](/api-reference/server/services/transport/sip) calling, registering a SIP account
 - `moq`: [Media over QUIC](/api-reference/server/services/transport/moq), serving its own socket or dialing a relay
 
 **`--proxy` / `-x`**: Required for most telephony transports (Twilio, Telnyx, Plivo). This should be a publicly accessible hostname (like `yourbot.ngrok.io`) that can receive webhooks from telephony providers. The runner automatically strips protocol prefixes (http://, https://) if provided. Not required for Exotel, which uses direct WebSocket connections.
 
-**`--direct` / `-d`**: Special mode for Daily that bypasses the web server and connects your bot directly to a Daily room. Useful for quick testing but not recommended for production use.
+**`--direct` / `-d`**: Bypasses the web server and runs your bot immediately: it joins a Daily room, or with `-t sip` registers the SIP account. Useful for quick testing but not recommended for production use.
 
 **`--dialin` / `--no-dialin`**: The `/daily-dialin-webhook` endpoint for handling Daily PSTN dial-in calls is mounted by default; pass `--no-dialin` to leave it out. This endpoint receives webhook data from Daily when a phone call dials into your configured phone number, creates a SIP-enabled room, and spawns your bot. It doesn't require `-t daily`.
 
@@ -479,6 +594,11 @@ Different transports require different environment variables:
 - `TWILIO_REGION`, `TWILIO_EDGE` (Optional): Twilio region and edge for non-US1 regions (set both)
 - `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`: Plivo credentials
 - `TELNYX_API_KEY`: Telnyx API key
+
+**SIP**: See [SIP](#sip-transport-sip) for the full list.
+
+- `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`: Existing SIP account
+- `DAILY_API_KEY`: Provisions a temporary SIP client when no account is given
 
 **Security**:
 
@@ -619,6 +739,24 @@ For `"transport": "twilio" | "telnyx" | "plivo" | "exotel"` or `"transport": "we
 Telephony connections use `/ws`; plain WebSocket clients use `/ws-client` (and also receive a `sessionId`). The bot starts when the connection is established. When the runner uses [`--ws-auth token`](#key-arguments), the response also carries a one-time `token` the client must present when it connects.
 
 When file uploads are enabled, the `/start` response also includes `fileUploadUrl`, the route to POST uploads to, relative to the `/start` endpoint's origin. It is the session-scoped `/sessions/{session_id}/files` route when the session is registered, or the flat `/files` route otherwise. Files uploaded through a session-scoped route are deleted when the session ends. The field is omitted when uploads are disabled.
+
+**Request Format (`"transport": "sip"`):**
+
+```json
+{
+  "transport": "sip",
+  "body": {
+    "sip_client": {
+      "username": "1001",
+      "password": "secret",
+      "domain": "sip.example.com",
+      "transport": "tls"
+    }
+  }
+}
+```
+
+The bot registers the account immediately and the response is `{"sessionId": "..."}`. `body.sip_client` is optional: without it the account comes from the environment, else a Daily SIP client is provisioned (see [SIP](#sip-transport-sip)). An unusable account returns HTTP 400.
 
 ### The `/status` Endpoint
 
@@ -804,20 +942,22 @@ This automatic logging applies to all runner endpoints and helps identify issues
 
 All transports are available from `python bot.py`; the `-t` form below restricts the server to one. Access columns assume the default `localhost:7860`.
 
-| Transport     | Command                                     | Access                          | Environment Variables                                                 |
-| ------------- | ------------------------------------------- | ------------------------------- | --------------------------------------------------------------------- |
-| All (default) | `python bot.py`                             | http://localhost:7860/client    | Per transport (see below)                                             |
-| WebRTC        | `python bot.py -t webrtc`                   | http://localhost:7860/client    | None                                                                  |
-| Daily         | `python bot.py -t daily`                    | `GET /daily`, `POST /start`     | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
-| Daily Direct  | `python bot.py -d`                          | Direct connection               | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
-| Daily Dial-In | `python bot.py`                             | Phone calls via Daily PSTN      | `DAILY_API_KEY` (Required)                                            |
-| LiveKit       | `python bot.py -t livekit`                  | `POST /start`                   | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (All required) |
-| Twilio        | `python bot.py -t twilio -x proxy.ngrok.io` | Phone calls                     | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`                             |
-| Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io` | Phone calls                     | `TELNYX_API_KEY`                                                      |
-| Plivo         | `python bot.py -t plivo -x proxy.ngrok.io`  | Phone calls                     | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                                   |
-| Exotel        | `python bot.py -t exotel`                   | Phone calls                     | None                                                                  |
-| WebSocket     | `python bot.py`                             | `ws://localhost:7860/ws-client` | None                                                                  |
-| ESP32 WebRTC  | `python bot.py --esp32 --host <ESP32_IP>`   | ESP32 WebRTC connection         | None                                                                  |
+| Transport     | Command                                     | Access                                         | Environment Variables                                                 |
+| ------------- | ------------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------------- |
+| All (default) | `python bot.py`                             | http://localhost:7860/client                   | Per transport (see below)                                             |
+| WebRTC        | `python bot.py -t webrtc`                   | http://localhost:7860/client                   | None                                                                  |
+| Daily         | `python bot.py -t daily`                    | `GET /daily`, `POST /start`                    | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
+| Daily Direct  | `python bot.py -d`                          | Direct connection                              | `DAILY_API_KEY`, `DAILY_ROOM_URL` (Optional)                          |
+| Daily Dial-In | `python bot.py`                             | Phone calls via Daily PSTN                     | `DAILY_API_KEY` (Required)                                            |
+| LiveKit       | `python bot.py -t livekit`                  | `POST /start`                                  | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (All required) |
+| SIP           | `python bot.py -t sip`                      | `POST /start`, `POST /daily-sip-trunk-webhook` | `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`, or `DAILY_API_KEY`              |
+| SIP Direct    | `python bot.py -t sip -d`                   | Direct registration                            | `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`, or `DAILY_API_KEY`              |
+| Twilio        | `python bot.py -t twilio -x proxy.ngrok.io` | Phone calls                                    | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`                             |
+| Telnyx        | `python bot.py -t telnyx -x proxy.ngrok.io` | Phone calls                                    | `TELNYX_API_KEY`                                                      |
+| Plivo         | `python bot.py -t plivo -x proxy.ngrok.io`  | Phone calls                                    | `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`                                   |
+| Exotel        | `python bot.py -t exotel`                   | Phone calls                                    | None                                                                  |
+| WebSocket     | `python bot.py`                             | `ws://localhost:7860/ws-client`                | None                                                                  |
+| ESP32 WebRTC  | `python bot.py --esp32 --host <ESP32_IP>`   | ESP32 WebRTC connection                        | None                                                                  |
 
 ## Examples
 
