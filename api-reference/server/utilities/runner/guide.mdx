@@ -366,7 +366,7 @@ Your bot receives the accepted FastAPI WebSocket. [`create_transport()`](#simpli
 
 ### SIP (`"transport": "sip"`)
 
-Native SIP calling through [`SIPTransport`](/api-reference/server/services/transport/sip). Requires `pipecat-ai[sip]`.
+Native SIP calling through [`SIPTransport`](/api-reference/server/services/transport/sip). Requires `pipecat-ai[sip]` (Linux or macOS; Windows through WSL2).
 
 ```bash
 # Server: POST /start and the Daily SIP-trunk webhook
@@ -376,33 +376,98 @@ python bot.py -t sip
 python bot.py -t sip -d
 ```
 
-The runner resolves the SIP account in this order:
+#### Quick start
 
-1. `body.sip_client` from the `/start` request, or from the `--runner-body` file in direct mode. This is what a Daily SIP trunk sends for each call.
-2. The `SIP_USER`, `SIP_PASS`, and `SIP_DOMAIN` environment variables.
-3. A temporary SIP client provisioned on your Daily domain with `DAILY_API_KEY`. The runner prints its dialable URI and deletes it when the bot exits.
+The runner can run a SIP bot with no SIP account at all. With `DAILY_API_KEY` set, plus whatever keys the bot's own services need:
 
-The bot registers at once and waits for its call. With `-t sip`, the runner exposes:
+```bash
+python bot.py -t sip -d
+```
 
-- `POST /start` with `"transport": "sip"`, with the account in `body.sip_client`
-- `POST /daily-sip-trunk-webhook`, which starts a bot on the per-call SIP client that each Daily SIP-trunk notification carries. A notification without a usable `sip_client` is rejected with HTTP 400, and the whole notification reaches the bot as `runner_args.body`. Point the trunk's `webhook_url` at it through a tunnel.
+The runner provisions a temporary SIP client on your Daily domain, logs `Created Daily SIP client: sip:pipecat-<id>@<domain>.sip-us.daily.co`, and the bot registers and waits. Dial that URI from any SIP softphone (Linphone, Zoiper, Telephone.app on macOS) and the bot answers. The client expires on its own after two hours and is deleted when the bot exits. Nothing else is needed to hear the transport work; the rest of this section is for a real account and for phone calls.
 
-**Environment Variables**:
+#### Where the account comes from
 
-- `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`: An existing SIP account. Without `SIP_USER` and `SIP_DOMAIN` (and no `sip_client` in the body), a temporary Daily SIP client is provisioned.
-- `DAILY_API_KEY`: Required when the runner has to provision a SIP client. `DAILY_API_URL` (Optional) overrides the API URL.
-- `SIP_TRANSPORT` (Optional): `udp`, `tcp`, or `tls`. Defaults to `udp` for an account from the environment and `tls` for a provisioned client or an account from the body. A `transport` in the body wins.
-- `SIP_AUDIO_CODECS` (Optional): Comma-separated codec preference list, for example `opus/48000/2,PCMU/8000/1`.
-- `SIP_AUTH_USER` (Optional): Digest username, when it differs from `SIP_USER`.
-- `SIP_REG_INTERVAL` (Optional): Seconds between registration refreshes. Defaults to 600; `0` disables registration (trunk mode).
-- `SIP_RTP_TIMEOUT` (Optional): Seconds without received RTP before a call is closed. Defaults to 0 (off).
-- `SIP_INSTANCE_ID` (Optional): A stable UUID identifying the endpoint across restarts.
-- `SIP_NET_INTERFACE` (Optional): Restrict the stack to one local interface, such as `127.0.0.1`.
-- `SIP_JITTER_BUFFER` (Optional): `off`, `fixed:MIN-MAX`, or `adaptive:MIN-MAX` (milliseconds). Defaults to a fixed 40-60 ms buffer.
-- `SIP_STUN_SERVER` (Optional): STUN server for media-NAT traversal. The runner enables `medianat=stun` by default using `stun.l.google.com`; set `off` to disable.
-- `SIP_EXTRA_PARAMS` (Optional): Comma-separated raw baresip account parameters (`key=value`). Replaces the default STUN setting.
-- `SIP_NATIVE_LOG_LEVEL` (Optional): Lowest severity captured from the native SIP stack's logs (`debug`, `info`, `warning`, or `error`). Defaults to `warning`.
-- `SIP_TRACE` (Optional): Set to `1` to log every SIP message verbatim. Contains authentication material, so leave it off in production.
+The runner resolves the account from three sources, in this order; the first that applies wins.
+
+**1. The request body (`body.sip_client`).** A `/start` request, or the `--runner-body` file in direct mode, names the account:
+
+```json
+{
+  "transport": "sip",
+  "body": {
+    "sip_client": {
+      "username": "1001",
+      "password": "secret",
+      "domain": "sip.example.com",
+      "transport": "tls"
+    }
+  }
+}
+```
+
+`username`, `password`, and `domain` are required. `transport` is optional and wins over `SIP_TRANSPORT`; it is `tls` when neither is given. `sip_uri` is optional and informational. This is the shape a Daily SIP trunk sends for each call, so one bot serves `/start` and the trunk webhook below without a code change. The whole `body` reaches the bot as `runner_args.body`.
+
+**2. The environment (`SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`).** A fixed account on any registrar: a PBX such as FreeSWITCH or Asterisk, a Kamailio deployment, a carrier's registration trunk, or a persistent Daily SIP client. The bot registers it at start and stays registered between calls. For a carrier trunk that authenticates each call instead of a registration (a credential list), set `SIP_REG_INTERVAL=0` and, when the digest username differs from the address, `SIP_AUTH_USER`.
+
+**3. A provisioned Daily SIP client (`DAILY_API_KEY`).** When neither of the above is set, the runner creates a temporary client, as in the quick start. Only the runner's own `/start` and direct modes provision; Pipecat Cloud and `create_transport()` on plain runner arguments never do.
+
+#### The Daily SIP-trunk webhook
+
+With `-t sip`, the runner also serves `POST /daily-sip-trunk-webhook`, a local stand-in for Pipecat Cloud's handler of Daily SIP-trunk notifications. A `sip_client` trunk on Daily provisions a SIP client for each inbound call and POSTs a [`sip_trunk.incoming` notification](https://docs.daily.co/reference/rest-api/sip-trunk/notification) to the trunk's `webhook_url`. The route starts a bot on that per-call account and answers at once, while Daily holds the caller until the bot's REGISTER lands. The config-time `sip_trunk.test` probe is acknowledged without starting anything, and a notification without a usable `sip_client` is refused with HTTP 400. The whole notification reaches the bot as `runner_args.body`.
+
+<Warning>
+  The runner's route does not verify the notification's `X-Siptrunk-Signature`;
+  it is a development tool meant to sit behind a tunnel. Pipecat Cloud's handler
+  verifies every notification with the trunk's secret, and a self-hosted handler
+  must do the same. The signature recipe is in Daily's notification reference.
+</Warning>
+
+To use it: run `python bot.py -t sip`, expose the port (`ngrok http 7860`), create the trunk through the [Daily SIP trunk API](https://docs.daily.co/reference/rest-api/sip-trunk) with `notification.webhook_url` set to `https://<host>/daily-sip-trunk-webhook`, and point your carrier at the trunk's `sip_uri`.
+
+#### Environment variables
+
+Grouped by what they are for; only the account group is ever required.
+
+**The account**
+
+- `SIP_USER`, `SIP_PASS`, `SIP_DOMAIN`: An existing SIP account; set these to run against your own registrar. Without `SIP_USER` and `SIP_DOMAIN`, and no `sip_client` in the body, a temporary Daily SIP client is provisioned.
+- `DAILY_API_KEY`: Needed only when the runner provisions that client. `DAILY_API_URL` (Optional) overrides the API URL.
+- `SIP_TRANSPORT` (Optional): `udp`, `tcp`, or `tls`. Defaults to `udp` for an account from the environment and `tls` for a provisioned client or a body account; a `transport` in the body wins. Use `tls` whenever the registrar offers it.
+- `SIP_AUTH_USER` (Optional): The digest username when it differs from `SIP_USER`; carrier credential lists are the usual case.
+- `SIP_REG_INTERVAL` (Optional): Seconds between registration refreshes; default 600. Lower it (240 or less) behind a NAT that drops idle connections, as cloud NAT gateways do. `0` disables registration: trunk mode, for a carrier that authenticates each INVITE instead.
+
+**Media and NAT**
+
+- `SIP_STUN_SERVER` (Optional): The runner enables `medianat=stun` by default with `stun.l.google.com`, so the bot advertises its public address in the SDP. Set `off` to disable it, for a registrar on the same network or on loopback. STUN alone does not work behind a symmetric NAT (Pipecat Cloud, AWS NAT Gateway); the remedies are under `extra_params` in the [SIPConnection reference](/api-reference/server/services/transport/sip#sipconnection).
+- `SIP_EXTRA_PARAMS` (Optional): Comma-separated raw baresip account parameters (`key=value`), for anything the typed settings do not cover, `medianat=turn,stunserver=turn:HOST:3478,stunuser=USER,stunpass=PASS` for instance. It replaces the default STUN setting, so repeat `medianat=stun,stunserver=...` if you still want that.
+- `SIP_AUDIO_CODECS` (Optional): Comma-separated codec preference list by stack name, for example `opus/48000/2,PCMU/8000/1`. Set it to match what the far end offers; PSTN trunks are `PCMU` and `PCMA`.
+- `SIP_JITTER_BUFFER` (Optional): `off`, `fixed:MIN-MAX`, or `adaptive:MIN-MAX` in milliseconds; default a fixed 40-60 ms. Raise the minimum on a jittery path (choppy audio, `on_dialin_warning` reports); lower it on a clean one to shave latency.
+- `SIP_RTP_TIMEOUT` (Optional): Seconds without received RTP before the call is closed as dead; default 0 (off). Set it (30, say) for peers that can vanish without a BYE.
+
+**Deployment**
+
+- `SIP_INSTANCE_ID` (Optional): A stable UUID identifying this endpoint across restarts (RFC 5626 `+sip.instance`). Set it so a restarted bot replaces its own registration instead of leaving a stale one that still receives calls.
+- `SIP_NET_INTERFACE` (Optional): Restrict the stack to one local interface, by name or address: `127.0.0.1` for a registrar on loopback, or one address of a multi-homed host.
+
+**Debugging**
+
+- `SIP_NATIVE_LOG_LEVEL` (Optional): Lowest severity captured from the native SIP stack (`debug`, `info`, `warning`, or `error`); default `warning`.
+- `SIP_TRACE` (Optional): `1` or `true` logs every SIP message verbatim, SDP included. The trace carries authentication material: never enable it in production or paste it into an issue.
+
+#### Debugging a SIP bot
+
+The events tell most of the story; the trace tells the rest.
+
+| Symptom                                                         | Where to look                                                                                                                                                                                                                                                                 |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `on_dialin_ready` never fires and `on_error` reports 401 or 403 | Credentials: `SIP_USER` and `SIP_PASS`, and `SIP_AUTH_USER` when the digest user differs.                                                                                                                                                                                     |
+| `on_error` reports a timeout or an unreachable registrar        | `SIP_DOMAIN` and `SIP_TRANSPORT` (TLS is usually port 5061, UDP 5060), and whether outbound SIP is firewalled.                                                                                                                                                                |
+| The call connects but audio flows one way                       | NAT. STUN advertises an address a symmetric NAT does not honour: have the peer latch onto the bot's RTP source address (carriers call it Symmetric RTP), or use TURN through `SIP_EXTRA_PARAMS`. `on_call_quality_stats` at close shows `rx_packets=0` on the dead direction. |
+| A trunk call rings, then fails after about 12 seconds           | Daily got no 2xx from the webhook in time: the tunnel, the `webhook_url` path, or a bot that failed to start. The runner log shows the notification, or nothing arrived.                                                                                                      |
+| Two bots answer, or calls ring a bot that is gone               | Two registrations on one account. Set `SIP_INSTANCE_ID`, or stop the other process.                                                                                                                                                                                           |
+
+When the table does not settle it, `SIP_TRACE=1 SIP_NATIVE_LOG_LEVEL=debug` shows the signaling and the stack's view of it.
 
 **Runner Arguments**: `SIPRunnerArguments`
 
@@ -677,7 +742,21 @@ When file uploads are enabled, the `/start` response also includes `fileUploadUr
 
 **Request Format (`"transport": "sip"`):**
 
-The bot registers its SIP account immediately and `/start` returns its `sessionId`. The account comes from `body.sip_client`, else the environment, else a provisioned Daily SIP client (see [SIP](#sip-transport-sip)). An unusable account returns HTTP 400.
+```json
+{
+  "transport": "sip",
+  "body": {
+    "sip_client": {
+      "username": "1001",
+      "password": "secret",
+      "domain": "sip.example.com",
+      "transport": "tls"
+    }
+  }
+}
+```
+
+The bot registers the account immediately and the response is `{"sessionId": "..."}`. `body.sip_client` is optional: without it the account comes from the environment, else a Daily SIP client is provisioned (see [SIP](#sip-transport-sip)). An unusable account returns HTTP 400.
 
 ### The `/status` Endpoint
 

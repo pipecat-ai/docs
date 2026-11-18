@@ -8,7 +8,7 @@ description: "Native SIP calling with SIPTransport, SIPConnection, and SIPParams
 
 `SIPTransport` makes a pipeline a SIP endpoint. The bot registers a SIP account (or dials through a registration-less trunk), answers inbound calls, places outbound calls, and exchanges audio, video, and DTMF with the pipeline. Its events and call-control methods use the same names as the dial-in and dial-out surface of [`DailyTransport`](/api-reference/server/services/transport/daily), so a bot can switch between the two by changing the constructor and params.
 
-Each `SIPTransport` handles one call. Create several instances, each with its own `SIPConnection`, to hold several conversations on one account.
+The transport is one half of the endpoint. A [`SIPConnection`](#sipconnection) holds the SIP side: the account, the stack settings, and one call. The transport holds the pipeline side: frames in and out, and the events a bot handles. Each `SIPTransport` handles one call and owns the connection it is given. To hold several conversations on one account, create several transports, each with its own connection; more than two at a time also needs `max_concurrent_calls` raised on every connection.
 
 <CardGroup cols={2}>
   <Card
@@ -33,9 +33,13 @@ Each `SIPTransport` handles one call. Create several instances, each with its ow
 uv add "pipecat-ai[sip]"
 ```
 
+The `sip` extra installs [baresip-python](https://pypi.org/project/baresip-python/), the SIP stack, as a binary wheel: no compiler and no system SIP software are needed. Wheels exist for Linux (x86_64, aarch64) and macOS (Apple Silicon and Intel) on Python 3.11 to 3.14. There is no Windows wheel; on Windows, run the bot under [WSL2](https://learn.microsoft.com/windows/wsl/), where the Linux wheel applies.
+
 ## Prerequisites
 
 A SIP account to register with, or a Daily domain to provision one on. With the [development runner](/api-reference/server/utilities/runner/guide#sip-transport-sip), a bot with no configured account gets a temporary Daily SIP client (`DAILY_API_KEY`). See [`DailyRESTHelper`](/api-reference/server/utilities/daily/rest-helper) to create SIP clients yourself.
+
+The fastest way to hear the transport is that zero-configuration path: with `DAILY_API_KEY` set, `python bot.py -t sip -d` provisions a temporary SIP client, logs its dialable URI (`Created Daily SIP client: sip:pipecat-<id>@<domain>.sip-us.daily.co`), and deletes it when the bot exits. Dial that URI from any SIP softphone and the bot answers. The [runner guide](/api-reference/server/utilities/runner/guide#sip-transport-sip) covers the other two account sources, a Daily SIP trunk and a plain SIP account on any registrar.
 
 ## Configuration
 
@@ -75,7 +79,11 @@ from pipecat.transports.sip.transport import SIPParams, SIPTransport
 
 ### SIPConnection
 
-All parameters are keyword-only. Parameters marked runtime-wide are shared by every `SIPConnection` in the process, and a connection that disagrees with the running settings raises `ValueError`. Connections that share a `user` and `domain` must agree on `transport`, `registrar`, `password`, `auth_user`, `audio_codecs`, `dtmf_mode`, and `extra_params`.
+A `SIPConnection` is the SIP endpoint itself: the account (`user@domain` and its credentials), the registration or trunk behaviour, the process-wide stack settings, and one call at a time. The transport does not create it, because the connection is also the application's handle on the SIP side of the call: a bot with `auto_answer=False` answers or declines on it (`connection.answer()`, `connection.reject()`), `connection.aor` is the registered address, `connection.final_stats` holds the close-time statistics, and `consult_connection()` produces the second leg an attended transfer dials on. Its constructor arguments are plain types; the underlying binding never appears in application code.
+
+One connection serves one transport instance, since the transport binds its handlers to the connection it is given. Connections that share a `user` and `domain` share one registration: an inbound call goes to the first idle connection, and a call that finds every connection busy is refused with 486. Those connections must agree on `transport`, `registrar`, `password`, `auth_user`, `audio_codecs`, `dtmf_mode`, and `extra_params`.
+
+All parameters are keyword-only. Parameters marked runtime-wide configure the SIP stack the whole process shares; the first connection to connect fixes them, and a later connection that disagrees raises `ValueError`.
 
 <ParamField path="user" type="str" required>
   The user part of `sip:user@domain`.
@@ -321,42 +329,60 @@ await transport.remove_video() -> str | None
 await transport.request_keyframe() -> None
 ```
 
-`set_video_direction()` renegotiates the call's video with `"sendrecv"`, `"sendonly"`, `"recvonly"`, or `"inactive"`; the call must already carry a video stream. `add_video()` and `remove_video()` set `"sendrecv"` and `"inactive"`. `request_keyframe()` asks the far end for a video keyframe.
+`set_video_direction()` changes the active call's video mid-call by sending a re-INVITE; the audio call is untouched while the far end answers it. The direction is the bot's side of the SDP:
+
+| Direction    | Bot sends video | Bot receives video | Typical use                                                      |
+| ------------ | --------------- | ------------------ | ---------------------------------------------------------------- |
+| `"sendrecv"` | yes             | yes                | Bring video up; what `add_video()` sends.                        |
+| `"sendonly"` | yes             | no                 | Send video to a caller who sends none.                           |
+| `"recvonly"` | no              | yes                | Watch the caller (vision) without sending anything back.         |
+| `"inactive"` | no              | no                 | Pause video and keep it negotiated; what `remove_video()` sends. |
+
+Three conditions apply. The call must already carry a video stream, dialed with a `video` setting or answered to a video offer; a plain audio call cannot grow one, and the method returns an error. Right after the call is established the stack may answer "retry shortly", because the ACK of the first offer is still in flight; the requested direction is kept, so calling again a moment later converges. And the far end decides: a peer that declines the re-INVITE leaves the previous direction in force and the method returns the stack's error. When a renegotiation completes, `on_participant_updated` fires on the transport, and the connection's `renegotiated` and `media_restarted` events fire as well; a consumer that caches frame geometry should re-read it after `media_restarted("video")`.
+
+`add_video()` and `remove_video()` are `set_video_direction("sendrecv")` and `set_video_direction("inactive")`. `request_keyframe()` asks the far end for a video keyframe, for a consumer that joins mid-stream and wants a decodable picture sooner than the next natural keyframe; it returns nothing.
 
 ## Notes
 
 - **Transfers**: A transfer that succeeds closes the bot's side of the call. `sip_call_transfer` is not supported.
 - **Trunk mode**: `reg_interval=0` is independent of `SIPParams.trunk`, which only builds `sip:+E164@trunk` URIs from `phoneNumber`. PSTN trunking typically uses both. Treat `on_connected` as the ready signal, since `on_dialin_ready` does not fire.
 - **DTMF**: Received digits that are not keypad entries (`A`-`D`) fire `on_dtmf_event` but produce no `InputDTMFFrame`.
+- **Debugging**: `sip_trace` and `native_log_level` on the connection (`SIP_TRACE` and `SIP_NATIVE_LOG_LEVEL` under the runner) show the signaling and the stack's view of it; the symptom table in the [runner guide](/api-reference/server/utilities/runner/guide#debugging-a-sip-bot) covers registration failures, one-way audio, and trunk calls that never arrive.
 - **Differences from DailyTransport**: `on_connected` carries no payload, so cross-transport handlers should accept `data=None`. Dial-out has no per-call `callerId`, `codecs`, or `videoSettings`; use the connection's `user`, `audio_codecs`, and `video_size`. Rooms, `on_app_message`, transcription, and recording events do not exist on this transport.
 
 ## Event Handlers
 
-| Event                         | Arguments                        | Description                                                                  |
-| ----------------------------- | -------------------------------- | ---------------------------------------------------------------------------- |
-| `on_connected`                | `transport`                      | The connection is up.                                                        |
-| `on_left`                     | `transport`                      | The connection closed.                                                       |
-| `on_before_leave`             | `transport`                      | About to leave. Synchronous.                                                 |
-| `on_error`                    | `transport, error`               | A transport error occurred.                                                  |
-| `on_call_state_updated`       | `transport, state`               | The call state changed: `"ringing"`, `"established"`, or `"closed"`.         |
-| `on_dialin_ready`             | `transport, aor`                 | The account registered; `aor` is the registered address-of-record.           |
-| `on_dialin_connected`         | `transport, data`                | An inbound call was established.                                             |
-| `on_dialin_stopped`           | `transport, data`                | An inbound call ended. `data["reason"]` is `"transferred"` after a transfer. |
-| `on_dialin_error`             | `transport, data`                | An inbound call could not be answered.                                       |
-| `on_dialin_warning`           | `transport, data`                | An audio warning on an inbound call.                                         |
-| `on_dialout_connected`        | `transport, data`                | An outbound call is ringing at the far end.                                  |
-| `on_dialout_answered`         | `transport, data`                | An outbound call was answered.                                               |
-| `on_dialout_stopped`          | `transport, data`                | An outbound call ended, including one that closed before it connected.       |
-| `on_dialout_error`            | `transport, data`                | An outbound call failed.                                                     |
-| `on_dialout_warning`          | `transport, data`                | An audio warning on an outbound call.                                        |
-| `on_dtmf_event`               | `transport, data`                | A DTMF digit was received. `data["tone"]` is the digit.                      |
-| `on_first_participant_joined` | `transport, participant`         | The first call of this transport was established.                            |
-| `on_participant_joined`       | `transport, participant`         | A call was established.                                                      |
-| `on_client_connected`         | `transport, participant`         | A call was established; a `ClientConnectedFrame` is pushed downstream.       |
-| `on_participant_left`         | `transport, participant, reason` | A call ended; `reason` is `"leftCall"`.                                      |
-| `on_client_disconnected`      | `transport, participant`         | An established call ended.                                                   |
-| `on_participant_updated`      | `transport, participant`         | The peer put the call on hold or resumed it, or video was renegotiated.      |
-| `on_call_quality_stats`       | `transport, stats`               | Final call quality statistics, fired when a call closes.                     |
+The names follow `DailyTransport`, so one bot can serve both transports. The differences:
+
+- **Only on `SIPTransport`**: `on_call_quality_stats`, the close-time media statistics of a call (duration, packets, loss, jitter, round-trip time). Daily has no equivalent.
+- **Only on `DailyTransport`**, never fired here: `on_joined`, `on_app_message`, `on_active_speaker_changed`, `on_network_connection_status_updated`, and the recording and transcription events (`on_recording_started`, `on_recording_stopped`, `on_recording_error`, `on_transcription_message`, `on_transcription_stopped`, `on_transcription_error`). A handler registered for one of them on a `SIPTransport` is never called, so a bot written for both transports keeps working.
+- **Same name, different payload or timing**: `on_connected` carries no data here (accept `data=None`); `on_participant_updated` reports hold, resume, and video renegotiation rather than Daily's participant property changes; `on_first_participant_joined` fires once per call, since each call is its own session.
+
+| Event                         | Arguments                        | Description                                                                    |
+| ----------------------------- | -------------------------------- | ------------------------------------------------------------------------------ |
+| `on_connected`                | `transport`                      | The connection is up.                                                          |
+| `on_left`                     | `transport`                      | The connection closed.                                                         |
+| `on_before_leave`             | `transport`                      | About to leave. Synchronous.                                                   |
+| `on_error`                    | `transport, error`               | A transport error occurred.                                                    |
+| `on_call_state_updated`       | `transport, state`               | The call state changed: `"ringing"`, `"established"`, or `"closed"`.           |
+| `on_dialin_ready`             | `transport, aor`                 | The account registered; `aor` is the registered address-of-record.             |
+| `on_dialin_connected`         | `transport, data`                | An inbound call was established.                                               |
+| `on_dialin_stopped`           | `transport, data`                | An inbound call ended. `data["reason"]` is `"transferred"` after a transfer.   |
+| `on_dialin_error`             | `transport, data`                | An inbound call could not be answered.                                         |
+| `on_dialin_warning`           | `transport, data`                | An audio warning on an inbound call.                                           |
+| `on_dialout_connected`        | `transport, data`                | An outbound call is ringing at the far end.                                    |
+| `on_dialout_answered`         | `transport, data`                | An outbound call was answered.                                                 |
+| `on_dialout_stopped`          | `transport, data`                | An outbound call ended, including one that closed before it connected.         |
+| `on_dialout_error`            | `transport, data`                | An outbound call failed.                                                       |
+| `on_dialout_warning`          | `transport, data`                | An audio warning on an outbound call.                                          |
+| `on_dtmf_event`               | `transport, data`                | A DTMF digit was received. `data["tone"]` is the digit.                        |
+| `on_first_participant_joined` | `transport, participant`         | The call was established; fires once per call, before `on_participant_joined`. |
+| `on_participant_joined`       | `transport, participant`         | A call was established.                                                        |
+| `on_client_connected`         | `transport, participant`         | A call was established; a `ClientConnectedFrame` is pushed downstream.         |
+| `on_participant_left`         | `transport, participant, reason` | A call ended; `reason` is `"leftCall"`.                                        |
+| `on_client_disconnected`      | `transport, participant`         | An established call ended.                                                     |
+| `on_participant_updated`      | `transport, participant`         | The peer put the call on hold or resumed it, or video was renegotiated.        |
+| `on_call_quality_stats`       | `transport, stats`               | Final call quality statistics, fired when a call closes.                       |
 
 Dial event `data` dicts carry `sessionId` and `sipCallId`. Dial-in data adds `sipFrom`, `sipTo`, and `sipHeaders`; dial-out data adds `origin` and `destination`; error and warning data carries `errorMsg`.
 
