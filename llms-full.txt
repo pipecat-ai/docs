@@ -38934,6 +38934,7 @@ Extensions add conversational behavior to a pipeline. They are built from frame 
 | [DuplexJev Turn Analyzer](/api-reference/server/extensions/pipecat-duplexjev) | `uv add pipecat-duplexjev`                                                 | Community  |
 | [IVRNavigator](/api-reference/server/extensions/ivr)                          | Built in                                                                   | Pipecat    |
 | [Pipecat Backchannel](/api-reference/server/extensions/pipecat-backchannel)   | `uv add pipecat-backchannel`                                               | Community  |
+| [Pipecat Guardrails](/api-reference/server/extensions/pipecat-guardrails)     | `uv add pipecat-guardrails`                                                | Community  |
 | [Turn Blend](/api-reference/server/extensions/pipecat-turn-blend)             | `uv pip install git+https://github.com/adhiraj4802/pipecat-turn-blend.git` | Community  |
 | [VoicemailDetector](/api-reference/server/extensions/voicemail)               | Built in                                                                   | Pipecat    |
 
@@ -39034,6 +39035,7 @@ Realtime LLMs (speech-to-speech) are multi-modal models that take in audio, vide
 | [Inworld Realtime](/api-reference/server/services/s2s/inworld)                 | `uv add "pipecat-ai[inworld]"`        | Pipecat    |
 | [OpenAI GPT-Live](/api-reference/server/services/s2s/openai-live)              | `uv add "pipecat-ai[openai]"`         | Pipecat    |
 | [OpenAI Realtime](/api-reference/server/services/s2s/openai)                   | `uv add "pipecat-ai[openai]"`         | Pipecat    |
+| [Rime Realtime](/api-reference/server/services/s2s/rime)                       | `uv add "pipecat-ai[rime-realtime]"`  | Pipecat    |
 | [Sophon-Realtime](/api-reference/server/services/s2s/sophon-realtime)          | `uv add "pipecat-ai[openai]"`         | Community  |
 | [ThunderPhone](/api-reference/server/services/s2s/thunderphone)                | `uv add pipecat-thunderphone`         | Community  |
 | [Ultravox](/api-reference/server/services/s2s/ultravox)                        | `uv add "pipecat-ai[ultravox]"`       | Pipecat    |
@@ -53972,6 +53974,7 @@ stt = RimeSTTService(
 - **Segment length**: A speech segment that runs about 90 to 110 seconds without a pause fails with no transcript.
 - **Transcript order**: Finals are pushed in speech order. When the user resumes speaking before an earlier segment's final arrives, only the latest segment's final finalizes the turn.
 - **Errors**: A failed request pushes a non-fatal `ErrorFrame` naming the Rime error type and request ID.
+- **Exhausted credits**: A refusal for exhausted credits pushes a non-fatal `ErrorFrame` with the `QUOTA` error category. The service stays usable and transcribes again once credits are added.
 
 # Ringg AI Speech-to-Text
 Source: https://docs.pipecat.ai/api-reference/server/services/stt/ringg.md
@@ -78344,6 +78347,233 @@ async def on_item_updated(service, item_id, item):
     print(f"Conversation item updated: {item_id}")
 ```
 
+# Rime Realtime
+Source: https://docs.pipecat.ai/api-reference/server/services/s2s/rime.md
+
+RimeRealtimeLLMService provides real-time speech-to-speech conversation using Rime Prism.
+
+## Overview
+
+`RimeRealtimeLLMService` runs one Rime Prism speech-to-speech conversation. It supports tools (including intermediate results), runtime settings updates, Prism tool fillers, speech speed, interruption rules, and token usage metrics. Use it with `LLMContextAggregatorPair` and any transport.
+
+<CardGroup cols={2}>
+  <Card
+    title="Rime Realtime API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.rime.realtime.llm.html"
+  >
+    Pipecat's API methods for Rime Realtime integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/realtime/realtime-rime.py"
+  >
+    Complete Rime Realtime conversation example
+  </Card>
+  <Card
+    title="Async Tool Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/realtime/realtime-rime-async-tool.py"
+  >
+    Rime with async function calling (cancel_on_interruption=False)
+  </Card>
+  <Card
+    title="Handoff Example"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/realtime/realtime-rime-billing-handoff.py"
+  >
+    Rime with tool fillers and a runtime handoff
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[rime-realtime]"
+```
+
+The extra requires `rimelabs-sdk >= 0.1.0a31`.
+
+## Prerequisites
+
+1. **Rime account**: Sign up with Rime and create an API key.
+2. **Environment variable**: Set `RIME_API_KEY`. The Rime client reads it when you don't pass `client`.
+
+## Configuration
+
+```python
+from pipecat.services.rime.realtime.llm import RimeRealtimeLLMService
+```
+
+<ParamField path="client" type="rimelabs_sdk.Rime | None" default="None">
+  Rime SDK client you own. When `None`, the service creates one. An injected
+  client is not closed when the service stops.
+</ParamField>
+
+<ParamField path="endpoint" type="str | None" default="None">
+  Prism WebSocket endpoint. When `None`, the SDK default is used.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="RimeRealtimeLLMService.Settings"
+  default="None"
+>
+  Initial settings and tools. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField
+  path="turn_detection"
+  type="rimelabs_sdk.realtime.TurnDetection | None"
+  default="None"
+>
+  Server turn detection for the opening, such as eagerness and the end-of-turn
+  silence floor. Its interruption rules (`interrupt_min_words`,
+  `interrupt_phrases`, `acknowledgment_phrases`) may instead be set in
+  `settings`. Setting the same rule in both raises `ValueError`.
+</ParamField>
+
+<ParamField
+  path="timeouts"
+  type="rimelabs_sdk.realtime.RealtimeTimeouts | None"
+  default="None"
+>
+  Connection, readiness, and acknowledgment limits. When `None`, the SDK
+  defaults are used.
+</ParamField>
+
+<ParamField path="request_id" type="str | None" default="None">
+  Correlation ID to request from Rime for this conversation.
+</ParamField>
+
+<ParamField path="startup" type="RimeStartupParams | None" default="None">
+  Retry policy for opening the conversation: `max_retries` (default 3, 0–10),
+  `retry_interval` (default 2 seconds), `attempt_timeout` (default 30 seconds),
+  and `total_timeout` (default 60 seconds).
+</ParamField>
+
+<ParamField
+  path="playback"
+  type='Literal["estimated", "discard"]'
+  default='"estimated"'
+>
+  `"estimated"` plays the output audio normally. `"discard"` drops all output
+  audio and reports it to Prism as unplayed.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `RimeRealtimeLLMService.Settings(...)`. These can be updated mid-conversation with `LLMUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter                | Type                                       | Default   | Description                                                                                                                                                    |
+| ------------------------ | ------------------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                  | `str`                                      | `"prism"` | Must be `"prism"`. _(Inherited from base settings.)_                                                                                                           |
+| `system_instruction`     | `str`                                      | `None`    | System instruction. _(Inherited from base settings.)_                                                                                                          |
+| `tools`                  | `ToolsSchema \| list`                      | `None`    | Tools advertised to Prism. An empty list removes all tools.                                                                                                    |
+| `voice`                  | `str \| None`                              | `None`    | Prism voice. `None` uses the server default.                                                                                                                   |
+| `interrupt_on_speech`    | `bool`                                     | `True`    | Whether Prism interrupts its own reply when it hears the user.                                                                                                 |
+| `tool_fillers`           | `dict[str, PrismFiller]`                   | `{}`      | Filler Prism speaks while a tool runs, keyed by tool name. Each key must name an advertised tool and each value must be a `rimelabs_sdk.realtime.PrismFiller`. |
+| `speed`                  | `float \| None`                            | `None`    | Speech speed from 0.85 to 1.3. `None` uses the server default.                                                                                                 |
+| `interrupt_min_words`    | `int \| None`                              | `None`    | Words, from 1 to 10, the user says over a reply before Prism interrupts it. `None` uses the server default.                                                    |
+| `interrupt_phrases`      | `list[str] \| None`                        | `None`    | Phrases that interrupt a reply regardless of `interrupt_min_words`. An empty list clears them.                                                                 |
+| `acknowledgment_phrases` | `list[str] \| None`                        | `None`    | Phrases, such as "uh huh", that don't interrupt a reply. An empty list clears them.                                                                            |
+| `truncation`             | `rimelabs_sdk.realtime.Truncation \| None` | `None`    | History capacity policy.                                                                                                                                       |
+| `response_metadata`      | `dict[str, str] \| None`                   | `None`    | Labels applied to responses.                                                                                                                                   |
+
+The constructor raises `ValueError` for an invalid value, such as a `speed` outside 0.85–1.3.
+
+## Usage
+
+### Basic Setup
+
+```python
+from pipecat.services.rime.realtime.llm import RimeRealtimeLLMService
+
+llm = RimeRealtimeLLMService(
+    settings=RimeRealtimeLLMService.Settings(
+        system_instruction="You are a helpful voice assistant.",
+        speed=1.1,
+    ),
+)
+```
+
+### With Interruption Rules and Tool Fillers
+
+```python
+from rimelabs_sdk.realtime import PrismFiller
+
+llm = RimeRealtimeLLMService(
+    settings=RimeRealtimeLLMService.Settings(
+        system_instruction="You are a billing assistant.",
+        tools=tools,
+        tool_fillers={
+            "lookup_invoice": PrismFiller(type="text", text="Checking your invoice."),
+        },
+        interrupt_min_words=3,
+        interrupt_phrases=["stop", "wait"],
+        acknowledgment_phrases=["uh huh", "okay"],
+    ),
+)
+```
+
+### Updating Settings at Runtime
+
+```python
+from pipecat.frames.frames import LLMUpdateSettingsFrame
+
+await worker.queue_frame(
+    LLMUpdateSettingsFrame(
+        delta=RimeRealtimeLLMService.Settings(
+            system_instruction="You are now a refunds specialist.",
+            speed=1.0,
+        )
+    )
+)
+```
+
+### Asking for a Reply
+
+To have the bot speak mid-conversation, queue an `LLMMessagesAppendFrame` with `run_llm=True`:
+
+```python
+from pipecat.frames.frames import LLMMessagesAppendFrame
+
+await worker.queue_frame(
+    LLMMessagesAppendFrame(
+        [{"role": "user", "content": "Greet the user."}], run_llm=True
+    )
+)
+```
+
+## Properties
+
+| Property       | Type                  | Description                                                          |
+| -------------- | --------------------- | -------------------------------------------------------------------- |
+| `session_info` | `SessionInfo \| None` | Acknowledged session information, including the provider request ID. |
+
+## Notes
+
+- **Context**: The first context frame opens the conversation with the context's messages and starts a reply. After that, the service only appends to Prism history: replacing context messages doesn't change it, and `LLMRunFrame` starts no reply. Use `LLMMessagesAppendFrame(run_llm=True)` instead.
+- **One conversation per instance**: There is no automatic reconnect or replay. After a failure, start a fresh instance with valid, completed history.
+- **Turn detection**: Prism detects turns on the server, so the service uses external user turn strategies.
+- **Async tools**: Functions registered with `cancel_on_interruption=False` are supported. Intermediate results (`is_final=False`) are added to Prism history beside the open call, and only the final result answers it. A result that arrives after its response round closed triggers a reply that reports it.
+- **Playback**: Playback positions are estimates, and completion receipts are not sent.
+- **Metrics**: Emits turn-to-first-output metrics and token usage.
+
+## Event Handlers
+
+| Event                | Parameters | Description                                           |
+| -------------------- | ---------- | ----------------------------------------------------- |
+| `on_session_updated` | `info`     | Called when Prism acknowledges session information    |
+| `on_rime_event`      | `event`    | Called for SDK events, including provider diagnostics |
+
+```python
+@llm.event_handler("on_session_updated")
+async def on_session_updated(service, info):
+    print(f"Prism session: {info}")
+```
+
 # Sophon-Realtime
 Source: https://docs.pipecat.ai/api-reference/server/services/s2s/sophon-realtime.md
 
@@ -89621,6 +89851,199 @@ aggregators = LLMContextAggregatorPair(context, user_params=LLMUserAggregatorPar
 
 If the gateway cannot be reached, the analyzer logs the error and reports "not finished", so Pipecat falls back to
 its silence timeout and the conversation never blocks.
+
+# Pipecat Guardrails
+Source: https://docs.pipecat.ai/api-reference/server/extensions/pipecat-guardrails.md
+
+Output guardrail that checks each sentence the bot is about to say and stops it before the TTS speaks it
+
+## Overview
+
+`OutputGuardProcessor` sits between the LLM and the TTS and checks what the bot
+is about to say. Each sentence is checked before the TTS gets it, so nothing
+unchecked is spoken. A sentence can be allowed, redacted (for example a phone
+number becomes `[phone number]`), or blocked: on a block, the rest of the reply
+is dropped and a fallback line is spoken instead.
+
+Blocked text never reaches the TTS, so it never enters the conversation history
+either. User interruptions, function calls, and lines your own code speaks
+(`TTSSpeakFrame`) pass through in order.
+
+A `Guard` decides what is allowed, in up to three layers, stopping at the first
+one that is sure:
+
+1. **Rules**: banned terms, regular expressions, and personal data (email,
+   phone, card numbers, plus an India pack for Aadhaar, PAN, and Hinglish word
+   lists). Local and instant.
+2. **Classifier** (optional): any [Pipecat classifier](/pipecat/learn/classifiers),
+   such as [Jev](/api-reference/server/classifiers/jev), answers yes/no
+   policies about the reply in one call.
+3. **Judge** (optional): an LLM, through Pipecat's
+   [LLM classifier](/api-reference/server/classifiers/llm), decides the
+   policies the classifier was unsure about.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Apoorv012/pipecat-guardrails"
+  >
+    Source code, examples, and issues for Pipecat Guardrails
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-guardrails/"
+  >
+    The `pipecat-guardrails` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-guardrails
+```
+
+To use the Jev classifier for policies:
+
+```bash
+uv add "pipecat-guardrails[jev]"
+```
+
+## Prerequisites
+
+- **Pipecat 1.12.0 or later**: `pipecat-ai>=1.12,<2`
+- **Python 3.11 or later**
+- **No API key for rules.** Rules run locally.
+- **For policies**, the keys of the classifier or judge you choose, for example
+  `TYPESAFE_API_KEY` for Jev, or your LLM provider's key for a judge.
+
+## Configuration
+
+### OutputGuardProcessor
+
+<ParamField path="guard" type="Guard" required>
+  The guard that checks each sentence (or the whole reply).
+</ParamField>
+
+<ParamField path="strategy" type="str" default="sentence">
+  `"sentence"` checks each sentence before it is spoken. `"full_reply"` holds
+  the whole reply, checks it once, then speaks it: safer for rules that need the
+  full reply, at the cost of latency.
+</ParamField>
+
+<ParamField path="max_parallel_checks" type="int" default="5">
+  With the `"sentence"` strategy, how many sentences are checked at once.
+  Sentences are always released in order, so usually only the first sentence of
+  a reply waits for a classifier or judge round trip.
+</ParamField>
+
+Events: `on_violation(processor, verdict)` when a rule or policy fires, and
+`on_check(processor, verdict)` for every check.
+
+### Guard
+
+<ParamField path="rules" type="Iterable[Rule]" default="()">
+  Layer 1: `BannedTerms`, `Regex`, `PII`, or any function decorated with
+  `@rule`. Each rule can `block`, `redact`, or `flag`.
+</ParamField>
+
+<ParamField path="policies" type="Mapping[str, str | Policy]" default="None">
+  Yes/no questions about the reply, by id, where "yes" means it breaks the
+  policy. Needs a `classifier`, a `judge`, or both.
+</ParamField>
+
+<ParamField path="classifier" type="BaseClassifier" default="None">
+  Layer 2: a Pipecat classifier that answers every policy in one call.
+</ParamField>
+
+<ParamField path="judge" type="BaseClassifier" default="None">
+  Layer 3: usually `LLMClassifier`, for the policies the classifier was unsure
+  about.
+</ParamField>
+
+<ParamField path="fallback" type="str | Callable" default="None">
+  What to say instead of blocked text, or a function of the verdict. `None`
+  says nothing.
+</ParamField>
+
+<ParamField path="mode" type="str" default="enforce">
+  `"shadow"` reports what the guard would do without changing anything, so new
+  rules can be tried on live traffic.
+</ParamField>
+
+<ParamField path="on_error" type="str" default="block">
+  What a failed or timed-out check does: `"block"` (fail closed) or `"allow"`
+  (fail open).
+</ParamField>
+
+See the [source repository](https://github.com/Apoorv012/pipecat-guardrails)
+for the full list of options, policies, and the `pipecat-guardrails eval`
+command for measuring a guard on your own data.
+
+## Usage
+
+Put `OutputGuardProcessor` between the LLM and the TTS:
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat_guardrails import Guard
+from pipecat_guardrails.pipecat import OutputGuardProcessor, guarded_rtvi_observer_params
+from pipecat_guardrails.rules import PII, BannedTerms, pii
+
+guard = Guard(
+    rules=[
+        BannedTerms(["acme corp"], id="no-competitors"),
+        PII(pii.email(), pii.phone(), id="pii"),  # redacts
+    ],
+    fallback="Sorry, I can only help with our own products.",
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    OutputGuardProcessor(guard),  # checks each sentence before it is spoken
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+
+# RTVI sends raw LLM text to the client before the guard sees it; turn that off.
+worker = PipelineWorker(pipeline, rtvi_observer_params=guarded_rtvi_observer_params())
+```
+
+Add policies for what word lists miss, such as paraphrases:
+
+```python
+import os
+
+from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
+from pipecat_guardrails import Guard, Policy
+
+guard = Guard(
+    rules=[...],
+    policies={
+        "no-med-advice": Policy(
+            "Does this reply tell the user to stop, skip or change a medication?",
+            no="Telling them to ask their doctor first.",
+        ),
+    },
+    classifier=JevClassifier(api_key=os.environ["TYPESAFE_API_KEY"]),
+    fallback="That's a question for your doctor.",
+)
+```
+
+## Compatibility
+
+Tested with Pipecat v1.16.0. Check the [source
+repository](https://github.com/Apoorv012/pipecat-guardrails) for the latest
+tested version and changelog.
 
 # Turn Blend
 Source: https://docs.pipecat.ai/api-reference/server/extensions/pipecat-turn-blend.md
