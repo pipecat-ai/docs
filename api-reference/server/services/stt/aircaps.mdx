@@ -1,0 +1,212 @@
+---
+title: "AirCaps AI Speech-to-Text"
+sidebarTitle: "AirCaps AI"
+description: "Real-time English STT with AirCapsLiveSTTService and AirCaps Live 1, with finals on VAD stop or model-detected end of turn."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="AirCaps AI"
+  maintainerUrl="https://github.com/aircaps"
+  repo="https://github.com/aircaps/pipecat-aircaps"
+/>
+
+## Overview
+
+`AirCapsLiveSTTService` provides real-time English speech-to-text through
+AirCaps Live 1 (`aircaps-live-1`), a low-latency model from
+[AirCaps AI](https://aircaps.ai) built for voice agents. It extends Pipecat's `WebsocketSTTService`, so connection
+management, reconnection, keepalive and metrics follow the same patterns as the
+built-in services. Interim results are pushed as `InterimTranscriptionFrame` and
+finals as `TranscriptionFrame`.
+
+By default Pipecat decides when a turn ends: when a `VADUserStoppedSpeakingFrame`
+arrives, the service sends `finalize`, and the turn's final transcript comes back
+right away, pushed with `finalized=True`. With `end_of_turn=True`, the model
+decides instead (see [Model-detected end of turn](#model-detected-end-of-turn)).
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/aircaps/pipecat-aircaps"
+  >
+    Source code, README, changelog and issues
+  </Card>
+  <Card
+    title="Example"
+    icon="play"
+    href="https://github.com/aircaps/pipecat-aircaps/blob/main/examples/voice-agent.py"
+  >
+    A voice agent that hears the user through AirCaps Live 1
+  </Card>
+  <Card
+    title="AirCaps Live 1 Guide"
+    icon="book"
+    href="https://aircaps.ai/docs/guides/live-1"
+  >
+    The model, its streaming protocol and end-of-turn settings
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-aircaps/"
+  >
+    The `pipecat-aircaps` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-aircaps
+```
+
+## Prerequisites
+
+### AirCaps AI Account Setup
+
+Before using the AirCaps AI STT service, you need:
+
+1. **AirCaps AI Account**: Sign up at [console.aircaps.ai](https://console.aircaps.ai)
+2. **API Key**: Open **API keys** in the console and create one
+
+### Required Environment Variables
+
+- `AIRCAPS_API_KEY`: Your AirCaps AI API key, passed to the service as `api_key`
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  AirCaps AI API key.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.aircaps.com">
+  AirCaps AI API address. Before each connection the service asks it which
+  WebSocket to open.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Sample rate of the incoming audio in Hz. If `None`, uses the pipeline's input
+  sample rate. Audio is resampled to 16 kHz before it is sent.
+</ParamField>
+
+<ParamField path="end_of_turn" type="bool" default="False">
+  Let the model detect the end of each turn instead of Pipecat's VAD and turn
+  strategies. See [Model-detected end of turn](#model-detected-end-of-turn).
+</ParamField>
+
+<ParamField path="should_interrupt" type="bool" default="True">
+  With `end_of_turn=True`: whether a new user turn interrupts the bot.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="AirCapsLiveSTTService.Settings"
+  default="None"
+>
+  Runtime-updatable settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="0.25">
+  P99 latency from speech end to final transcript, in seconds, used by turn
+  strategies. Measure your own deployment with
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) and pass the
+  result.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument
+using `AirCapsLiveSTTService.Settings(...)`. They can be updated mid-conversation
+with `STTUpdateSettingsFrame`; the session reopens to apply them. The end-of-turn
+settings apply only with `end_of_turn=True`; the last four override single values
+of `end_of_turn_mode`, and `None` keeps the mode's value.
+
+| Parameter               | Type            | Default            | Description                                                                   |
+| ----------------------- | --------------- | ------------------ | ----------------------------------------------------------------------------- |
+| `model`                 | `str`           | `"aircaps-live-1"` | Model id.                                                                     |
+| `language`              | `Language`      | `Language.EN`      | English only.                                                                 |
+| `end_of_turn_mode`      | `str`           | `"balanced"`       | `"min_latency"`, `"balanced"` or `"max_accuracy"`: speed versus certainty.    |
+| `end_of_turn_threshold` | `float \| None` | `None`             | How sure the model must be that the turn ended, 0.2 to 0.9.                   |
+| `min_turn_silence_ms`   | `int \| None`   | `None`             | The shortest pause that can end a turn, 0 to 1000 ms.                         |
+| `max_turn_silence_ms`   | `int \| None`   | `None`             | A pause this long always ends the turn, 500 to 5000 ms, or 0 for no limit.    |
+| `vad_threshold`         | `float \| None` | `None`             | How sure the model's voice detector must be that it hears speech, 0.3 to 0.9. |
+
+## Usage
+
+### Basic Setup
+
+The service needs VAD frames to know when a turn ends, which the user aggregator
+provides when it has a VAD analyzer:
+
+```python
+import os
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat_aircaps import AirCapsLiveSTTService
+
+stt = AirCapsLiveSTTService(api_key=os.getenv("AIRCAPS_API_KEY"))
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+### Model-detected end of turn
+
+With `end_of_turn=True`, the model decides when the user has finished. The
+service pushes `ProposedUserStartedSpeakingFrame` when a turn's first words
+arrive, and the turn's final `TranscriptionFrame` followed by
+`ProposedUserStoppedSpeakingFrame` when the model ends the turn. It recommends
+`ExternalUserTurnStrategies`, so the user aggregator follows these frames; your
+own `user_turn_strategies` take precedence if you pass them.
+
+```python
+from pipecat_aircaps import AirCapsLiveSTTService
+
+stt = AirCapsLiveSTTService(
+    api_key=os.getenv("AIRCAPS_API_KEY"),
+    end_of_turn=True,
+    settings=AirCapsLiveSTTService.Settings(end_of_turn_mode="balanced"),
+)
+```
+
+## Notes
+
+- **Audio format**: The service sends 16-bit mono PCM at 16 kHz.
+- **Connections**: Before each session the service looks up which WebSocket to
+  open (`GET /v1/realtime/endpoint`). A session the server ends is reopened
+  automatically.
+- **Idle connections**: While no audio flows (for example, while the user is
+  muted), the service pings the session so it stays open.
+- **Concurrency**: Accounts run one AirCaps Live 1 session at a time by default;
+  [contact AirCaps AI](https://aircaps.ai/contact) for more.
+- **Language**: English only.
+
+## Compatibility
+
+Tested with Pipecat 1.16.0 and Python 3.11, 3.12 and 3.13. See the [source
+repository](https://github.com/aircaps/pipecat-aircaps) for the latest tested
+version and changelog.
