@@ -13,7 +13,7 @@ Idle detection monitors user activity and:
 
 1. Starts a timer when the bot finishes speaking (`BotStoppedSpeakingFrame`)
 2. Cancels the timer when the user or bot starts speaking
-3. Suppresses the timer during function calls and active user turns (to avoid false triggers during interruptions)
+3. Suppresses the timer during function calls, background work, and active user turns (to avoid false triggers during interruptions)
 4. Restarts the timer after a user turn that ends with no transcript and gets no reply (e.g. background noise)
 5. Emits an `on_user_turn_idle` event when the timer expires
 6. Allows you to implement escalating responses or gracefully end the conversation in your application code
@@ -118,6 +118,43 @@ await worker.queue_frame(UserIdleTimeoutUpdateFrame(timeout=0))
 **Immediate application**: Timeout updates take effect immediately. If an idle timer is currently running, it restarts with the new duration. If the bot is waiting for the user to speak and you enable a positive timeout (e.g., upgrading from `0` to `10.0`), the timer arms right away without waiting for the next bot turn.
 
 This is useful when you want to enable idle detection only at certain points in the conversation, or adjust the timeout based on context.
+
+## Detecting a Waiting User
+
+Silence after the bot's turn means one of two things, depending on whether the bot is still working in the background:
+
+- **Idle**: no background work is in progress. The user may have stepped away. `user_idle_timeout` and `on_user_turn_idle` cover this case.
+- **Waiting**: the bot is performing asynchronous background work, such as an asynchronous function call (`cancel_on_interruption=False`) or the work an `LLMWithBackend` backend has in flight. `user_waiting_timeout` and `on_user_waiting` cover this case.
+
+The idle timeout doesn't fire while background work is in progress. To check in with a user who is waiting, set `user_waiting_timeout`. The default, `0`, turns it off:
+
+```python
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_idle_timeout=5.0,
+        user_waiting_timeout=8.0,  # Check in after 8 seconds of quiet during background work
+    ),
+)
+
+@user_aggregator.event_handler("on_user_waiting")
+async def on_user_waiting(aggregator):
+    message = {
+        "role": "developer",
+        "content": "You're still working on the user's request. Briefly let them know.",
+    }
+    await aggregator.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+```
+
+Background work is bookended by `BackgroundWorkStartedFrame` and `BackgroundWorkFinishedFrame`, which share a `work_id`. `LLMService` and `LLMWithBackend` broadcast them for you. A component that dispatches other background work, such as a job to another worker, should broadcast the same pair so the user counts as waiting rather than idle.
+
+Both events are also broadcast as frames, `UserTurnIdleFrame` and `UserWaitingFrame`, each carrying `quiet_secs` (how long nothing has been said), so other processors can act on either silence. Change the waiting timeout at runtime with `UserWaitingTimeoutUpdateFrame`, the same way `UserIdleTimeoutUpdateFrame` changes the idle one:
+
+```python
+from pipecat.frames.frames import UserWaitingTimeoutUpdateFrame
+
+await worker.queue_frame(UserWaitingTimeoutUpdateFrame(timeout=10.0))
+```
 
 ## Best Practices
 
