@@ -1,0 +1,68 @@
+---
+title: "Wait Reassurance"
+description: "WaitReassuranceLLMExtension has the LLM say a brief word while the user waits on long-running background work"
+---
+
+## Overview
+
+`WaitReassuranceLLMExtension` keeps a conversation from going silent while the user waits on background work: an asynchronous function call (`cancel_on_interruption=False`), or work delegated to an [`LLMWithBackend`](/api-reference/server/composite-services/llm-with-backend) backend. Once nothing has been said for `interval_secs` with work in flight, the LLM says one short sentence in its own words, shaped by what the user asked for, or answers with a silent mark to say nothing.
+
+The extension belongs on a text LLM. A speech-to-speech service's audio carries no mark to read.
+
+## How It Works
+
+1. At start, the extension sets the user aggregator's waiting timeout to `interval_secs`.
+2. It adds `instruction` to the LLM's system instruction.
+3. When the conversation has been quiet for `interval_secs` with background work in progress, it appends `prompt` to the conversation as a developer message and runs the LLM.
+4. If the reply opens with `silent_mark`, the reply is dropped before the TTS or any observer sees it, and nothing is recorded in the context. The decision is broadcast as an [`LLMMarkerResponseFrame`](/api-reference/server/frames/data-frames#llmmarkerresponseframe) with `kind="silent"`, and the user aggregator starts the interval over.
+5. Otherwise the bot speaks the reply, which starts the interval over through the bot's speech.
+
+A long wait gets a fresh decision every interval. The RTVI observer sends a silent reply to clients that asked for marker reports as [`bot-llm-marker`](/api-reference/standards/rtvi/latest#bot-llm-marker), and a [scripted eval](/pipecat/evals/scripted-scenarios#turn-completion-markers-with-llm_marker) asserts it with `event: llm_marker` and `marker: silent`.
+
+To answer the wait another way, such as a canned phrase or music, use the user aggregator's `user_waiting_timeout` and `on_user_waiting` event instead.
+
+## Configuration
+
+<ParamField path="interval_secs" type="float" default="10.0">
+  Seconds the conversation stays quiet, with background work in progress, before
+  the LLM is asked whether to say something.
+</ParamField>
+
+<ParamField path="instruction" type="str" default="WAIT_REASSURANCE_INSTRUCTION">
+  Standing guidance added to the LLM's system instruction. A template with
+  `{mark}` for the silent mark, so any other brace in it is doubled.
+</ParamField>
+
+<ParamField path="prompt" type="str" default="WAIT_REASSURANCE_PROMPT">
+  The developer message appended each time the user has waited. A template with
+  `{quiet_secs}` for how long nothing has been said, and optionally `{mark}`.
+  The default opens with "The user is waiting on background work you started on
+  their behalf", which is how `instruction` refers to it.
+</ParamField>
+
+<ParamField path="silent_mark" type="str" default="∅">
+  What the LLM answers with to say nothing.
+</ParamField>
+
+## Usage
+
+Pass the extension in the LLM service's settings:
+
+```python
+import os
+
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.turns.wait_reassurance.llm_extension import WaitReassuranceLLMExtension
+
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAILLMService.Settings(
+        extensions=[WaitReassuranceLLMExtension(interval_secs=8.0)],
+    ),
+)
+```
+
+## Notes
+
+- A change in the wording of `instruction` or `prompt` can change what the model says, or whether it stays silent. Check the result with a [scripted eval](/pipecat/evals/scripted-scenarios) after changing either.
+- Judge a reassurance in a scripted eval with `allow_continue: false` on the expectation, so the judge treats the reply as final.
