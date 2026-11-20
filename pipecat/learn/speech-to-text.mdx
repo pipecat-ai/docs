@@ -156,6 +156,7 @@ stt = YourSTTService(
     audio_passthrough=True,      # Pass audio frames downstream (recommended)
     sample_rate=16000,           # Audio sample rate (better set in PipelineParams)
     keepalive_timeout=None,      # Silence to hold an idle connection open
+    text_transforms=None,        # Rewrite each transcript before it is pushed
 )
 ```
 
@@ -177,6 +178,9 @@ stt = YourSTTService(
   transcript, broadcast at pipeline start so downstream processors such as turn
   strategies can tune their timing. Each service supplies a measured default;
   set this to override it for your own deployment.
+- **`text_transforms`**: A list of `(text_type, transform)` pairs that rewrite
+  each transcript before the service pushes it. See
+  [Rewriting Transcripts](#rewriting-transcripts).
 
 Runtime settings are covered in [Service Settings](/pipecat/fundamentals/service-settings).
 
@@ -202,6 +206,35 @@ stt = WhisperSTTService(
 **Key option:**
 
 - **`trailing_silence_secs`** (default `0.5`): Seconds of silence appended to each speech segment before transcription. Models tend to drop or garble the final word when audio ends abruptly at the VAD cutoff, so padding lets the model hear the end of speech and finish the last word. The padding is submitted to the provider and counts toward STT usage metrics. Set to `0` to disable, or tune to another value if needed.
+
+### Rewriting Transcripts
+
+Text transforms rewrite each transcript before the STT service pushes it. Everything after the service sees only the rewritten text: the context, observers such as the RTVI client transcript, and the STT tracing span. This keeps text such as a card number a caller reads out of the context, the client, and the logs.
+
+A transform is an async callable that takes the text and its type and returns the rewritten text. A final transcript has the type `TranscriptionType.FINAL` and an interim one `TranscriptionType.INTERIM`. Register a transform for one type, or for both with `"*"`. Transforms run in the order they were added.
+
+```python
+import re
+
+from pipecat.services.stt_service import TranscriptionType
+
+async def mask_card_numbers(text: str, text_type: str) -> str:
+    return re.sub(r"\b(?:\d[ -]?){13,16}\b", "[card number]", text)
+
+stt = DeepgramSTTService(
+    api_key=os.getenv("DEEPGRAM_API_KEY"),
+    text_transforms=[("*", mask_card_numbers)],
+)
+
+# Or register and remove them at runtime
+stt.add_text_transformer(mask_card_numbers, TranscriptionType.FINAL)
+stt.remove_text_transformer(mask_card_numbers, TranscriptionType.FINAL)
+```
+
+<Note>
+  A transcription whose text a transform changed loses its `result`, the
+  provider's response with the text as heard.
+</Note>
 
 ### Pipeline-Level Audio Configuration
 
