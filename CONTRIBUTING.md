@@ -101,6 +101,14 @@ All pages must be registered in `docs.json` under `navigation.tabs[].groups[].pa
 "overview/introduction"
 ```
 
+### Redirects
+
+Only add a redirect to `docs.json` when you move or delete a page that's
+already published, so its old URL keeps working. **A new page doesn't need a
+redirect.** Many of the existing `/server/...` → `/api-reference/server/...`
+entries are left over from an earlier site restructure, so don't copy one for a
+new service page.
+
 ### Project Structure
 
 The content directories correspond one-to-one with the navigation tabs in `docs.json`:
