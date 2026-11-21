@@ -13847,7 +13847,7 @@ Scenarios assert on a small set of semantic events, mapped from the RTVI message
 | `tts_response`              | The text the TTS reports speaking, one segment at a time. Audio mode only.                                                                                                                                                                                                                                                                        |
 | `expression`                | An expression the agent's TTS performed in [expressive conversation](/pipecat/features/expressive-conversation), in the tags the LLM writes: `<<excited>>` where the delivery changes (`<<neutral>>` back to the baseline), `[[laugh]]` for a sound, `[[pause 600]]` for a pause. A tag the TTS can't perform is never reported. Audio mode only. |
 | `llm_started`               | The LLM began generating a response.                                                                                                                                                                                                                                                                                                              |
-| `llm_marker`                | The turn-completion marker the agent's LLM produced, reported when the response ends. Only sent when a scenario asks for it. See [Turn-completion markers](#turn-completion-markers-with-llm_marker).                                                                                                                                             |
+| `llm_marker`                | The marker the agent's LLM produced, a turn-completion marker or the silent mark of a dropped reply, reported when the response ends. Only sent when a scenario asks for it. See [Turn-completion markers](#turn-completion-markers-with-llm_marker).                                                                                             |
 | `bot_started_speaking`      | The agent reported itself as speaking (emitted by the pipeline).                                                                                                                                                                                                                                                                                  |
 | `bot_stopped_speaking`      | The agent reported itself as quiet (emitted by the pipeline).                                                                                                                                                                                                                                                                                     |
 | `bot_interrupted`           | The agent's reply was cut off by the user, as an anchor for a barge-in test.                                                                                                                                                                                                                                                                      |
@@ -13887,7 +13887,13 @@ The `eval:` field is a natural-language criterion that the event's text must sat
 
 The judge sees the whole conversation so far, so it can resolve terse or context-dependent replies (like "That's four"). It also understands that audio-mode responses come from a speech-to-text pass and judges intended meaning rather than exact spelling, so "for" transcribed instead of "four" still passes.
 
-The judge handles interim replies gracefully: if the agent says "Let me check on that." before the real answer, the judge answers `continue` rather than yes or no, and the harness keeps accumulating response text and re-judges until the criterion is met or the time budget runs out. A turn whose budget runs out that way fails with the kind `judge_continue`. When every reply you judge is a final answer, [`allow_continue: false`](/pipecat/evals/scenario-configuration#final-answers-with-allow_continue) in the `judge.eval:` block limits the judge to yes or no.
+The judge handles interim replies gracefully: if the agent says "Let me check on that." before the real answer, the judge answers `continue` rather than yes or no, and the harness keeps accumulating response text and re-judges until the criterion is met or the time budget runs out. A turn whose budget runs out that way fails with the kind `judge_continue`. When every reply you judge is a final answer, [`allow_continue: false`](/pipecat/evals/scenario-configuration#final-answers-with-allow_continue) in the `judge.eval:` block limits the judge to yes or no. Set `allow_continue: false` on a single expectation to limit the judge to yes or no for that reply alone, which forces it to judge the reply as final rather than skip it, as for a wait reassurance ("still working on it..."):
+
+```yaml
+- event: response
+  eval: "says it is still working on the task, reporting no result"
+  allow_continue: false
+```
 
 A `no` on a complete reply fails the turn with the kind `judge_no` (a `no` on a reply still arriving is judged again as more comes), and its reason is the [explainer's](/pipecat/evals/scenario-configuration#reasons-from-the-explainer) followed by the classifier's probabilities.
 
@@ -14058,7 +14064,7 @@ A `server_message` expectation matches the data the agent pushed in an `RTVIServ
 
 ### Turn-completion markers with `llm_marker`
 
-An agent that [filters incomplete user turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns) has its LLM open every response with a marker saying whether the user's turn was complete. The `llm_marker` event reports the marker the LLM produced when the response ends, and `marker:` names its meaning: `complete` (the turn was finished and the agent answers), `short` (the user was cut off and the agent waits), `long` (the user asked for time), or `incomplete` for either of the last two. It checks the marker's meaning, not its text, so a scenario holds whatever marker characters the agent configured. A bare `llm_marker` asserts only that the agent read a marker:
+An agent that [filters incomplete user turns](/api-reference/server/utilities/turn-management/filter-incomplete-turns) has its LLM open every response with a marker saying whether the user's turn was complete. The `llm_marker` event reports the marker the LLM produced when the response ends, and `marker:` names its meaning: `complete` (the turn was finished and the agent answers), `short` (the user was cut off and the agent waits), `long` (the user asked for time), `incomplete` for either of the last two, or `silent` (the LLM answered with its silent mark and the agent dropped the reply unspoken, as with [wait reassurance](/api-reference/server/utilities/turn-management/wait-reassurance)). It checks the marker's meaning, not its text, so a scenario holds whatever marker characters the agent configured. A bare `llm_marker` asserts only that the agent read a marker:
 
 ```yaml
 turns:
@@ -14914,7 +14920,7 @@ judge:
     allow_continue: false # every judged reply is a final answer
 ```
 
-The judge then answers only yes or no, so it never waits for more of a reply that is already complete. With `continue` allowed, a judge that wrongly waits on a complete reply lets the turn run out its time budget, and the turn fails as `judge_continue` instead of as a `no` with a reason. A reply that is still arriving is judged again as more of it comes either way. `allow_continue:` only affects an `eval:` on a reply: a function call's `eval:` and a simulation have no `continue` to begin with.
+The judge then answers only yes or no, so it never waits for more of a reply that is already complete. With `continue` allowed, a judge that wrongly waits on a complete reply lets the turn run out its time budget, and the turn fails as `judge_continue` instead of as a `no` with a reason. A reply that is still arriving is judged again as more of it comes either way. An expectation can also set `allow_continue:` on itself, which takes precedence over the judge's setting for that reply. `allow_continue:` only affects an `eval:` on a reply: a function call's `eval:` and a simulation have no `continue` to begin with.
 
 ## Custom services with `factory:`
 
@@ -99555,6 +99561,80 @@ This ensures the feature doesn't break conversations if the LLM occasionally dis
 - [User Turn Strategies](/api-reference/server/utilities/turn-management/user-turn-strategies) - Configure turn detection
 - [Smart Turn Detection](/api-reference/server/utilities/turn-detection/smart-turn-overview) - AI-powered end-of-turn detection
 - [Transcriptions](/api-reference/server/utilities/turn-management/transcriptions) - Working with conversation transcripts
+- [Wait Reassurance](/api-reference/server/utilities/turn-management/wait-reassurance) - Keep the conversation from going silent during background work
+
+# Wait Reassurance
+Source: https://docs.pipecat.ai/api-reference/server/utilities/turn-management/wait-reassurance.md
+
+WaitReassuranceLLMExtension has the LLM say a brief word while the user waits on long-running background work
+
+## Overview
+
+`WaitReassuranceLLMExtension` keeps a conversation from going silent while the user waits on background work: an asynchronous function call (`cancel_on_interruption=False`), or work delegated to an [`LLMWithBackend`](/api-reference/server/composite-services/llm-with-backend) backend. Once nothing has been said for `interval_secs` with work in flight, the LLM says one short sentence in its own words, shaped by what the user asked for, or answers with a silent mark to say nothing.
+
+The extension belongs on a text LLM. A speech-to-speech service's audio carries no mark to read.
+
+## How It Works
+
+1. At start, the extension sets the user aggregator's waiting timeout to `interval_secs`.
+2. It adds `instruction` to the LLM's system instruction.
+3. When the conversation has been quiet for `interval_secs` with background work in progress, it appends `prompt` to the conversation as a developer message and runs the LLM.
+4. If the reply opens with `silent_mark`, the reply is dropped before the TTS or any observer sees it, and nothing is recorded in the context. The decision is broadcast as an [`LLMMarkerResponseFrame`](/api-reference/server/frames/data-frames#llmmarkerresponseframe) with `kind="silent"`, and the user aggregator starts the interval over.
+5. Otherwise the bot speaks the reply, which starts the interval over through the bot's speech.
+
+A long wait gets a fresh decision every interval. The RTVI observer sends a silent reply to clients that asked for marker reports as [`bot-llm-marker`](/api-reference/standards/rtvi/latest#bot-llm-marker), and a [scripted eval](/pipecat/evals/scripted-scenarios#turn-completion-markers-with-llm_marker) asserts it with `event: llm_marker` and `marker: silent`.
+
+To answer the wait another way, such as a canned phrase or music, use the user aggregator's `user_waiting_timeout` and `on_user_waiting` event instead.
+
+## Configuration
+
+<ParamField path="interval_secs" type="float" default="10.0">
+  Seconds the conversation stays quiet, with background work in progress, before
+  the LLM is asked whether to say something.
+</ParamField>
+
+<ParamField
+  path="instruction"
+  type="str"
+  default="WAIT_REASSURANCE_INSTRUCTION"
+>
+  Standing guidance added to the LLM's system instruction. A template with `
+  {mark}` for the silent mark, so any other brace in it is doubled.
+</ParamField>
+
+<ParamField path="prompt" type="str" default="WAIT_REASSURANCE_PROMPT">
+  The developer message appended each time the user has waited. A template with
+  `{quiet_secs}` for how long nothing has been said, and optionally `{mark}`.
+  The default opens with "The user is waiting on background work you started on
+  their behalf", which is how `instruction` refers to it.
+</ParamField>
+
+<ParamField path="silent_mark" type="str" default="∅">
+  What the LLM answers with to say nothing.
+</ParamField>
+
+## Usage
+
+Pass the extension in the LLM service's settings:
+
+```python
+import os
+
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.turns.wait_reassurance.llm_extension import WaitReassuranceLLMExtension
+
+llm = OpenAILLMService(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    settings=OpenAILLMService.Settings(
+        extensions=[WaitReassuranceLLMExtension(interval_secs=8.0)],
+    ),
+)
+```
+
+## Notes
+
+- A change in the wording of `instruction` or `prompt` can change what the model says, or whether it stays silent. Check the result with a [scripted eval](/pipecat/evals/scripted-scenarios) after changing either.
+- Judge a reassurance in a scripted eval with `allow_continue: false` on the expectation, so the judge treats the reply as final.
 
 # Turn Events
 Source: https://docs.pipecat.ai/api-reference/server/utilities/turn-management/turn-events.md
@@ -102494,12 +102574,13 @@ Inherits from `DataFrame`.
 
 ### LLMMarkerResponseFrame
 
-What a marker-reading LLM service made of one whole response. Pushed when the response ends, after `LLMMarkerFrame` and the spoken text: the marker found, what it meant, and the raw text the LLM produced before anything was held back. A diagnostic, for consumers that check how well the LLM follows the marker protocol; it plays no part in the conversation.
+What a marker-reading LLM service made of one whole response. Pushed when the response ends, after `LLMMarkerFrame` and the spoken text: the marker found, what it meant, and the raw text the LLM produced before anything was held back. A reply dropped as a silent mark is reported as soon as the mark is read, broadcast both ways: the user aggregator starts its idle or waiting timer over on it, and the assistant aggregator records nothing for the reply. A diagnostic otherwise, for consumers that check how well the LLM follows the marker protocol; it plays no part in the conversation.
 
 Inherits from `DataFrame`.
 
 <ParamField path="raw" type="str" required>
-  The response text as the LLM produced it, markers included.
+  The response text as the LLM produced it, markers included. For a silent
+  reply, its opening up to the mark.
 </ParamField>
 
 <ParamField path="marker" type="str | None" default="None">
@@ -102509,7 +102590,9 @@ Inherits from `DataFrame`.
 <ParamField path="kind" type="str | None" default="None">
   What the marker meant, in the emitter's own vocabulary, for consumers that
   should not depend on the marker text (which is configurable). The
-  turn-completion mixin uses `"complete"`, `"short"` and `"long"`.
+  turn-completion mixin uses `"complete"`, `"short"` and `"long"`; the [wait
+  reassurance](/api-reference/server/utilities/turn-management/wait-reassurance)
+  extension uses `"silent"` for a reply it dropped as its silent mark.
 </ParamField>
 
 <ParamField path="markers" type="list[str]" default="[]">
