@@ -9,7 +9,7 @@ Writing the flow this way puts a seam between the graph and the bot: the handler
 
 ## The Document
 
-A config has an `initial_node`, a map of `nodes` keyed by name, and an optional list of `global_functions`. Here is the food-ordering example in full:
+A config has an `initial_node`, a map of `nodes` keyed by name, an optional list of `global_functions`, and an optional map of `flows` (subflows). Here is the food-ordering example in full:
 
 ```yaml flow.yaml
 initial_node: initial
@@ -96,13 +96,14 @@ At the top level, `initial_node` names the node the flow starts in, `nodes` hold
 
 A node has:
 
-- `task_messages` (required): what the LLM should do at this node, each entry with a `role` and `content`.
+- `task_messages` (required unless the node runs a subflow): what the LLM should do at this node, each entry with a `role` and `content`.
 - `role_message`: the bot's role, sent as the LLM's system instruction and kept until another node sets its own.
 - `functions`: the tools the node offers. See [Functions](/pipecat/flows/functions).
 - `pre_actions` and `post_actions`: see [Actions](/pipecat/flows/actions).
 - `context_strategy`: `append` or `reset`. See [Context Strategies](/pipecat/flows/context-strategies).
 - `respond_immediately`: whether the LLM responds as soon as the node is entered. Defaults to true.
-- `metadata`: optional mapping of JSON values the application keeps with the node. Flows never acts on it or sends it to the LLM. A function entry takes `metadata` too.
+- `metadata`: optional mapping of JSON values the application keeps with the node. Flows never acts on it or sends it to the LLM, but an RTVI client receives it when the node is entered, so keep anything the end user should not see out of it. A function entry takes `metadata` too.
+- `flow` and `return_to`: run a subflow in place of prompting the LLM. See [Sharing Nodes with Subflows](#sharing-nodes-with-subflows).
 
 `role_message` and each task message's `content` may contain `{{ key }}` placeholders, filled from the manager's state each time the node is entered. See [Placeholders](/pipecat/flows/state-management#placeholders). Every field, with its validation rules, is in the [`FlowConfig` reference](/api-reference/pipecat-flows/flow-config).
 
@@ -134,15 +135,47 @@ nodes:
     task_messages: !include prompts/greeting.yaml
 ```
 
+A file that includes itself, directly or through the files it includes, is an error.
+
 `!include` is available with `from_file`, and with `from_yaml` when you pass `base_dir`. It is not available in JSON.
 
 `!include` paths are not confined to the config's directory and can read any file the process can read, so use it only in configs your application ships. For a config from another source, such as a request body, use `from_yaml` without `base_dir`, or `from_json`.
+
+### Sharing Nodes with Subflows
+
+When the same steps are needed from several places, such as verifying a caller before booking and before cancelling, write them once as a subflow under `flows` and run them from any node that names the subflow as its `flow`:
+
+```yaml
+initial_node: greet
+
+flows:
+  verification: !include verification.yaml
+
+nodes:
+  greet:
+    # ...
+  verify_to_book:
+    flow: verification
+    return_to: book
+  verify_to_cancel:
+    flow: verification
+    return_to: cancel
+```
+
+A node that runs a subflow has no prompts or functions of its own: it takes `flow`, `return_to`, and `metadata`. Entering it enters the subflow at the subflow's `initial_node`. Inside the subflow, a function's `transition_to` names one of the subflow's own nodes, or is `return`, which leads to the `return_to` of the node running it. To return to two places, run the subflow from two nodes, as above.
+
+Each node that runs a subflow gets its own copy of the subflow's nodes, named `<node>.<subflow node>`, such as `verify_to_book.ask_name` for a subflow node named `ask_name`. That is the name `FlowManager.current_node` reports, and `on_node_entered` gives the running node (`verify_to_book`) as `parent`. A config with subflows therefore cannot have a dot in a node name. A subflow's nodes cannot run subflows, and global functions are offered at them too.
+
+<Info>
+  The full example is in
+  [`examples/flows/yaml/clinic_appointments/`](https://github.com/pipecat-ai/pipecat/tree/main/examples/flows/yaml/clinic_appointments).
+</Info>
 
 ## Validation
 
 A config is checked in two stages.
 
-**On load**, its structure: the top level is a mapping, `initial_node` names a defined node, every `transition_to` names a defined node, tool names are unique within a node and across `global_functions`, a `transition_only` entry has both a `description` and a plain node name to transition to, an ordinary entry has no `description`, and every action is well-formed. A failure raises a Pydantic `ValidationError`.
+**On load**, its structure: the top level is a mapping, `initial_node` names a defined node, every `transition_to` names a defined node, tool names are unique within a node and across `global_functions`, a `transition_only` entry has both a `description` and a plain node name to transition to, an ordinary entry has no `description`, every action is well-formed, and a node either has `task_messages` or runs a subflow that exists under `flows`. A failure raises a Pydantic `ValidationError`.
 
 **When the `Flow` is constructed**, its references into your code: every tool it names exists in the handlers, is callable, and is a valid direct function; every action `handler` it names exists. These are collected and reported together as a single [`FlowReferenceError`](/api-reference/pipecat-flows/exceptions#flowreferenceerror), rather than stopping at the first, so one run surfaces every miss.
 
