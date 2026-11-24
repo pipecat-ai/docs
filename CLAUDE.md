@@ -111,6 +111,18 @@ Conventions (enforced by `scripts/docs-meta-lint.mjs`, which runs in CI):
 
 All pages must be registered in `docs.json` under `navigation.tabs[].groups[].pages`. The path is relative to the repo root without the `.mdx` extension (e.g., `"overview/introduction"`).
 
+### Redirects
+
+Add an entry to `docs.json` `redirects` only when an existing, published page
+moves or is deleted, so its old URL keeps working. A new page has no old URL
+and needs no redirect.
+
+Most of the existing entries map `/server/...` to `/api-reference/server/...`.
+They date from when the server reference moved under `/api-reference`, and they
+only cover pages that existed at that point. Don't copy that pattern for a new
+service page: a `/server/services/...` source for a page that never lived there
+redirects a URL nobody has.
+
 ### Mintlify components
 
 Use Mintlify's built-in components for structured content:

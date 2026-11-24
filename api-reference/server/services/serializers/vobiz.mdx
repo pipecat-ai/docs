@@ -1,0 +1,209 @@
+---
+title: "Vobiz Frame Serializer"
+sidebarTitle: "Vobiz"
+description: "VobizFrameSerializer connects Pipecat to phone calls on Vobiz over bidirectional audio streams, with μ-law and L16 audio up to 24 kHz."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Vobiz"
+  maintainerUrl="https://www.vobiz.ai"
+  repo="https://github.com/Piyush-sahoo/Pipecat-Vobiz"
+/>
+
+## Overview
+
+`VobizFrameSerializer` connects a Pipecat pipeline to phone calls on
+[Vobiz](https://www.vobiz.ai), through a `FastAPIWebsocketTransport` and the
+WebSocket opened by the `<Stream>` XML element.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Piyush-sahoo/Pipecat-Vobiz"
+  >
+    Source code, a complete example bot and issues
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-vobiz/"
+  >
+    The `pipecat-vobiz` package on PyPI
+  </Card>
+  <Card
+    title="Vobiz Pipecat Guide"
+    icon="book"
+    href="https://www.vobiz.ai/docs/integrations/pipecat"
+  >
+    Set up numbers, applications and calls
+  </Card>
+  <Card
+    title="Audio Formats"
+    icon="waveform"
+    href="https://www.vobiz.ai/docs/xml/stream/audio-formats"
+  >
+    The formats Vobiz supports in each direction
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-vobiz
+```
+
+Or use `pip install pipecat-vobiz` if you manage dependencies with `pip`.
+
+```python
+from pipecat_vobiz import VobizFrameSerializer, parse_vobiz_start
+```
+
+## Prerequisites
+
+1. **A [Vobiz account](https://console.vobiz.ai)** with a phone number.
+2. **A public HTTPS URL for your server**, so that Vobiz can request your answer
+   URL and open the WebSocket.
+
+### Required Environment Variables
+
+- `VOBIZ_AUTH_ID`: Your Vobiz Auth ID, used for automatic hang-up.
+- `VOBIZ_AUTH_TOKEN`: Your Vobiz Auth Token, used for automatic hang-up.
+
+### Answer URL
+
+Your answer URL returns XML that opens a bidirectional stream:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">wss://your-domain.com/ws</Stream>
+</Response>
+```
+
+## Configuration
+
+<ParamField path="stream_id" type="str" required>
+  The `streamId` from the Vobiz `start` event.
+</ParamField>
+
+<ParamField path="call_id" type="str | None" default="None">
+  The `callId` from the `start` event. Required while `auto_hang_up` is on.
+</ParamField>
+
+<ParamField path="auth_id" type="str | None" default="None">
+  Vobiz Auth ID. Required while `auto_hang_up` is on.
+</ParamField>
+
+<ParamField path="auth_token" type="str | None" default="None">
+  Vobiz Auth Token. Required while `auto_hang_up` is on.
+</ParamField>
+
+<ParamField
+  path="params"
+  type="VobizFrameSerializer.InputParams | None"
+  default="None"
+>
+  Optional settings: `encoding` and `vobiz_sample_rate` (inbound),
+  `output_encoding` and `output_sample_rate` (outbound), `sample_rate` and
+  `auto_hang_up`.
+</ParamField>
+
+Inbound and outbound formats are set independently. Raises `ValueError` for a
+format not marked Yes:
+
+| Direction | μ-law 8 kHz | L16 8 kHz | L16 16 kHz | L16 24 kHz |
+| --------- | ----------- | --------- | ---------- | ---------- |
+| Inbound   | Yes         | Yes       | Yes        | No         |
+| Outbound  | Yes         | Yes       | Yes        | Yes        |
+
+<Note>
+  This serializer does not use the Pipecat Settings dataclass pattern. See the
+  [source repository](https://github.com/Piyush-sahoo/Pipecat-Vobiz) for the
+  authoritative, up-to-date parameters.
+</Note>
+
+## Usage
+
+### Connect a Call
+
+Read the `start` event, then pass the serializer to a
+`FastAPIWebsocketTransport`:
+
+```python
+import os
+
+from fastapi import WebSocket
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
+from pipecat_vobiz import VobizFrameSerializer, parse_vobiz_start
+
+
+async def run_bot(websocket: WebSocket):
+    await websocket.accept()
+    start = await parse_vobiz_start(websocket)
+
+    serializer = VobizFrameSerializer(
+        stream_id=start["stream_id"],
+        call_id=start["call_id"],
+        auth_id=os.getenv("VOBIZ_AUTH_ID"),
+        auth_token=os.getenv("VOBIZ_AUTH_TOKEN"),
+        params=VobizFrameSerializer.InputParams(
+            encoding=start["encoding"],
+            vobiz_sample_rate=start["sample_rate"],
+        ),
+    )
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            serializer=serializer,
+        ),
+    )
+```
+
+### Run the Pipeline
+
+Run the transport in a pipeline at the sample rate from the `start` event:
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        # ... VAD, STT, LLM, TTS, etc.
+        transport.output(),
+    ]
+)
+worker = PipelineWorker(
+    pipeline,
+    params=PipelineParams(
+        audio_in_sample_rate=start["sample_rate"],
+        audio_out_sample_rate=start["sample_rate"],
+    ),
+)
+```
+
+<Tip>
+  `auto_hang_up` ends the whole call on `EndFrame` or `CancelFrame`. If your XML
+  has an element after `<Stream>`, such as `<Dial>` for a transfer, set
+  `auto_hang_up=False` so that it can run.
+</Tip>
+
+## Compatibility
+
+Tested with Pipecat v1.15.0 on real phone calls in every format above, with
+Gemini STT, LLM and TTS and with Gemini Live, including interruptions and
+automatic hang-up. DTMF is not supported: digits pressed during a
+call do not reach the stream. Check the
+[source repository](https://github.com/Piyush-sahoo/Pipecat-Vobiz) for the latest
+tested versions and the changelog.

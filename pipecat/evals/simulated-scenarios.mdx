@@ -182,7 +182,7 @@ judge:
     model: small-streaming
 
 metrics:
-  - measure: latency # from the persona stopping to the agent's first spoken sentence
+  - measure: latency # from the persona stopping to the agent starting to speak
     max_value: 5
 ```
 
@@ -256,15 +256,15 @@ metrics:
 
 The built-in measures:
 
-| Measure          | What it measures                                                                                                                                                                                                  | Unit    |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `turns`          | The persona's turns in the conversation. A reply that only calls `end_call` is not a turn.                                                                                                                        | count   |
-| `duration`       | The conversation's length, from its first line to the hang-up.                                                                                                                                                    | seconds |
-| `words`          | The longest agent reply. Bounds every reply.                                                                                                                                                                      | words   |
-| `latency`        | The slowest agent reply. In text mode, from the persona's send to the reply's first LLM token; in audio mode, from the agent noticing the persona stop speaking to its first spoken sentence. Bounds every reply. | seconds |
-| `function_calls` | The function calls the agent made, checked against a `calls:` list instead of a range. See [below](#checking-tool-calls-with-function_calls).                                                                     | calls   |
+| Measure          | What it measures                                                                                                                                                                                                                                                                                  | Unit    |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `turns`          | The persona's turns in the conversation. A reply that only calls `end_call` is not a turn.                                                                                                                                                                                                        | count   |
+| `duration`       | The conversation's length, from its first line to the hang-up.                                                                                                                                                                                                                                    | seconds |
+| `words`          | The longest agent reply. Bounds every reply.                                                                                                                                                                                                                                                      | words   |
+| `latency`        | The slowest agent reply, in seconds. It starts at the persona's send for a text caller, or when the agent notices the persona stop speaking for a spoken one, and ends at the reply's first LLM token for a text judge, or when the agent starts speaking for an audio judge. Bounds every reply. | seconds |
+| `function_calls` | The function calls the agent made, checked against a `calls:` list instead of a range. See [below](#checking-tool-calls-with-function_calls).                                                                                                                                                     | calls   |
 
-The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode there is no speech, so `latency` times the agent's own work before it starts answering: any tool call, then the LLM's first token. It is a budget on the LLM, not on what a caller would hear. Only in audio mode does it measure what a caller experiences. The two are not comparable, so a failed `latency` metric says what it timed, "to the first token" or "from the persona stopping to the first spoken sentence". A measure outside its range fails with the `failure_kind` `out_of_range`; a `function_calls` list that did not match, with `function_calls`.
+The per-reply measures, `words` and `latency`, bound the worst reply, so `max_value: 5` on `latency` means no reply took longer than five seconds. In text mode there is no speech, so `latency` times the agent's own work before it starts answering: any tool call, then the LLM's first token. It is a budget on the LLM, not on what a caller would hear. Only in audio mode does it measure what a caller experiences. The two are not comparable, so a failed `latency` metric says what it timed, "to the first token" or "to the agent starting to speak". A reply that opens with a function call is timed to its first text token. A turn still unanswered when the run ends by silence or its time limit counts with its wait up to the end. For a spoken persona, `latency` leaves out the agent's end-of-turn wait, so it is not voice-to-voice latency. A measure outside its range fails with the `failure_kind` `out_of_range`; a `function_calls` list that did not match, with `function_calls`; a bounded measure with no value, such as `words` or `latency` when the agent never replied, with `error`.
 
 There is deliberately no interruptions measure. The persona causes interruptions; the agent cannot.
 
@@ -353,12 +353,12 @@ The line beside the ✓ or ✗ is how the run ended. The `judge:` line is the ve
 
   Failures (1 of 1):
   ✗ ws://localhost:7860/ws book_table/available
-      • politeness 0.75 below 1.00: turn 3: the reply is curt, a bare "No." (P(meets)=0.08, P(fails)=0.90, P(not_applicable)=0.02) end_call
+      • politeness 0.75 below 1.00: turn 3: the reply is curt, a bare "No." end_call
 
   0/1 passed, 1 failed  ·  16.1s
 ```
 
-The failure shown is the first thing that went wrong, in this order: an error, then the goal ("goal not met: ..."), then the first failed metric. Every metric's score, value, and per-turn verdicts are in the decision trace at `<file>__<scenario>.eval.log`, and in `results.jsonl` when a suite ran it. The judge's and the persona LLM's own logs are in `<file>__<scenario>.debug.log` under `-d`.
+The failure shown is the first thing that went wrong, in this order: an error, then the goal ("goal not met: ..."), then the first failed metric. Every metric's score, value, and per-turn verdicts are in the decision trace at `<file>__<scenario>.eval.log`, and in `results.jsonl` when a suite ran it. The conversation, with the agent's function calls in place, is saved as `<file>__<scenario>.conversation.json`; [`pipecat eval judge`](/api-reference/cli/eval#eval-judge) judges it again without the agent, which is how to reword a `success:` or a metric's `criterion:` and see the new verdicts. The judge's and the persona LLM's own logs are in `<file>__<scenario>.debug.log` under `-d`.
 
 ## Writing good simulations
 
@@ -415,6 +415,35 @@ scenarios:
 ```
 
 When every caller is held to the same bar, put `metrics:` at the top instead. Each simulation runs on its own, against its own bot, as `book_table/available` and `book_table/impossible`, and a suite's `-s book_table` runs them all. The full rules, and a scripted scenario's side of them, are on [Scenario files](/pipecat/evals/scenario-configuration#scenario-files).
+
+## Judging a production session
+
+A rubric judges a conversation the harness didn't drive, such as a production call recorded by `EvalConversationObserver`. It is an entry with `success:` and neither `persona:` nor `turns:`, and it takes the same `success:`, judged `metrics:`, and `judge:` block as a simulation:
+
+```yaml food_ordering.yaml
+name: food_ordering
+judge: !include judge_text.yaml
+
+scenarios:
+  - name: production
+    success: "the bot took the caller's order and completed it"
+    metrics:
+      - name: politeness
+        criterion: "the reply is courteous and helpful, never curt or dismissive"
+        min_score: 1
+```
+
+A rubric has nothing to run, so `pipecat eval run` and `pipecat eval suite` skip it. Judge saved conversations with it using [`pipecat eval judge -s production`](/api-reference/cli/eval#eval-judge), or from Python:
+
+```python
+from pipecat.evals.scenario import EvalScenarioFile
+from pipecat.evals.simulation_judge import EvalSimulationJudge
+
+rubric = EvalScenarioFile.load("food_ordering.yaml")["food_ordering/production"]
+judgement = await EvalSimulationJudge(rubric).judge(message.conversation)
+```
+
+A rubric takes the file's top-level defaults like any entry, so a `persona:` at the top of the file makes every entry a simulation. Of the file's `metrics:` it takes only the judged ones; a measured metric needs a live run, and one listed on the rubric itself is an error.
 
 ## Next steps
 

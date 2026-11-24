@@ -1,0 +1,142 @@
+---
+title: "RTVI"
+description: "The RTVI (Real-Time Voice Interface) standard: the open protocol connecting Pipecat clients and servers."
+---
+
+The RTVI (Real-Time Voice Interface) standard defines a set of message types and structures sent between clients and servers. It is designed to facilitate real-time interactions between clients and AI applications that require voice, video, and text communication. It provides a consistent framework for building applications that can communicate with AI models and the backends running those models in real-time.
+
+<Note>
+  The current version of the RTVI standard is 2.4.0 (Pipecat 1.17.0). See [RTVI
+  2.4.0](/api-reference/standards/rtvi/2.4.0) for its messages, and [Protocol
+  Versions](#protocol-versions) for what each version changed.
+</Note>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Connection Management" icon="plug">
+    RTVI provides a flexible connection model that allows clients to connect to
+    AI services and coordinate state.
+  </Card>
+  <Card title="Transcriptions" icon="text">
+    The standard includes built-in support for real-time transcription of audio
+    streams.
+  </Card>
+  <Card title="Client-Server Messaging" icon="comments">
+    The standard defines a messaging protocol for sending and receiving messages
+    between clients and servers, allowing for efficient communication of
+    requests and responses.
+  </Card>
+  <Card title="Advanced LLM Interactions" icon="robot">
+    The standard supports advanced interactions with large language models
+    (LLMs), including context management, function call handling, and search
+    results.
+  </Card>
+  <Card title="Service-Specific Insights" icon="lightbulb">
+    RTVI supports events to provide insight into the input/output and state for
+    typical services that exist in speech-to-speech workflows.
+  </Card>
+  <Card title="Metrics and Monitoring" icon="chart-line">
+    RTVI provides mechanisms for collecting metrics and monitoring the
+    performance of server-side services.
+  </Card>
+  <Card title="User Interface" icon="window-maximize">
+    RTVI lets a server-side agent observe and drive the client's GUI through
+    accessibility snapshots, UI events, and commands.
+  </Card>
+</CardGroup>
+
+## Terms
+
+- **Client**: The front-end application or user interface that interacts with the RTVI server.
+- **Server**: The backend service that runs the AI framework and processes requests from the client.
+- **User**: The end user interacting with the client application.
+- **Bot**: The AI interacting with the user, technically an amalgamation of a large language model (LLM) and a text-to-speech (TTS) service.
+
+## RTVI Message Format
+
+The messages defined as part of the RTVI protocol adhere to the following format:
+
+```json
+{
+    "id": string,
+    "label": "rtvi-ai",
+    "type": string,
+    "data": unknown
+}
+```
+
+<ParamField path="id" type="string" required={false}>
+  A unique identifier for the message, used to correlate requests and responses.
+</ParamField>
+<ParamField path="label" type="string" required={true} default="rtvi-ai">
+  A label that identifies this message as an RTVI message. This field is
+  required and should always be set to `'rtvi-ai'`.
+</ParamField>
+<ParamField path="type" type="string" required={true}>
+  The type of message being sent. This field is required and should be set to
+  one of the message types in the version's [protocol
+  reference](#protocol-reference).
+</ParamField>
+<ParamField path="data" type="unknown" required={false}>
+  The payload of the message, which can be any data structure relevant to the
+  message type.
+</ParamField>
+
+If the server receives a message with an unknown `type`, or a message whose `data` fails validation, it replies with an [`error-response`](/api-reference/standards/rtvi/latest#error-response) carrying the message's `id`.
+
+## Concepts
+
+### Requests and Answers
+
+Every message a client sends has an `id`, and the server's answer to it carries the same `id`: `bot-ready` answers `client-ready`, a `server-response` or an `error-response` answers a `client-message`, and an `error-response` answers any message the server can't handle, such as one of an unknown `type`. A message that isn't valid RTVI at all gets an `error` instead, since it has no `id` to answer. The [server behaviors](/api-reference/standards/rtvi/latest#server-behaviors) give the full rules.
+
+### Messages the Server Can Turn Off
+
+Some server messages are sent only while a setting on the server turns them on: the `vad-user-*-speaking` messages and the audio levels, for example, are off by default, and most of the speaking and transcription messages are on. Each message's reference says whether a setting controls it and what its default is. In Pipecat, the settings are the fields of [`RTVIObserverParams`](/api-reference/server/rtvi/rtvi-observer).
+
+### Bot Output and Spoken Progress
+
+`bot-output` carries what the bot says or shows, split into segments, such as sentences, each with its own `segment_id`. For clients of protocol 2.0.0 or later:
+
+- Text the bot will speak has `will_be_spoken: true`, and waits for `bot-started-speaking`:
+  - When the TTS service reports word timestamps, the server sends the segment with `spoken_status: "new"` before it is spoken, then again as each word is spoken, with `"in-progress"`, and the last time with `"completed"`. `spoken_progress` splits the text into `accumulated_text`, already spoken, and `remaining_text`. Every message carries the segment's full `text` and the same `segment_id`.
+  - Otherwise, the server sends the segment once, with `"completed"`, after it is spoken.
+- Text the bot won't speak, such as text for display only, is sent once, with `will_be_spoken: false` and `spoken_status: "new"`.
+- When the user interrupts the bot, the server sends `bot-interrupted`, and drops the segments it was holding for speech that won't happen.
+
+Words aren't sent as `bot-output` messages of their own: word-level progress is in `spoken_progress`. Clients of protocol 1.x receive each spoken word as its own message, and read `spoken` instead.
+
+### Output Types
+
+`output_type` says what kind of text a `bot-output` carries:
+
+- `sentence` and `word` are the text the bot speaks.
+- `backchannel` is a short acknowledgment the bot says while the user talks, such as "Mm-hmm.". Sent to clients of protocol 2.2.0 or later.
+- `expression_sound` and `expression_pause` are a sound or a pause the bot performs in [expressive conversation](/pipecat/features/expressive-conversation). The `text` is the sound's name, such as `"laugh"`, or the pause's length in milliseconds, such as `"600"`. Each is a segment of its own, sent once, as it's performed, with `"completed"`. Sent to clients of protocol 2.3.0 or later.
+- Other types come from the server's own text aggregators, such as `code` or `url`.
+
+## Protocol Versions
+
+The client sends its protocol version in `client-ready`, and the server sends its own in `bot-ready`. A server serves each client in the format of the client's version:
+
+- A client on the server's major version is fully compatible.
+- A client on any 1.x version is still served, with the 1.x `bot-output` format.
+- Any other client version, or a missing or malformed one, gets an `error-response` warning that compatibility issues may occur. The connection still proceeds.
+
+Messages added in a minor version are only sent to clients of that version or later (and to any client before it sends `client-ready`, since the server doesn't know its version yet), and clients should only send a new client message when the bot's `bot-ready` advertises a version that supports it.
+
+| Version                                      | Pipecat | client-js | Changes                                                                                                                                                                                        |
+| -------------------------------------------- | ------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [2.4.0](/api-reference/standards/rtvi/2.4.0) | 1.17.0  | —         | `flow-node-entered` message, telling a client each time a Pipecat Flows conversation enters a node. Until `client-ready`, the server sends messages as it does to a client of its own version. |
+| [2.3.0](/api-reference/standards/rtvi/2.3.0) | 1.15.0  | 1.16.0    | `delivery` in `bot-output`; `expression_sound` and `expression_pause` output types; `perception` in `user-input`. Carries [RCS](/api-reference/standards/real-time-context-standard) 0.1.      |
+| 2.2.0                                        | 1.13.0  | 1.14.0    | `send-file` client message; `capabilities` in `bot-ready`; `stt-raw-text`, `llm-raw-text`, and `tts-raw-text`; `backchannel` text type.                                                        |
+| 2.1.0                                        | 1.6.0   | 1.13.0    | `dtmf` carries a `buttons` list instead of a single `button`.                                                                                                                                  |
+| 2.0.0                                        | 1.4.0   | 1.12.0    | `bot-output` adds `will_be_spoken`, `spoken_status`, `spoken_progress`, and `segment_id`, and reports word-level progress through them instead of separate `word` messages.                    |
+
+## Protocol Reference
+
+Each protocol version has a reference page listing every message with its fields, generated from the version's machine-readable [AsyncAPI](https://www.asyncapi.com/) document:
+
+- [RTVI 2.4.0](/api-reference/standards/rtvi/2.4.0) (current)
+- [RTVI 2.3.0](/api-reference/standards/rtvi/2.3.0)

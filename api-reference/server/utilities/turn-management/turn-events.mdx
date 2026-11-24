@@ -21,6 +21,7 @@ Turn events provide hooks into the conversation turn lifecycle, allowing you to 
 | `on_user_turn_message_added`       | `user_aggregator`      | A user message was written to the LLM context       |
 | `on_user_turn_stop_timeout`        | `user_aggregator`      | User turn ended due to timeout                      |
 | `on_user_turn_idle`                | `user_aggregator`      | User has been idle (not speaking) for timeout       |
+| `on_user_waiting`                  | `user_aggregator`      | User has been quiet while background work runs      |
 | `on_user_mute_started`             | `user_aggregator`      | User input was muted                                |
 | `on_user_mute_stopped`             | `user_aggregator`      | User input was unmuted                              |
 | `on_user_backchannel`              | `user_aggregator`      | User acknowledged the bot without interrupting      |
@@ -53,9 +54,9 @@ async def on_user_turn_started(aggregator, strategy):
 
 ### on_user_turn_inference_triggered
 
-Fired when a stop strategy has enough signal to start LLM inference for the current turn. For the default strategies this fires together with `on_user_turn_stopped`. When a strategy gates finalization on a separate signal — for example [`FilterIncompleteUserTurnStrategies`](/api-reference/server/utilities/turn-management/filter-incomplete-turns), where the public stop event waits for the LLM's `●` verdict — this event fires first (and may fire multiple times in one turn) while `on_user_turn_stopped` is deferred.
+Fired when LLM inference starts for the current turn. For the default strategies this fires together with `on_user_turn_stopped`. When a stop strategy waits for the inference — for example [`FilterIncompleteUserTurnStrategies`](/api-reference/server/utilities/turn-management/filter-incomplete-turns), where the public stop event waits for the LLM's `●` verdict — this event fires first (and may fire multiple times in one turn) and `on_user_turn_stopped` follows the verdict.
 
-With [`EagerUserTurnStrategies`](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies), this event may fire speculatively from a predicted end of turn before the turn has ended. The `UserTurnController` adds a third parameter, `speculation`, carrying the turn text the inference was run against when the turn is still open. Handlers registered on `LLMUserAggregator` or `UserTurnProcessor` remain unchanged and do not receive this parameter.
+With [`EagerUserTurnStrategies`](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstrategies), this event may fire speculatively from a predicted end of turn before the turn has ended. The `UserTurnController` adds a third parameter, `speculation`, carrying the text the service predicted, covering the speech since it last committed a transcript, when the turn is still open. Handlers registered on `LLMUserAggregator` or `UserTurnProcessor` remain unchanged and do not receive this parameter.
 
 ```python
 @user_aggregator.event_handler("on_user_turn_inference_triggered")
@@ -76,12 +77,12 @@ async def on_user_turn_inference_triggered(controller, strategy, speculation):
 
 **Parameters:**
 
-| Parameter     | Type                          | Description                                                                                           |
-| ------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `aggregator`  | `LLMUserAggregator`           | The user aggregator instance (for handlers on the aggregator)                                         |
-| `controller`  | `UserTurnController`          | The turn controller instance (for handlers on the controller)                                         |
-| `strategy`    | `BaseUserTurnStopStrategy`    | The strategy that triggered the inference                                                             |
-| `speculation` | `UserTurnSpeculation \| None` | Set when the inference answers a turn that hasn't ended yet, carrying the turn text (controller only) |
+| Parameter     | Type                          | Description                                                                                                |
+| ------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `aggregator`  | `LLMUserAggregator`           | The user aggregator instance (for handlers on the aggregator)                                              |
+| `controller`  | `UserTurnController`          | The turn controller instance (for handlers on the controller)                                              |
+| `strategy`    | `BaseUserTurnStopStrategy`    | The strategy that started the inference                                                                    |
+| `speculation` | `UserTurnSpeculation \| None` | Set when the inference answers a turn that hasn't ended yet, carrying the predicted text (controller only) |
 
 <Note>
   Bind `on_user_turn_inference_triggered` to react when inference starts, and
@@ -173,7 +174,7 @@ async def on_user_turn_stop_timeout(aggregator):
 
 ### on_user_turn_idle
 
-Fired when the user has been idle (not speaking) for a configured timeout period. This event is useful for re-engaging users who may have stepped away or need a prompt to continue the conversation. The idle timer starts when the bot finishes speaking and is cancelled when the user or bot starts speaking again.
+Fired when the user has been idle (not speaking) for a configured timeout period. This event is useful for re-engaging users who may have stepped away or need a prompt to continue the conversation. The idle timer starts when the bot finishes speaking and is cancelled when the user or bot starts speaking again. It doesn't run while background work is in progress; see `on_user_waiting`.
 
 ```python
 @user_aggregator.event_handler("on_user_turn_idle")
@@ -197,6 +198,26 @@ async def on_user_turn_idle(aggregator):
   user or bot starts speaking. It is suppressed during function calls and active
   user turns. This event can fire multiple times if the user remains idle.
 </Note>
+
+### on_user_waiting
+
+Fired when the conversation has stayed quiet for `user_waiting_timeout` seconds while the bot performs asynchronous background work, such as an asynchronous function call or an `LLMWithBackend` backend task. Use it to let the user know the work is still under way. It is off by default (`user_waiting_timeout=0`). The aggregator also broadcasts a `UserWaitingFrame` with the `quiet_secs` value.
+
+```python
+@user_aggregator.event_handler("on_user_waiting")
+async def on_user_waiting(aggregator):
+    message = {
+        "role": "developer",
+        "content": "You're still working on the user's request. Briefly let them know.",
+    }
+    await aggregator.push_frame(LLMMessagesAppendFrame([message], run_llm=True))
+```
+
+**Parameters:**
+
+| Parameter    | Type                | Description                  |
+| ------------ | ------------------- | ---------------------------- |
+| `aggregator` | `LLMUserAggregator` | The user aggregator instance |
 
 ### on_user_mute_started
 

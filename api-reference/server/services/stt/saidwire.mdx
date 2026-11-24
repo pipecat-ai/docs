@@ -1,0 +1,190 @@
+---
+title: "Saidwire Speech-to-Text"
+sidebarTitle: "Saidwire"
+description: "Real-time English STT with SaidwireSTTService over Saidwire's WebSocket API, with interim results and Finalize on VAD stop."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="SaidwireLLC"
+  maintainerUrl="https://github.com/SaidwireLLC"
+  repo="https://github.com/SaidwireLLC/pipecat-saidwire"
+/>
+
+## Overview
+
+`SaidwireSTTService` provides real-time English speech-to-text through
+[Saidwire](https://saidwire.com). It extends Pipecat's `WebsocketSTTService`, so
+connection management, reconnection, keepalive and metrics follow the same patterns as
+the built-in services. Interim results are pushed as `InterimTranscriptionFrame` and
+finals as `TranscriptionFrame`.
+
+When a `VADUserStoppedSpeakingFrame` arrives, the service sends `Finalize`, and Saidwire
+answers right away with the final transcript of everything heard so far. That final is
+pushed with `finalized=True`, so turn-taking doesn't wait on a server-side pause.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/SaidwireLLC/pipecat-saidwire"
+  >
+    Source code, README, changelog and issues
+  </Card>
+  <Card
+    title="Example"
+    icon="play"
+    href="https://github.com/SaidwireLLC/pipecat-saidwire/blob/main/examples/bot.py"
+  >
+    A voice agent that hears the user through Saidwire
+  </Card>
+  <Card
+    title="Saidwire API Docs"
+    icon="book"
+    href="https://saidwire.com/docs/api"
+  >
+    Streaming protocol, parameters, limits and error codes
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-saidwire/"
+  >
+    The `pipecat-saidwire` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-saidwire
+```
+
+## Prerequisites
+
+### Saidwire Account Setup
+
+Before using the Saidwire STT service, you need:
+
+1. **Saidwire Account**: Sign up at [saidwire.com/dev](https://saidwire.com/dev)
+2. **API Key**: Create a key from your dashboard
+
+### Required Environment Variables
+
+- `SAIDWIRE_API_KEY`: Your Saidwire API key
+
+## Configuration
+
+<ParamField path="api_key" type="str" default="None">
+  Saidwire API key. Defaults to the `SAIDWIRE_API_KEY` environment variable.
+</ParamField>
+
+<ParamField
+  path="base_url"
+  type="str"
+  default="wss://api.saidwire.com/v1/listen"
+>
+  Streaming endpoint.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Sample rate of the incoming audio in Hz (8000 to 48000). If `None`, uses the
+  pipeline's input sample rate.
+</ParamField>
+
+<ParamField path="vad_force_finalize" type="bool" default="True">
+  Send `Finalize` when a `VADUserStoppedSpeakingFrame` arrives, so the final
+  transcript comes back right away.
+</ParamField>
+
+<ParamField path="warmup_timeout" type="float" default="300.0">
+  Seconds to keep retrying while the service answers "starting up" or "busy"
+  (HTTP 503 or 429) before reporting a permanent error.
+</ParamField>
+
+<ParamField path="settings" type="SaidwireSTTService.Settings" default="None">
+  Runtime-updatable settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="0.30">
+  P99 latency from speech end to final transcript, in seconds, used by turn
+  strategies. Measure your own deployment with
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) and pass the
+  result.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument
+using `SaidwireSTTService.Settings(...)`. They can be updated mid-conversation with
+`STTUpdateSettingsFrame`; a change reconnects the stream between user turns.
+
+| Parameter          | Type                  | Default                    | Description                                                                         |
+| ------------------ | --------------------- | -------------------------- | ----------------------------------------------------------------------------------- |
+| `model`            | `str`                 | `"saidwire-en-2026-10-30"` | Model id.                                                                           |
+| `language`         | `str`                 | `"en"`                     | `"en"`, `"en-US"`, `"en-GB"`, ... (English only).                                   |
+| `endpointing`      | `int \| bool \| None` | `None`                     | Pause in ms that ends an utterance on the server. `False` leaves turns to your VAD. |
+| `interim_results`  | `bool`                | `True`                     | Interim transcripts while the user speaks.                                          |
+| `punctuate`        | `bool`                | `True`                     | Punctuation and capitals.                                                           |
+| `early_words`      | `bool`                | `False`                    | Fire `on_early_word` for each word as soon as it is committed.                      |
+| `vad_events`       | `bool`                | `False`                    | Fire `on_speech_started` when the server hears speech begin.                        |
+| `utterance_end_ms` | `int \| None`         | `None`                     | Fire `on_utterance_end` after this much silence.                                    |
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_saidwire import SaidwireSTTService
+
+stt = SaidwireSTTService(api_key=os.getenv("SAIDWIRE_API_KEY"))
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+### With Early Words
+
+```python
+from pipecat_saidwire import SaidwireSTTService
+
+stt = SaidwireSTTService(
+    settings=SaidwireSTTService.Settings(early_words=True),
+)
+
+
+@stt.event_handler("on_early_word")
+async def on_early_word(stt, word):
+    # {"word": "cancel", "punctuated_word": "cancel.", "start": 6.84, "end": 7.29, ...}
+    ...
+```
+
+## Notes
+
+- **Audio format**: The service sends 16-bit mono PCM at the pipeline's input rate.
+- **Idle connections**: While no audio flows (for example, while the user is muted),
+  the service sends `KeepAlive` messages instead of silent audio.
+- **Errors**: A bad or revoked key, or used-up credit, is reported once as a permanent
+  error, with no retry loop.
+- **Language**: English only.
+
+## Compatibility
+
+Tested with Pipecat 1.15.0 and Python 3.12. See the [source
+repository](https://github.com/SaidwireLLC/pipecat-saidwire) for the latest tested
+version and changelog.

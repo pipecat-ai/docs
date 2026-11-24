@@ -19,8 +19,9 @@ Pipecat uses [user turn strategies](/api-reference/server/utilities/turn-managem
 
 - Turn detection model (default): uses AI to understand if the user has finished their thought
 - Speech timeout: waits for silence after transcription to determine when the user is done
+- Turn completeness: an LLM or a classifier judges whether what the user said is a complete thought
 
-Custom strategies can also be implemented for specific use cases. By combining these techniques, you can create responsive yet natural conversations that don't interrupt users mid-sentence or wait too long after they've finished.
+Custom strategies can also be implemented for specific use cases. By [combining these techniques](#combining-strategies), you can create responsive yet natural conversations that don't interrupt users mid-sentence or wait too long after they've finished.
 
 ## Voice Activity Detection (VAD)
 
@@ -104,8 +105,8 @@ While VAD detects speech vs. silence, it can't understand linguistic context. A 
 
 ### How It Works
 
-1. **Turn Start**: When VAD detects speech (or transcription arrives), the start strategy emits `UserStartedSpeakingFrame` and optionally triggers an interruption
-2. **Turn End**: When the stop strategy determines the user is done, it emits `UserStoppedSpeakingFrame`
+1. **Turn Start**: When a start strategy decides the user started speaking (VAD detects speech, or a transcription arrives), the user aggregator emits `UserStartedSpeakingFrame` and optionally triggers an interruption
+2. **Turn End**: When the stop strategies decide the user is done, the user aggregator emits `UserStoppedSpeakingFrame` and pushes the user's message to the LLM context
 
 <Note>
   VAD also emits its own frames (`VADUserStartedSpeakingFrame`,
@@ -135,6 +136,40 @@ from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 
 stop_strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)
 ```
+
+**Turn Completeness**: Smart Turn and speech timeouts judge how the user spoke. To also judge what they said, add a stop strategy that checks whether the turn is a complete thought. [`FilterIncompleteUserTurnStrategies`](/api-reference/server/utilities/turn-management/filter-incomplete-turns) has the conversation LLM mark each turn complete or incomplete. [`ClassifierUserTurnStrategies`](/api-reference/server/utilities/turn-management/user-turn-strategies#classifieruserturnstrategies) asks a [classifier](/pipecat/learn/classifiers) instead, which suits an LLM that doesn't follow the markers well. Both add their check after Smart Turn, so a turn like "I'd go to Japan because I love" stays open until the user finishes or a timeout passes.
+
+### Combining Strategies
+
+`UserTurnStrategies` takes a list of start strategies and a list of stop strategies, and by default the two lists decide differently:
+
+- **Start**: the first strategy to decide starts the turn. That's what lets `TranscriptionUserTurnStartStrategy` act as a fallback, starting a turn VAD missed.
+- **Stop**: every strategy has to decide before the turn ends. Smart Turn next to a turn-completeness check ends the turn only once both say the user is done. If the user speaks again first, the decisions made so far are cleared.
+
+To change either rule, pass [`UserTurnStrategiesParams`](/api-reference/server/utilities/turn-management/user-turn-strategies#userturnstrategiesparams) as `user_turn_strategies_params`. This configuration ends the turn on whichever stop strategy decides first:
+
+```python
+from pipecat.turns.user_turn_strategies import (
+    StrategyMode,
+    UserTurnStrategies,
+    UserTurnStrategiesParams,
+)
+
+user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context,
+    user_params=LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            stop=[
+                TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3()),
+                SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.5),
+            ],
+        ),
+        user_turn_strategies_params=UserTurnStrategiesParams(stop_mode=StrategyMode.FIRST),
+    ),
+)
+```
+
+An STT service with its own turn detection, such as [Deepgram Flux](/api-reference/server/services/stt/deepgram), recommends strategies of its own. The `user_turn_strategies` you pass replace them. To add yours to the service's instead, set `stop_merge_mode=MergeMode.EXTEND` (or `start_merge_mode`) on `UserTurnStrategiesParams`. For example, `FilterIncompleteUserTurnStrategies` with `stop_merge_mode=MergeMode.EXTEND` checks turn completeness on top of the service's turn detection.
 
 <CardGroup cols={2}>
 <Card

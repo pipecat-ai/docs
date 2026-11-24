@@ -127,12 +127,13 @@ Inherits from `DataFrame`.
 
 ### LLMMarkerResponseFrame
 
-What a marker-reading LLM service made of one whole response. Pushed when the response ends, after `LLMMarkerFrame` and the spoken text: the marker found, what it meant, and the raw text the LLM produced before anything was held back. A diagnostic, for consumers that check how well the LLM follows the marker protocol; it plays no part in the conversation.
+What a marker-reading LLM service made of one whole response. Pushed when the response ends, after `LLMMarkerFrame` and the spoken text: the marker found, what it meant, and the raw text the LLM produced before anything was held back. A reply dropped as a silent mark is reported as soon as the mark is read, broadcast both ways: the user aggregator starts its idle or waiting timer over on it, and the assistant aggregator records nothing for the reply. A diagnostic otherwise, for consumers that check how well the LLM follows the marker protocol; it plays no part in the conversation.
 
 Inherits from `DataFrame`.
 
 <ParamField path="raw" type="str" required>
-  The response text as the LLM produced it, markers included.
+  The response text as the LLM produced it, markers included. For a silent
+  reply, its opening up to the mark.
 </ParamField>
 
 <ParamField path="marker" type="str | None" default="None">
@@ -142,7 +143,9 @@ Inherits from `DataFrame`.
 <ParamField path="kind" type="str | None" default="None">
   What the marker meant, in the emitter's own vocabulary, for consumers that
   should not depend on the marker text (which is configurable). The
-  turn-completion mixin uses `"complete"`, `"short"` and `"long"`.
+  turn-completion mixin uses `"complete"`, `"short"` and `"long"`; the [wait
+  reassurance](/api-reference/server/utilities/turn-management/wait-reassurance)
+  extension uses `"silent"` for a reply it dropped as its silent mark.
 </ParamField>
 
 <ParamField path="markers" type="list[str]" default="[]">
@@ -194,14 +197,15 @@ Inherits from `AggregatedTextFrame`.
 
 ### Transcriptions
 
-Frames produced by speech-to-text services at different stages of recognition. All inherit from `TextFrame`, so they flow through text aggregators and other `TextFrame` handlers.
+Frames produced by speech-to-text services at different stages of recognition. All except `TranscriptionFinalizedFrame` inherit from `TextFrame`, so they flow through text aggregators and other `TextFrame` handlers.
 
 #### TranscriptionFrame
 
 A non-interim transcription result from an STT service: the service's best recognition of what the user said, as opposed to the streaming partial results in `InterimTranscriptionFrame`.
 
 <ParamField path="user_id" type="str" required>
-  Identifier for the user who spoke.
+  Identifier of the participant whose audio was transcribed, as reported by the
+  input transport. Empty when the transport does not identify participants.
 </ParamField>
 
 <ParamField path="timestamp" type="str" required>
@@ -214,6 +218,15 @@ A non-interim transcription result from an STT service: the service's best recog
 
 <ParamField path="result" type="Any | None" default="None">
   Raw result object from the STT service.
+</ParamField>
+
+<ParamField path="speaker" type="TranscriptionSpeaker | None" default="None">
+  The speaker the STT service's diarization assigned to this text, or `None`
+  when diarization is off or the service gave no label. `TranscriptionSpeaker`
+  has a `label` (the provider's label, e.g. `"A"`) and a `number` (the speaker's
+  place in the order speakers first appeared in the session, starting at `1`).
+  Speakers only distinguish people within one transcription stream and are not
+  participant identities.
 </ParamField>
 
 <ParamField path="finalized" type="bool" default="False">
@@ -229,6 +242,19 @@ rather than for every final transcript. Whether a given service does either,
 and under what conditions, is documented on its own page. Services that do
 neither leave it `False`.
 
+</ParamField>
+
+#### TranscriptionFinalizedFrame
+
+Confirmation that the transcription of an utterance is complete, pushed by an STT service when a finalization is confirmed but has no text left to carry. This happens when the service's own endpointing already delivered the last transcript before it was asked to finalize. The frame means what `finalized=True` means on a `TranscriptionFrame`, for the transcripts pushed before it: user turn stop strategies treat it as a finalized transcript, and the STT TTFB is reported. An utterance is finalized by one or the other, never both.
+
+<ParamField path="user_id" type="str" default='""'>
+  Identifier of the participant whose audio was transcribed, as on the
+  transcripts this confirms.
+</ParamField>
+
+<ParamField path="timestamp" type="str" default='""'>
+  When the confirmation arrived.
 </ParamField>
 
 #### UserBackchannelFrame
@@ -252,7 +278,8 @@ A short acknowledgment the user said while the bot talks, such as "mhm". It is p
 A partial, in-progress transcription. These frames update frequently while the user is still speaking, and are superseded by a `TranscriptionFrame` once the STT service produces its result.
 
 <ParamField path="user_id" type="str" required>
-  Identifier for the user who spoke.
+  Identifier of the participant whose audio was transcribed, as reported by the
+  input transport. Empty when the transport does not identify participants.
 </ParamField>
 
 <ParamField path="timestamp" type="str" required>
@@ -267,12 +294,19 @@ A partial, in-progress transcription. These frames update frequently while the u
   Raw result object from the STT service.
 </ParamField>
 
+<ParamField path="speaker" type="TranscriptionSpeaker | None" default="None">
+  The speaker the STT service's diarization assigned to this text, or `None`
+  when diarization is off or the service gave no label. See
+  [`TranscriptionFrame`](#transcriptionframe).
+</ParamField>
+
 #### EagerTranscriptionFrame
 
-Transcript of a turn a service predicts has ended, before it commits. Some STT services emit a provisional end of turn ahead of the real one, so a response can be generated during the gap. The prediction may be withdrawn (`EagerEndOfTurnCancelFrame`) and the committed transcript may differ from this one, so nothing produced from it may reach the user or the context until it is confirmed. See [`EagerUserTurnStopStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstopstrategy).
+Transcript of a turn a service predicts has ended, before it commits. Some STT services emit a provisional end of turn ahead of the real one, so a response can be generated during the gap. The prediction may be withdrawn (`UserTurnResponseCancelFrame`) and the committed transcript may differ from this one, so nothing produced from it may reach the user or the context until it is confirmed. See [`EagerUserTurnStopStrategy`](/api-reference/server/utilities/turn-management/user-turn-strategies#eageruserturnstopstrategy).
 
 <ParamField path="user_id" type="str" required>
-  Identifier for the user who spoke.
+  Identifier of the participant whose audio was transcribed, as reported by the
+  input transport. Empty when the transport does not identify participants.
 </ParamField>
 
 <ParamField path="timestamp" type="str" required>
@@ -285,6 +319,12 @@ Transcript of a turn a service predicts has ended, before it commits. Some STT s
 
 <ParamField path="result" type="Any | None" default="None">
   Raw result object from the STT service.
+</ParamField>
+
+<ParamField path="speaker" type="TranscriptionSpeaker | None" default="None">
+  The speaker the STT service's diarization assigned to this text, or `None`
+  when diarization is off or the service gave no label. See
+  [`TranscriptionFrame`](#transcriptionframe).
 </ParamField>
 
 #### TranslationFrame
@@ -409,6 +449,23 @@ Records when an assistant message was created. Used internally to track timing o
 
 <ParamField path="timestamp" type="str" required>
   Timestamp when the assistant message was created.
+</ParamField>
+
+### LLMContextUserTurnFrame
+
+Broadcast by the user aggregator with the user's aggregated transcript for a turn, as written to the context. A transcription the aggregator leaves out, such as one while the user is muted, is not in it. With an eager end of turn, the turn the early response answers is broadcast first with `speculation=True`, ahead of the response, so processors after the LLM learn the turn before the held response is released. The turn is broadcast again, as written to the context, when it ends, so a processor that keeps the conversation should skip speculative turns. A `UserTurnResponseCancelFrame` withdraws a speculative turn, and the final turn can differ from it.
+
+<ParamField path="text" type="str" required>
+  The user's aggregated transcript for this turn.
+</ParamField>
+
+<ParamField path="timestamp" type="str" required>
+  ISO-8601 timestamp of when the user turn started.
+</ParamField>
+
+<ParamField path="speculation" type="bool" default="False">
+  Whether this is the turn a speculative inference answers, not yet part of the
+  conversation.
 </ParamField>
 
 ## LLM Thinking

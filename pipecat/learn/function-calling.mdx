@@ -123,7 +123,7 @@ By default, a direct function is cancelled if the user interrupts, and it uses t
 ```python
 import asyncio
 
-from pipecat.adapters.schemas.direct_function import tool_options
+from pipecat.adapters.llm.schemas.direct_function import tool_options
 from pipecat.services.llm_service import FunctionCallParams
 
 @tool_options(cancel_on_interruption=False, timeout_secs=30)
@@ -175,6 +175,8 @@ async def write_report(params: FunctionCallParams, topic: str):
 
 For each cancellable tool, Pipecat advertises a matching `cancel_<name>` tool — `cancel_write_report` here — alongside supporting system instructions. Calling it with no arguments stops the running call; a `tool_call_id` is only needed to pick one out when several calls of the same tool are in flight.
 
+Any tool handler can also act on calls in flight through the LLM service: `llm.running_function_calls()` returns the running calls (each with its function name, `tool_call_id`, arguments, and registry item), and `await llm.cancel_function_call(tool_call_id)` cancels one of them.
+
 `cancellable_by_llm` only does something in combination with `cancel_on_interruption=False`. A synchronous call blocks the LLM, so there is no moment at which it could ask for the cancellation, and the work has to outlast the model's round trip to the cancel tool to be worth stopping.
 
 <Warning>
@@ -216,79 +218,17 @@ llm = OpenAILLMService(
   the LLM, so the model responds once for every tool call in the batch.
 </Note>
 
-## Suppressing Text After Tool Calls
+## Text after a tool call
 
-Some models stream acknowledgement text after requesting a tool. In a voice
-pipeline, that text can reach TTS before the tool result is available. Set
-`tool_call_text_policy` to `ToolCallPolicy.SUPPRESS_TEXT_AFTER_TOOL_CALL_DETECTED` to
-omit text emitted after the first tool-call fragment in a response.
+By default, Pipecat forwards assistant text throughout a response. To keep the
+preamble and omit further text once the model begins a tool call your application
+runs, set the LLM service's `tool_call_text_policy` to
+`ToolCallPolicy.SUPPRESS_TEXT_AFTER_TOOL_CALL_DETECTED`. Import `ToolCallPolicy`
+from `pipecat.services.settings`.
 
-Text emitted before the tool call is preserved. The response triggered by the
-tool result is unaffected. The default policy, `ToolCallPolicy.PRESERVE_TEXT_AFTER_TOOL_CALL_DETECTED`,
-keeps all streamed text.
-
-This setting is available on all text-based LLM services: OpenAI-compatible
-services (OpenAI, Azure, Groq, Fireworks, DeepSeek, and the rest),
-`OpenAIResponsesLLMService`, `AnthropicLLMService`, `GoogleLLMService` (and
-the Vertex variants), and `AWSBedrockLLMService`. Realtime speech-to-speech
-services don't stream TTS-bound text, so the setting has no effect there.
-
-<CodeGroup>
-
-```python OpenAI-compatible
-import os
-
-from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.settings import ToolCallPolicy
-
-llm = OpenAILLMService(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    settings=OpenAILLMService.Settings(
-        model="gpt-4.1",
-        tool_call_text_policy=ToolCallPolicy.SUPPRESS_TEXT_AFTER_TOOL_CALL_DETECTED,
-    ),
-)
-```
-
-```python AWS Bedrock
-from pipecat.services.aws.llm import AWSBedrockLLMService
-from pipecat.services.settings import ToolCallPolicy
-
-llm = AWSBedrockLLMService(
-    settings=AWSBedrockLLMService.Settings(
-        model="us.amazon.nova-2-lite-v1:0",
-        tool_call_text_policy=ToolCallPolicy.SUPPRESS_TEXT_AFTER_TOOL_CALL_DETECTED,
-    ),
-)
-```
-
-```python Anthropic
-from pipecat.services.anthropic.llm import AnthropicLLMService
-from pipecat.services.settings import ToolCallPolicy
-
-llm = AnthropicLLMService(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    settings=AnthropicLLMService.Settings(
-        model="claude-sonnet-4-6",
-        tool_call_text_policy=ToolCallPolicy.SUPPRESS_TEXT_AFTER_TOOL_CALL_DETECTED,
-    ),
-)
-```
-
-```python Google
-from pipecat.services.google.llm import GoogleLLMService
-from pipecat.services.settings import ToolCallPolicy
-
-llm = GoogleLLMService(
-    api_key=os.getenv("GOOGLE_API_KEY"),
-    settings=GoogleLLMService.Settings(
-        model="gemini-3.6-flash",
-        tool_call_text_policy=ToolCallPolicy.SUPPRESS_TEXT_AFTER_TOOL_CALL_DETECTED,
-    ),
-)
-```
-
-</CodeGroup>
+This also omits acknowledgements after the call. The next response can speak the
+result. The setting applies to generated text, including realtime text mode.
+Native speech keeps its matching transcript.
 
 ## Changing Tools Mid-Conversation
 
@@ -307,7 +247,7 @@ await worker.queue_frame(LLMSetToolsFrame(tools=NOT_GIVEN))
 
 ## Tools Across Service Switches
 
-When you use an [`LLMSwitcher`](/api-reference/server/utilities/service-switchers/llm-switcher) to swap LLM providers mid-session, the tools you list in `LLMContext(tools=[...])` are available on whichever provider is active. You define them once for the whole switcher.
+When you use an [`LLMSwitcher`](/api-reference/server/composite-services/llm-switcher) to swap LLM providers mid-session, the tools you list in `LLMContext(tools=[...])` are available on whichever provider is active. You define them once for the whole switcher.
 
 ```python
 from pipecat.pipeline.llm_switcher import LLMSwitcher
@@ -326,7 +266,7 @@ Direct functions cover most cases. Reach for the verbose `FunctionSchema` patter
 A `FunctionSchema` spells out the tool's name, description, and parameters by hand. Pass the `handler` that runs when the LLM calls the tool as the schema's `handler`, then list the schema in `LLMContext(tools=[...])` — exactly as you would a direct function.
 
 ```python
-from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
 from pipecat.services.llm_service import FunctionCallParams
 
 async def fetch_weather_from_api(params: FunctionCallParams):
@@ -359,7 +299,7 @@ context = LLMContext(tools=[weather_function])
 To override the handler's default call options, decorate it with [`@tool_options`](#per-tool-options-with-@tool_options) — the same decorator direct functions use, with the same [synchronous vs. asynchronous](#synchronous-vs-asynchronous-calls) semantics:
 
 ```python
-from pipecat.adapters.schemas.direct_function import tool_options
+from pipecat.adapters.llm.schemas.direct_function import tool_options
 
 @tool_options(cancel_on_interruption=False, timeout_secs=30)
 async def fetch_weather_from_api(params: FunctionCallParams):
@@ -391,8 +331,8 @@ For normal function calling, prefer `standard_tools` with `FunctionSchema` or di
 <CodeGroup>
 
 ```python OpenAI-family adapter
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import AdapterType, ToolsSchema
 
 # Standard function converted by Pipecat
 weather_function = FunctionSchema(
@@ -413,8 +353,8 @@ tools = ToolsSchema(
 ```
 
 ```python Gemini
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import AdapterType, ToolsSchema
 
 # Standard function converted by Pipecat
 weather_function = FunctionSchema(
@@ -654,6 +594,8 @@ class FunctionCallResultProperties:
 - **`on_context_updated`**: Async callback executed after the function result is added to context
 - **`is_final=False`**: Treat this as an intermediate result for an async function call. Only use this for async functions (`cancel_on_interruption=False`)
 
+Any result other than `None` runs the LLM and is recorded in the context as returned, including falsy values such as `""`, `{}`, `[]`, `0`, and `False`. To complete a call without a reply, return `None` or pass `run_llm=False`.
+
 <Tip>
   Skip LLM execution (`run_llm=False`) when you have back-to-back function
   calls. If you skip a completion, you must manually trigger one from the
@@ -698,7 +640,7 @@ async def query_database(params: FunctionCallParams):
 Async function calls can send progress updates before their final result. Make the function async with `@tool_options(cancel_on_interruption=False)`, then call `params.result_callback(..., properties=FunctionCallResultProperties(is_final=False))` for each intermediate update. Finish with a normal `params.result_callback(...)`.
 
 ```python
-from pipecat.adapters.schemas.direct_function import tool_options
+from pipecat.adapters.llm.schemas.direct_function import tool_options
 from pipecat.frames.frames import FunctionCallResultProperties
 from pipecat.services.llm_service import FunctionCallParams
 

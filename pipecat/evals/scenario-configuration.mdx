@@ -9,7 +9,7 @@ Everything here is optional apart from `name:` and the `scenarios:` list. A scen
 
 ## Scenario files
 
-A scenario file has a `name:` and a `scenarios:` list. Each entry is one scenario, with a `name:` of its own, and its keys say which kind it is: `turns:` makes it [scripted](/pipecat/evals/scripted-scenarios), `persona:` makes it a [simulation](/pipecat/evals/simulated-scenarios). Most files hold one scenario:
+A scenario file has a `name:` and a `scenarios:` list. Each entry is one scenario, with a `name:` of its own, and its keys say which kind it is: `turns:` makes it [scripted](/pipecat/evals/scripted-scenarios), `persona:` makes it a [simulation](/pipecat/evals/simulated-scenarios). An entry with `success:` and neither is a [rubric](/pipecat/evals/simulated-scenarios#judging-a-production-session), which only judges saved conversations and is skipped by `pipecat eval run` and `pipecat eval suite`. Most files hold one scenario:
 
 ```yaml capital_question.yaml
 name: capital_question
@@ -188,7 +188,10 @@ judge:
 
 <Note>
   The built-in transcribers are `moonshine` and `whisper`, both local models.
-  When `transcription.service:` is omitted, it defaults to `moonshine`.
+  When `transcription.service:` is omitted, it defaults to `moonshine`. The
+  transcriber must be a `SegmentedSTTService`, such as `moonshine`, `whisper`,
+  or `DeepgramSegmentedSTTService`. Any other STT fails the run with a
+  `ValueError` before it connects.
 </Note>
 
 In either modality, the `judge.eval:` block sets what decides a scripted scenario's [`eval:`](/pipecat/evals/scripted-scenarios#semantic-judging-with-eval) assertions, and a simulation's [`success:`](/pipecat/evals/simulated-scenarios#judging-the-outcome) and judged metrics. Every verdict comes from a [classifier](/pipecat/learn/classifiers), which picks one of the possible answers and gives a probability for each. By default that is an `LLMClassifier` over Ollama (`gemma4:12b`, with an optional `endpoint:` for a remote Ollama), so the default judge needs no API key. A [`factory:`](#custom-services-with-factory) can return any other LLM to classify with, or a classifier of its own, such as [Jev](#judging-with-a-classifier). `service: openai` is deprecated since 1.9.0 in favor of a factory and will be removed in 2.0.0.
@@ -240,12 +243,12 @@ A factory may return any `BaseClassifier`, so a classifier of your own judges th
 
 ### Reasons from the explainer
 
-A classifier answers with probabilities, not reasons. So the judge asks an LLM, the **explainer**, for the reason behind every `no`, and behind any verdict less sure than `explain_below` (`0.75` by default). It never asks about a `continue`, which is only a request to wait for more of the reply. The explainer answers the same question on its own, which costs one LLM call per verdict it explains, or one per simulation run when any of the run's verdicts needs a reason. Its answer never changes a verdict: the classifier's stands, and when the two disagree the reason says so ("the explainer judged yes: ...").
+A classifier answers with probabilities, not reasons. So the judge asks an LLM, the **explainer**, for the reason behind every `no`, and behind any verdict less sure than `explain_below` (`0.75` by default). It never asks about a `continue`, which is only a request to wait for more of the reply. The explainer is told the classifier's verdict and says what in the conversation supports it, so it never changes or argues with a verdict. That costs one LLM call per verdict it explains, or one per simulation run when any of the run's verdicts needs a reason.
 
-A verdict's reason ends with the probabilities the classifier gave, and a verdict that wasn't explained has only those:
+An explained verdict's reason is the explainer's sentence. A verdict that wasn't explained, or whose explanation failed, has the classifier's probabilities as its reason. The probabilities and the `confidence` are also reported in fields of their own:
 
 ```
-judge said no: the reply says the capital is Berlin, not Madrid (P(yes)=0.02, P(no)=0.97, P(continue)=0.01)
+judge said no: the reply says the capital is Berlin, not Madrid
 judge said yes: P(yes)=0.98, P(no)=0.01, P(continue)=0.01
 ```
 
@@ -253,7 +256,7 @@ Which LLM explains depends on the block:
 
 - With the default judge, or an LLM from a factory, the LLM that judges also explains.
 - With a classifier from a factory, the default Ollama model explains, unless an `explainer:` block names another LLM. The block takes the same `service`, `model`, `endpoint`, `extra`, and `factory` keys as an LLM `judge.eval:` block.
-- `explainer: false` turns reasons off, so every verdict carries its probabilities alone, and a judge like Jev needs no LLM beside it.
+- `explainer: false` turns reasons off, so every verdict's reason is its probabilities alone, and a judge like Jev needs no LLM beside it.
 
 `explain_below: 0` limits the reasons to the `no` verdicts, and a value above `1` explains every verdict, which is how to compare a classifier's verdicts against an LLM's. An LLM's probabilities are its own guess rather than calibrated, and rarely fall below `0.75`, so with an LLM judge it's in practice the `no` verdicts that get explained.
 
@@ -267,7 +270,7 @@ judge:
     allow_continue: false # every judged reply is a final answer
 ```
 
-The judge then answers only yes or no, so it never waits for more of a reply that is already complete. With `continue` allowed, a judge that wrongly waits on a complete reply lets the turn run out its time budget, and the turn fails as `judge_continue` instead of as a `no` with a reason. A reply that is still arriving is judged again as more of it comes either way. `allow_continue:` only affects an `eval:` on a reply: a function call's `eval:` and a simulation have no `continue` to begin with.
+The judge then answers only yes or no, so it never waits for more of a reply that is already complete. With `continue` allowed, a judge that wrongly waits on a complete reply lets the turn run out its time budget, and the turn fails as `judge_continue` instead of as a `no` with a reason. A reply that is still arriving is judged again as more of it comes either way. An expectation can also set `allow_continue:` on itself, which takes precedence over the judge's setting for that reply. `allow_continue:` only affects an `eval:` on a reply: a function call's `eval:` and a simulation have no `continue` to begin with.
 
 ## Custom services with `factory:`
 
@@ -321,7 +324,7 @@ The pipeline sets each service's sample rate, so a factory doesn't. What a facto
 - `judge.eval.explainer:`: an LLM service that supports `run_inference()`.
 - `simulator:`: an OpenAI-compatible LLM service that supports function calling.
 - `user.speech:`: a local or HTTP TTS. The cache around it drives synthesis directly, so a WebSocket-streaming TTS yields nothing there.
-- `judge.transcription:`: any pipeline STT.
+- `judge.transcription:`: any `SegmentedSTTService`.
 
 `pipecat eval` loads the nearest `.env` before it runs, so a factory can read its API key from the environment the way your agent does.
 
@@ -329,7 +332,7 @@ For a fully custom setup (your own caching, a pre-built service instance), pass 
 
 ## Sharing config with `!include`
 
-Any value can be pulled from another file with `!include`, resolved relative to the scenario file. This keeps per-scenario noise down when a whole directory of scenarios shares the same audio setup, or the same `simulator:` block:
+Any value can be pulled from another file with `!include`, resolved relative to the file that names it, so a fragment's own includes resolve against the fragment's directory. A file that includes itself, directly or through the files it includes, is an error. This keeps per-scenario noise down when a whole directory of scenarios shares the same audio setup, or the same `simulator:` block:
 
 ```yaml
 name: capital_question
