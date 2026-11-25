@@ -1,6 +1,7 @@
 """Frames: dataclasses, so their constructors are their fields."""
 
 from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 
 @dataclass
@@ -18,3 +19,11 @@ class TextFrame(Frame):
 class TTSSpeakFrame(Frame):
     text: str
     append_to_context: bool | None = None
+
+
+@dataclass
+class STTUpdateSettingsFrame(Frame):
+    """Shaped like pipecat's: a deprecated `settings` dict beside `delta`."""
+
+    settings: Mapping[str, Any] = field(default_factory=dict)
+    delta: Any = None
