@@ -41,6 +41,7 @@ _spec.loader.exec_module(cr)
 
 TTS = "api-reference/server/services/tts/acme.mdx"
 STT = "api-reference/server/services/stt/acme.mdx"
+LOCAL_STT = "api-reference/server/services/stt/acme-local.mdx"
 CONN = "api-reference/server/services/transport/acme-connection.mdx"
 COMMUNITY = "api-reference/server/services/community/community-tts.mdx"
 EVAL = "api-reference/cli/eval.mdx"
@@ -211,6 +212,11 @@ class TestParams(Case):
     def test_type_mismatch_normalizes(self):
         self.not_flagged(TTS, "type-mismatch", "region")  # "string" vs Optional[str]
         self.not_flagged(TTS, "type-mismatch", "language")  # `Language \| str` in a table
+
+    def test_overlap_tie_goes_to_the_page_subject(self):
+        # The lone `settings` entry overlaps the imported service and a frame
+        # the prose names, with fewer fields: the service is what it documents.
+        self.page_clean(LOCAL_STT)
 
     def test_unmarked_deprecation(self):
         self.flagged(TTS, "unmarked-deprecation", "voice_id")
