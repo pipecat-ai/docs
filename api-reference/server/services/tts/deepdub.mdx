@@ -1,7 +1,7 @@
 ---
 title: "Deepdub Text-to-Speech"
 sidebarTitle: "Deepdub"
-description: "DeepdubTTSService streams real-time TTS over Deepdub AI's WebSocket API, extending InterruptibleTTSService for interruption handling."
+description: "DeepdubTTSService streams LLM tokens to Deepdub's emotional TTS and audio back over one WebSocket, canceling interrupted replies in place."
 ---
 
 import { CommunityMaintained } from "/snippets/community-maintained.mdx";
@@ -14,10 +14,16 @@ import { CommunityMaintained } from "/snippets/community-maintained.mdx";
 
 ## Overview
 
-`DeepdubTTSService` generates speech from text using [Deepdub AI](https://deepdub.ai/)'s
-real-time streaming WebSocket API. It extends Pipecat's `InterruptibleTTSService`
-and pushes `TTSAudioRawFrame` audio into the pipeline, with support for multiple
-models (`dd-etts-2.5`, `dd-etts-3.0`), voice customization, and accent control.
+`DeepdubTTSService` generates speech with [Deepdub](https://deepdub.ai/)'s emotional
+TTS. It extends Pipecat's `WebsocketTTSService`: LLM tokens stream to Deepdub as they
+arrive, and audio streams back over the same connection as `TTSAudioRawFrame`s.
+
+An interruption cancels the reply on the open connection instead of reconnecting, and
+audio from the canceled reply is dropped. A reply that starts while another is still
+speaking, such as a `TTSSpeakFrame`, waits for it to finish. Voice, locale and model
+changes apply to the open connection from the next text.
+
+The same package provides [Deepdub speech-to-text](/api-reference/server/services/stt/deepdub).
 
 <CardGroup cols={2}>
   <Card
@@ -25,17 +31,24 @@ models (`dd-etts-2.5`, `dd-etts-3.0`), voice customization, and accent control.
     icon="github"
     href="https://github.com/deepdub-ai/pipecat"
   >
-    Source code, examples, and issues for the Deepdub TTS integration
+    Source code, README, changelog and issues
+  </Card>
+  <Card
+    title="Example"
+    icon="play"
+    href="https://github.com/deepdub-ai/pipecat/blob/main/examples/foundational/deepdub-voice-agent.py"
+  >
+    A voice agent that listens and speaks with Deepdub
+  </Card>
+  <Card title="Deepdub API Docs" icon="book" href="https://docs.deepdub.ai">
+    Streaming protocol, voices, locales and limits
   </Card>
   <Card
     title="PyPI Package"
     icon="cube"
-    href="https://pypi.org/project/pipecat-deepdub-tts/"
+    href="https://pypi.org/project/pipecat-deepdub/"
   >
-    The `pipecat-deepdub-tts` package on PyPI
-  </Card>
-  <Card title="Deepdub AI" icon="book" href="https://deepdub.ai/">
-    Learn more about Deepdub AI and sign up for an API key
+    The `pipecat-deepdub` package on PyPI
   </Card>
 </CardGroup>
 
@@ -44,7 +57,7 @@ models (`dd-etts-2.5`, `dd-etts-3.0`), voice customization, and accent control.
 This is a community-maintained package distributed separately from `pipecat-ai`:
 
 ```bash
-uv add pipecat-deepdub-tts
+uv add pipecat-deepdub
 ```
 
 ## Prerequisites
@@ -53,85 +66,93 @@ uv add pipecat-deepdub-tts
 
 Before using the Deepdub TTS service, you need:
 
-1. **Deepdub Account**: Sign up at [Deepdub AI](https://deepdub.ai/)
+1. **Deepdub Account**: Sign up at [Deepdub](https://deepdub.ai/)
 2. **API Key**: Obtain your API key from your Deepdub account
-3. **Voice Prompt ID**: A voice prompt ID to use for synthesis
 
 ### Required Environment Variables
 
-- `DEEPDUB_API_KEY`: Your Deepdub API key for authentication
-- `DEEPDUB_VOICE_ID`: The voice prompt ID used for synthesis
+- `DEEPDUB_API_KEY`: Your Deepdub API key
 
 ## Configuration
 
 <ParamField path="api_key" type="str" required>
-  Deepdub API key for authentication.
+  Deepdub API key.
 </ParamField>
 
-<ParamField path="voice_id" type="str" required>
-  Voice prompt ID to use for synthesis.
+<ParamField path="url" type="str" default="wss://wss.deepdub.ai/ws">
+  Streaming endpoint. Use `wss://wss.eu.deepdub.ai/ws` to process data in the
+  EU.
 </ParamField>
 
-<ParamField path="model" type="str" default="dd-etts-2.5">
-  TTS model name (e.g. `"dd-etts-2.5"`, `"dd-etts-3.0"`).
+<ParamField path="sample_rate" type="int" default="None">
+  Output sample rate in Hz. If `None`, uses the pipeline's output rate. Deepdub
+  streams 8000, 16000, 22050, 24000, 32000, 36000, 44100 or 48000 Hz; other
+  rates are resampled from the next one up.
 </ParamField>
 
-<ParamField path="sample_rate" type="int" default="16000">
-  Audio sample rate in Hz. Valid values: `8000`, `16000`, `22050`, `24000`,
-  `44100`, `48000`.
+<ParamField path="enable_logging" type="bool" default="None">
+  Set to `False` to keep this session's text out of Deepdub's server-side logs.
+  `None` leaves Deepdub's default (on).
 </ParamField>
 
-<ParamField path="params" type="DeepdubTTSService.InputParams" default="None">
-  Optional voice customization parameters. See [InputParams](#inputparams)
-  below.
+<ParamField path="turn_timeout" type="float" default="10.0">
+  Seconds to wait for audio after a reply is complete before reporting an error.
 </ParamField>
 
-### InputParams
+<ParamField path="settings" type="DeepdubTTSService.Settings" default="None">
+  Runtime-updatable settings. See [Settings](#settings) below.
+</ParamField>
 
-Optional voice customization passed via the `params` constructor argument using
-`DeepdubTTSService.InputParams(...)`.
+### Settings
 
-| Parameter            | Type    | Default   | Description                                                                |
-| -------------------- | ------- | --------- | -------------------------------------------------------------------------- |
-| `locale`             | `str`   | `"en-US"` | Language locale for synthesis.                                             |
-| `temperature`        | `float` | `None`    | Controls output variability.                                               |
-| `variance`           | `float` | `None`    | Controls variance in generated speech.                                     |
-| `tempo`              | `float` | `None`    | Speech tempo multiplier.                                                   |
-| `prompt_boost`       | `bool`  | `None`    | Enable prompt boosting for improved quality.                               |
-| `accent_base_locale` | `str`   | `None`    | Base locale for accent control. All three accent params required together. |
-| `accent_locale`      | `str`   | `None`    | Target accent locale.                                                      |
-| `accent_ratio`       | `float` | `None`    | Accent blending ratio (0.0 to 1.0).                                        |
+Runtime-configurable settings passed via the `settings` constructor argument using
+`DeepdubTTSService.Settings(...)`. They can be updated mid-conversation with
+`TTSUpdateSettingsFrame`, without reconnecting.
 
-<Note>
-  Available parameters and defaults are defined by the integration. See the
-  [source repository](https://github.com/deepdub-ai/pipecat) for the
-  authoritative, up-to-date list.
-</Note>
+| Parameter       | Type           | Default                                  | Description                                                                       |
+| --------------- | -------------- | ---------------------------------------- | --------------------------------------------------------------------------------- |
+| `model`         | `str`          | `"dd-etts-4.0"`                          | Deepdub TTS model.                                                                |
+| `voice`         | `str`          | `"b2abb241-ac92-48bf-a890-fec03f43e209"` | Voice prompt ID.                                                                  |
+| `language`      | `str`          | `"en-US"`                                | Locale to speak, such as `"he-IL"`. A Pipecat `Language` works too.               |
+| `target_gender` | `str \| None`  | `None`                                   | `"male"` or `"female"`, for language-specific handling such as Hebrew diacritics. |
+| `accept_emojis` | `bool \| None` | `None`                                   | Whether flag and emotion emojis switch locale or emotion instead of being spoken. |
 
 ## Usage
 
 ```python
 import os
-from pipecat_deepdub_tts import DeepdubTTSService
+
+from pipecat_deepdub import DeepdubTTSService
 
 tts = DeepdubTTSService(
     api_key=os.getenv("DEEPDUB_API_KEY"),
-    voice_id=os.getenv("DEEPDUB_VOICE_ID"),
-    model="dd-etts-2.5",
-    sample_rate=24000,
-    params=DeepdubTTSService.InputParams(
-        locale="en-US",
-        temperature=0.7,
-        tempo=1.1,
-        prompt_boost=True,
+    settings=DeepdubTTSService.Settings(
+        voice="b2abb241-ac92-48bf-a890-fec03f43e209",
+        language="en-US",
     ),
 )
-
-# ... add tts to your pipeline, e.g. Pipeline([llm, tts, ...])
 ```
+
+### Switching Language Mid-Conversation
+
+```python
+from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+await worker.queue_frame(
+    TTSUpdateSettingsFrame(delta=DeepdubTTSService.Settings(language="he-IL"))
+)
+```
+
+## Notes
+
+- **Audio format**: Deepdub streams 16-bit mono PCM.
+- **Migrating from `pipecat-deepdub-tts`**: Install `pipecat-deepdub` and import from
+  `pipecat_deepdub`. `voice_id`, `model` and `params` became `settings`. The
+  `temperature`, `variance`, `tempo`, `prompt_boost` and accent options are gone,
+  because Deepdub's streaming endpoint ignores them.
 
 ## Compatibility
 
-Tested with Pipecat v0.0.97. Check the [source
-repository](https://github.com/deepdub-ai/pipecat) for the latest tested version
-and changelog.
+Tested with Pipecat 1.17.0. See the [source
+repository](https://github.com/deepdub-ai/pipecat) for the latest tested version and
+changelog.
