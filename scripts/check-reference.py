@@ -40,7 +40,8 @@ From each page under api-reference/server and api-reference/pipecat-flows:
   - event names (`on_...`) mentioned anywhere on the page
 
 Each group of entries is matched to the class on the page whose parameters or
-settings it overlaps most, so the check doesn't depend on heading wording.
+settings it overlaps most, so the check doesn't depend on heading wording. A
+tie goes to a class the page imports or names in a heading.
 
 Findings, most to least certain:
   stale-param        documented parameter the class doesn't accept
@@ -1076,28 +1077,40 @@ class Checker:
             {"kind": kind, "page": page, "line": line, "class": cls, "name": name, "detail": detail}
         )
 
+    @staticmethod
+    def is_subject(page, name):
+        """Whether the page presents the class as its subject: imports it or
+        names it in a heading, rather than only mentioning it in prose."""
+        return page.classes.get(name) is not None or any(name in h for g in page.groups for h in g.chain)
+
     def page_targets(self, page):
         """Targets for every class the page names, keyed by the names a
-        heading might use for them (`Foo`, `Foo.InputParams`, `InputParams`)."""
+        heading might use for them (`Foo`, `Foo.InputParams`, `InputParams`),
+        and the ids of those that belong to the page's subjects (a subject's
+        nested classes included)."""
         by_alias = defaultdict(list)
         all_targets = []
+        subjects = set()
         for name, hint in page.classes.items():
             if hint is None and name in self.generic:
                 continue
             c = self.idx.get(name, hint)
             if not c:
                 continue
+            subject = self.is_subject(page, name)
             nested = [n for n in self.idx.by_name if n.startswith(c.name + ".")]
             for cc, aliases in [(c, [c.name])] + [
                 (self.idx.by_name[n][0], [n, n.split(".")[-1]]) for n in nested
             ]:
                 for t in targets_for(cc, self.idx):
                     all_targets.append(t)
+                    if subject:
+                        subjects.add(id(t))
                     for a in aliases:
                         by_alias[a].append(t)
-        return by_alias, all_targets
+        return by_alias, all_targets, subjects
 
-    def match_group(self, g, by_alias, all_targets):
+    def match_group(self, g, by_alias, all_targets, subjects):
         # A table under a method's heading (`### job_group`) documents that
         # method's parameters, not a class.
         if g.chain and re.fullmatch(r"[a-z_]\w*(\(.*\))?(\s*->.*)?", g.chain[0].strip("` ")):
@@ -1117,23 +1130,28 @@ class Checker:
                 else:
                     cands.sort(key=lambda t: -len(names & set(t.spec)))
                 return cands[0]
-        # 2. Otherwise the best overlap, if it is convincing.
-        best, best_score = None, 0.0
+        # 2. Otherwise the best overlap, if it is convincing. A tie goes to a
+        # class the page is about over one its prose only mentions (a lone
+        # `settings` entry overlaps both the service and
+        # `STTUpdateSettingsFrame`), then to the class with fewer members.
+        best, best_key = None, None
         for t in all_targets:
             hit = len(names & set(t.spec))
-            score = hit / len(names)
-            if hit >= min(2, len(names)) and (score, -len(t.spec)) > (best_score, -len(best.spec) if best else 0):
-                best, best_score = t, score
-        return best if best_score >= 0.6 else None
+            if hit < min(2, len(names)):
+                continue
+            key = (hit / len(names), id(t) in subjects, -len(t.spec))
+            if best_key is None or key > best_key:
+                best, best_key = t, key
+        return best if best_key and best_key[0] >= 0.6 else None
 
     def check_page(self, page):
         if page.community:
             return  # integrations maintained outside pipecat
         self.pages[page.path] = page
-        by_alias, all_targets = self.page_targets(page)
+        by_alias, all_targets, subjects = self.page_targets(page)
         self.page_events[page.path] = page.events
         for g in page.groups:
-            t = self.match_group(g, by_alias, all_targets)
+            t = self.match_group(g, by_alias, all_targets, subjects)
             if not t:
                 continue
             self.matches.append((page, g, t))
@@ -1204,10 +1222,7 @@ class Checker:
             # Only a page that presents the class as its subject: named in a
             # heading or imported. Thin subclasses' pages often show a base's
             # parameters without being its reference.
-            named = page.classes.get(t.cls.name) is not None or any(
-                t.cls.name in h for gg in page.groups for h in gg.chain
-            )
-            if not named:
+            if not self.is_subject(page, t.cls.name):
                 continue
             done.add((t.key, page.path))
             documented = self.documented[(page.path, t.cls.name)]

@@ -1,0 +1,163 @@
+---
+title: "Ormem Memory"
+sidebarTitle: "Ormem"
+description: "Give Pipecat voice agents dated, cross-call memory with Ormem, so a caller's latest correction wins over what they said before."
+---
+
+import { CommunityMaintained } from "/snippets/community-maintained.mdx";
+
+<CommunityMaintained
+  maintainer="Ormem"
+  maintainerUrl="https://ormem.app"
+  repo="https://github.com/ormem/pipecat-ormem"
+/>
+
+## Overview
+
+`pipecat-ormem` gives a Pipecat voice agent long-term memory of each caller,
+backed by [Ormem](https://ormem.app).
+
+Memories are dated, so corrections stick. `OrmemMemoryService` lists the
+caller's memories oldest first with their dates and tells the LLM that the
+newer one wins. If a caller says "I parked at B14" and later "I moved the car
+to C7", the next call answers C7.
+
+Ormem publishes its benchmark results: on LongMemEval-S (all 500 questions,
+full chat history), 91.8% with OpenAI models (answered by gpt-6-luna) and
+94.0% with open models only (answered by Kimi K3), with every graded answer
+published. See [the results](https://ormem.app/api).
+Benchmark run with about 6,000 tokens of memory per question; the plugin's lookup size is configurable with `evidence_budget`.
+
+The service sits between the user context aggregator and the LLM. On each
+user turn it looks up the caller's memories (`POST /v1/context`) and adds them
+as one message just before the latest question, replacing the previous turn's
+memory message. Like other memory services, it has a recall time limit (1.5 s
+by default; on timeout the turn goes ahead without memory) and saves new
+messages in the background (`POST /v1/memories`) with idempotency keys.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/ormem/pipecat-ormem"
+  >
+    Package source, demo, changelog, and issues
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-ormem/"
+  >
+    The `pipecat-ormem` package on PyPI
+  </Card>
+  <Card title="Ormem API" icon="book" href="https://ormem.app/api">
+    API reference for the endpoints the service uses
+  </Card>
+  <Card title="API Keys" icon="key" href="https://app.ormem.app">
+    Create and manage your Ormem API keys
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-ormem
+```
+
+Requires Python 3.11 or newer.
+
+## Prerequisites
+
+### Ormem Account Setup
+
+1. **Ormem account**: sign up at [app.ormem.app](https://app.ormem.app)
+2. **API key**: create a key under Account
+
+### Required Environment Variables
+
+- `ORMEM_API_KEY`: your Ormem API key. Keep it on your server.
+
+## Configuration
+
+### `OrmemMemoryService`
+
+<ParamField path="api_key" type="str" required>
+  Ormem API key.
+</ParamField>
+
+<ParamField path="owner" type="str" required>
+  Stable ID of the caller whose memories these are, such as a phone number or
+  your user ID. 1 to 200 characters, without `~`.
+</ParamField>
+
+<ParamField path="session_id" type="str" required>
+  ID of this call. Used for idempotency keys; use a new one for each call.
+</ParamField>
+
+<ParamField path="user_name" type="str" default="owner">
+  Speaker name stored with the caller's messages.
+</ParamField>
+
+<ParamField path="base_url" type="str" default='"https://app.ormem.app"'>
+  Ormem API base URL.
+</ParamField>
+
+<ParamField path="params" type="OrmemMemoryService.InputParams" default="None">
+  Tuning options, listed below.
+</ParamField>
+
+<ParamField path="session" type="aiohttp.ClientSession" default="None">
+  Optional shared HTTP session.
+</ParamField>
+
+### `InputParams`
+
+| Parameter               | Type          | Default            | Description                                                                 |
+| ----------------------- | ------------- | ------------------ | --------------------------------------------------------------------------- |
+| `recall_timeout`        | `float`       | `1.5`              | Seconds to wait for memories before replying without them.                  |
+| `evidence_budget`       | `int`         | `800`              | Upper bound on memory tokens per turn (500 or more).                        |
+| `store_timeout`         | `float`       | `30.0`             | Seconds allowed for a background save.                                      |
+| `add_as_system_message` | `bool`        | `True`             | Add memories as a `developer` message instead of a `user` message.          |
+| `position`              | `int \| None` | `None`             | Where the memory message goes. `None`: just before the latest user message. |
+| `max_memories`          | `int \| None` | `None`             | Optional cap on memories per turn; matched memories are kept first.         |
+| `conflict_note`         | `str`         | "If two memories…" | Tells the LLM that the more recent memory is the current truth.             |
+| `agent_name`            | `str`         | `"assistant"`      | Speaker name stored with the agent's messages.                              |
+
+## Usage
+
+```python
+import os
+
+from pipecat.pipeline.pipeline import Pipeline
+from ormem_pipecat import OrmemMemoryService
+
+memory = OrmemMemoryService(
+    api_key=os.environ["ORMEM_API_KEY"],
+    owner=caller_phone_number,
+    session_id=call_id,
+    user_name=caller_name,
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        memory,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+Pending saves are finished when the pipeline ends, so the end of a call is not
+lost. A runnable two-call demo is in the repository: `examples/demo.py`.
+
+## Compatibility
+
+Tested with Pipecat v1.17.0. See the repository's changelog for the latest
+tested version.

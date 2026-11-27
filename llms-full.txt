@@ -3577,7 +3577,7 @@ stt = WhisperSTTService(
 
 Text transforms rewrite each transcript before the STT service pushes it. Everything after the service sees only the rewritten text: the context and observers such as the RTVI client transcript. This keeps text such as a card number a caller reads out of the context and the client.
 
-A transform is an async callable that takes the text and its type and returns the rewritten text. A final transcript has the type `TranscriptionType.FINAL` and an interim one `TranscriptionType.INTERIM`. Register a transform for one type, or for both with `"*"`. Transforms run in the order they were added.
+A transform is an async callable that takes the text and its type and returns the rewritten text. A final transcript has the type `TranscriptionType.FINAL` and an interim one `TranscriptionType.INTERIM`. An eager transcript, which services with `enable_eager_end_of_turn=True` push to predict the final one, also has the type `TranscriptionType.FINAL`. Register a transform for one type, or for both with `"*"`. Transforms run in the order they were added.
 
 ```python
 import re
@@ -9187,7 +9187,7 @@ In long-running voice AI conversations, context grows with every exchange. This 
 
 Context summarization automatically triggers when **either** condition is met:
 
-- **Token limit reached**: Context size exceeds `max_context_tokens` (estimated using ~4 characters per token)
+- **Token limit reached**: Context size exceeds `max_context_tokens` (estimated using ~4 characters per token, plus separate estimates for images and audio)
 - **Message count reached**: Number of new messages exceeds `max_unsummarized_messages`
 
 You can disable either threshold by setting it to `None`, but at least one must remain active. Summarization always generates a summary and cannot be reduced to pure truncation.
@@ -14550,7 +14550,7 @@ Every listed call must have happened, and any call not listed fails the metric. 
 
 ## Limits and runs
 
-`max_turns:` caps the persona's turns (default 20), `max_duration_s:` caps the run's wall clock (default 300 seconds), and `max_silence_s:` caps how long neither side does anything (default 30 seconds). An agent that never greets, or stops answering, ends the run as `silence` instead of running out the clock. A reply in progress is never silence: a token or a spoken sentence from either side resets the timer. These limits stop a conversation that never ends. A run they cut short has not succeeded, whatever the transcript says. If the harness's own pipeline fails, for example the persona LLM, the run ends at once as an error.
+`max_turns:` caps the persona's turns (default 20), `max_duration_s:` caps the run's wall clock (default 300 seconds), and `max_silence_s:` caps how long neither side does anything (default 30 seconds). An agent that never greets, or stops answering, ends the run as `silence` instead of running out the clock. A reply in progress is never silence: a token or a spoken sentence from either side resets the timer. Both must be finite positive numbers; `.nan` and `.inf` are rejected when the file loads. These limits stop a conversation that never ends. A run they cut short has not succeeded, whatever the transcript says. If the harness's own pipeline fails, for example the persona LLM, the run ends at once as an error.
 
 `runs:` is how many times a [suite](/pipecat/evals/suites) runs the simulation (default 1), and every run must pass. A persona doesn't say the same thing twice, so one run proves little and three are a real check:
 
@@ -19347,10 +19347,7 @@ response = await httpx.post(
     f"https://api.pipecat.daily.co/v1/public/{agent_id}/start",
     headers={"Authorization": f"Bearer {pipecat_api_key}"},
     json={
-        "createDailyRoom": True,
-        "dailyRoomProperties": {
-            "sip": {"sip_mode": "dial-in", "num_endpoints": 1}
-        },
+        "createDailyRoom": False,  # We already created the room
         "body": {
             "room_url": room_url,
             "token": token,
@@ -24521,17 +24518,21 @@ These events track the connection state of the client and bot. See [Session Life
 
 These events are driven by the bot's VAD (voice activity detection) model. VAD is smarter than tracking raw audio levels — it understands turn-taking, so it can distinguish between a user who has finished speaking and one who has simply paused or is speaking slowly.
 
-| Event                 | Callback                | When it fires                                           |
-| --------------------- | ----------------------- | ------------------------------------------------------- |
-| `UserStartedSpeaking` | `onUserStartedSpeaking` | VAD detected the user started speaking                  |
-| `UserStoppedSpeaking` | `onUserStoppedSpeaking` | VAD detected the user stopped speaking                  |
-| `BotStartedSpeaking`  | `onBotStartedSpeaking`  | Bot started sending audio                               |
-| `BotStoppedSpeaking`  | `onBotStoppedSpeaking`  | Bot stopped sending audio                               |
-| `BotInterrupted`      | `onBotInterrupted`      | Bot's in-flight output was cut off (RTVI 2.0.0+)        |
-| `LocalAudioLevel`     | `onLocalAudioLevel`     | Local audio gain level (0–1); fires continuously        |
-| `RemoteAudioLevel`    | `onRemoteAudioLevel`    | Remote audio gain level (0–1); fires continuously       |
-| `UserMuteStarted`     | `onUserMuteStarted`     | Server started ignoring client audio (server-side mute) |
-| `UserMuteStopped`     | `onUserMuteStopped`     | Server resumed processing client audio                  |
+| Event                    | Callback                   | When it fires                                                                              |
+| ------------------------ | -------------------------- | ------------------------------------------------------------------------------------------ |
+| `UserStartedSpeaking`    | `onUserStartedSpeaking`    | VAD detected the user started speaking                                                     |
+| `UserStoppedSpeaking`    | `onUserStoppedSpeaking`    | VAD detected the user stopped speaking                                                     |
+| `BotStartedSpeaking`     | `onBotStartedSpeaking`     | Bot started sending audio                                                                  |
+| `BotStoppedSpeaking`     | `onBotStoppedSpeaking`     | Bot stopped sending audio                                                                  |
+| `BotInterrupted`         | `onBotInterrupted`         | Bot's in-flight output was cut off (RTVI 2.0.0+)                                           |
+| `VadUserStartedSpeaking` | `onVadUserStartedSpeaking` | Bot's VAD heard the user start, before the turn starts (needs `vad_user_speaking_enabled`) |
+| `VadUserStoppedSpeaking` | `onVadUserStoppedSpeaking` | Bot's VAD heard the user stop, before the turn ends (needs `vad_user_speaking_enabled`)    |
+| `ClientUserAudioLevel`   | `onClientUserAudioLevel`   | Microphone level (0–1) the transport measures; fires continuously                          |
+| `ClientBotAudioLevel`    | `onClientBotAudioLevel`    | Bot audio level (0–1) the transport measures; fires continuously                           |
+| `ServerUserAudioLevel`   | `onServerUserAudioLevel`   | User audio level (0–1) the bot measures (needs `user_audio_level_enabled`)                 |
+| `ServerBotAudioLevel`    | `onServerBotAudioLevel`    | Bot audio level (0–1) the bot measures (needs `bot_audio_level_enabled`)                   |
+| `UserMuteStarted`        | `onUserMuteStarted`        | Server started ignoring client audio (server-side mute)                                    |
+| `UserMuteStopped`        | `onUserMuteStopped`        | Server resumed processing client audio                                                     |
 
 <Tip>
   `UserMuteStarted`/`UserMuteStopped` reflect server-side muting — the client
@@ -25759,13 +25760,13 @@ Set `participantType="bot"` to visualize the bot's audio instead.
 
 <View title="JavaScript" icon="js">
 
-Listen for `LocalAudioLevel` and `RemoteAudioLevel` events, which fire continuously with gain values between 0 and 1, and drive your own visualization:
+Listen for `ClientUserAudioLevel` and `ClientBotAudioLevel` events, which fire continuously with gain values between 0 and 1, and drive your own visualization:
 
 ```ts
 const canvas = document.getElementById("viz") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d")!;
 
-client.on(RTVIEvent.LocalAudioLevel, (level) => {
+client.on(RTVIEvent.ClientUserAudioLevel, (level) => {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = "#3b82f6";
   ctx.fillRect(0, 0, canvas.width * level, canvas.height);
@@ -37423,9 +37424,9 @@ The user speaking over the bot interrupts it, and so does a send-text with `run_
 
 #### user-audio-level
 
-How loud the user's audio is, from 0 (quiet) to 1 (loud), sent regularly while the user's audio comes in. Off by default; turned on by the server's `user_audio_level_enabled` setting.
+How loud the user's audio is, from 0 (quiet) to 1 (loud), as the server's pipeline receives it, sent regularly while the user's audio comes in. Off by default; turned on by the server's `user_audio_level_enabled` setting.
 
-Sent every 0.15 seconds by default, the server's `audio_level_period_secs` setting.
+Sent every 0.15 seconds by default, the server's `audio_level_period_secs` setting. The server measures the level, so it isn't the level a client measures on the device, such as the one its transport reports for the microphone.
 
 <ParamField path="data.value" type="number" required>
   How loud the audio is, from 0 (quiet) to 1 (loud).
@@ -37443,9 +37444,9 @@ Sent every 0.15 seconds by default, the server's `audio_level_period_secs` setti
 
 #### bot-audio-level
 
-How loud the bot's audio is, from 0 (quiet) to 1 (loud), sent regularly while the bot speaks. Off by default; turned on by the server's `bot_audio_level_enabled` setting.
+How loud the bot's audio is, from 0 (quiet) to 1 (loud), as the server's pipeline produces it, sent regularly while the bot speaks. Off by default; turned on by the server's `bot_audio_level_enabled` setting.
 
-Sent every 0.15 seconds by default, the server's `audio_level_period_secs` setting.
+Sent every 0.15 seconds by default, the server's `audio_level_period_secs` setting. The server measures the level, so it isn't the level a client measures on the device, such as the one its transport reports for the audio it plays.
 
 <ParamField path="data.value" type="number" required>
   How loud the audio is, from 0 (quiet) to 1 (loud).
@@ -41038,6 +41039,7 @@ LLMs receive text or audio based input and output a streaming text response.
 | [Google Gemini](/api-reference/server/services/llm/google)                           | `uv add "pipecat-ai[google]"`     | Pipecat    |
 | [Google Gemini Interactions](/api-reference/server/services/llm/google-interactions) | `uv add "pipecat-ai[google]"`     | Pipecat    |
 | [Google Vertex AI](/api-reference/server/services/llm/google-vertex)                 | `uv add "pipecat-ai[google]"`     | Pipecat    |
+| [GMI Cloud](/api-reference/server/services/llm/gmicloud)                             | `uv add pipecat-gmicloud-llm`     | Community  |
 | [Grok](/api-reference/server/services/llm/grok)                                      | `uv add "pipecat-ai[grok]"`       | Pipecat    |
 | [Groq](/api-reference/server/services/llm/groq)                                      | `uv add "pipecat-ai[groq]"`       | Pipecat    |
 | [Inception](/api-reference/server/services/llm/inception)                            | `uv add "pipecat-ai[inception]"`  | Pipecat    |
@@ -41066,8 +41068,10 @@ Memory services can be used to store and retrieve conversations.
 | Service                                                        | Setup                          | Maintainer |
 | -------------------------------------------------------------- | ------------------------------ | ---------- |
 | [mem0](/api-reference/server/services/memory/mem0)             | `uv add "pipecat-ai[mem0]"`    | Pipecat    |
+| [Harny](/api-reference/server/services/memory/harny)           | `uv add pipecat-harny`         | Community  |
 | [Memcode](/api-reference/server/services/memory/memcode)       | `uv add pipecat-memcode`       | Community  |
 | [MemorySync](/api-reference/server/services/memory/memorysync) | `uv add pipecat-memorysync`    | Community  |
+| [Ormem](/api-reference/server/services/memory/ormem)           | `uv add pipecat-ormem`         | Community  |
 | [Synap](/api-reference/server/services/memory/synap)           | `uv add maximem-synap-pipecat` | Community  |
 
 ## Perception
@@ -41139,6 +41143,7 @@ Speech-to-Text services receive and audio input and output transcriptions.
 | [Cartesia](/api-reference/server/services/stt/cartesia)         | `uv add "pipecat-ai[cartesia]"`                                               | Pipecat    |
 | [Chariot](/api-reference/server/services/stt/chariot)           | `uv add pipecat-chariot`                                                      | Community  |
 | [ConvoZen](/api-reference/server/services/stt/convozen)         | `uv add pipecat-convozen`                                                     | Community  |
+| [Deepdub](/api-reference/server/services/stt/deepdub)           | `uv add pipecat-deepdub`                                                      | Community  |
 | [Deepgram](/api-reference/server/services/stt/deepgram)         | `uv add "pipecat-ai[deepgram]"`                                               | Pipecat    |
 | [ElevenLabs](/api-reference/server/services/stt/elevenlabs)     | `uv add "pipecat-ai[elevenlabs]"`                                             | Pipecat    |
 | [Fal Wizper](/api-reference/server/services/stt/fal)            | `uv add "pipecat-ai[fal]"`                                                    | Pipecat    |
@@ -41194,7 +41199,7 @@ For the services and models that perform expression tags, such as laughter or a 
 | [Cartesia](/api-reference/server/services/tts/cartesia)           | `uv add "pipecat-ai[cartesia]"`                                                                 | Pipecat    |
 | [Chariot](/api-reference/server/services/tts/chariot)             | `uv add pipecat-chariot`                                                                        | Community  |
 | [ConvoZen](/api-reference/server/services/tts/convozen)           | `uv add pipecat-convozen`                                                                       | Community  |
-| [Deepdub](/api-reference/server/services/tts/deepdub)             | `uv add pipecat-deepdub-tts`                                                                    | Community  |
+| [Deepdub](/api-reference/server/services/tts/deepdub)             | `uv add pipecat-deepdub`                                                                        | Community  |
 | [Deepgram](/api-reference/server/services/tts/deepgram)           | `uv add "pipecat-ai[deepgram]"`                                                                 | Pipecat    |
 | [ElevenLabs](/api-reference/server/services/tts/elevenlabs)       | `uv add "pipecat-ai[elevenlabs]"`                                                               | Pipecat    |
 | [Fish](/api-reference/server/services/tts/fish)                   | `uv add "pipecat-ai[fish]"`                                                                     | Pipecat    |
@@ -41222,6 +41227,7 @@ For the services and models that perform expression tags, such as laughter or a 
 | [OpenAI](/api-reference/server/services/tts/openai)               | `uv add "pipecat-ai[openai]"`                                                                   | Pipecat    |
 | [Pipecat TTS Cache](/api-reference/server/services/tts/tts-cache) | `uv add pipecat-tts-cache`                                                                      | Community  |
 | [Piper](/api-reference/server/services/tts/piper)                 | `uv add "pipecat-ai[piper]"`                                                                    | Pipecat    |
+| [Plivo](/api-reference/server/services/tts/plivo)                 | `uv add "pipecat-ai[plivo]"`                                                                    | Pipecat    |
 | [Pocket TTS](/api-reference/server/services/tts/pocket-tts)       | `uv add "pipecat-ai[pocket-tts]"`                                                               | Pipecat    |
 | [ReadAloud](/api-reference/server/services/tts/readaloud)         | `uv add pipecat-readaloud`                                                                      | Community  |
 | [ResembleAI](/api-reference/server/services/tts/resembleai)       | `uv add "pipecat-ai[resembleai]"`                                                               | Pipecat    |
@@ -41317,6 +41323,7 @@ Video services enable you to build an avatar where audio and video are synchroni
 | [ChatFX Avatar](/api-reference/server/services/video/chatfx)    | `uv add pipecat-chatfx`       | Community  |
 | [HeyGen](/api-reference/server/services/video/heygen)           | `uv add "pipecat-ai[heygen]"` | Pipecat    |
 | [MeshLite](/api-reference/server/services/video/meshlite)       | `uv add pipecat-meshlite`     | Community  |
+| [Ojin](/api-reference/server/services/video/ojin)               | `uv add pipecat-ojin`         | Community  |
 | [Protoface](/api-reference/server/services/video/protoface)     | `uv add pipecat-protoface`    | Community  |
 | [Simli](/api-reference/server/services/video/simli)             | `uv add "pipecat-ai[simli]"`  | Pipecat    |
 | [SpatialReal](/api-reference/server/services/video/spatialreal) | `uv add pipecat-spatialreal`  | Community  |
@@ -44349,6 +44356,17 @@ All parameters are keyword-only. Parameters marked runtime-wide configure the SI
   `"127.0.0.1"` for a registrar on loopback or one address of a multi-homed
   host. `None` lets the OS pick the source address per destination.
   Runtime-wide.
+</ParamField>
+
+<ParamField path="sip_port" type="int | None" default="None">
+  The local SIP port, from 1 to 65535, for example `5060`. The stack binds it on
+  each interface it uses, so `net_interface` decides the addresses. UDP and TCP
+  listen on this port and TLS on the next one (`5060` gives TLS on `5061`).
+  `None` binds an ephemeral port, which suits a registering connection. Set it
+  for trunk mode (`reg_interval=0`) behind a carrier that routes calls to a
+  fixed `host:port`. Interface discovery skips loopback, so a test with both
+  ends on one machine also needs `net_interface="127.0.0.1"`. A fixed port does
+  not cross NAT, and bots that share a host need distinct ports. Runtime-wide.
 </ParamField>
 
 <ParamField path="expose_headers" type="tuple" default="()">
@@ -50776,7 +50794,7 @@ uv add pipecat-convozen
 
 Before using ConvoZen STT, you need:
 
-1. **ConvoZen Account**: Sign up at [ConvoZen](https://convozen.ai/)
+1. **ConvoZen Account**: Sign up at [ConvoZen](https://app.convozen.ai/auth/signin)
 2. **API Key**: Generate an API key from your [account dashboard](https://app.convozen.ai/developers/models)
 
 ### Required Environment Variables
@@ -50890,6 +50908,167 @@ complete runnable example wiring a transport → STT → LLM → TTS.
 Built and verified against Pipecat v1.12.0. Check the [source
 repository](https://github.com/ConvoZenAI/pipecat-convozen) for the latest tested
 version and changelog.
+
+# Deepdub Speech-to-Text
+Source: https://docs.pipecat.ai/api-reference/server/services/stt/deepdub.md
+
+Real-time English and Hebrew STT with DeepdubSTTService over Deepdub's WebSocket API, with interim results and Finalize on VAD stop.
+
+## Overview
+
+`DeepdubSTTService` provides real-time English and Hebrew speech-to-text through
+[Deepdub](https://deepdub.ai/). It extends Pipecat's `WebsocketSTTService`. Interim
+results are pushed as `InterimTranscriptionFrame` and finals as `TranscriptionFrame`,
+tagged with the language Deepdub detected.
+
+By default, Pipecat's turn strategies decide when the user's turn ends. When a
+`VADUserStoppedSpeakingFrame` arrives, the service asks Deepdub to finalize, and the
+final transcript comes back with `finalized=True`. With
+`vad_force_turn_endpoint=False`, Deepdub's endpoint detection decides instead.
+
+The same package provides [Deepdub text-to-speech](/api-reference/server/services/tts/deepdub).
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/deepdub-ai/pipecat"
+  >
+    Source code, README, changelog and issues
+  </Card>
+  <Card
+    title="Example"
+    icon="play"
+    href="https://github.com/deepdub-ai/pipecat/blob/main/examples/foundational/deepdub-voice-agent.py"
+  >
+    A voice agent that listens and speaks with Deepdub
+  </Card>
+  <Card title="Deepdub API Docs" icon="book" href="https://docs.deepdub.ai">
+    Protocol, parameters, limits and error codes
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-deepdub/"
+  >
+    The `pipecat-deepdub` package on PyPI
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-deepdub
+```
+
+## Prerequisites
+
+### Deepdub Account Setup
+
+Before using the Deepdub STT service, you need:
+
+1. **Deepdub Account**: Sign up at [Deepdub](https://deepdub.ai/)
+2. **API Key**: Obtain your API key from your Deepdub account
+
+### Required Environment Variables
+
+- `DEEPDUB_API_KEY`: Your Deepdub API key
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  Deepdub API key.
+</ParamField>
+
+<ParamField
+  path="url"
+  type="str"
+  default="wss://wsgw.deepdub.ai/transcribe-websocket"
+>
+  Speech-to-text endpoint. Use `wss://wsgw.eu.deepdub.ai/transcribe-websocket`
+  for the EU.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Sample rate of the incoming audio in Hz. If `None`, uses the pipeline's input
+  sample rate.
+</ParamField>
+
+<ParamField path="vad_force_turn_endpoint" type="bool" default="True">
+  When `True`, Pipecat's turn strategies end the user's turn and a VAD stop asks
+  Deepdub to finalize the transcript right away. When `False`, Deepdub's
+  endpoint detection ends the turn.
+</ParamField>
+
+<ParamField path="should_interrupt" type="bool" default="True">
+  Whether the user speaking interrupts the bot, when Deepdub detects turns.
+</ParamField>
+
+<ParamField path="settings" type="DeepdubSTTService.Settings" default="None">
+  Runtime-updatable settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField path="ttfs_p99_latency" type="float" default="0.35">
+  P99 latency from speech end to final transcript, in seconds, used by turn
+  strategies. Measure your own deployment with
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) and pass the
+  result.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using
+`DeepdubSTTService.Settings(...)`. They can be updated mid-conversation with
+`STTUpdateSettingsFrame`; a change reconnects the stream.
+
+| Parameter               | Type                | Default     | Description                                                                         |
+| ----------------------- | ------------------- | ----------- | ----------------------------------------------------------------------------------- |
+| `model`                 | `str`               | `"stt-egf"` | Deepdub STT model.                                                                  |
+| `language`              | `str \| None`       | `None`      | `"en"` or `"he"`. `None` lets Deepdub detect the language of each utterance.        |
+| `language_hints_strict` | `bool \| None`      | `None`      | Recognize only `language`, instead of preferring it.                                |
+| `context_terms`         | `list[str] \| None` | `None`      | Words and names to recognize reliably, such as product names.                       |
+| `context_text`          | `str \| None`       | `None`      | Background text about the conversation.                                             |
+| `max_endpoint_delay_ms` | `int \| None`       | `None`      | Longest wait after speech stops before Deepdub reports an endpoint, 500 to 3000 ms. |
+| `client_reference_id`   | `str \| None`       | `None`      | Your own identifier for the session.                                                |
+
+## Usage
+
+```python
+import os
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_deepdub import DeepdubSTTService
+
+stt = DeepdubSTTService(
+    api_key=os.getenv("DEEPDUB_API_KEY"),
+    settings=DeepdubSTTService.Settings(context_terms=["Deepdub"]),
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+## Notes
+
+- **Audio format**: The service sends 16-bit mono PCM at the pipeline's input rate.
+- **Languages**: English and Hebrew.
+
+## Compatibility
+
+Tested with Pipecat 1.17.0. See the [source
+repository](https://github.com/deepdub-ai/pipecat) for the latest tested version and
+changelog.
 
 # Deepgram Speech-to-Text
 Source: https://docs.pipecat.ai/api-reference/server/services/stt/deepgram.md
@@ -51094,6 +51273,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `profanity_filter` | `bool \| None`    | `None`             | Filter profanity from transcripts. `None` is not sent, so Deepgram's default applies.                                                                                                                                                                                                                             |
 | `punctuate`        | `bool`            | `True`             | Add punctuation to transcripts.                                                                                                                                                                                                                                                                                   |
 | `redact`           | `str \| list`     | `None`             | Redact sensitive information.                                                                                                                                                                                                                                                                                     |
+| `redact_usage`     | `bool \| None`    | `None`             | Store `keyterm`, `keywords`, `replace`, `search`, and `extra` as `[REDACTED]` in Deepgram's usage records. Transcription and the response are unaffected. Requires deepgram-sdk 7.19.0 or later.                                                                                                                  |
 | `replace`          | `str \| list`     | `None`             | Word replacement rules.                                                                                                                                                                                                                                                                                           |
 | `search`           | `str \| list`     | `None`             | Search terms to highlight.                                                                                                                                                                                                                                                                                        |
 | `smart_format`     | `bool`            | `False`            | Apply smart formatting to transcripts.                                                                                                                                                                                                                                                                            |
@@ -51191,28 +51371,29 @@ Transcribes each speech segment with one request to Deepgram's pre-recorded API 
 
 Passed via the `settings` constructor argument using `DeepgramSegmentedSTTService.Settings(...)`. Settings are read for every request, so an update made with `STTUpdateSettingsFrame` applies from the next segment without reconnecting. Each setting is sent as the Deepgram query parameter of the same name, except `diarize` and `speaker_format`; `None` leaves a parameter out. Any other pre-recorded query parameter can be passed through `extra`.
 
-| Parameter          | Type              | Default            | Description                                                                                                                                                  |
-| ------------------ | ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `model`            | `str`             | `"nova-3-general"` | Deepgram model to use. _(Inherited from base STT settings.)_                                                                                                 |
-| `language`         | `Language \| str` | `Language.EN`      | Recognition language. _(Inherited from base STT settings.)_                                                                                                  |
-| `detect_entities`  | `bool`            | `False`            | Enable named entity detection.                                                                                                                               |
-| `detect_language`  | `bool`            | `False`            | Detect the spoken language and transcribe in it, overriding `language`. The detected language is reported on the transcript.                                 |
-| `diarize`          | `bool`            | `False`            | Enable speaker diarization. Each contiguous speaker run is pushed as its own frame, with Deepgram's speaker number (`"0"`, `"1"`, ...) in `speaker.label`.   |
-| `diarize_model`    | `str`             | `"latest"`         | Diarization model that `diarize` turns on: `"latest"` or a version such as `"v2"`. Sent only when `diarize` is `True`.                                       |
-| `dictation`        | `bool`            | `False`            | Enable dictation mode (converts commands to punctuation).                                                                                                    |
-| `filler_words`     | `bool`            | `False`            | Include filler words such as "uh" and "um".                                                                                                                  |
-| `keyterm`          | `str \| list`     | `None`             | Keyterms to boost recognition accuracy.                                                                                                                      |
-| `keywords`         | `str \| list`     | `None`             | Keywords to boost.                                                                                                                                           |
-| `language_hint`    | `str \| list`     | `None`             | BCP-47 language tag, or list of tags, biasing language detection on Nova-3 multilingual. Deepgram ignores it unless `model="nova-3"` and `language="multi"`. |
-| `numerals`         | `bool`            | `False`            | Convert spoken numbers to numerals.                                                                                                                          |
-| `profanity_filter` | `bool \| None`    | `None`             | Filter profanity from transcripts.                                                                                                                           |
-| `punctuate`        | `bool`            | `True`             | Add punctuation to transcripts.                                                                                                                              |
-| `redact`           | `str \| list`     | `None`             | Redact sensitive information.                                                                                                                                |
-| `replace`          | `str \| list`     | `None`             | Word replacement rules.                                                                                                                                      |
-| `search`           | `str \| list`     | `None`             | Search terms to highlight.                                                                                                                                   |
-| `smart_format`     | `bool`            | `False`            | Apply smart formatting to transcripts.                                                                                                                       |
-| `speaker_format`   | `str \| None`     | `None`             | Format string for diarized speaker runs. Use `{speaker}`, `{speaker_number}`, and `{text}`, e.g. `"{speaker}: {text}"`. If `None`, the text is not modified. |
-| `version`          | `str`             | `None`             | Model version to transcribe with. `None` leaves Deepgram on `"latest"`.                                                                                      |
+| Parameter          | Type              | Default            | Description                                                                                                                                                                                |
+| ------------------ | ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`            | `str`             | `"nova-3-general"` | Deepgram model to use. _(Inherited from base STT settings.)_                                                                                                                               |
+| `language`         | `Language \| str` | `Language.EN`      | Recognition language. _(Inherited from base STT settings.)_                                                                                                                                |
+| `detect_entities`  | `bool`            | `False`            | Enable named entity detection.                                                                                                                                                             |
+| `detect_language`  | `bool`            | `False`            | Detect the spoken language and transcribe in it, overriding `language`. The detected language is reported on the transcript.                                                               |
+| `diarize`          | `bool`            | `False`            | Enable speaker diarization. Each contiguous speaker run is pushed as its own frame, with Deepgram's speaker number (`"0"`, `"1"`, ...) in `speaker.label`.                                 |
+| `diarize_model`    | `str`             | `"latest"`         | Diarization model that `diarize` turns on: `"latest"` or a version such as `"v2"`. Sent only when `diarize` is `True`.                                                                     |
+| `dictation`        | `bool`            | `False`            | Enable dictation mode (converts commands to punctuation).                                                                                                                                  |
+| `filler_words`     | `bool`            | `False`            | Include filler words such as "uh" and "um".                                                                                                                                                |
+| `keyterm`          | `str \| list`     | `None`             | Keyterms to boost recognition accuracy.                                                                                                                                                    |
+| `keywords`         | `str \| list`     | `None`             | Keywords to boost.                                                                                                                                                                         |
+| `language_hint`    | `str \| list`     | `None`             | BCP-47 language tag, or list of tags, biasing language detection on Nova-3 multilingual. Deepgram ignores it unless `model="nova-3"` and `language="multi"`.                               |
+| `numerals`         | `bool`            | `False`            | Convert spoken numbers to numerals.                                                                                                                                                        |
+| `profanity_filter` | `bool \| None`    | `None`             | Filter profanity from transcripts.                                                                                                                                                         |
+| `punctuate`        | `bool`            | `True`             | Add punctuation to transcripts.                                                                                                                                                            |
+| `redact`           | `str \| list`     | `None`             | Redact sensitive information.                                                                                                                                                              |
+| `redact_usage`     | `bool \| None`    | `None`             | Store `keyterm`, `keywords`, `replace`, `search`, `extra`, `custom_topic`, and `custom_intent` as `[REDACTED]` in Deepgram's usage records. Transcription and the response are unaffected. |
+| `replace`          | `str \| list`     | `None`             | Word replacement rules.                                                                                                                                                                    |
+| `search`           | `str \| list`     | `None`             | Search terms to highlight.                                                                                                                                                                 |
+| `smart_format`     | `bool`            | `False`            | Apply smart formatting to transcripts.                                                                                                                                                     |
+| `speaker_format`   | `str \| None`     | `None`             | Format string for diarized speaker runs. Use `{speaker}`, `{speaker_number}`, and `{text}`, e.g. `"{speaker}: {text}"`. If `None`, the text is not modified.                               |
+| `version`          | `str`             | `None`             | Model version to transcribe with. `None` leaves Deepgram on `"latest"`.                                                                                                                    |
 
 ### Usage
 
@@ -57214,7 +57395,7 @@ await worker.queue_frame(
 - **VAD analyzer required**: A VAD analyzer is required in either endpointing mode. Under `vad` it times transcription latency; under `manual` it also marks the turn for Sarvam.
 - **In-band configuration updates**: Settings can be updated mid-conversation with `STTUpdateSettingsFrame` without reconnecting. Connection-only values (`sample_rate`, `return_timestamps`, `keyterms`, `prefix_padding_ms`, `endpointing`) cannot be updated at runtime.
 - **Stream types**: `fast` provides lowest latency, `balanced` provides moderate latency with better quality, and `simulated` is for testing. The stream type controls server-side flush cadence; the client always sends audio in 50ms chunks.
-- **Reconnection**: A dropped connection is reopened in the background unless `reconnect_on_error=False`; audio that arrives meanwhile isn't transcribed. An utterance cut short by the drop ends with its latest partial transcript, and speech after the reconnect starts a new one (under `endpointing="manual"`, an open turn is resent as `speech_start`). A setting Sarvam rejects, such as an unknown model or language, raises a permanent error instead of a retry. After three consecutive connections fail to be confirmed with `session.begin`, the service stops reconnecting, so a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) moves to its next service.
+- **Reconnection**: A dropped connection is reopened in the background unless `reconnect_on_error=False`; audio that arrives meanwhile isn't transcribed. An utterance cut short by the drop ends with its latest partial transcript, and speech after the reconnect starts a new one (under `endpointing="manual"`, an open turn is resent as `speech_start`). A setting Sarvam rejects, such as an unknown model or language, and a fatal `error` event for an invalid API key or a model the account can't use, raise a permanent error instead of a retry; a rate limit or exhausted credits is still retried. After three consecutive connections fail to be confirmed with `session.begin`, the service stops reconnecting, so a [`ServiceSwitcher`](/api-reference/server/utilities/service-switchers/service-switcher) moves to its next service.
 
 ### SarvamHttpSTTService
 
@@ -57885,6 +58066,7 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
 | `enable_agent_text_input`           | `bool`                       | `True`        | Send each completed bot reply to Soniox as agent text, so words the bot said are recognized when the user repeats them. Only takes effect on `stt-rt-v6` and later models. Agent text is billed as input text tokens.                                                                                                                                                                    |
 | `enable_echo_cancellation`          | `bool`                       | `False`       | Send the bot's reply to Soniox word by word while it plays, so Soniox lines the words up with the audio and doesn't transcribe the bot's own voice as the user. Implies `enable_agent_text_input`, replacing the per-reply send. Needs a TTS service that reports word timestamps, such as `SonioxTTSService`; without them the text is sent untimed and echo cancellation doesn't work. |
 | `agent_text_lead_ms`                | `int`                        | `700`         | How far ahead of playback each word is sent, in milliseconds. Soniox documents 500-1000; `0` sends each word as it starts playing. Cannot be negative. Only used with `enable_echo_cancellation`.                                                                                                                                                                                        |
+| `enable_reconnect`                  | `bool`                       | `False`       | Reconnect a dropped connection to the same Soniox stream, so no audio or transcript is lost around the drop. Soniox bills the up to 20 s a dropped stream waits for the reconnect.                                                                                                                                                                                                       |
 
 ## Usage
 
@@ -61844,6 +62026,168 @@ llm = GoogleVertexLLMService(
 - Authentication supports three methods: direct JSON credentials string, path to a service account key file, or Application Default Credentials (ADC). The constructor raises `ValueError` when none of them yields credentials.
 - The `project_id` parameter is required. The default `location` is `"global"`, which serves the Gemini 3 series. Regional endpoints (e.g., `"us-east4"`, `"us-central1"`) serve the Gemini 2.5 series. To use Gemini 2.5 models, explicitly pass `location="us-east4"` or another regional endpoint.
 - The default model is `gemini-3.8-flash`, with a default thinking level of `low`. To use a Gemini 2.5 model, pass `settings=GoogleVertexLLMService.Settings(model="gemini-2.5-flash")` and `location="us-east4"`.
+
+# GMI Cloud LLM
+Source: https://docs.pipecat.ai/api-reference/server/services/llm/gmicloud.md
+
+GmicloudLLMService runs any GMI Cloud text model in Pipecat pipelines through GMI Cloud's OpenAI-compatible inference API, with reasoning surfaced as thought frames.
+
+## Overview
+
+`GmicloudLLMService` runs any text model in [GMI Cloud](https://www.gmicloud.ai)'s
+catalog, GLM, DeepSeek, Gemini, Qwen and more, behind GMI Cloud's
+OpenAI-compatible chat completions endpoint. It extends Pipecat's
+`OpenAILLMService`, so it supports streaming responses and function calling.
+
+The default model, `zai-org/GLM-5.3-Flash`, reasons before it answers, and its
+reasoning tokens count against the completion budget. The service therefore
+defaults `max_completion_tokens` to 1000 and surfaces the model's reasoning as
+Pipecat thought frames (`LLMThoughtStartFrame` / `LLMThoughtTextFrame` /
+`LLMThoughtEndFrame`) instead of silently dropping it.
+
+The full model list is in
+[MODELS.md](https://github.com/Jayanng/pipecat-gmicloud-llm/blob/Master/MODELS.md)
+in the source repository. It is a snapshot from 2026-11-26, 71 models, and the
+catalog changes, so check the live list before relying on a specific model id.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/Jayanng/pipecat-gmicloud-llm"
+  >
+    Source code, examples, and issues for the GMI Cloud integration
+  </Card>
+
+<Card
+  title="PyPI Package"
+  icon="cube"
+  href="https://pypi.org/project/pipecat-gmicloud-llm/"
+>
+  The `pipecat-gmicloud-llm` package on PyPI
+</Card>
+
+<Card
+  title="GMI Cloud Console"
+  icon="gauge"
+  href="https://console.gmicloud.ai/"
+>
+  Create an API key and browse GMI Cloud's text models
+</Card>
+
+  <Card
+    title="Demo Video"
+    icon="circle-play"
+    href="https://github.com/Jayanng/pipecat-gmicloud-llm/blob/Master/assets/demo.mp4"
+  >
+    Screen recording: live pipeline run, thought frames, and a tool call
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-gmicloud-llm
+```
+
+## Prerequisites
+
+### GMI Cloud Account Setup
+
+1. **GMI Cloud account**: sign up at [GMI Cloud](https://www.gmicloud.ai/)
+2. **API key**: create a key in the [GMI Cloud console](https://console.gmicloud.ai/)
+
+### Required Environment Variables
+
+- `GMI_CLOUD_API_KEY`: your GMI Cloud API key, passed to the `api_key` constructor argument.
+
+## Configuration
+
+<ParamField path="api_key" type="str" required>
+  GMI Cloud API key for authentication.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.gmi-serving.com/v1">
+  GMI Cloud OpenAI-compatible base URL.
+</ParamField>
+
+<ParamField path="model" type="str" default="zai-org/GLM-5.3-Flash">
+  Model identifier to use. Any model id from GMI Cloud's `/v1/models` list.
+  Prefer setting it through `settings` instead of this direct argument.
+</ParamField>
+
+<ParamField path="settings" type="GmicloudLLMService.Settings" default="None">
+  Runtime-configurable settings. See [Settings](#settings) below.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument
+using `GmicloudLLMService.Settings(...)`.
+
+| Setting                 | Default                   | Description                                                          |
+| ----------------------- | ------------------------- | -------------------------------------------------------------------- |
+| `model`                 | `"zai-org/GLM-5.3-Flash"` | Any GMI Cloud text model id.                                         |
+| `temperature`           | model default             | Sampling temperature.                                                |
+| `top_p`                 | model default             | Nucleus sampling probability.                                        |
+| `max_tokens`            | unset                     | Maximum tokens. Dropped when `max_completion_tokens` is set.         |
+| `max_completion_tokens` | `1000`                    | Maximum completion tokens, including reasoning tokens.               |
+| `emit_thought_frames`   | `True`                    | Emit reasoning as Pipecat thought frames. Set to `False` to drop it. |
+
+<Note>
+  GMI's support for the `developer` message role and for strict JSON-schema
+  responses has not been verified, so the service converts `developer` messages
+  to `user` messages and does not advertise response-schema support. See the
+  [source repository](https://github.com/Jayanng/pipecat-gmicloud-llm) for the
+  full list of what is and is not verified.
+</Note>
+
+## Usage
+
+```python
+import os
+
+from pipecat_gmicloud_llm import GmicloudLLMService
+
+llm = GmicloudLLMService(
+    api_key=os.getenv("GMI_CLOUD_API_KEY"),
+    settings=GmicloudLLMService.Settings(
+        model="zai-org/GLM-5.3-Flash",
+    ),
+)
+
+# Drop into any Pipecat pipeline:
+# Pipeline([llm, transport.output()])
+```
+
+See
+[`examples/ask-one-question-gmicloud.py`](https://github.com/Jayanng/pipecat-gmicloud-llm/blob/Master/examples/ask-one-question-gmicloud.py)
+in the source repository for the full working version, which prints the
+streamed reply and the thought frames. In a voice agent, put the service in
+the pipeline next to your STT and TTS services.
+
+Switching models is one setting:
+
+```python
+settings=GmicloudLLMService.Settings(
+    model="deepseek-ai/deepseek-v4.1-flash-1017",
+)
+```
+
+Function calling works through Pipecat's OpenAI adapter. Register tools in the
+`LLMContext` as `FunctionSchema` objects with handlers, or with
+`llm.register_function(...)`, exactly as with any OpenAI-compatible Pipecat LLM
+service. See the [source
+repository](https://github.com/Jayanng/pipecat-gmicloud-llm) for a complete
+function calling example.
+
+## Compatibility
+
+Tested with Pipecat v1.17.0 (`pipecat-ai`). Check the [source
+repository](https://github.com/Jayanng/pipecat-gmicloud-llm) for the latest tested
+version and changelog.
 
 # Grok LLM
 Source: https://docs.pipecat.ai/api-reference/server/services/llm/grok.md
@@ -66801,7 +67145,7 @@ uv add pipecat-convozen
 
 Before using ConvoZen TTS, you need:
 
-1. **ConvoZen Account**: Sign up at [ConvoZen](https://convozen.ai/)
+1. **ConvoZen Account**: Sign up at [ConvoZen](https://app.convozen.ai/auth/signin)
 2. **API Key**: Generate an API key from your [account dashboard](https://app.convozen.ai/developers/models)
 
 ### Required Environment Variables
@@ -66908,14 +67252,20 @@ version and changelog.
 # Deepdub Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/deepdub.md
 
-DeepdubTTSService streams real-time TTS over Deepdub AI's WebSocket API, extending InterruptibleTTSService for interruption handling.
+DeepdubTTSService streams LLM tokens to Deepdub's emotional TTS and audio back over one WebSocket, canceling interrupted replies in place.
 
 ## Overview
 
-`DeepdubTTSService` generates speech from text using [Deepdub AI](https://deepdub.ai/)'s
-real-time streaming WebSocket API. It extends Pipecat's `InterruptibleTTSService`
-and pushes `TTSAudioRawFrame` audio into the pipeline, with support for multiple
-models (`dd-etts-2.5`, `dd-etts-3.0`), voice customization, and accent control.
+`DeepdubTTSService` generates speech with [Deepdub](https://deepdub.ai/)'s emotional
+TTS. It extends Pipecat's `WebsocketTTSService`: LLM tokens stream to Deepdub as they
+arrive, and audio streams back over the same connection as `TTSAudioRawFrame`s.
+
+An interruption cancels the reply on the open connection instead of reconnecting, and
+audio from the canceled reply is dropped. A reply that starts while another is still
+speaking, such as a `TTSSpeakFrame`, waits for it to finish. Voice, locale and model
+changes apply to the open connection from the next text.
+
+The same package provides [Deepdub speech-to-text](/api-reference/server/services/stt/deepdub).
 
 <CardGroup cols={2}>
   <Card
@@ -66923,17 +67273,24 @@ models (`dd-etts-2.5`, `dd-etts-3.0`), voice customization, and accent control.
     icon="github"
     href="https://github.com/deepdub-ai/pipecat"
   >
-    Source code, examples, and issues for the Deepdub TTS integration
+    Source code, README, changelog and issues
+  </Card>
+  <Card
+    title="Example"
+    icon="play"
+    href="https://github.com/deepdub-ai/pipecat/blob/main/examples/foundational/deepdub-voice-agent.py"
+  >
+    A voice agent that listens and speaks with Deepdub
+  </Card>
+  <Card title="Deepdub API Docs" icon="book" href="https://docs.deepdub.ai">
+    Streaming protocol, voices, locales and limits
   </Card>
   <Card
     title="PyPI Package"
     icon="cube"
-    href="https://pypi.org/project/pipecat-deepdub-tts/"
+    href="https://pypi.org/project/pipecat-deepdub/"
   >
-    The `pipecat-deepdub-tts` package on PyPI
-  </Card>
-  <Card title="Deepdub AI" icon="book" href="https://deepdub.ai/">
-    Learn more about Deepdub AI and sign up for an API key
+    The `pipecat-deepdub` package on PyPI
   </Card>
 </CardGroup>
 
@@ -66942,7 +67299,7 @@ models (`dd-etts-2.5`, `dd-etts-3.0`), voice customization, and accent control.
 This is a community-maintained package distributed separately from `pipecat-ai`:
 
 ```bash
-uv add pipecat-deepdub-tts
+uv add pipecat-deepdub
 ```
 
 ## Prerequisites
@@ -66951,99 +67308,108 @@ uv add pipecat-deepdub-tts
 
 Before using the Deepdub TTS service, you need:
 
-1. **Deepdub Account**: Sign up at [Deepdub AI](https://deepdub.ai/)
+1. **Deepdub Account**: Sign up at [Deepdub](https://deepdub.ai/)
 2. **API Key**: Obtain your API key from your Deepdub account
-3. **Voice Prompt ID**: A voice prompt ID to use for synthesis
 
 ### Required Environment Variables
 
-- `DEEPDUB_API_KEY`: Your Deepdub API key for authentication
-- `DEEPDUB_VOICE_ID`: The voice prompt ID used for synthesis
+- `DEEPDUB_API_KEY`: Your Deepdub API key
 
 ## Configuration
 
 <ParamField path="api_key" type="str" required>
-  Deepdub API key for authentication.
+  Deepdub API key.
 </ParamField>
 
-<ParamField path="voice_id" type="str" required>
-  Voice prompt ID to use for synthesis.
+<ParamField path="url" type="str" default="wss://wss.deepdub.ai/ws">
+  Streaming endpoint. Use `wss://wss.eu.deepdub.ai/ws` to process data in the
+  EU.
 </ParamField>
 
-<ParamField path="model" type="str" default="dd-etts-2.5">
-  TTS model name (e.g. `"dd-etts-2.5"`, `"dd-etts-3.0"`).
+<ParamField path="sample_rate" type="int" default="None">
+  Output sample rate in Hz. If `None`, uses the pipeline's output rate. Deepdub
+  streams 8000, 16000, 22050, 24000, 32000, 36000, 44100 or 48000 Hz; other
+  rates are resampled from the next one up.
 </ParamField>
 
-<ParamField path="sample_rate" type="int" default="16000">
-  Audio sample rate in Hz. Valid values: `8000`, `16000`, `22050`, `24000`,
-  `44100`, `48000`.
+<ParamField path="enable_logging" type="bool" default="None">
+  Set to `False` to keep this session's text out of Deepdub's server-side logs.
+  `None` leaves Deepdub's default (on).
 </ParamField>
 
-<ParamField path="params" type="DeepdubTTSService.InputParams" default="None">
-  Optional voice customization parameters. See [InputParams](#inputparams)
-  below.
+<ParamField path="turn_timeout" type="float" default="10.0">
+  Seconds to wait for audio after a reply is complete before reporting an error.
 </ParamField>
 
-### InputParams
+<ParamField path="settings" type="DeepdubTTSService.Settings" default="None">
+  Runtime-updatable settings. See [Settings](#settings) below.
+</ParamField>
 
-Optional voice customization passed via the `params` constructor argument using
-`DeepdubTTSService.InputParams(...)`.
+### Settings
 
-| Parameter            | Type    | Default   | Description                                                                |
-| -------------------- | ------- | --------- | -------------------------------------------------------------------------- |
-| `locale`             | `str`   | `"en-US"` | Language locale for synthesis.                                             |
-| `temperature`        | `float` | `None`    | Controls output variability.                                               |
-| `variance`           | `float` | `None`    | Controls variance in generated speech.                                     |
-| `tempo`              | `float` | `None`    | Speech tempo multiplier.                                                   |
-| `prompt_boost`       | `bool`  | `None`    | Enable prompt boosting for improved quality.                               |
-| `accent_base_locale` | `str`   | `None`    | Base locale for accent control. All three accent params required together. |
-| `accent_locale`      | `str`   | `None`    | Target accent locale.                                                      |
-| `accent_ratio`       | `float` | `None`    | Accent blending ratio (0.0 to 1.0).                                        |
+Runtime-configurable settings passed via the `settings` constructor argument using
+`DeepdubTTSService.Settings(...)`. They can be updated mid-conversation with
+`TTSUpdateSettingsFrame`, without reconnecting.
 
-<Note>
-  Available parameters and defaults are defined by the integration. See the
-  [source repository](https://github.com/deepdub-ai/pipecat) for the
-  authoritative, up-to-date list.
-</Note>
+| Parameter       | Type           | Default                                  | Description                                                                       |
+| --------------- | -------------- | ---------------------------------------- | --------------------------------------------------------------------------------- |
+| `model`         | `str`          | `"dd-etts-4.0"`                          | Deepdub TTS model.                                                                |
+| `voice`         | `str`          | `"b2abb241-ac92-48bf-a890-fec03f43e209"` | Voice prompt ID.                                                                  |
+| `language`      | `str`          | `"en-US"`                                | Locale to speak, such as `"he-IL"`. A Pipecat `Language` works too.               |
+| `target_gender` | `str \| None`  | `None`                                   | `"male"` or `"female"`, for language-specific handling such as Hebrew diacritics. |
+| `accept_emojis` | `bool \| None` | `None`                                   | Whether flag and emotion emojis switch locale or emotion instead of being spoken. |
 
 ## Usage
 
 ```python
 import os
-from pipecat_deepdub_tts import DeepdubTTSService
+
+from pipecat_deepdub import DeepdubTTSService
 
 tts = DeepdubTTSService(
     api_key=os.getenv("DEEPDUB_API_KEY"),
-    voice_id=os.getenv("DEEPDUB_VOICE_ID"),
-    model="dd-etts-2.5",
-    sample_rate=24000,
-    params=DeepdubTTSService.InputParams(
-        locale="en-US",
-        temperature=0.7,
-        tempo=1.1,
-        prompt_boost=True,
+    settings=DeepdubTTSService.Settings(
+        voice="b2abb241-ac92-48bf-a890-fec03f43e209",
+        language="en-US",
     ),
 )
-
-# ... add tts to your pipeline, e.g. Pipeline([llm, tts, ...])
 ```
+
+### Switching Language Mid-Conversation
+
+```python
+from pipecat.frames.frames import TTSUpdateSettingsFrame
+
+await worker.queue_frame(
+    TTSUpdateSettingsFrame(delta=DeepdubTTSService.Settings(language="he-IL"))
+)
+```
+
+## Notes
+
+- **Audio format**: Deepdub streams 16-bit mono PCM.
+- **Migrating from `pipecat-deepdub-tts`**: Install `pipecat-deepdub` and import from
+  `pipecat_deepdub`. `voice_id`, `model` and `params` became `settings`. The
+  `temperature`, `variance`, `tempo`, `prompt_boost` and accent options are gone,
+  because Deepdub's streaming endpoint ignores them.
 
 ## Compatibility
 
-Tested with Pipecat v0.0.97. Check the [source
-repository](https://github.com/deepdub-ai/pipecat) for the latest tested version
-and changelog.
+Tested with Pipecat 1.17.0. See the [source
+repository](https://github.com/deepdub-ai/pipecat) for the latest tested version and
+changelog.
 
 # Deepgram Text-to-Speech
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/deepgram.md
 
-Aura and Flux TTS with DeepgramTTSService, DeepgramHttpTTSService, DeepgramFluxTTSService, and SageMaker variants for hosted inference.
+Aura and Flux TTS with DeepgramTTSService, DeepgramHttpTTSService, DeepgramFluxTTSService, DeepgramFluxHttpTTSService, and SageMaker variants.
 
 ## Overview
 
-Deepgram provides five TTS service implementations:
+Deepgram provides six TTS service implementations:
 
 - `DeepgramFluxTTSService` for real-time synthesis using Deepgram's Flux WebSocket API, a streaming-first service designed for voice agents with token-level streaming and cross-turn prosody state
+- `DeepgramFluxHttpTTSService` for batch synthesis using Deepgram's Flux HTTP API, including voices for languages that only have Flux voices, such as Hindi
 - `DeepgramFluxSageMakerTTSService` for real-time Flux synthesis using Deepgram Flux TTS models deployed on AWS SageMaker endpoints via HTTP/2 bidirectional streaming
 - `DeepgramTTSService` for real-time streaming synthesis using Deepgram's Aura WebSocket API with support for interruptions and ultra-low latency
 - `DeepgramHttpTTSService` for batch synthesis using Deepgram's Aura HTTP API
@@ -67145,7 +67511,7 @@ Before using `DeepgramSageMakerTTSService` or `DeepgramFluxSageMakerTTSService`,
 
 ### Flux Setup
 
-Before using `DeepgramFluxTTSService`, you need:
+Before using `DeepgramFluxTTSService` or `DeepgramFluxHttpTTSService`, you need:
 
 1. **Deepgram Account**: Sign up at [Deepgram Console](https://console.deepgram.com/)
 2. **API Key**: Generate an API key with Flux TTS access
@@ -67216,6 +67582,58 @@ Runtime-configurable settings passed via the `settings` constructor argument usi
   tracking. Deepgram's Flux API uses the voice identifier as its model
   parameter.
 </Note>
+
+### DeepgramFluxHttpTTSService
+
+<ParamField path="api_key" type="str" required>
+  Deepgram API key for authentication.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession" required>
+  An aiohttp session for HTTP requests. You must create and manage this
+  yourself.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.deepgram.com">
+  HTTP API base URL.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Audio sample rate in Hz. When `None`, uses the pipeline's configured sample
+  rate. Must be one of: 8000, 16000, 24000, 32000, 44100, 48000.
+</ParamField>
+
+<ParamField path="mip_opt_out" type="bool | None" default="None">
+  Opt out of the Deepgram Model Improvement Program (MIP). See the [MIP
+  Guide](https://developers.deepgram.com/docs/the-deepgram-model-improvement-partnership-program)
+  for pricing impacts before setting to `True`.
+</ParamField>
+
+<ParamField path="tag" type="list[str] | None" default="None">
+  Tags to label requests for identification during usage reporting.
+</ParamField>
+
+<ParamField
+  path="settings"
+  type="DeepgramFluxHttpTTSService.Settings"
+  default="None"
+>
+  Runtime-configurable settings. See [DeepgramFluxHttpTTSService
+  Settings](#deepgramfluxhttpttsservice-settings) below.
+</ParamField>
+
+#### DeepgramFluxHttpTTSService Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `DeepgramFluxHttpTTSService.Settings(...)`. These can be updated mid-conversation with `TTSUpdateSettingsFrame` and take effect on the next request. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter          | Type                               | Default             | Description                                                                                                    |
+| ------------------ | ---------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `voice`            | `str`                              | `flux-heather-en`   | Flux voice identifier (e.g., `flux-heather-en`, `flux-anjali-hi`).                                             |
+| `speed`            | `float \| None`                    | `None`              | Speech-rate multiplier, from 0.5 to 1.5 in steps of 0.05. `None` leaves Flux at its default rate.              |
+| `expressivity`     | `Literal[-2, -1, 0, 1, 2] \| None` | `None`              | Expressive range on a calm-to-animated axis. `None` leaves Flux at its default range.                          |
+| `normalize_volume` | `bool \| None`                     | `None`              | Whether Flux levels the loudness of the generated speech. `None` leaves Flux at its default, which normalizes. |
+| `model`            | `str`                              | _(synced to voice)_ | Model identifier. Automatically set to match `voice`. _(Inherited.)_                                           |
+| `language`         | `Language \| str`                  | `None`              | Language used to split text into sentences; not sent to Deepgram. _(Inherited.)_                               |
 
 ### DeepgramFluxSageMakerTTSService
 
@@ -67475,6 +67893,23 @@ tts = DeepgramFluxTTSService(
 )
 ```
 
+### Flux HTTP Service
+
+```python
+import aiohttp
+
+from pipecat.services.deepgram.flux.tts import DeepgramFluxHttpTTSService
+
+async with aiohttp.ClientSession() as session:
+    tts = DeepgramFluxHttpTTSService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        aiohttp_session=session,
+        settings=DeepgramFluxHttpTTSService.Settings(
+            voice="flux-anjali-hi",
+        ),
+    )
+```
+
 ### Flux SageMaker Service
 
 ```python
@@ -67522,7 +67957,7 @@ tts = DeepgramSageMakerTTSService(
 
 ## Notes
 
-- **Choosing a service**: The Aura WebSocket service (`DeepgramTTSService`) and Aura SageMaker service (`DeepgramSageMakerTTSService`) both support real-time streaming with interruption handling, making them suitable for interactive conversations. The HTTP service (`DeepgramHttpTTSService`) is simpler but processes each request as a batch. The Flux services (`DeepgramFluxTTSService` and `DeepgramFluxSageMakerTTSService`) are streaming-first options built for voice agents, with token-level streaming and cross-turn prosody state.
+- **Choosing a service**: The Aura WebSocket service (`DeepgramTTSService`) and Aura SageMaker service (`DeepgramSageMakerTTSService`) both support real-time streaming with interruption handling, making them suitable for interactive conversations. The HTTP service (`DeepgramHttpTTSService`) is simpler but processes each request as a batch. The Flux services (`DeepgramFluxTTSService` and `DeepgramFluxSageMakerTTSService`) are streaming-first options built for voice agents, with token-level streaming and cross-turn prosody state. `DeepgramFluxHttpTTSService` synthesizes each request as a batch with no cross-turn prosody state, so use it where a streaming service doesn't fit.
 - **Encoding validation**: The WebSocket service validates the `encoding` parameter at initialization and raises a `ValueError` for unsupported formats.
 - **SageMaker deployment**: The SageMaker services (`DeepgramSageMakerTTSService` and `DeepgramFluxSageMakerTTSService`) require a Deepgram TTS model deployed to an AWS SageMaker endpoint. See the [Deepgram SageMaker deployment guide](https://developers.deepgram.com/docs/deploy-amazon-sagemaker) for setup instructions.
 - **Refused connections**: When Deepgram refuses the WebSocket connection (an out-of-range setting, a bad API key), the `ErrorFrame` and the `on_connection_error` event carry Deepgram's reason, such as `Deepgram refused the connection (HTTP 400): 'speed' must be within documented range.` `DeepgramTTSService` and `DeepgramFluxTTSService` are then unusable, so a configured failover can take over. A rate limit (429) or server error (5xx) is retried.
@@ -72560,6 +72995,208 @@ async with aiohttp.ClientSession() as session:
 - **Port 5000 on macOS**: The Piper HTTP server listens on port 5000 by default, which macOS also uses for AirPlay Receiver, so requests to `localhost:5000` reach AirPlay, which answers `403 Forbidden`. On a Mac, start the server with another port (for example, `--port 5055`) and use that port in `base_url`, or turn off AirPlay Receiver in System Settings.
 - **No API key required**: Piper is open-source and runs locally, so no API credentials are needed.
 - **GPL-3.0 license**: Both services import the `piper-tts` package (the `piper` extra), which is GPL-3.0 licensed, and `PiperTTSService` runs it in-process. Distributing an application that includes it may subject the application to the GPL's source-disclosure terms.
+
+# Plivo Text-to-Speech
+Source: https://docs.pipecat.ai/api-reference/server/services/tts/plivo.md
+
+TTS with PlivoTTSService (Realtime API over WebSocket, with word timestamps) and PlivoHttpTTSService (Batch API) using Plivo's Koyal model.
+
+## Overview
+
+Plivo provides text-to-speech with [Koyal](https://www.plivo.com/docs/models/text-to-speech/overview), its TTS model, through two service implementations: `PlivoTTSService` streams over Plivo's Realtime API on one WebSocket, with one context per turn and word timestamps, and `PlivoHttpTTSService` sends one Batch API request per sentence. `PlivoTTSService` is recommended for interactive applications requiring low latency.
+
+<CardGroup cols={2}>
+  <Card
+    title="Plivo TTS API Reference"
+    icon="code"
+    href="https://reference-server.pipecat.ai/en/latest/api/pipecat.services.plivo.tts.html"
+  >
+    Pipecat's API methods for Plivo TTS integration
+  </Card>
+  <Card
+    title="Example Implementation"
+    icon="play"
+    href="https://github.com/pipecat-ai/pipecat/blob/main/examples/voice/voice-plivo.py"
+  >
+    Complete example with WebSocket streaming
+  </Card>
+  <Card
+    title="Plivo Documentation"
+    icon="book"
+    href="https://www.plivo.com/docs/models/text-to-speech/overview"
+  >
+    Official Plivo text-to-speech documentation
+  </Card>
+</CardGroup>
+
+## Installation
+
+```bash
+uv add "pipecat-ai[plivo]"
+```
+
+## Prerequisites
+
+### Plivo Account Setup
+
+Before using Plivo TTS services, you need:
+
+1. **Plivo Account**: Sign up at [Plivo](https://www.plivo.com/)
+2. **Auth ID and Auth Token**: Get them from your Plivo console
+3. **Voice Selection** (optional): Choose a voice ID for the Koyal model. If you don't, the service uses the default voice, Hailey (US English)
+
+### Required Environment Variables
+
+- `PLIVO_AUTH_ID`: Your Plivo auth ID
+- `PLIVO_AUTH_TOKEN`: Your Plivo auth token
+
+## Configuration
+
+### PlivoTTSService
+
+<ParamField path="auth_id" type="str" required>
+  Plivo auth ID.
+</ParamField>
+
+<ParamField path="auth_token" type="str" required>
+  Plivo auth token.
+</ParamField>
+
+<ParamField path="url" type="str" default="wss://api.plivo.com">
+  Base URL of the Realtime API.
+</ParamField>
+
+<ParamField path="client_ref" type="str" default="None">
+  Label of 1 to 64 letters, digits, `_` or `-`. The API ID of each request
+  starts with it.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Output audio sample rate in Hz: 8000, 16000, 22050, 24000, 32000, 44100 or
+  48000. If `None`, uses the pipeline default.
+</ParamField>
+
+<ParamField path="settings" type="PlivoTTSService.Settings" default="None">
+  Runtime-configurable settings. See [Settings](#settings) below.
+</ParamField>
+
+<ParamField
+  path="text_aggregation_mode"
+  type="TextAggregationMode"
+  default="TextAggregationMode.TOKEN"
+>
+  How incoming text is aggregated before synthesis. `TOKEN` sends the text as it
+  arrives and the model cuts the sentences. `SENTENCE` has Pipecat cut them, and
+  the model speaks each one as it arrives. Import from
+  `pipecat.services.tts_service`.
+</ParamField>
+
+### PlivoHttpTTSService
+
+<ParamField path="auth_id" type="str" required>
+  Plivo auth ID.
+</ParamField>
+
+<ParamField path="auth_token" type="str" required>
+  Plivo auth token.
+</ParamField>
+
+<ParamField path="aiohttp_session" type="aiohttp.ClientSession" required>
+  An aiohttp session for HTTP requests. Its timeout applies to each request.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="https://api.plivo.com">
+  Base URL of the Batch API.
+</ParamField>
+
+<ParamField path="client_ref" type="str" default="None">
+  Label of 1 to 64 letters, digits, `_` or `-`. The API ID of each request
+  starts with it.
+</ParamField>
+
+<ParamField path="sample_rate" type="int" default="None">
+  Output audio sample rate in Hz: 8000, 16000, 22050, 24000, 32000, 44100 or
+  48000. If `None`, uses the pipeline default.
+</ParamField>
+
+<ParamField path="settings" type="PlivoHttpTTSService.Settings" default="None">
+  Runtime-configurable settings. See [Settings](#settings) below.
+</ParamField>
+
+### Settings
+
+Runtime-configurable settings passed via the `settings` constructor argument using `PlivoTTSService.Settings(...)` (or `PlivoHttpTTSService.Settings(...)`). These can be updated mid-conversation with `TTSUpdateSettingsFrame`. See [Service Settings](/pipecat/fundamentals/service-settings) for details.
+
+| Parameter                     | Type              | Default                  | Description                                                                                                                                                                                               |
+| ----------------------------- | ----------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                       | `str`             | `None`                   | TTS model. When unset, uses `"koyal-v1"`. _(Inherited.)_                                                                                                                                                  |
+| `voice`                       | `str`             | `"lC7qzMoRE7SSjaNCVeff"` | Voice ID. Defaults to Hailey, a US English voice. _(Inherited.)_                                                                                                                                          |
+| `language`                    | `Language \| str` | `None`                   | Language of the text. For English, the region (`EN_IN`, `EN_US`, `EN_GB` or `EN_AU`) sets how numbers and dates are normalized. When unset, the model finds the language of each sentence. _(Inherited.)_ |
+| `speed`                       | `float`           | `None`                   | Speaking rate, from 0.7 to 1.2. Plivo's default is `1.0`.                                                                                                                                                 |
+| `volume`                      | `float`           | `None`                   | Volume of the speech, from 0.5 to 2.0. Plivo's default is `1.0`.                                                                                                                                          |
+| `pronunciation_dictionary_id` | `str`             | `None`                   | ID of a pronunciation dictionary whose rules set the pronunciation of a word in IPA, ARPAbet or as a respelling.                                                                                          |
+| `seed`                        | `int`             | `None`                   | Seed of the speech, from 0 to 2\*\*53 - 1. Defaults to the voice's default seed.                                                                                                                          |
+| `continuation`                | `bool`            | `None`                   | Whether the speech of a context continues from the previous context's. Realtime API only. Plivo's default is `True`.                                                                                      |
+| `text_normalization`          | `bool`            | `None`                   | Whether the model spells out numbers, dates and similar text before speech. Plivo's default is `True`.                                                                                                    |
+
+With `PlivoTTSService`, a new model, voice or language during a turn applies to the rest of the turn, and any other setting applies from the next context. With `PlivoHttpTTSService`, an update applies from the next request.
+
+## Usage
+
+### Basic Setup
+
+```python
+import os
+
+from pipecat.services.plivo.tts import PlivoTTSService
+
+tts = PlivoTTSService(
+    auth_id=os.environ["PLIVO_AUTH_ID"],
+    auth_token=os.environ["PLIVO_AUTH_TOKEN"],
+    settings=PlivoTTSService.Settings(
+        voice="lC7qzMoRE7SSjaNCVeff",
+    ),
+)
+```
+
+### HTTP Service
+
+```python
+import aiohttp
+
+from pipecat.services.plivo.tts import PlivoHttpTTSService
+
+async with aiohttp.ClientSession() as session:
+    tts = PlivoHttpTTSService(
+        auth_id=os.environ["PLIVO_AUTH_ID"],
+        auth_token=os.environ["PLIVO_AUTH_TOKEN"],
+        aiohttp_session=session,
+        settings=PlivoHttpTTSService.Settings(
+            voice="lC7qzMoRE7SSjaNCVeff",
+        ),
+    )
+```
+
+## Notes
+
+- **Word timestamps**: `PlivoTTSService` builds its text frames from the per-character timestamps the Realtime API returns, so word tracking follows the audio.
+- **Pronunciations**: Phoneme spans between braces, such as `{ˈpliːvoʊ}`, take IPA or ARPAbet. Pipecat renders them for pronunciation rules. Alternatively, apply `text_transforms` find-and-replace rules before the text reaches Plivo.
+
+## Event Handlers
+
+`PlivoTTSService` supports the standard [service connection events](/api-reference/server/events/service-events):
+
+| Event                 | Description                         |
+| --------------------- | ----------------------------------- |
+| `on_connected`        | Connected to Plivo WebSocket        |
+| `on_disconnected`     | Disconnected from Plivo WebSocket   |
+| `on_connection_error` | WebSocket connection error occurred |
+
+```python
+@tts.event_handler("on_connected")
+async def on_connected(service):
+    print("Connected to Plivo")
+```
 
 # Pocket TTS
 Source: https://docs.pipecat.ai/api-reference/server/services/tts/pocket-tts.md
@@ -83631,8 +84268,8 @@ Constructor parameters for `MeshLiteAvatarProcessor` (keyword arguments):
 
 <ParamField path="language" type="Language | str" default="None">
   The language the bot speaks at the start. It picks the lip model of each new
-  session: English, French or Mandarin Chinese; any other language uses MeshLite's
-  multilingual lip model (`auto`).
+  session: English, French or Mandarin Chinese; any other language uses
+  MeshLite's multilingual lip model (`auto`).
 </ParamField>
 
 <ParamField path="max_sessions" type="int" default="3">
@@ -83642,8 +84279,8 @@ Constructor parameters for `MeshLiteAvatarProcessor` (keyword arguments):
 
 <ParamField path="follow_language" type="bool" default="True">
   Send `meshlite-language` to the page when the language the bot speaks changes.
-  A bot that switches language on purpose can also call
-  `await avatar.set_language("fr")`.
+  A bot that switches language on purpose can also call `await
+  avatar.set_language("fr")`.
 </ParamField>
 
 ## Usage
@@ -83710,6 +84347,118 @@ Tested with Pipecat v1.16.0 (Python 3.12) and v1.15.0 (Python 3.11) on SmallWebR
 1.16.0 and the MeshLite web SDK 1.11.60. Check the
 [source repository](https://github.com/meshlite-avatar/pipecat-meshlite) for the latest
 compatibility notes.
+
+# Ojin Video Avatar
+Source: https://docs.pipecat.ai/api-reference/server/services/video/ojin.md
+
+OjinVideoService generates real-time lip-synced Ojin video avatars from your Pipecat agent's TTS audio.
+
+## Overview
+
+`OjinVideoService` turns the TTS audio in your pipeline into a lip-synced video
+avatar using [Ojin](https://ojin.ai). It is maintained by Ojin, the company that
+provides the service. By default it pushes synchronized audio and video frames to
+your transport. With `OjinVideoSettings.webrtc` set, Ojin joins your LiveKit or
+Daily room as the `ojin-avatar` participant and publishes the avatar there, so the
+service pushes no media frames.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/ojinai/pipecat-ojin"
+  >
+    Source code, examples, and issues for the Ojin integration
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-ojin/"
+  >
+    The `pipecat-ojin` package on PyPI
+  </Card>
+  <Card title="Ojin Docs" icon="book" href="https://docs.ojin.ai">
+    Python SDK, direct WebRTC and troubleshooting guides
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-ojin
+```
+
+## Prerequisites
+
+1. **Ojin account**: get an API key and a Face model config ID from [ojin.ai](https://ojin.ai).
+2. API keys for the STT, LLM and TTS services in your pipeline.
+3. For direct WebRTC: a LiveKit or Daily room that Ojin can reach, and a token for the avatar.
+
+### Required Environment Variables
+
+- `OJIN_API_KEY`: your Ojin API key
+- `OJIN_CONFIG_ID`: the Face model (avatar) configuration to drive
+
+## Configuration
+
+<ParamField path="settings" type="OjinVideoSettings" required>
+  Connection identity and options: `api_key`, `config_id`, `ws_url`,
+  `buffer_preinit_tts_audio`, `stv_config`, and `webrtc` (optional direct WebRTC
+  settings).
+</ParamField>
+
+<ParamField
+  path="session_trace"
+  type="ojin.stv.OjinSessionTrace"
+  default="None"
+>
+  Optional per-call trace, dumped when the session closes.
+</ParamField>
+
+<Note>
+  See the [source repository](https://github.com/ojinai/pipecat-ojin) for the
+  authoritative parameter list. Set your transport's `video_out_width` and
+  `video_out_height` to your Face model's frame size when using the WebSocket
+  path.
+</Note>
+
+## Usage
+
+```python
+import os
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_ojin import OjinVideoService, OjinVideoSettings
+
+avatar = OjinVideoService(
+    OjinVideoSettings(
+        api_key=os.environ["OJIN_API_KEY"],
+        config_id=os.environ["OJIN_CONFIG_ID"],
+    )
+)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    avatar,  # Ojin video avatar, after TTS
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+See the [foundational example](https://github.com/ojinai/pipecat-ojin/blob/main/examples/foundational/ojin_livekit_avatar.py)
+for a complete LiveKit pipeline.
+
+## Compatibility
+
+Tested with Pipecat v1.3.0 and v1.16.0 (Python 3.11+).
+Check the [source repository](https://github.com/ojinai/pipecat-ojin) for the latest
+tested version and changelog.
 
 # Protoface Video Avatar
 Source: https://docs.pipecat.ai/api-reference/server/services/video/protoface.md
@@ -84369,6 +85118,115 @@ tavus = TavusVideoService(
 - **Metrics support**: The service supports TTFB metrics tracking using `TTSStartedFrame` and `BotStartedSpeakingFrame` signals.
 - **Facial emotion**: With `PipelineParams(enable_expressive_conversation=True)`, the service sets the replica's facial emotion from each `TTSTextFrame.delivery`, as the frame's words are heard, and sends `conversation.set_emotion` when the emotion changes. Each delivery in `TAVUS_DELIVERY_EMOTIONS` maps to a `TavusEmotion` (for example `warm` to `happiness` and `angry` to `anger`); any other delivery shows `neutral`. A delivery in the expression policy with no matching emotion is logged as a warning at startup.
 
+# Harny Memory
+Source: https://docs.pipecat.ai/api-reference/server/services/memory/harny.md
+
+Harny gives every customer of an app their own AI agent. The pipecat-harny integration brings the part that knows each customer to Pipecat voice agents: long-term memory that keeps up when facts change.
+
+## Overview
+
+The `pipecat-harny` integration connects [Harny](https://harny.ai) to Pipecat voice pipelines. It ships one `FrameProcessor`: `HarnyMemoryService` sits between the user context aggregator and the LLM service. For each new user turn it recalls dated facts about the person, adds them to the LLM context as one developer message, and saves what the person said in the background.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/harny-ai/pipecat-harny"
+  >
+    Source code, example bot, and issues for the Pipecat integration
+  </Card>
+  <Card title="Website" icon="globe" href="https://harny.ai">
+    Learn more about Harny
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-harny
+```
+
+Requires `pipecat-ai>=1.17.0` and Python 3.10+.
+
+## Prerequisites
+
+You do not need an account first. From the project folder:
+
+```bash
+pip install harny
+harny init --name "<business>" --about "<what the app does>" --customers "<who its customers are>"
+```
+
+That creates the app and saves `HARNY_API_KEY` to `.env` without printing it. Never print, log or commit the key.
+
+## Configuration
+
+### `HarnyMemoryService`
+
+Inserted **after** the user context aggregator and **before** the LLM service.
+
+<ParamField path="user" type="str" required>
+  Your own id for the person. The API reads only that person's memory, so one app key can serve every user safely.
+</ParamField>
+
+<ParamField path="api_key" type="str" default="None">
+  Harny app key (`fsa_`). Falls back to the `HARNY_API_KEY` environment variable.
+</ParamField>
+
+<ParamField path="base_url" type="str" default="None">
+  Harny API address. Falls back to `HARNY_API_URL`, else `https://api.harny.ai`.
+</ParamField>
+
+<ParamField path="level" type="str" default='"medium"'>
+  How much evidence to recall: `low`, `medium`, `high` or `extra-high`.
+</ParamField>
+
+<ParamField path="limit" type="int" default="None">
+  Most facts recalled per turn (1 to 200). Defaults to the API's own default.
+</ParamField>
+
+<ParamField path="recall_timeout_secs" type="float" default="2.0">
+  How long a turn waits for recall. On timeout the frame goes on without memory.
+</ParamField>
+
+<ParamField path="save_user_messages" type="bool" default="True">
+  Save what the person says after each turn. The model's replies are never saved.
+</ParamField>
+
+<ParamField path="position" type="int" default="1">
+  Where in the context messages the recalled facts are inserted.
+</ParamField>
+
+## Usage
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat_harny import HarnyMemoryService
+
+memory = HarnyMemoryService(user="nadia")  # reads HARNY_API_KEY; "nadia" is YOUR id for the person
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    user_aggregator,
+    memory,
+    llm,
+    tts,
+    transport.output(),
+    assistant_aggregator,
+])
+```
+
+<Note>
+  A memory problem never fails the call. If recall is refused or too slow, the turn goes on without memory and one warning with the error code is logged.
+</Note>
+
+## Compatibility
+
+The integration requires `pipecat-ai>=1.17.0` and was tested with Pipecat v1.17.0, through `pipecat.tests.utils.run_test`. Check the [source repository](https://github.com/harny-ai/pipecat-harny) for the latest tested version and changelog.
+
 # Mem0 Long-Term Memory
 Source: https://docs.pipecat.ai/api-reference/server/services/memory/mem0.md
 
@@ -84856,6 +85714,161 @@ The integration requires `pipecat-ai>=1.0.0` (tested with Pipecat v1.8.1,
 through `pipecat.tests.utils.run_test` â€” the framework's own harness). Check
 the [source repository](https://github.com/memorysyncio/memorysync-pipecat)
 for the latest tested version and changelog.
+
+# Ormem Memory
+Source: https://docs.pipecat.ai/api-reference/server/services/memory/ormem.md
+
+Give Pipecat voice agents dated, cross-call memory with Ormem, so a caller's latest correction wins over what they said before.
+
+## Overview
+
+`pipecat-ormem` gives a Pipecat voice agent long-term memory of each caller,
+backed by [Ormem](https://ormem.app).
+
+Memories are dated, so corrections stick. `OrmemMemoryService` lists the
+caller's memories oldest first with their dates and tells the LLM that the
+newer one wins. If a caller says "I parked at B14" and later "I moved the car
+to C7", the next call answers C7.
+
+Ormem publishes its benchmark results: on LongMemEval-S (all 500 questions,
+full chat history), 91.8% with OpenAI models (answered by gpt-6-luna) and
+94.0% with open models only (answered by Kimi K3), with every graded answer
+published. See [the results](https://ormem.app/api).
+Benchmark run with about 6,000 tokens of memory per question; the plugin's lookup size is configurable with `evidence_budget`.
+
+The service sits between the user context aggregator and the LLM. On each
+user turn it looks up the caller's memories (`POST /v1/context`) and adds them
+as one message just before the latest question, replacing the previous turn's
+memory message. Like other memory services, it has a recall time limit (1.5 s
+by default; on timeout the turn goes ahead without memory) and saves new
+messages in the background (`POST /v1/memories`) with idempotency keys.
+
+<CardGroup cols={2}>
+  <Card
+    title="Source Repository"
+    icon="github"
+    href="https://github.com/ormem/pipecat-ormem"
+  >
+    Package source, demo, changelog, and issues
+  </Card>
+  <Card
+    title="PyPI Package"
+    icon="cube"
+    href="https://pypi.org/project/pipecat-ormem/"
+  >
+    The `pipecat-ormem` package on PyPI
+  </Card>
+  <Card title="Ormem API" icon="book" href="https://ormem.app/api">
+    API reference for the endpoints the service uses
+  </Card>
+  <Card title="API Keys" icon="key" href="https://app.ormem.app">
+    Create and manage your Ormem API keys
+  </Card>
+</CardGroup>
+
+## Installation
+
+This is a community-maintained package distributed separately from `pipecat-ai`:
+
+```bash
+uv add pipecat-ormem
+```
+
+Requires Python 3.11 or newer.
+
+## Prerequisites
+
+### Ormem Account Setup
+
+1. **Ormem account**: sign up at [app.ormem.app](https://app.ormem.app)
+2. **API key**: create a key under Account
+
+### Required Environment Variables
+
+- `ORMEM_API_KEY`: your Ormem API key. Keep it on your server.
+
+## Configuration
+
+### `OrmemMemoryService`
+
+<ParamField path="api_key" type="str" required>
+  Ormem API key.
+</ParamField>
+
+<ParamField path="owner" type="str" required>
+  Stable ID of the caller whose memories these are, such as a phone number or
+  your user ID. 1 to 200 characters, without `~`.
+</ParamField>
+
+<ParamField path="session_id" type="str" required>
+  ID of this call. Used for idempotency keys; use a new one for each call.
+</ParamField>
+
+<ParamField path="user_name" type="str" default="owner">
+  Speaker name stored with the caller's messages.
+</ParamField>
+
+<ParamField path="base_url" type="str" default='"https://app.ormem.app"'>
+  Ormem API base URL.
+</ParamField>
+
+<ParamField path="params" type="OrmemMemoryService.InputParams" default="None">
+  Tuning options, listed below.
+</ParamField>
+
+<ParamField path="session" type="aiohttp.ClientSession" default="None">
+  Optional shared HTTP session.
+</ParamField>
+
+### `InputParams`
+
+| Parameter               | Type          | Default            | Description                                                                 |
+| ----------------------- | ------------- | ------------------ | --------------------------------------------------------------------------- |
+| `recall_timeout`        | `float`       | `1.5`              | Seconds to wait for memories before replying without them.                  |
+| `evidence_budget`       | `int`         | `800`              | Upper bound on memory tokens per turn (500 or more).                        |
+| `store_timeout`         | `float`       | `30.0`             | Seconds allowed for a background save.                                      |
+| `add_as_system_message` | `bool`        | `True`             | Add memories as a `developer` message instead of a `user` message.          |
+| `position`              | `int \| None` | `None`             | Where the memory message goes. `None`: just before the latest user message. |
+| `max_memories`          | `int \| None` | `None`             | Optional cap on memories per turn; matched memories are kept first.         |
+| `conflict_note`         | `str`         | "If two memories…" | Tells the LLM that the more recent memory is the current truth.             |
+| `agent_name`            | `str`         | `"assistant"`      | Speaker name stored with the agent's messages.                              |
+
+## Usage
+
+```python
+import os
+
+from pipecat.pipeline.pipeline import Pipeline
+from ormem_pipecat import OrmemMemoryService
+
+memory = OrmemMemoryService(
+    api_key=os.environ["ORMEM_API_KEY"],
+    owner=caller_phone_number,
+    session_id=call_id,
+    user_name=caller_name,
+)
+
+pipeline = Pipeline(
+    [
+        transport.input(),
+        stt,
+        user_aggregator,
+        memory,
+        llm,
+        tts,
+        transport.output(),
+        assistant_aggregator,
+    ]
+)
+```
+
+Pending saves are finished when the pipeline ends, so the end of a call is not
+lost. A runnable two-call demo is in the repository: `examples/demo.py`.
+
+## Compatibility
+
+Tested with Pipecat v1.17.0. See the repository's changelog for the latest
+tested version.
 
 # Synap Memory
 Source: https://docs.pipecat.ai/api-reference/server/services/memory/synap.md
@@ -94425,12 +95438,14 @@ Controls when automatic context summarization triggers.
 
 <ParamField path="max_context_tokens" type="int | None" default="8000">
   Maximum context size in estimated tokens before triggering summarization.
-  Tokens are estimated using the heuristic of 1 token per 4 characters. This
-  measures the context messages only: the LLM service's `system_instruction` is
-  sent on every inference but is not part of the context, and summarization
-  cannot compress it. Size this limit against the model's window minus the
-  instruction. Set to `None` to disable token-based triggering. At least one of
-  `max_context_tokens` or `max_unsummarized_messages` must be set.
+  Tokens are estimated using the heuristic of 1 token per 4 characters. Images
+  and WAV audio (`input_audio` parts) are estimated separately, audio from its
+  duration. This measures the context messages only: the LLM service's
+  `system_instruction` is sent on every inference but is not part of the
+  context, and summarization cannot compress it. Size this limit against the
+  model's window minus the instruction. Set to `None` to disable token-based
+  triggering. At least one of `max_context_tokens` or
+  `max_unsummarized_messages` must be set.
 </ParamField>
 
 <ParamField path="max_unsummarized_messages" type="int | None" default="20">
@@ -98004,6 +99019,16 @@ python bot.py --esp32 --host 192.168.1.100
 
 - `webrtc_connection`: Pre-configured WebRTC peer connection
 
+#### Connecting from a phone
+
+When the runner listens on a network address (for example `--host 0.0.0.0`) with the WebRTC or Daily transport enabled, the startup banner prints a `pipecat://connect` link and a QR code of it. Scanning the code with a phone opens the Pipecat Playground app connected to your bot. The link names the transport only when the runner is restricted to WebRTC or Daily with `-t`; otherwise the app uses the transport picked in it.
+
+```bash
+python bot.py --host 0.0.0.0
+```
+
+With `--host 0.0.0.0` or `::`, the link uses this machine's LAN address. No link is printed for a loopback host such as the default `localhost`. The QR code requires `segno`, which the `runner` extra installs; without it, only the link is printed.
+
 ### Daily (`"transport": "daily"`)
 
 Integration with Daily for production video conferencing with rooms, participant management, and Pipecat client compatibility.
@@ -98186,6 +99211,7 @@ Grouped by what they are for; only the account group is ever required.
 
 - `SIP_INSTANCE_ID` (Optional): A stable UUID identifying this endpoint across restarts (RFC 5626 `+sip.instance`). Set it so a restarted bot replaces its own registration instead of leaving a stale one that still receives calls.
 - `SIP_NET_INTERFACE` (Optional): Restrict the stack to one local interface, by name or address: `127.0.0.1` for a registrar on loopback, or one address of a multi-homed host.
+- `SIP_PORT` (Optional): A fixed local SIP port for UDP and TCP, with TLS on the next one. Unset binds an ephemeral port, which suits a registering bot; set it for trunk mode (`SIP_REG_INTERVAL=0`) behind a carrier that routes to a fixed `host:port`. Must be an integer.
 
 **Debugging**
 
@@ -98281,6 +99307,8 @@ Options:
 - `websocket`: Plain WebSocket server
 - `sip`: [SIP](/api-reference/server/services/transport/sip) calling, registering a SIP account
 - `moq`: [Media over QUIC](/api-reference/server/services/transport/moq), serving its own socket or dialing a relay
+
+**`--host`**: Address the server listens on. Use `0.0.0.0` to accept connections from other devices on your network, such as a phone scanning the [QR code](#connecting-from-a-phone) the runner prints.
 
 **`--proxy` / `-x`**: Required for most telephony transports (Twilio, Telnyx, Plivo). This should be a publicly accessible hostname (like `yourbot.ngrok.io`) that can receive webhooks from telephony providers. The runner automatically strips protocol prefixes (http://, https://) if provided. Not required for Exotel, which uses direct WebSocket connections.
 
@@ -101041,18 +102069,27 @@ No extra install: `num2words`, which the number-expanding transforms depend on, 
   or `trillion`) or its abbreviation (`k`, `m`/`mn`, `b`/`bn`, `t`/`tn`) is read
   as one number, so `"$2.5 billion"` and `"$2.5bn"` become `"two point five
   billion dollars"`. Trailing zeros in the fraction are dropped, so `"$2.50
-  million"` reads the same as `"$2.5 million"`.
+  million"` reads the same as `"$2.5 million"`. A minus sign touching the amount
+  is read as "minus", so `"-$5"` becomes `"minus five dollars"`. A range such as
+  `"$10-$20"` or a spaced dash as in `"Latte - $4.50"` is left as written.
 </ParamField>
 
 <ParamField path="expand_percentages" type="bool" default="True">
-  Expand percentages, so `"50%"` becomes `"fifty percent"`.
+  Expand percentages, so `"50%"` becomes `"fifty percent"`. A leading minus sign
+  is read as "minus", so `"-5%"` becomes `"minus five percent"`, and the dash of
+  a range is read as "to", so `"5-10%"` becomes `"5 to ten percent"`.
 </ParamField>
 
 <ParamField path="expand_units" type="bool" default="True">
   Expand unit abbreviations, so `"5km"` becomes `"5 kilometers"`. The
   single-letter units `m` and `g` and the unit `in` match only in lowercase, so
   `"5m"` becomes `"5 meters"` but `"5M"` and `"5G"` are left as written. Liters
-  match `l` or `L`.
+  match `l` or `L`. Degrees are expanded too, so `"25°C"` becomes `"25 degrees
+  Celsius"` and `"90°"` becomes `"90 degrees"`. A degree sign followed by
+  another letter or a digit, as in `"40°N"` or `"40°30′"`, is left as written. A
+  unit followed by a slash and a time unit (`h`, `hr`, `s`, `sec`, `min`) is
+  read as a rate, so `"100 km/h"` becomes `"100 kilometers per hour"` and `"9.8
+  m/s"` becomes `"9.8 meters per second"`.
 </ParamField>
 
 <ParamField path="email_to_speech" type="bool" default="True">
@@ -101065,7 +102102,10 @@ No extra install: `num2words`, which the number-expanding transforms depend on, 
 
 <ParamField path="expand_numbers" type="bool" default="False">
   Expand bare numeric digits into words. Off by default, because plenty of
-  numbers are clearer read as digits — a room number, a year, a version.
+  numbers are clearer read as digits — a room number, a year, a version. A minus
+  sign touching the number is read as "minus", so `"-5"` becomes `"minus five"`.
+  Hyphens in ranges, phone numbers, dates, and words such as `"COVID-19"` are
+  left as written.
 </ParamField>
 
 <ParamField path="number_digit_cutoff" type="int | None" default="None">
@@ -112928,6 +113968,11 @@ pcClient.on(RTVIEvent.BotReady, () => console.log("Bot ready via event"));
   flexible and defined by the server implementation.
 </ParamField>
 
+<ParamField path="onSystemLog" type="data:SystemLogData">
+  A line of the bot's log, as `{text}`, for debugging. The bot sends it only
+  when Pipecat's `system_logs_enabled` `RTVIObserverParams` setting is on.
+</ParamField>
+
 <ParamField path="onMessageError" type="message:RTVIMessage">
   Response error when an action fails or an unknown message type is sent from
   the client.
@@ -113048,17 +114093,38 @@ pcClient.on(RTVIEvent.BotReady, () => console.log("Bot ready via event"));
 
 ### Audio and Voice Activity
 
-<ParamField path="onLocalAudioLevel" type="level:number">
-  Local audio gain level (0 to 1).
+<ParamField path="onClientUserAudioLevel" type="level:number">
+  How loud the user's microphone audio is (0 to 1), as the transport measures it
+  on the device. Reported regularly.
+</ParamField>
+
+<ParamField path="onClientBotAudioLevel" type="level:number">
+  How loud the bot's audio is (0 to 1), as the transport measures it on the
+  device while playing it. Reported regularly.
+</ParamField>
+
+<ParamField path="onLocalAudioLevel" type="level: number" deprecated>
+  Deprecated. Use `onClientUserAudioLevel` instead.
 </ParamField>
 
 <ParamField
   path="onRemoteAudioLevel"
   type="level: number, participant: Participant"
+  deprecated
 >
-  Remote audio gain level (0 to 1). Note: if more than one participant is
-  connected to the transport, the `participant` property details the associated
-  peer/bot.
+  Deprecated. Use `onClientBotAudioLevel` instead.
+</ParamField>
+
+<ParamField path="onServerUserAudioLevel" type="data:AudioLevelData">
+  How loud the user's audio is, as `{value}` from 0 to 1, as the bot received
+  it. Sent regularly while audio comes in. The bot sends it only when Pipecat's
+  `user_audio_level_enabled` `RTVIObserverParams` setting is on.
+</ParamField>
+
+<ParamField path="onServerBotAudioLevel" type="data:AudioLevelData">
+  How loud the bot's audio is, as `{value}` from 0 to 1, as the bot produced it.
+  Sent regularly while it speaks. The bot sends it only when Pipecat's
+  `bot_audio_level_enabled` `RTVIObserverParams` setting is on.
 </ParamField>
 
 <ParamField path="onBotStartedSpeaking">
@@ -113083,6 +114149,20 @@ pcClient.on(RTVIEvent.BotReady, () => console.log("Bot ready via event"));
 
 <ParamField path="onUserStoppedSpeaking">
   The local user stopped speaking, indicated by the VAD model.
+</ParamField>
+
+<ParamField path="onVadUserStartedSpeaking">
+  The bot's voice activity detection heard the user start speaking. It reacts to
+  any voice, sooner than `onUserStartedSpeaking`, which fires when the bot
+  decides the user's turn started. The bot sends it only when Pipecat's
+  `vad_user_speaking_enabled` `RTVIObserverParams` setting is on.
+</ParamField>
+
+<ParamField path="onVadUserStoppedSpeaking">
+  The bot's voice activity detection heard the user stop speaking. It reacts to
+  any pause, sooner than `onUserStoppedSpeaking`, which fires when the bot
+  decides the user's turn ended. The bot sends it only when Pipecat's
+  `vad_user_speaking_enabled` `RTVIObserverParams` setting is on.
 </ParamField>
 
 <ParamField path="onUserMuteStarted">
@@ -113279,6 +114359,27 @@ Callback receives a `TranscriptData` object:
 
 <ParamField path="onBotLlmStopped">LLM service inference concluded.</ParamField>
 
+<ParamField path="onBotLlmMarker" type="BotLLMMarkerData">
+  The marker the bot's LLM put in a response, outside the text it speaks, such
+  as one saying whether the user's turn was complete. Sent once per response,
+  when it ends. It carries the response's raw text, so it's for evaluating and
+  debugging the bot, not for showing to the user. The bot sends it only when
+  Pipecat's `bot_llm_marker_enabled` `RTVIObserverParams` setting is on.
+  <Expandable title="BotLLMMarkerData">
+    <ParamField path="text" type="string">
+      The marker as the LLM produced it; empty when the response carried none.
+    </ParamField>
+    <ParamField path="kind" type="string" optional>
+      What the marker means, such as `complete`, `short`, or `long` for markers
+      that say whether the user's turn was complete, or `silent` for a dropped
+      reply.
+    </ParamField>
+    <ParamField path="raw" type="string">
+      The response's text as the LLM produced it, markers included.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
 <ParamField path="onBotTtsText" type="BotTTSTextData" deprecated>
   Deprecated. Use `onBotOutput` to show the bot's text, or `onTtsRawText` to
   inspect what the TTS produced. If your TTS service supports streamed responses
@@ -113460,6 +114561,7 @@ Here's the complete reference mapping events to their corresponding callbacks:
 | Event Name           | Callback Name          | Data Type                 |
 | -------------------- | ---------------------- | ------------------------- |
 | `ServerMessage`      | `onServerMessage`      | `any`                     |
+| `SystemLog`          | `onSystemLog`          | `SystemLogData`           |
 | `MessageError`       | `onMessageError`       | `RTVIMessage`             |
 | `Error`              | `onError`              | `RTVIMessage`             |
 | `UnsupportedFeature` | `onUnsupportedFeature` | `UnsupportedFeatureError` |
@@ -113485,17 +114587,23 @@ Here's the complete reference mapping events to their corresponding callbacks:
 
 ### Audio Activity Events
 
-| Event Name            | Callback Name           | Data Type             |
-| --------------------- | ----------------------- | --------------------- |
-| `LocalAudioLevel`     | `onLocalAudioLevel`     | `number`              |
-| `RemoteAudioLevel`    | `onRemoteAudioLevel`    | `number, Participant` |
-| `BotStartedSpeaking`  | `onBotStartedSpeaking`  | -                     |
-| `BotStoppedSpeaking`  | `onBotStoppedSpeaking`  | -                     |
-| `BotInterrupted`      | `onBotInterrupted`      | -                     |
-| `UserStartedSpeaking` | `onUserStartedSpeaking` | -                     |
-| `UserStoppedSpeaking` | `onUserStoppedSpeaking` | -                     |
-| `UserMuteStarted`     | `onUserMuteStarted`     | -                     |
-| `UserMuteStopped`     | `onUserMuteStopped`     | -                     |
+| Event Name               | Callback Name              | Data Type             |
+| ------------------------ | -------------------------- | --------------------- |
+| `ClientUserAudioLevel`   | `onClientUserAudioLevel`   | `number`              |
+| `ClientBotAudioLevel`    | `onClientBotAudioLevel`    | `number`              |
+| ~`LocalAudioLevel`~      | ~`onLocalAudioLevel`~      | `number`              |
+| ~`RemoteAudioLevel`~     | ~`onRemoteAudioLevel`~     | `number, Participant` |
+| `ServerUserAudioLevel`   | `onServerUserAudioLevel`   | `AudioLevelData`      |
+| `ServerBotAudioLevel`    | `onServerBotAudioLevel`    | `AudioLevelData`      |
+| `BotStartedSpeaking`     | `onBotStartedSpeaking`     | -                     |
+| `BotStoppedSpeaking`     | `onBotStoppedSpeaking`     | -                     |
+| `BotInterrupted`         | `onBotInterrupted`         | -                     |
+| `UserStartedSpeaking`    | `onUserStartedSpeaking`    | -                     |
+| `UserStoppedSpeaking`    | `onUserStoppedSpeaking`    | -                     |
+| `VadUserStartedSpeaking` | `onVadUserStartedSpeaking` | -                     |
+| `VadUserStoppedSpeaking` | `onVadUserStoppedSpeaking` | -                     |
+| `UserMuteStarted`        | `onUserMuteStarted`        | -                     |
+| `UserMuteStopped`        | `onUserMuteStopped`        | -                     |
 
 ### Text and Transcription Events
 
@@ -113517,6 +114625,7 @@ Here's the complete reference mapping events to their corresponding callbacks:
 | Event Name             | Callback Name            | Data Type                  |
 | ---------------------- | ------------------------ | -------------------------- |
 | `BotLlmSearchResponse` | `onBotLlmSearchResponse` | `BotLLMSearchResponseData` |
+| `BotLlmMarker`         | `onBotLlmMarker`         | `BotLLMMarkerData`         |
 | `BotLlmStarted`        | `onBotLlmStarted`        | -                          |
 | `BotLlmStopped`        | `onBotLlmStopped`        | -                          |
 | `BotTtsStarted`        | `onBotTtsStarted`        | -                          |
